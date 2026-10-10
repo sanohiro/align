@@ -470,7 +470,7 @@ fn fixed_owned_strings_reject_invalid_transfers_and_consumers() {
             ("zero-twice", "fn empty(values: [string; 0]) {}\nfn main() { values: [string; 0] := []; empty(values); empty(values) }".into()),
             ("cardinality", "fn main() { values: [string; 2] := [\"a\".clone()] }".into()),
             ("nested-array", "fn main() { values: [[string; 1]; 1] := [[\"a\".clone()]] }".into()),
-            ("dynamic-owner", "fn main() { values := [[1].to_array(), [2].to_array()] }".into()),
+            ("specialized-dynamic-owner", "fn main() { values := [[1, 2].chunks(1)] }".into()),
         ];
             for (name, body) in [
                 (
@@ -563,7 +563,7 @@ fn main() { arena { value := Mixed { values: ["a".clone(), "b".clone()], numbers
                 (
                     "generic-invalid-element",
                     r#"Bad<T> { marker: T, values: [T; 2] }
-fn main() { value := Bad { marker: [0].to_array(), values: [[1].to_array(), [2].to_array()] } }"#,
+fn main() { value := Bad { marker: [0].chunks(1), values: [[1].chunks(1), [2].chunks(1)] } }"#,
                 ),
                 (
                     "sum-duplicate",

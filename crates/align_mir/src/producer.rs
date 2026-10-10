@@ -1535,8 +1535,9 @@ fn xml_plain_fixed_array_element(element: Scalar) -> bool {
     )
 }
 
-fn xml_fixed_array_load_needs_construction_proof(element: Scalar, length: u32) -> bool {
-    xml_plain_fixed_array_element(element) || (element == Scalar::String && length == 0)
+fn xml_fixed_array_load_needs_construction_proof(element: Scalar) -> bool {
+    xml_plain_fixed_array_element(element)
+        || align_sema::fixed_owned_header_scalar(scalar_to_ty(element)).is_some()
 }
 
 /// Exact native-owner contracts, shared by value and out-slot producer checks.
@@ -3751,7 +3752,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 } else if path.is_empty()
                     && let Ty::Array(element, length) = result_ty
-                    && xml_fixed_array_load_needs_construction_proof(element, length)
+                    && xml_fixed_array_load_needs_construction_proof(element)
                 {
                     // A whole inline scalar array copies its elements, not a backing header.
                     // Keep the literal completeness proof and every reaching element producer;
@@ -3959,7 +3960,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                             self.graph.program,
                             scalar_to_ty(element),
                             scalar_to_ty(view),
-                        ) && (xml_plain_fixed_array_element(element) || element == Scalar::String)
+                        ) && (xml_plain_fixed_array_element(element)
+                            || align_sema::fixed_owned_header_scalar(scalar_to_ty(element)).is_some())
                             && u32::try_from(length) == Ok(actual)
                     }
                     _ => false,
@@ -5734,6 +5736,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                             | Ty::String
                             | Ty::Slice(_)
                             | Ty::Array(_, _)
+                            | Ty::StructArray(_, _)
                             | Ty::DynArray(_)
                             | Ty::DynStructArray(_, _)
                             | Ty::DynSliceArray(_)
@@ -7210,7 +7213,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let Ty::Array(element, length) = expected else {
             return false;
         };
-        if !xml_fixed_array_load_needs_construction_proof(element, length)
+        if !xml_fixed_array_load_needs_construction_proof(element)
             || xml_operand_base_ty(self.graph.function, operand) != Some(expected)
         {
             return false;
@@ -7261,11 +7264,26 @@ impl<'a> XmlAccessAnalyzer<'a> {
         let element_ty = scalar_to_ty(element);
         let mut initialized = HashSet::new();
         let mut constant_array = false;
+        if mir_block_reachable_avoiding(self.graph.function, load_block, None) != Some(true) {
+            return false;
+        }
         for block in &self.graph.function.blocks {
+            // An element expression may contain a materializer loop or a fallible branch.
+            // Its unique initialization must still occur on every path reaching publication.
+            let mut dominates_load = None;
             for (position, statement) in block.stmts.iter().enumerate() {
+                let precedes_load = |cached: &mut Option<bool>| {
+                    if block.id == load_block {
+                        position < load_position
+                    } else {
+                        *cached.get_or_insert_with(|| {
+                            mir_block_reachable_avoiding(self.graph.function, load_block, Some(block.id)) == Some(false)
+                        })
+                    }
+                };
                 match statement {
                     Stmt::StoreIndex(slot, index, value) if slot == array_slot => {
-                        if block.id != load_block || position >= load_position || constant_array {
+                        if !precedes_load(&mut dominates_load) || constant_array {
                             return false;
                         }
                         let Operand::Const(Const::Int(index_value, index_ty)) = index else {
@@ -7286,8 +7304,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         self.check_whole_operand(equation, value, element_ty);
                     }
                     Stmt::StoreConstArray { slot, elems, elem } if slot == array_slot => {
-                        if block.id != load_block
-                            || position >= load_position
+                        if !precedes_load(&mut dominates_load)
                             || constant_array
                             || !initialized.is_empty()
                             || *elem != element_ty
@@ -7445,7 +7462,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid = true;
                 continue;
             }
-            if matches!(stored_ty, Ty::Array(element, length) if xml_fixed_array_load_needs_construction_proof(element, length)) {
+            if matches!(stored_ty, Ty::Array(element, _) if xml_fixed_array_load_needs_construction_proof(element)) {
                 if !self.check_fixed_array_construction_operand(&mut equation, &operand, stored_ty) {
                     equation.invalid = true;
                     continue;
@@ -7814,7 +7831,7 @@ fn xml_borrowed_access(
             else {
                 return XmlProducerState::Invalid;
             };
-            let Some((base_selected, _)) =
+            let Some((base_selected, mut base_path)) =
                 xml_borrowed_path(graph.program, root, &place.base.path)
             else {
                 return XmlProducerState::Invalid;
@@ -7823,10 +7840,8 @@ fn xml_borrowed_access(
             if base_selected != place.base.ty && !base_retype {
                 return XmlProducerState::Invalid;
             }
-            let physical_element = match base_selected {
-                Ty::Slice(element) | Ty::DynArray(element) => scalar_to_ty(element),
-                Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
-                _ => return XmlProducerState::Invalid,
+            let Some(physical_element) = align_sema::shared_index_element_type(base_selected) else {
+                return XmlProducerState::Invalid;
             };
             let selected = if place.field_path.is_empty() {
                 physical_element
@@ -7857,6 +7872,14 @@ fn xml_borrowed_access(
             let view_retype = xml_borrowed_place_ty_is_view_retype(selected, place.element_ty);
             if selected != place.element_ty && !view_retype {
                 return XmlProducerState::Invalid;
+            }
+            if matches!(base_selected, Ty::Array(..) | Ty::StructArray(..)) {
+                // Inline construction records element producers, not a heap-header producer at
+                // the array root. Read the selected element graph; the exact bounds reservation
+                // and stable backing are certified independently before pointer formation.
+                base_path.push(XmlAccessPathSegment::Element);
+                base_path.extend(place.field_path.iter().copied().map(XmlAccessPathSegment::StructField));
+                return xml_slot_path_access(graph, place.base.slot, selected, base_path);
             }
             return xml_borrowed_access(
                 graph,

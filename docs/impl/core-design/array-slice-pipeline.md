@@ -35,6 +35,16 @@ source and payload roots and cannot survive move, replacement, destruction or ov
 exclusive access. Indexed String writes and other Move consumer/capture exclusions remain.
 Exact closure: [plan 73](../73-fixed-array-field-plan.md) and [plan164](../164-fixed-owned-string-arrays.md).
 
+
+Ordinary `[array<P>; N]` and AoS `[array<Record>; N]` use the same inline Move lifecycle,
+including at N=0, with no outer allocation. P is integer, float, bool, char, str or string.
+Stable fixed elements, including String and Move-record siblings, support explicit shared
+`borrow` calls at constant/runtime indices. Ranges/coercion form read-only slices of these headers;
+length and shared calls preserve both backing and payload lifetimes. Whole indexed extraction,
+indexed replacement, `borrow mut`, specialized inner arrays and nested dynamic representations
+remain excluded. Existing conservative control/producer refusals remain; see
+[plan165](../165-fixed-dynamic-array-elements.md).
+
 ## Signatures (verified)
 
 ```text
@@ -136,8 +146,8 @@ returns a borrowed `str`, whose keys keep the existing shallow cleanup.
 
 ## Type & ownership classification
 
-- Fixed arrays are Copy values; source-formed fixed arrays of Move structs (`[User{name}]` with
-  owned fields) have recursive element Drop. Whole Move-element reads remain restricted to the
+- Fixed arrays derive Copy/Move from their element; admitted Move records and owned headers
+  have recursive element Drop, including when nested in records or sums. Whole Move-element reads remain restricted to the
   explicit shared-call places described below.
 - Dynamic `array<T>` is a Move type with recursive Drop (owned-string arrays deep-free, #339
   precedent).
@@ -191,15 +201,13 @@ input-vs-output scope; sources are allowed to alias one another and are never de
 
 ## Spec'd but not implemented
 
-- Slicing **Move-element** collections and ordinary whole-value indexing of every Move element
-  remain unsupported except for the owned-string `array<string>`/`[string; N]`/`slice<string>` views: indexing
-  yields `str` and ranges yield read-only `slice<string>`. Move-record
-  arrays retain their direct-field view and explicit shared-borrow call-place forms. Dynamic
-  slice/AoS record views accept a checked runtime index for a Move field; a source-formed fixed
-  `StructArray` uses its static element path and requires an integer-literal index. The existing
-  fixed-resource exception remains unchanged. Fixed arrays of Move structs and owned struct-array
-  fields already have recursive element drop; the remaining gap is a public view type or transfer
-  rule for the whole element, not missing destruction for the collection itself.
+- Ordinary whole-value indexing of Move elements remains unavailable. Owned-string
+  `array<string>`/`[string; N]`/`slice<string>` indexing yields borrowed `str`. Read-only slices of
+  Move records, String and plan165's ordinary dynamic-array headers preserve source ownership.
+  Explicit shared calls inspect whole stable elements, including fixed elements at runtime indices.
+  Direct fixed `StructArray` Move-field calls still require an integer-literal index; dynamic
+  slice/AoS Move-field calls accept runtime indices. For the new owned-header domain, indexed ownership extraction/replacement and mutable element
+  borrowing remain excluded. Existing fixed-record element stores and resource exceptions are unchanged.
 - Dynamic `array<Struct>` element-field writes with a **non-primitive leaf** (str/owned/nested-
   Move) — `StoreElemFieldPtr` is primitive-leaf-only (#316).
 - Nested element write `arr[i].a.x = v` works; nested **soa** columns and element write via

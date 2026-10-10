@@ -19039,20 +19039,44 @@ fn ordinary_directory_records_reject_malformed_types() -> Result<(), &'static st
 }
 
 #[test]
+fn nested_owned_dynamic_array_placement_rejects_header_elements() -> Result<(), &'static str> {
+    let original = checked_source_program("Row { value: i64 }\nfn use(borrow value: array<Row>) {}\nfn main() {}\n");
+    assert!(validate_hir::type_placement_metadata_is_valid(&original));
+    let id = u32::try_from(original.structs.iter().position(|record| record.source_name == "Row").ok_or("Row definition")?).map_err(|_| "Row id")?;
+    for element in [Scalar::DynStructArray(id), Scalar::DynArray(align_sema::PrimScalar::Bool)] {
+        let mut bad = original.clone();
+        let function = bad.fns.iter_mut().find(|function| function.name == "use").ok_or("use function")?;
+        function.locals[function.params[0] as usize].ty = Ty::DynArray(element);
+        assert!(!validate_hir::type_placement_metadata_is_valid(&bad), "{element:?}");
+        assert_body_entrypoints_empty("nested owned dynamic header", &bad);
+    }
+    Ok(())
+}
+
+#[test]
 fn move_slice_records_reject_forged_shapes() -> Result<(), &'static str> {
     let source = "Row { text: string }\nfn inspect(borrow row: Row) -> i64 = row.text.len()\nfn use(view: slice<Row>) -> i64 = inspect(view[0])\nfn field(view: slice<Row>) -> str = view[0].text\nfn text(view: slice<string>) -> str = view[0]\nfn main() {}\n";
     let source = format!("{source}Inner {{ text: string }}\nNested {{ inner: Inner }}\nfn nested(view: slice<Nested>) -> str = view[0].inner.text\n");
     let base = checked_source_program(&source);
     assert!(!is_empty(&lower_program(&base)));
+    for (element, collection, read) in [
+        ("Row", "slice<Row>", "value.text.len()"),
+        ("Row", "[Row; 2]", "value.text.len()"),
+        ("string", "[string; 2]", "value.len()"),
+        ("array<i64>", "[array<i64>; 2]", "value.len()"),
+        ("array<i64>", "slice<array<i64>>", "value.len()"),
+    ] {
+        let indexed_base = checked_source_program(&format!("Row {{ text: string }}\nfn inspect(borrow value: {element}) -> i64 = {read}\nfn use(borrow values: {collection}) -> i64 = inspect(values[0])\nfn main() {{}}\n"));
+        assert!(!is_empty(&lower_program(&indexed_base)));
     for mutation in 0..7 {
-        let mut bad = base.clone();
+        let mut bad = indexed_base.clone();
         let function = bad.fns.iter_mut().find(|f| f.name == "use").ok_or("use")?;
         let expression = function.body.value.as_mut().ok_or("tail")?;
         let hir::ExprKind::Call { args, .. } = &mut expression.kind else { return Err("call"); };
         let hir::ExprKind::BorrowedIndex { base, index } = &mut args[0].kind else { return Err("index"); };
         match mutation {
             0 => base.array_ty = Ty::Soa(0),
-            1 => base.element_ty = Ty::String,
+            1 => base.element_ty = Ty::Bool,
             2 => base.root_local = u32::MAX,
             3 => base.owner_fact.clear(),
             4 => base.path.push(hir::BorrowedPathSegment::StructField(99)),
@@ -19063,6 +19087,7 @@ fn move_slice_records_reject_forged_shapes() -> Result<(), &'static str> {
         for lowered in [lower_program(&bad), lower_program_per_unit(&bad), lower_program_located(&bad, &map), lower_program_per_unit_located(&bad, &map)] {
             assert!(is_empty(&lowered), "forged Move slice place {mutation}");
         }
+    }
     }
     for name in ["field", "text"] {
         let mut bad = base.clone();

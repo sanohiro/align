@@ -1623,11 +1623,11 @@ impl<'a> PlacementValidator<'a> {
                 self.field_scalar_ok(ok, allow_param) && self.field_scalar_ok(err, allow_param)
             }
             Ty::Tagged(id) => self.field_tagged_payload_ok(id, allow_param),
-            Ty::Slice(element) => self.scalar_ok(element, ScalarPlacement::Collection),
+            Ty::Slice(element) => self.view_element_ok(element),
             Ty::DynArray(element) => {
                 // `array<Struct>` has its own `DynStructArray` producer; a plain scalar array
                 // with a struct element is a malformed HIR spelling of that type.
-                !matches!(element, Scalar::Struct(_))
+                !matches!(element, Scalar::Struct(_) | Scalar::DynStructArray(_))
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
             Ty::DynStructArray(id, Layout::Aos) => self.dynamic_struct_array_ok(id),
@@ -1806,6 +1806,15 @@ impl<'a> PlacementValidator<'a> {
             }
         }
         false
+    }
+
+    // Views may inspect admitted owned headers without making those headers legal elements of
+    // another dynamic allocation. Keep dynamic-array formation under its separate collection gate.
+    fn view_element_ok(&self, scalar: Scalar) -> bool {
+        match scalar {
+            Scalar::DynArray(element) => valid_prim(element),
+            other => self.scalar_ok(other, ScalarPlacement::Collection),
+        }
     }
 
     fn scalar_leaf_ok(&self, scalar: Scalar, mode: ScalarPlacement) -> bool {
@@ -2018,9 +2027,9 @@ impl<'a> PlacementValidator<'a> {
                 ) == Some(ty)
             }
             Ty::DynStructArray(id, Layout::Aos) => self.dynamic_struct_array_ok(id),
-            Ty::Slice(element) => self.scalar_ok(element, ScalarPlacement::Collection),
+            Ty::Slice(element) => self.view_element_ok(element),
             Ty::DynArray(element) => {
-                !matches!(element, Scalar::Struct(_))
+                !matches!(element, Scalar::Struct(_) | Scalar::DynStructArray(_))
                     && self.scalar_ok(element, ScalarPlacement::Collection)
             }
             Ty::DynSliceArray(element) => valid_prim(element),
@@ -4038,7 +4047,7 @@ impl<'a> BodyValidator<'a> {
             return false;
         }
         match ty {
-            Ty::String => true,
+            owned if align_sema::fixed_owned_header_scalar(owned).is_some() => true,
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             Ty::Slice(_) => false,
@@ -4615,11 +4624,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::Index { .. }
             | hir::ExprKind::SliceRange { .. } => true,
             hir::ExprKind::BorrowedIndex { base, index } => {
-                let element_ty = match base.array_ty {
-                    Ty::Slice(element) | Ty::DynArray(element) => Some(align_sema::scalar_to_ty(element)),
-                    Ty::DynStructArray(id, align_sema::Layout::Aos) => Some(Ty::Struct(id)),
-                    _ => None,
-                };
+                let element_ty = align_sema::shared_index_element_type(base.array_ty);
                 self.program
                     .fns
                     .get(context.function)
@@ -11154,11 +11159,7 @@ impl<'a> BodyValidator<'a> {
                 if index_flow.falls && index_flow.ty != i64_ty() {
                     return None;
                 }
-                let element_ty = match base.array_ty {
-                    Ty::Slice(element) | Ty::DynArray(element) => align_sema::scalar_to_ty(element),
-                    Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
-                    _ => return None,
-                };
+                let element_ty = align_sema::shared_index_element_type(base.array_ty)?;
                 if !self.body_ty_matches(element_ty, base.element_ty)
                     || !self.body_ty_matches(expression.ty, element_ty)
                     || !align_sema::ty_is_move(

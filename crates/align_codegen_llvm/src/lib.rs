@@ -13673,8 +13673,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         // Drop site for this root type. It frees owned fields in declaration order,
                         // including nested Move structs (null-safe — moved-out storage was zeroed).
                         self.drop_struct_fields(self.slots[slot], sid)?;
-                    } else if matches!(ty, Ty::Array(Scalar::String, _)) {
-                        // Inline String slots own only their element payloads. Reuse the same
+                    } else if matches!(ty, Ty::Array(..)) {
+                        // Inline owned slots own only their element payloads. Reuse the same
                         // ascending cleanup as a fixed array nested in a record; never free the
                         // inline array address or treat its first element as the whole header.
                         self.drop_ty_at(self.slots[slot], ty)?;
@@ -19133,7 +19133,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             Rvalue::SliceLen(op) => {
                 if let Operand::BorrowedPlace(place) = op {
-                    self.borrowed_view_part(place, 1, "borrow.view.len")?
+                    match self.checked_borrowed_place_ty(place)? {
+                        Ty::Array(_, length) | Ty::StructArray(_, length) => {
+                            self.ctx.i64_type().const_int(u64::from(length), false).into()
+                        }
+                        _ => self.borrowed_view_part(place, 1, "borrow.view.len")?,
+                    }
                 } else {
                     let agg = self.operand(op)?.into_struct_value();
                     self.builder.build_extract_value(agg, 1, "len").map_err(|e| self.err(e))?
@@ -25180,15 +25185,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         place: &align_mir::BorrowedElementPlace,
     ) -> Result<Ty, CodegenError> {
         let base_ty = self.checked_borrowed_place_ty(&place.base)?;
-        let element_ty = match base_ty {
-            Ty::Slice(element) | Ty::DynArray(element) => align_sema::scalar_to_ty(element),
-            Ty::DynStructArray(id, align_sema::Layout::Aos) => Ty::Struct(id),
-            _ => {
-                return Err(self.err(
-                    "borrowed element place base is not an ordinary array or slice",
-                ));
-            }
-        };
+        let element_ty = align_sema::shared_index_element_type(base_ty)
+            .ok_or_else(|| self.err("borrowed element place base is not an ordinary array or slice"))?;
         let selected = if place.field_path.is_empty() {
             element_ty
         } else {
@@ -25640,31 +25638,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
     ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
         self.checked_borrowed_element_place_ty(place)?;
         let header = self.borrowed_place_ptr(&place.base)?;
-        let data_field = self
-            .builder
-            .build_struct_gep(slice_struct_type(self.ctx), header, 0, "borrow.element.data.field")
-            .map_err(|error| self.err(error))?;
-        let data = self
-            .builder
-            .build_load(
-                self.ctx.ptr_type(AddressSpace::default()),
-                data_field,
-                "borrow.element.data",
-            )
-            .map_err(|error| self.err(error))?
-            .into_pointer_value();
+        let data = if matches!(place.base.ty, Ty::Array(..) | Ty::StructArray(..)) {
+            // Inline arrays start at their first element. They contain no outer data pointer.
+            header
+        } else {
+            let data_field = self.builder
+                .build_struct_gep(slice_struct_type(self.ctx), header, 0, "borrow.element.data.field")
+                .map_err(|error| self.err(error))?;
+            self.builder.build_load(
+                self.ctx.ptr_type(AddressSpace::default()), data_field, "borrow.element.data",
+            ).map_err(|error| self.err(error))?.into_pointer_value()
+        };
         let index = self.operand(&place.index)?.into_int_value();
         // MIR's successful bounds block dominates this call action. This GEP has no independent
         // bounds decision and is formed only now, after every later argument has fallen through.
-        let physical_element_ty = match place.base.ty {
-            Ty::Slice(element) | Ty::DynArray(element) => align_sema::scalar_to_ty(element),
-            Ty::DynStructArray(id, align_sema::Layout::Aos) => Ty::Struct(id),
-            _ => {
-                return Err(self.err(
-                    "borrowed element place base is not an ordinary array or slice",
-                ));
-            }
-        };
+        let physical_element_ty = align_sema::shared_index_element_type(place.base.ty)
+            .ok_or_else(|| self.err("borrowed element place base is not an ordinary array or slice"))?;
         let element = unsafe {
             self.builder
                 .build_gep(
@@ -27275,7 +27264,18 @@ fn main() -> i32 {
 
     #[test]
     fn borrowed_element_guard_fails_closed_before_pointer_codegen() {
-        let source = "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow records: array<Record>) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n";
+        for source in [
+            "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow records: array<Record>) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
+            "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow records: [Record; 2]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
+            "fn inspect(borrow value: string) -> i64 = value.len()\nfn use(borrow records: [string; 2]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
+            "fn inspect(borrow value: array<i64>) -> i64 = value.len()\nfn use(borrow records: [array<i64>; 2]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
+            "fn inspect(borrow value: array<i64>) -> i64 = value.len()\nfn use(records: slice<array<i64>>) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n"
+        ] {
+            assert_borrowed_element_guard_rejects_mutations(source);
+        }
+    }
+
+    fn assert_borrowed_element_guard_rejects_mutations(source: &str) {
         let program = mir(source);
         emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
             .unwrap_or_else(|error| panic!("valid borrowed element guard must lower: {error}"));
@@ -38912,6 +38912,8 @@ fn main() -> i32 = 0
         // stored i32 element deliberately differs from an omitted tagged Unit payload.
         for element in [
             Scalar::Unit, Scalar::Bool, Scalar::Char, Scalar::Str, Scalar::String, Scalar::Fn(0),
+            Scalar::DynArray(align_sema::PrimScalar::Bool),
+            Scalar::DynArray(align_sema::PrimScalar::String), Scalar::DynStructArray(0),
             sc_int(8, false), sc_int(16, true), sc_int(32, false), sc_int(64, true),
             Scalar::Float(FloatTy { bits: 32 }), Scalar::Float(FloatTy { bits: 64 }),
         ] {

@@ -466,10 +466,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             next: 0,
                         });
                     }
-                    Ty::Array(Scalar::String, len) => {
+                    Ty::Array(element, len) => {
                         work.push(Work::FixedArray {
                             base,
-                            element: Ty::String,
+                            element: scalar_to_ty(element),
                             len,
                             next: 0,
                         });

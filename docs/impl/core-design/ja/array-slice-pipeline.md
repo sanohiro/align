@@ -34,6 +34,15 @@ view は source と payload の寿命を保持し、move・置換・破棄・重
 使用できません。String 要素への添字代入と、それ以外の Move consumer/capture の制限は維持します。
 正確な契約は [plan164](../../164-fixed-owned-string-arrays.md) を参照してください。
 
+
+通常の `[array<P>; N]` と AoS の `[array<Record>; N]` も同じ inline Move lifecycle に従い、
+N=0 でも Move です。外側の allocation はありません。P は整数、float、bool、char、str、string です。
+String と Move record を含む固定長配列の stable な要素は、定数・実行時添字から明示的な shared
+`borrow` call に渡せます。range/coercion は header の読み取り専用 slice を作り、length と shared
+call は backing と payload の寿命を保持します。添字による所有権の取り出し・置換、`borrow mut`、
+特殊化された内側の配列、dynamic array の再帰的な入れ子は対象外です。既存の保守的な control／producer
+判定も維持します。正確な対応範囲は [plan165](../../165-fixed-dynamic-array-elements.md) を参照してください。
+
 ## Signatures (verified)
 
 ```text
@@ -128,7 +137,7 @@ storage: field 'f' owns independent heap storage`。設計は
 
 ## Type & ownership classification
 
-- Fixed array は Copy 値である。所有権付きフィールドを持つ source-formed な Move struct 固定配列（`[User{name}]` など）には再帰的な要素 Drop がある。Move 要素全体の読み取りは、下記の明示的な shared-call place に限定される。
+- Fixed array の Copy/Move は要素型から決まる。受理された Move record と所有 header には再帰的な要素 Drop があり、record や sum の内部でも同じ規則に従う。Move 要素全体の読み取りは、下記の明示的な shared-call place に限定される。
 - Dynamic `array<T>` は再帰的な Drop を持つ Move 型である（所有する string 要素の配列は deep-free される。#339 の前例を参照）。
 - `array_builder<T>` は1つの Move owner である。heap 形式は通常の型付き parameter/return を
   move でき、helper は同じ owner を `borrow mut` 経由で変更できる。builder は aggregate field
@@ -165,7 +174,7 @@ storage: field 'f' owns independent heap storage`。設計は
 
 ## 仕様先行（未実装の範囲）
 
-- **Move 要素** のコレクションの slicing と通常の whole-value indexing は未対応である。ただし、所有文字列の `array<string>` / `[string; N]` / `slice<string>` view は例外であり、添字アクセスは `str`、range は読み取り専用の `slice<string>` を返す。Move record 配列では、直接 field view と明示的な shared-borrow call-place の形式が引き続き使用できる。dynamic な slice/AoS record view は Move field に checked runtime index を使え、source-formed な固定 `StructArray` は static element path のため整数リテラル添字だけを受理する。既存の fixed-resource exception は変わらない。固定長の Move struct 配列と所有 struct-array フィールドには再帰的な要素 drop が実装済みである。残る問題はコレクションの破棄ではなく、要素全体に対する public view type または所有権移動の規則である。
+- Move 要素全体を通常の添字アクセスで値として読むことは未対応です。所有文字列の `array<string>` / `[string; N]` / `slice<string>` は借用した `str` を返します。Move record、String、plan165 の通常の dynamic-array header は、所有者を保持する読み取り専用 slice を作れます。明示的な shared call は stable な要素全体を参照でき、固定長配列でも実行時添字を使えます。固定 `StructArray` の Move field を直接渡す場合は整数リテラル添字が必要で、dynamic slice/AoS の Move field は実行時添字を使えます。新しい所有 header の範囲では、添字による所有権の取り出し・置換と mutable element borrow は対象外です。既存の fixed-record element store と resource exception は維持します。
 - **非プリミティブな leaf**（str / owned / nested-Move）を持つ dynamic `array<Struct>` における要素フィールドの書き込み — `StoreElemFieldPtr` はプリミティブ leaf 専用である（#316）。
 - ネストした要素書き込み `arr[i].a.x = v` は動作する。しかし、ネストした **soa** 列や、テスト済みの形式を超える chained projection 経由での要素書き込みは未対応 — `08-nested-structs.md` の deferred リストを参照。
 - `soa` 列は汎用パス（generic path）経由では範囲スライスできない（列のウィンドウは実装済みの `s.field[a..b]` を経由する。未対応なのは汎用的な `check_slice_range` のアームのみである）。

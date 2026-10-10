@@ -1283,7 +1283,7 @@ pub enum ExprKind {
     /// is the scalar element). Lowering emits a bounds check (`0 <= index < len`) that aborts on
     /// an out-of-range index (the settled panic model). `index` is an `i64`.
     Index { recv: Box<Expr>, index: Box<Expr> },
-    /// A Move element selected from an ordinary dynamic array for one immediate shared-borrow call
+    /// A Move element selected from an ordinary fixed/dynamic array or slice for one shared call
     /// argument. The index is evaluated once and bounds-checked before later arguments; MIR keeps
     /// the result as a guarded place descriptor and forms the pointer only at the call action.
     BorrowedIndex { base: BorrowedElementBase, index: Box<Expr> },

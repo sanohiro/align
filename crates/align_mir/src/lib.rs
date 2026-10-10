@@ -26996,9 +26996,9 @@ fn main() -> i32 {
         // Other scalar Move families retain their formation boundary.
         let scalar_move_cases = [
             (
-                "owned array",
+                "owned sum",
                 r#"module main
-fn owned() -> array<i64> = [1, 2].to_array()
+fn owned() -> Option<string> = Some("value".clone())
 fn main() -> i32 {
   arrays := [owned()]
   return arrays.len() as i32

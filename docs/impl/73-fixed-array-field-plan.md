@@ -47,8 +47,9 @@ Exact type        N is in 0..=u32::MAX and is part of the structural type.
                   fixed-array literal formation after generic substitution.
                   Plan164 admits owned string with complete element transfer and
                   Drop; it is Move even at N=0 and indexes to borrowed str.
-                  Nested fixed arrays and other independently owned scalar elements
-                  such as dynamic array, resource or native handle stay rejected
+                  Plan165 admits ordinary dynamic-array headers with the same
+                  complete lifecycle and shared indexed inspection. Nested fixed
+                  arrays, specialized inner arrays, resources and native handles stay rejected
                   by that one element classifier. A Move
                   record element remains admitted only through the existing
                   in-place construction and recursive element-Drop rules.
