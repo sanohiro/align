@@ -67,6 +67,18 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
         if kind != 2 {
             cases.push((0u8..=255).collect());
             cases.push((0u8..=255).rev().collect());
+        } else {
+            for length in (0..=84).chain([127, 128, 129, 255, 256, 257, 4095, 4096, 4097]) {
+                for &entity in b"&<>\"'" {
+                    let mut input = vec![entity];
+                    input.extend(std::iter::repeat_n(b'a', length));
+                    input.push(entity);
+                    input.extend_from_slice("日本\0".as_bytes());
+                    input.extend(std::iter::repeat_n(b'z', length));
+                    input.extend_from_slice(b"&<>\"'");
+                    cases.push(input);
+                }
+            }
         }
         for input in cases {
             let expected = reference(&input, kind);

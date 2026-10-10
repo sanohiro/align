@@ -7,13 +7,61 @@ and cleans its temporary executable. `CARGO_TARGET_DIR` and `CC` are supported;
 no optional native codec/crypto libraries are needed.
 
 Kind 0 is percent/component, 1 percent/path, 2 HTML, and 3 form. Plain and mixed
-UTF-8 seeds join unreserved, dense reserved-byte and dense five-entity HTML controls. Requested sizes
-are 0, 1, 8, 64, 4096 and 65536 bytes; whole seed repetitions preserve UTF-8,
-and CSV records actual lengths. Empty input appears once per encoder, and
-repeated rounded lengths are skipped, leaving 96 distinct cases. An independent
-oracle checks exact bytes before timing. Each case warms for 100 ms, then emits
-nine samples including final output allocation/free. Returned lengths, calls
-and output bytes are observed, and empty/nonempty pointer shape is checked.
+UTF-8 seeds join unreserved, dense reserved-byte, dense five-entity HTML,
+sparse-entity and late-entity controls. Requested sizes are 0, 1, 8, 64, 4096
+and 65536 bytes; whole seed repetitions preserve UTF-8, and CSV records actual
+lengths. Empty input appears once per encoder, and repeated rounded lengths
+are skipped, leaving 136 distinct cases. An independent oracle checks exact
+bytes before timing. Each case warms for 100 ms, then emits nine samples
+including final output allocation/free. Returned lengths, calls and output
+bytes are observed, and empty/nonempty pointer shape is checked.
+
+## HTML ordinary-run copying, 2026-10-10
+
+Baseline: `b0aa0fec8619b6e86f61bb62901ead20017d86b6`. Plan168 keeps the
+shared checked count and copies ordinary output runs in bulk after sixteen
+ordinary bytes, with at least 64 input bytes remaining. Inputs below 80 bytes
+compile out that counter. The five entities and publication strategy remain.
+
+Linux x86_64 WSL2, AMD Ryzen 9 5950X, pinned to CPU 0; Rust 1.96.0 and
+Debian GCC 14.2.0. Both actual producers rebuilt ordinary release archives;
+identical C source used `-O3 -Wall -Wextra -Werror`. No build/test overlapped
+the ABBA run. Each of 136 cases contributes nine samples per process, hence
+18 per arm/case and 4,896 total, with no removed observations.
+
+Harness SHA256:
+`fadce8f16cd5a4a99f6b8b8aaa2909f6f8a967c018a306ba2fdf822ceee58ec9`.
+Baseline/candidate archive SHA256:
+`9034c54ba9da19e1dae2cf0a094c1e2c6d48552e8ccbfc5743aca034462c7292` /
+`65dcf70f37b07cd48d6e8b0b5861c248742012d42dd2f212657f9adcbec0f729`.
+
+The corpus adds `html_sparse`, ordinary ASCII with an entity byte every 256
+bytes cycling through all five entities, and `html_late`, ordinary ASCII with
+a final apostrophe. The independent oracle verifies complete bytes before
+timing; every sample checks output extent, pointer convention and exact observed
+call/output counts. All four encoders consume the same fixtures; the other
+three remain controls. Medians below are microseconds per complete HTML
+encode/free call at approximately 64 KiB.
+
+| Input | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| plain | 50.006 | 8.771 | -82.5% |
+| mixed | 76.677 | 63.956 | -16.6% |
+| unreserved | 49.576 | 8.749 | -82.4% |
+| dense reserved bytes | 105.364 | 8.715 | -91.7% |
+| dense HTML entities | 134.252 | 110.385 | -17.8% |
+| sparse HTML entities | 52.667 | 13.484 | -74.4% |
+| late HTML entity | 48.966 | 8.753 | -82.1% |
+
+The reserved-byte seed is space/slash/plus/percent, so it needs no HTML entities.
+At 4 KiB, the ordinary/sparse/late cases improve 73.1–82.3%. The largest short
+HTML increase is 6.45 ns (64-byte reserved input, 59.85 → 66.30 ns, +10.8%).
+Unchanged long controls range from -17.5% to +4.4%, and their largest short
+increase is 5.65 ns. That dispersion limits interpretation of the smaller dense
+HTML/mixed gains; the substantial ordinary-run gains and stated short cost are
+accepted without a portable or template/application-throughput claim.
+[All observations](html-runs-linux-x86_64-samples.csv) are retained. Timing is
+not a correctness or CI gate.
 
 ## HTML narrow-count qualification
 
@@ -24,7 +72,8 @@ their corresponding source before linking the identical expanded C harness
 with `-O3`. No local build/test work overlapped timing. The existing
 `native_probe.run_phase` bounded each link/probe and retired its process group.
 
-Four runs in ABBA order give 18 observations per arm/case.
+The then-current 96-case corpus has four runs in ABBA order, giving 18
+observations per arm/case.
 [All 3,456 observations](html-count-linux-x86_64-samples.csv) preserve every
 case, trial and producer call/output-byte count. The independent byte oracle,
 returned extents and counts agree in both arms. Median microseconds per

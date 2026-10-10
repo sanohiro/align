@@ -7,6 +7,12 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan168](docs/impl/168-html-ordinary-runs.md) bulk-copies long ordinary HTML
+output runs through safe slice initialization. The checked size, five entities,
+allocation and publication remain unchanged for encoding and template callers.
+Native/mismatch/allocation and source owners pass; local x86_64 measurements
+retain all samples and short/control costs without a portable speed claim.
+
 [Plan167](docs/impl/167-escaped-decode-runs.md) extends percent/form bulk copying
 to long ordinary runs after escapes. Exact admission, output, allocation and
 publication remain unchanged; native/allocation and raw-query source owners

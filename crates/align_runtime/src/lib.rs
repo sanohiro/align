@@ -13934,18 +13934,41 @@ fn html_escaped_len(data: &[u8]) -> Option<usize> {
 
 /// Write `data` HTML-escaped into `out` (exactly [`html_escaped_len`] bytes).
 fn html_escape_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    if data.len() < 80 {
+        html_escape_runs::<false>(data, out);
+    } else {
+        html_escape_runs::<true>(data, out);
+    }
+}
+
+fn html_escape_runs<const BULK_RUNS: bool>(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    let mut i = 0;
     let mut o = 0;
-    for &b in data {
+    let mut ordinary = 0;
+    while i < data.len() {
+        let b = data[i];
+        i += 1;
         match html_entity(b) {
             Some(ent) => {
                 for &e in ent {
                     out[o].write(e);
                     o += 1;
                 }
+                ordinary = 0;
             }
             None => {
                 out[o].write(b);
                 o += 1;
+                if BULK_RUNS { ordinary += 1; }
+                if BULK_RUNS && ordinary == 16 && data.len() - i >= 64 {
+                    let tail = &data[i..];
+                    let markup = memchr::memchr3(b'&', b'<', b'>', tail).unwrap_or(tail.len());
+                    let copied = memchr::memchr2(b'"', b'\'', &tail[..markup]).unwrap_or(markup);
+                    out[o..][..copied].write_copy_of_slice(&tail[..copied]);
+                    i += copied;
+                    o += copied;
+                    ordinary = 0;
+                }
             }
         }
     }

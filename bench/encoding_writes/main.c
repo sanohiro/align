@@ -53,12 +53,12 @@ static size_t expected(const unsigned char *input, size_t length, int kind, unsi
     return written;
 }
 int main(void) {
-    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'", "A", " /+%", "&<>\"'"};
-    const char *names[] = {"plain", "mixed", "unreserved", "dense", "html_dense"};
+    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'", "A", " /+%", "&<>\"'", "a", "a"};
+    const char *names[] = {"plain", "mixed", "unreserved", "dense", "html_dense", "html_sparse", "html_late"};
     size_t sizes[] = {0, 1, 8, 64, 4096, 65536};
     Encode encoders[] = {align_rt_percent_encode, align_rt_percent_encode_path, align_rt_html_escape, align_rt_form_encode};
     puts("input,input_bytes,kind,trial,calls,output_bytes,ns_per_call");
-    for (int seed = 0; seed < 5; ++seed) {
+    for (int seed = 0; seed < 7; ++seed) {
         size_t unit = strlen(seeds[seed]);
         size_t previous_length = SIZE_MAX;
         for (int size = 0; size < 6; ++size) {
@@ -69,6 +69,12 @@ int main(void) {
             unsigned char *input = malloc(length + 1), *oracle = malloc(length * 6 + 1);
             require(input && oracle, "fixture allocation");
             for (size_t i = 0; i < length; i += unit) memcpy(input + i, seeds[seed], unit);
+            if (seed == 5) {
+                for (size_t i = 0; i < length; i += 256) input[i] = "&<>\"'"[(i / 256) % 5];
+            } else if (seed == 6) {
+                require(length != 0, "late HTML fixture extent");
+                input[length - 1] = '\'';
+            }
             size_t repeats = 4 * 1024 * 1024 / (length + 64);
             if (repeats < 64) repeats = 64;
             for (int kind = 0; kind < 4; ++kind) {
