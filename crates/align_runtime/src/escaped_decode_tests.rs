@@ -28,8 +28,11 @@ fn decoders() -> [fn(&[u8]) -> Option<Vec<u8>>; 2] {
 
 #[test]
 fn every_escape_suffix_matches_scalar_admission() {
-    let prefix = 128;
-    let mut input = vec![b'a'; prefix];
+    let mut input = b"%00+".to_vec();
+    input.extend_from_slice(&[b'a'; 128]);
+    input.extend_from_slice(b"%2b+");
+    input.extend_from_slice(&[b'b'; 128]);
+    let prefix = input.len();
     input.extend_from_slice(b"%00+tail");
     for high in 0..=u8::MAX {
         for low in 0..=u8::MAX {
@@ -89,13 +92,15 @@ fn ordinary_bytes_and_escapes_preserve_binary_values() {
 
 #[test]
 fn ordinary_run_boundaries_resume_exact_escape_and_plus_transitions() {
-    for length in (0..=65).chain([127, 128, 129, 255, 256, 257, 4095, 4096, 4097]) {
+    for length in (0..=81).chain([127, 128, 129, 255, 256, 257, 4095, 4096, 4097]) {
         for prefix in [b"".as_slice(), b"%00", b"+", b"%2b+"] {
             for tail in [b"".as_slice(), b"%ff", b"+%00+", b"%", b"%0", b"%G0"] {
                 let mut input = prefix.to_vec();
                 input.extend((0..length).map(|index| [b'a', 0, 0xff, b'~'][index % 4]));
                 input.extend_from_slice(tail);
                 input.extend_from_slice(b"ordinary+%25tail");
+                input.extend((0..length).map(|index| [0xff, b'Z', 0, b'_'][index % 4]));
+                input.extend_from_slice(tail);
                 for (form, decode) in decoders().into_iter().enumerate() {
                     assert_eq!(decode(&input), oracle(&input, form != 0),
                         "run={length}, prefix={prefix:?}, tail={tail:?}, form={form}");
@@ -117,6 +122,12 @@ type Decode = unsafe extern "C" fn(*const u8, i64, *mut *mut Buffer) -> i32;
 #[test]
 fn native_publication_preserves_capacity_independence_and_failure_slots() {
     let decoders: [Decode; 2] = [align_rt_percent_decode, align_rt_form_decode];
+    let mut long_runs = b"%20+".to_vec();
+    long_runs.extend_from_slice(&[b'a'; 1024]);
+    long_runs.extend_from_slice(b"%2B+");
+    long_runs.extend_from_slice(&[b'b'; 1024]);
+    let mut malformed_runs = long_runs.clone();
+    malformed_runs.extend_from_slice(b"%0g");
     for (form, decode) in decoders.into_iter().enumerate() {
         for initial in [
             b"".as_slice(),
@@ -125,6 +136,8 @@ fn native_publication_preserves_capacity_independence_and_failure_slots() {
             b"%",
             b"before%0g",
             b"after%00%",
+            &long_runs,
+            &malformed_runs,
         ] {
             let mut input = initial.to_vec();
             let expected = oracle(&input, form != 0);
@@ -158,11 +171,19 @@ fn allocation_requests_remain_one_input_sized_reservation() {
     let Some(_completion) = crate::allocation_test::enter() else {
         return;
     };
+    let mut repeated = b"%20+".to_vec();
+    repeated.extend_from_slice(&[b'a'; 1024]);
+    repeated.extend_from_slice(b"%2B+");
+    repeated.extend_from_slice(&[b'b'; 1024]);
+    let mut malformed = repeated.clone();
+    malformed.extend_from_slice(b"%0g");
     for input in [
         vec![],
         vec![b'a'; 4096],
         b"%20+%ff".repeat(1024),
         b"a%0g".repeat(1024),
+        repeated,
+        malformed,
     ] {
         for (form, decode) in decoders().into_iter().enumerate() {
             let expected = oracle(&input, form != 0);

@@ -13860,9 +13860,18 @@ fn escaped_literal_prefix<const FORM: bool>(input: &[u8]) -> usize {
 /// codec only — it deliberately does NOT map `+` to space, which is the distinct
 /// `application/x-www-form-urlencoded` rule.
 fn percent_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
+    if input.len() < 80 {
+        percent_decode_runs::<false>(input)
+    } else {
+        percent_decode_runs::<true>(input)
+    }
+}
+
+fn percent_decode_runs<const BULK_RUNS: bool>(input: &[u8]) -> Option<Vec<u8>> {
     let mut v = Vec::with_capacity(input.len());
     let mut i = escaped_literal_prefix::<false>(input);
     v.extend_from_slice(&input[..i]);
+    let mut ordinary = 0;
     while i < input.len() {
         if input[i] == b'%' {
             // Need both hex digits in range: indices i+1 and i+2 must exist.
@@ -13871,9 +13880,18 @@ fn percent_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
             }
             v.push(percent_escape_byte(input[i + 1], input[i + 2])?);
             i += 3;
+            ordinary = 0;
         } else {
             v.push(input[i]);
             i += 1;
+            if BULK_RUNS { ordinary += 1; }
+            if BULK_RUNS && ordinary == 16 && input.len() - i >= 64 {
+                let tail = &input[i..];
+                let copied = memchr::memchr(b'%', tail).unwrap_or(tail.len());
+                v.extend_from_slice(&tail[..copied]);
+                i += copied;
+                ordinary = 0;
+            }
         }
     }
     Some(v)
@@ -14318,14 +14336,24 @@ fn form_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
 /// Decode `application/x-www-form-urlencoded`: `+` is a space, `%XX` is a byte, everything else
 /// passes through. A `%` not followed by two hex digits invalidates the input (`None`).
 fn form_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
+    if input.len() < 80 {
+        form_decode_runs::<false>(input)
+    } else {
+        form_decode_runs::<true>(input)
+    }
+}
+
+fn form_decode_runs<const BULK_RUNS: bool>(input: &[u8]) -> Option<Vec<u8>> {
     let mut v = Vec::with_capacity(input.len());
     let mut i = escaped_literal_prefix::<true>(input);
     v.extend_from_slice(&input[..i]);
+    let mut ordinary = 0;
     while i < input.len() {
         match input[i] {
             b'+' => {
                 v.push(b' ');
                 i += 1;
+                ordinary = 0;
             }
             b'%' => {
                 if i + 2 >= input.len() {
@@ -14333,10 +14361,19 @@ fn form_decode_impl(input: &[u8]) -> Option<Vec<u8>> {
                 }
                 v.push(percent_escape_byte(input[i + 1], input[i + 2])?);
                 i += 3;
+                ordinary = 0;
             }
             b => {
                 v.push(b);
                 i += 1;
+                if BULK_RUNS { ordinary += 1; }
+                if BULK_RUNS && ordinary == 16 && input.len() - i >= 64 {
+                    let tail = &input[i..];
+                    let copied = memchr::memchr2(b'%', b'+', tail).unwrap_or(tail.len());
+                    v.extend_from_slice(&tail[..copied]);
+                    i += copied;
+                    ordinary = 0;
+                }
             }
         }
     }
