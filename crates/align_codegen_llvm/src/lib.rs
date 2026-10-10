@@ -25185,6 +25185,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         place: &align_mir::BorrowedElementPlace,
     ) -> Result<Ty, CodegenError> {
         let base_ty = self.checked_borrowed_place_ty(&place.base)?;
+        if matches!(base_ty, Ty::Array(..) | Ty::StructArray(..))
+            != matches!(place.base.ty, Ty::Array(..) | Ty::StructArray(..))
+        {
+            return Err(self.err("borrowed element base changes the fixed storage representation"));
+        }
         let element_ty = align_sema::shared_index_element_type(base_ty)
             .ok_or_else(|| self.err("borrowed element place base is not an ordinary array or slice"))?;
         let selected = if place.field_path.is_empty() {
@@ -27269,7 +27274,10 @@ fn main() -> i32 {
             "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow records: [Record; 2]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
             "fn inspect(borrow value: string) -> i64 = value.len()\nfn use(borrow records: [string; 2]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
             "fn inspect(borrow value: array<i64>) -> i64 = value.len()\nfn use(borrow records: [array<i64>; 2]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
-            "fn inspect(borrow value: array<i64>) -> i64 = value.len()\nfn use(records: slice<array<i64>>) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n"
+            "fn inspect(borrow value: array<i64>) -> i64 = value.len()\nfn use(records: slice<array<i64>>) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
+            "Record { value: string }\nfn inspect(borrow record: Record) -> i64 = record.value.len()\nfn use(borrow records: [Record; 0]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
+            "fn inspect(borrow value: string) -> i64 = value.len()\nfn use(borrow records: [string; 0]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n",
+            "fn inspect(borrow value: array<i64>) -> i64 = value.len()\nfn use(borrow records: [array<i64>; 0]) -> i64 = inspect(records[0])\nfn main() -> i32 = 0\n"
         ] {
             assert_borrowed_element_guard_rejects_mutations(source);
         }
@@ -27427,6 +27435,30 @@ fn main() -> i32 {
                 .expect_err("a descriptor with unrelated length evidence must fail"),
             "borrowed element guard length lacks a checked array-length value",
         );
+
+        let (function_index, original_place) = borrowed_element_place(&program);
+        let slice_ty = match original_place.base.ty {
+            Ty::Array(element, _) => Some(Ty::Slice(element)),
+            Ty::StructArray(record, _) => Some(Ty::Slice(Scalar::Struct(record))),
+            _ => None,
+        };
+        if let Some(slice_ty) = slice_ty {
+            let mut retyped_base = program.clone();
+            borrowed_element_place_mut(&mut retyped_base).base.ty = slice_ty;
+            let function = &mut retyped_base.fns[function_index];
+            let mut changed_len = false;
+            for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                if let Stmt::Let(value, Rvalue::SliceLen(Operand::BorrowedPlace(base))) = statement {
+                    if matches!(original_place.guard.len, Operand::Value(len) if len == *value) {
+                        base.ty = slice_ty;
+                        changed_len = true;
+                    }
+                }
+            }
+            assert!(changed_len, "exact array length producer missing");
+            emit_llvm_ir(&retyped_base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                .expect_err("matching base and length retypes cannot change inline storage to a header");
+        }
 
         let mut invalid_base = program;
         borrowed_element_place_mut(&mut invalid_base)

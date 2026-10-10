@@ -132,6 +132,13 @@ or conservative control limitation is resolved.
 - `fixed_dynamic_arrays_reject_forged_construction` checks malformed HIR across all
   four lowering entrypoints, complete/dominating initialization and empty-owner
   cycles/type/SSA mutations in whole and partition producer validation.
+- `empty_fixed_borrowed_elements_retain_bounds` covers zero-length String,
+  record and dynamic-header bases through local construction, record fields and
+  borrowed parameters. Whole/per-unit native execution preserves a runtime
+  length guard and stops an actual out-of-bounds access before later arguments.
+  Empty construction still needs its producer witness; missing witnesses and
+  the existing empty-owner cycle/type/store mutations fail closed. Matching
+  forged base/length descriptors cannot retype inline storage as a slice header.
 - `move_slice_records_reject_forged_shapes` and
   `borrowed_element_guard_fails_closed_before_pointer_codegen` now parameterize
   the existing malformed place/reservation/bounds/root proofs over dynamic,

@@ -7427,6 +7427,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         };
         let producers = producers.clone();
+        if path.is_empty()
+            && matches!(slot_ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+            && root_stores.is_empty()
+            && field_stores.is_empty()
+            && element_stores.is_empty()
+            && element_field_stores.is_empty()
+            && constant_stores.is_empty()
+            && producers.is_empty()
+            && self.graph.function.blocks.iter().flat_map(|block| &block.stmts)
+                .any(|statement| matches!(statement, Stmt::DropFlagInit(candidate) if *candidate == slot))
+        {
+            // A zeroed empty inline owner has no element producer. Seed only the bare
+            // construction: stores and producer edges must retain their ordinary proof, so
+            // an empty type cannot ground a forged cyclic or type-mismatched assignment.
+            equation.seed = merge_xml_access(equation.seed, XmlAccessProvenance::Owned);
+        }
         for operand in root_stores {
             if !xml_operand_base_ty(self.graph.function, &operand)
                 .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, slot_ty)) {
@@ -7837,7 +7853,10 @@ fn xml_borrowed_access(
                 return XmlProducerState::Invalid;
             };
             let base_retype = xml_borrowed_place_ty_is_view_retype(base_selected, place.base.ty);
-            if base_selected != place.base.ty && !base_retype {
+            if (base_selected != place.base.ty && !base_retype)
+                || (matches!(base_selected, Ty::Array(..) | Ty::StructArray(..))
+                    != matches!(place.base.ty, Ty::Array(..) | Ty::StructArray(..)))
+            {
                 return XmlProducerState::Invalid;
             }
             let Some(physical_element) = align_sema::shared_index_element_type(base_selected) else {
@@ -7874,6 +7893,11 @@ fn xml_borrowed_access(
                 return XmlProducerState::Invalid;
             }
             if matches!(base_selected, Ty::Array(..) | Ty::StructArray(..)) {
+                if matches!(base_selected, Ty::Array(_, 0) | Ty::StructArray(_, 0)) {
+                    // Empty storage has no element producer. Authenticate the complete zero-bit
+                    // value instead; the independent exact bounds proof prevents any access.
+                    return xml_slot_path_access(graph, place.base.slot, base_selected, base_path);
+                }
                 // Inline construction records element producers, not a heap-header producer at
                 // the array root. Read the selected element graph; the exact bounds reservation
                 // and stable backing are certified independently before pointer formation.

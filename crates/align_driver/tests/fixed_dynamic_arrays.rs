@@ -232,7 +232,7 @@ fn main() -> i32 {
 }
 "#;
 
-fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
+fn run(stage: &Path, programs: &[align_mir::Program], label: &str) -> std::process::Output {
     let mut objects = Vec::new();
     let mut libraries = Vec::new();
     for (index, program) in programs.iter().enumerate() {
@@ -263,7 +263,11 @@ fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
     )
     .unwrap();
     // The parent-owned fixture bounds this entire compile/link/run process group.
-    let output = std::process::Command::new(executable).output().unwrap();
+    std::process::Command::new(executable).output().unwrap()
+}
+
+fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
+    let output = run(stage, programs, label);
     assert!(output.status.success(), "{label}: {output:?}");
     assert!(
         output.stdout.is_empty() && output.stderr.is_empty(),
@@ -721,4 +725,131 @@ fn fixed_dynamic_arrays_reject_forged_construction() {
         }
         certify(&bad, false, &format!("empty {mutation}"));
     }
+}
+
+#[test]
+fn empty_fixed_borrowed_elements_retain_bounds() {
+    owned_fixture::run("empty_fixed_borrowed_elements_retain_bounds", |stage| {
+        for (label, element, definition, body) in [
+            ("header", "array<i64>", "", "value.len()"),
+            ("string", "string", "", "value.len()"),
+            ("record", "Row", "Row { text: string }", "value.text.len()"),
+        ] {
+            let common = format!(
+                r#"{definition}
+Holder {{ values: [{element}; 0] }}
+fn inspect(borrow value: {element}) -> i64 = {body}
+fn later() -> i64 {{ print("later"); return 1 }}
+fn inspect_after(borrow value: {element}, ignored: i64) -> i64 = inspect(value)
+fn parameter(borrow values: [{element}; 0], index: i64) -> i64 {{
+  if index >= values.len() {{ return 7 }}
+  return inspect(values[index])
+}}
+fn guarded(index: i64) -> i64 {{
+  values: [{element}; 0] := []
+  holder := Holder {{ values: [] }}
+  if parameter(values, index) != 7 {{ return 1 }}
+  if index >= holder.values.len() {{ return 7 }}
+  return inspect(holder.values[index])
+}}
+fn local(index: i64, guarded: bool) -> i64 {{
+  values: [{element}; 0] := []
+  if guarded && index >= values.len() {{ return 7 }}
+  return inspect_after(values[index], later())
+}}
+"#
+            );
+            for fails in [false, true] {
+                let main = if fails {
+                    "fn main() -> i32 { local(0, false); return 0 }\n"
+                } else {
+                    "fn main() -> i32 { if guarded(0) == 7 && local(0, true) == 7 { return 0 }; return 1 }\n"
+                };
+                let source = format!("{common}{main}");
+                let entry = stage.join(format!("empty-{label}-{fails}.align"));
+                std::fs::write(&entry, &source).unwrap();
+                let mut sources = SourceMap::new();
+                let checked = check(&mut sources, entry.to_str().unwrap(), &source);
+                assert!(
+                    !checked.diags.has_errors(),
+                    "{label}: {}",
+                    align_driver::format_diagnostics(&sources, &checked.diags)
+                );
+                let whole = vec![lower_to_mir(&checked.hir)];
+                if !fails {
+                    let mut missing_construction = whole[0].clone();
+                    let function = missing_construction
+                        .fns
+                        .iter_mut()
+                        .find(|function| function.name.as_str() == "local")
+                        .unwrap();
+                    let slot = function
+                        .slots
+                        .iter()
+                        .position(|ty| {
+                            matches!(
+                                ty,
+                                align_sema::Ty::Array(_, 0) | align_sema::Ty::StructArray(_, 0)
+                            )
+                        })
+                        .unwrap() as u32;
+                    let mut removed = false;
+                    for block in &mut function.blocks {
+                        block.stmts.retain(|statement| {
+                            let remove = matches!(statement, align_mir::Stmt::DropFlagInit(candidate) if *candidate == slot);
+                            removed |= remove;
+                            !remove
+                        });
+                    }
+                    assert!(removed, "empty construction marker missing");
+                    assert!(
+                        align_mir::producer::validate_mir_producers(&missing_construction).is_err(),
+                        "empty borrowed base must have a construction witness"
+                    );
+                    let defined = missing_construction
+                        .fns
+                        .iter()
+                        .map(|function| function.name.clone())
+                        .collect();
+                    assert!(
+                        align_mir::producer::validate_partition_resource_rvalues(
+                            &missing_construction,
+                            &defined
+                        )
+                        .is_err(),
+                        "partition empty borrowed base must have a construction witness"
+                    );
+                }
+                let mut sources = SourceMap::new();
+                let built = build_per_unit(&mut sources, entry.to_str().unwrap(), &source);
+                assert!(
+                    !built.diags.has_errors(),
+                    "{label}: {}",
+                    align_driver::format_diagnostics(&sources, &built.diags)
+                );
+                let units = built
+                    .units
+                    .into_iter()
+                    .map(|unit| unit.mir)
+                    .collect::<Vec<_>>();
+                for (mode, programs) in [("whole", whole), ("units", units)] {
+                    let run_label = format!("empty-{label}-{fails}-{mode}");
+                    if fails {
+                        let output = run(stage, &programs, &run_label);
+                        assert!(!output.status.success(), "{run_label}: {output:?}");
+                        assert!(
+                            output.stdout.is_empty(),
+                            "later argument ran: {run_label}: {output:?}"
+                        );
+                        assert!(
+                            String::from_utf8_lossy(&output.stderr).contains("index out of bounds"),
+                            "{run_label}: {output:?}"
+                        );
+                    } else {
+                        execute(stage, &programs, &run_label);
+                    }
+                }
+            }
+        }
+    });
 }
