@@ -7,6 +7,12 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan174](docs/impl/174-named-arena-loop-validation.md) includes named-arena
+handles in the checked-HIR loop-local inventory. Legal nested/repeated uses now
+lower; exact range, duplicate, type, scope and region-exit restrictions remain.
+Parameterized malformed-HIR and whole/per-unit/cache owners qualify the existing
+contract without changing ownership, allocation, IR or runtime ABI.
+
 [Plan173](docs/impl/173-deferred-aggregate-transfers.md) records retained source
 transfers during aggregate/call evaluation and commits them only when the action
 succeeds. Structural wrappers, fixed-array members and selected bound tails share

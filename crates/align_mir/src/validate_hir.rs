@@ -6616,6 +6616,9 @@ impl<'a> BodyValidator<'a> {
                     }
                 }
                 BodyWork::EnterExpr(expression, context) => {
+                    if let hir::ExprKind::NamedArena { local, .. } = &expression.kind {
+                        *actual.entry(*local).or_default() += 1;
+                    }
                     self.push_expression_children(expression, &context, &mut work);
                 }
                 BodyWork::EnterArm(arm, _, arm_context) => {
