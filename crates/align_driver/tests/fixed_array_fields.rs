@@ -350,10 +350,6 @@ fn fixed_array_cardinality_and_excluded_elements_fail_before_lowering() {
         ),
         ("nested", "Box { values: [[i64; 2]; 2] }\nfn main() {}\n"),
         (
-            "owned-array",
-            "Box { values: [array<i64>; 2] }\nfn main() {}\n",
-        ),
-        (
             "native-owner",
             "Box { values: [buffer; 2] }\nfn main() {}\n",
         ),
@@ -362,6 +358,14 @@ fn fixed_array_cardinality_and_excluded_elements_fail_before_lowering() {
         let checked = check(&mut sources, name, source);
         assert!(checked.diags.has_errors(), "must reject {name}");
     }
+    // Plan165 admits ordinary dynamic-array headers in fixed inline storage.
+    let mut sources = SourceMap::new();
+    let checked = check(
+        &mut sources,
+        "owned-array",
+        "Box { values: [array<i64>; 2] }\nfn main() {}\n",
+    );
+    assert!(!checked.diags.has_errors());
 }
 
 #[test]

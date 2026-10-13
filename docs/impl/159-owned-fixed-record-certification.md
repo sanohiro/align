@@ -55,9 +55,9 @@ and contained-view rejection in both modes.
 The MIR library and existing fixed-array field, Request135 sibling, owned struct
 array, Move-return cleanup, owned replacement and borrowed-composition targets
 remain the owner set for unchanged control, allocation and lifetime rules.
-Standalone canonical borrows of a local fixed array can still reach the existing
-whole-storage producer refusal; this request repairs arrays inside owned records
-and does not expand that independent storage-descriptor proof.
+Plan170 separately closes standalone canonical borrows of local plain scalar
+fixed arrays with an initialized-at-use storage proof. This request remains the
+owned-record value-certification boundary.
 
 ## Review correction
 
