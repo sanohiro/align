@@ -7,6 +7,14 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan171](docs/impl/171-assignment-target-liveness.md) checks indexed-assignment
+backing after both eager operands. Consumed roots and ended view storage reject;
+complete rebinding, independent siblings and overwritten payloads retain their
+existing behavior. Ordinary record-field assignment's incremental literal
+publication needs a separate staging/cleanup repair. Request147's dynamic-field
+admission remains closed pending a selected-backing lifetime/retention closure;
+this repair does not resume K1 or general aggregate provenance.
+
 [Plan170](docs/impl/170-fixed-scalar-array-borrows.md) repairs Request148's local
 fixed scalar-array borrows through complete inline construction and separate
 readable-payload/exclusive-storage checks. Strict literal validation, pooled
