@@ -47,7 +47,7 @@ Median microseconds per complete encode/free call at approximately 64 KiB:
 | dense space/slash/plus/percent | 95.891 → 96.422 | 83.766 → 84.836 | 53.188 → 47.266 |
 
 Across the 4/64-KiB unchanged-output cases, component/path improve 83.4–85.6%
-and HTML 10.5–12.6%. Expanded-input cases range from -2.7% to +2.0%; the
+and HTML 10.5–12.6%. Long expanded-input cases range from -2.7% to +2.0%; the
 largest increase is 1.859 microseconds (dense HTML entities in component
 encoding at 64 KiB). The largest short increase is 2.45 ns (65 bytes of HTML
 entities in path encoding: 120.70 → 123.15 ns). The unchanged form control's

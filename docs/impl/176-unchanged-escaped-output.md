@@ -39,7 +39,7 @@ Nine focused native owners and 23 source owners pass on macOS ARM64.
 
 The [measurement record](../../bench/encoding_writes/README.md) retains all
 7,200 ABBA observations and exact producer identities. At 4/64 KiB the unchanged
-component/path cases improve 83.4–85.6%, and HTML 10.5–12.6%. Expanded cases
+component/path cases improve 83.4–85.6%, and HTML 10.5–12.6%. Long expanded cases
 cost at most 2.0%; the largest short increase is 2.45 ns. Form controls remain
 explicit. Adopt these local gains and costs without a portable or template/
 application-throughput promise. No public contract or allocation strategy changes.
