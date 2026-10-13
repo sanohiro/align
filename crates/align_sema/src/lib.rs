@@ -42795,6 +42795,27 @@ impl<'a> MoveCheck<'a> {
         body_locals.clone().filter(|&id| self.is_dropped_local(id)).collect()
     }
 
+    /// Check the inline shell containing a write, independently of overwritten payloads and
+    /// unrelated siblings. `enclosing_path` includes only projections needed to reach the write.
+    fn check_assignment_shell(
+        &mut self,
+        base: LocalId,
+        enclosing_path: &[u32],
+        moved: &MovedSet,
+        span: Span,
+    ) -> bool {
+        if moved.contains(&MovedKey::Whole(base))
+            || enclosing_path.first().is_some_and(|field| {
+                moved.contains(&MovedKey::Field(base, *field))
+            })
+        {
+            let name = self.f.locals.get(base as usize).map_or("<target>", |local| local.name.as_str());
+            self.diags.error(format!("use of moved value '{name}'"), span);
+            return false;
+        }
+        true
+    }
+
     /// Indexed lowering reads its destination after both eager operands. Recheck the live
     /// shell at that point, without treating an overwritten payload or unrelated sibling as
     /// destination storage. A completed replacement may legitimately install a fresh header.
@@ -42805,13 +42826,7 @@ impl<'a> MoveCheck<'a> {
         moved: &MovedSet,
         span: Span,
     ) {
-        if moved.contains(&MovedKey::Whole(base))
-            || path.first().is_some_and(|field| {
-                moved.contains(&MovedKey::Field(base, *field))
-            })
-        {
-            let name = self.f.locals.get(base as usize).map_or("<target>", |local| local.name.as_str());
-            self.diags.error(format!("use of moved value '{name}'"), span);
+        if !self.check_assignment_shell(base, path, moved, span) {
             return;
         }
         let target_ty = self.f.locals.get(base as usize).map(|local| local.ty)
@@ -43366,6 +43381,10 @@ impl<'a> MoveCheck<'a> {
                     } else {
                         move_expr!(self, value, moved, true, true);
                     }
+                    // The replaced field itself may have moved into this RHS, but its enclosing
+                    // record must still exist after evaluation. A completed whole rebind restores it.
+                    let ancestors = path.split_last().map_or(&[][..], |(_, ancestors)| ancestors);
+                    self.check_assignment_shell(*root, ancestors, moved, value.span);
                     // The assignment installs a live replacement even when its RHS moved out of
                     // this same field through a transparent wrapper, consuming call, or one arm of
                     // a control-flow expression. MIR zeros the source on precisely the paths that
@@ -46769,6 +46788,8 @@ impl<'a> MoveCheck<'a> {
                     self_assign,
                 } => {
                     if falls_through {
+                        let ancestors = path.split_last().map_or(&[][..], |(_, ancestors)| ancestors);
+                        self.check_assignment_shell(root, ancestors, moved, value.span);
                         if let [field] = path {
                             moved.remove(&MovedKey::Field(root, *field));
                         }

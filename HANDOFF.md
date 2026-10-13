@@ -7,11 +7,20 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan172](docs/impl/172-field-assignment-publication.md) stages a complete record-field
+RHS before old-value Drop and publication, and rechecks the enclosing record
+shell after evaluation. Direct retained sources remain readable until successful
+construction. Native allocation/cleanup, termination, root-rebind and
+whole/per-unit/cache owners qualify the existing contract. The separately
+identified canonical aggregate wrapper-transfer observation gap remains the
+next independent correctness boundary; no new field admission or provenance
+strategy is included.
+
 [Plan171](docs/impl/171-assignment-target-liveness.md) checks indexed-assignment
 backing after both eager operands. Consumed roots and ended view storage reject;
 complete rebinding, independent siblings and overwritten payloads retain their
-existing behavior. Ordinary record-field assignment's incremental literal
-publication needs a separate staging/cleanup repair. Request147's dynamic-field
+existing behavior. Plan172 closes the ordinary record-field publication
+boundary. Request147's dynamic-field
 admission remains closed pending a selected-backing lifetime/retention closure;
 this repair does not resume K1 or general aggregate provenance.
 

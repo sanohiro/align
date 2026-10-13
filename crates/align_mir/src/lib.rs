@@ -7174,47 +7174,34 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             ) {
                 return;
             }
-            // `root.f0.… = value`. A struct-literal value is expanded in place at the path (its
-            // leaves stored under the extended path); a scalar value is a single field store.
-            // If the leaf being overwritten has an active Drop plan, drop the OLD value first
-            // and null a moved RHS source after the replacement is stored.
+            // Complete the RHS before accessing the destination. In particular, use the ordinary
+            // value-position struct producer: later members may read retained sources, replace
+            // this root, or exit before publication. Fresh members retain its partial cleanup.
             let leaf_ty = field_ty_at(b, *root, path);
             let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.enums, &b.tagged_types);
-            let drop_old_field = !matches!(value.kind, hir::ExprKind::StructLit { .. })
-                && leaf_plan.needs_drop();
-            if !drop_old_field {
-                store_value_at(b, *root, &mut path.clone(), value);
-                return;
-            }
-            if matches!(value.kind, hir::ExprKind::ArrayLit { .. }) {
-                // A fixed Move-record array is an aggregate value that cannot travel through the
-                // scalar `lower_expr` path. Build it under a temporary owner before touching the
-                // destination, then drop the old field and publish the complete replacement.
+            let (replacement, owner) = if matches!(value.kind, hir::ExprKind::ArrayLit { .. }) {
+                // Fixed arrays keep their complete inline materializer and temporary ownership.
                 let Some((replacement, owner, _)) = materialize_array_literal(b, value) else {
                     return;
                 };
-                let old = b.fresh_value(leaf_ty);
-                b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
-                b.emit_drop_value_if_owner_live(*root, Operand::Value(old));
-                b.push(Stmt::StoreField(*root, path.clone(), replacement));
-                if let Some(owner) = owner {
-                    b.set_drop_flag(owner, false);
-                }
-                return;
-            }
-            // Assignment evaluates the RHS before mutating the destination. Capture it first so
-            // borrows of the old field remain valid during evaluation and a consuming RHS can
-            // transfer that exact ownership back into the destination.
-            let replacement = lower_required!(b, lower_expr(b, value), ());
+                (replacement, owner)
+            } else {
+                (lower_required!(b, lower_expr(b, value), ()), None)
+            };
             // The replacement is already captured, so clear its old source before the store. This
             // is path-local for control-flow RHSs: an arm that transfers the destination zeros it,
             // while a fresh-value arm leaves the old value live. Dropping the destination
             // afterwards therefore frees exactly the paths that still own the old payload.
             null_moved_source(b, value);
-            let old = b.fresh_value(leaf_ty);
-            b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
-            b.emit_drop_value_if_owner_live(*root, Operand::Value(old));
+            if leaf_plan.needs_drop() {
+                let old = b.fresh_value(leaf_ty);
+                b.push(Stmt::Let(old, Rvalue::Field(*root, path.clone())));
+                b.emit_drop_value_if_owner_live(*root, Operand::Value(old));
+            }
             b.push(Stmt::StoreField(*root, path.clone(), replacement));
+            if let Some(owner) = owner {
+                b.set_drop_flag(owner, false);
+            }
         }
         hir::Stmt::AssignIndex {
             base,
