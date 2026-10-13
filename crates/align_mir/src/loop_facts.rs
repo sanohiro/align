@@ -2603,6 +2603,194 @@ fn admit(
 // The rewrite.
 // ---------------------------------------------------------------------------------------------
 
+/// Direct slot fields omitted from the operand-use inventory. Keep this exhaustive: a new
+/// variant must classify its storage references before loop-local storage can be isolated.
+fn direct_statement_slots(statement: &Stmt) -> Option<Vec<Slot>> {
+    Some(match statement {
+        Stmt::Let(_, rvalue) => match rvalue {
+            Rvalue::Load(slot)
+            | Rvalue::Field(slot, _)
+            | Rvalue::Index(slot, _)
+            | Rvalue::IndexField(slot, _, _)
+            | Rvalue::MakeSlice(slot, _)
+            | Rvalue::MakeFieldSlice(slot, _, _) => vec![*slot],
+            // EnumPayload.slot is a payload ordinal, not a storage Slot.
+            Rvalue::EnumPayload { enum_id: _, variant: _, slot: _, operand: _ } => Vec::new(),
+            Rvalue::SoaColumn { base, .. } => vec![*base],
+            Rvalue::Use(_)
+            | Rvalue::Un(_, _)
+            | Rvalue::Bin(_, _, _)
+            | Rvalue::SliceLen(_)
+            | Rvalue::SlicePtr(_)
+            | Rvalue::SliceIndex(_, _)
+            | Rvalue::OptionSome(_)
+            | Rvalue::OptionIsSome(_)
+            | Rvalue::OptionUnwrap(_)
+            | Rvalue::ResultOk(_)
+            | Rvalue::ResultErr(_)
+            | Rvalue::ResultIsOk(_)
+            | Rvalue::ResultUnwrapOk(_)
+            | Rvalue::ResultUnwrapErr(_)
+            | Rvalue::StrLit(_)
+            | Rvalue::RawIsNull(_)
+            | Rvalue::BoxGet(_)
+            | Rvalue::Call(_, _)
+            | Rvalue::Cast { operand: _, from: _, to: _ }
+            | Rvalue::FloatBin { op: _, a: _, b: _, mode: _ }
+            | Rvalue::FloatFma { ty: _, a: _, b: _, c: _, mode: _ }
+            | Rvalue::IntArith { op: _, mode: _, int_ty: _, a: _, b: _ }
+            | Rvalue::MathOp { fn_: _, ty: _, operands: _ }
+            | Rvalue::Select { cond: _, a: _, b: _ }
+            | Rvalue::SliceIndexNoalias { slice: _, index: _, scope: _ }
+            | Rvalue::SubSlice { base: _, start: _, len: _, elem: _ }
+            | Rvalue::IndexFieldPtr { base: _, index: _, path: _, struct_id: _ }
+            | Rvalue::MakeTuple { tuple_id: _, elems: _ }
+            | Rvalue::TupleIndex { tuple: _, index: _ }
+            | Rvalue::MakeEnum { enum_id: _, variant: _, payload: _ }
+            | Rvalue::EnumTagEq { enum_id: _, scrutinee: _, variant: _ }
+            | Rvalue::ConstArray { elems: _, elem: _ }
+            | Rvalue::MakeVec { elems: _, elem: _, n: _ }
+            | Rvalue::VecExtract { vec: _, lane: _, elem: _ }
+            | Rvalue::VecInsert { vec: _, value: _, lane: _ }
+            | Rvalue::VecLoad { slice: _, index: _, elem: _, n: _, align: _ }
+            | Rvalue::VecSum { vec: _, elem: _, n: _, mode: _ }
+            | Rvalue::VecDot { a: _, b: _, elem: _, n: _, mode: _ }
+            | Rvalue::VecMinMax { vec: _, elem: _, n: _, max: _ }
+            | Rvalue::VecSumWhere { vec: _, mask: _, elem: _, n: _, mode: _ }
+            | Rvalue::MaskAny { mask: _, n: _ }
+            | Rvalue::FnAddr { target: _, signature: _ }
+            | Rvalue::RawOffset { ptr: _, offset: _ }
+            | Rvalue::RawLoad { ptr: _, offset: _, scalar: _ }
+            | Rvalue::RawPointerLoad { ptr: _, offset: _ }
+            | Rvalue::BytesView { bytes: _, elem: _ }
+            | Rvalue::SliceAsBytes { slice: _, elem: _ }
+            | Rvalue::BytesRead { bytes: _, offset: _, scalar: _, be: _ }
+            | Rvalue::SoaGather { base: _, index: _, struct_id: _ }
+            | Rvalue::IndexColumn { base: _, index: _, field: _, struct_id: _ }
+            | Rvalue::CallIndirect { callee: _, args: _, param_tys: _, ret_ty: _, signature: _ }
+            | Rvalue::OptionNone
+            | Rvalue::RawNull => Vec::new(),
+            unmodelled_rvalues!() => return None,
+        },
+        Stmt::Store(slot, _)
+        | Stmt::StoreField(slot, _, _)
+        | Stmt::StoreIndex(slot, _, _)
+        | Stmt::StoreConstArray { slot, .. }
+        | Stmt::StoreElemField(slot, _, _, _)
+        | Stmt::DropFlagInit(slot)
+        | Stmt::NullTupleField(slot, _)
+        | Stmt::NullStructField(slot, _)
+        | Stmt::NullElemField(slot, _, _)
+        | Stmt::Drop(slot)
+        | Stmt::DropField(slot, _)
+        | Stmt::DropElem(slot, _, _)
+        | Stmt::DropElemField(slot, _, _)
+        | Stmt::BorrowedElementReservation { root: slot, .. }
+        | Stmt::ArrayTruncate { root: slot, .. } => vec![*slot],
+        Stmt::DropFlagMoveOut { slot, flag } => vec![*slot, *flag],
+        Stmt::PtrStore(..)
+        | Stmt::PtrStoreNoalias { .. }
+        | Stmt::VecStore { .. }
+        | Stmt::StoreElemFieldPtr { .. }
+        | Stmt::StoreColumn { .. }
+        | Stmt::ArenaEnd(_)
+        | Stmt::RawFree(_)
+        | Stmt::ColumnBatchFinish { .. }
+        | Stmt::ColumnBatchDrop { .. }
+        | Stmt::RawStore { .. }
+        | Stmt::TgWait(_)
+        | Stmt::TgEnd(_)
+        | Stmt::DropValue(_) => Vec::new(),
+    })
+}
+
+/// Immutable inline constructors cannot share a slot between fast and slow copies: the
+/// producer's strict complete-writer proof must still see exactly one construction. Isolate
+/// only a complete nonescaping constructor whose entire lifetime lies inside the cloned body.
+fn isolated_array_constructors(
+    function: &Function,
+    body: &[BlockId],
+    preheader: &[Stmt],
+) -> Option<Vec<Slot>> {
+    let cfg = Cfg::build(function)?;
+    let escaping = slots_with_escaping_address(function)?;
+    let reachable = cfg.reachable_from(function, function.entry, &BTreeSet::new());
+    let mut references = BTreeMap::<Slot, Vec<(BlockId, usize)>>::new();
+    for block in &function.blocks {
+        for (position, statement) in block.stmts.iter().enumerate() {
+            for slot in direct_statement_slots(statement)? {
+                references
+                    .entry(slot)
+                    .or_default()
+                    .push((block.id, position));
+            }
+        }
+    }
+    let mut preheader_slots = BTreeSet::new();
+    for statement in preheader {
+        preheader_slots.extend(direct_statement_slots(statement)?);
+    }
+    let mut isolated = Vec::new();
+    for (slot, sites) in references {
+        let Some(Ty::Array(element, length)) = function.slots.get(slot as usize).copied() else {
+            continue;
+        };
+        if length == 0
+            || !crate::producer::xml_plain_fixed_array_element(element)
+            || function.params.contains(&slot)
+            || function.borrow_mut_cleanup_slots.contains(&Some(slot))
+            || escaping.contains(&slot)
+            || preheader_slots.contains(&slot)
+            || sites.iter().any(|(block, _)| !body.contains(block))
+        {
+            continue;
+        }
+        let mut load = None;
+        let mut writes = BTreeMap::new();
+        let mut valid = true;
+        for (block, position) in sites {
+            match &function.blocks[block as usize].stmts[position] {
+                Stmt::Let(value, Rvalue::Load(_))
+                    if load.is_none()
+                        && function.value_tys.get(*value as usize)
+                            == Some(&Ty::Array(element, length)) =>
+                {
+                    load = Some((block, position));
+                }
+                Stmt::StoreIndex(_, Operand::Const(Const::Int(index, ty)), input)
+                    if *ty == i64_ty()
+                        && *index >= 0
+                        && *index < i128::from(length)
+                        && operand_ty(function, input)
+                            == Some(align_sema::scalar_to_ty(element)) =>
+                {
+                    if writes.insert(*index, (block, position)).is_some() {
+                        valid = false;
+                    }
+                }
+                _ => valid = false,
+            }
+        }
+        let Some((load_block, load_position)) = load else {
+            continue;
+        };
+        if valid
+            && reachable.contains(&load_block)
+            && usize::try_from(length) == Ok(writes.len())
+            && writes.values().all(|(block, position)| {
+                if *block == load_block {
+                    *position < load_position
+                } else {
+                    cfg.dominates(*block, load_block)
+                }
+            })
+        {
+            isolated.push(slot);
+        }
+    }
+    Some(isolated)
+}
+
 /// Apply one admitted plan: append the fast copy, insert the preheader, and redirect every edge
 /// that entered the loop from outside. Returns the blocks the clone created.
 struct AppliedPlan {
@@ -2642,11 +2830,26 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<Applied
         }
     }
 
+    let mut slot_map = BTreeMap::new();
+    let mut cloned_slots = Vec::new();
+    let mut cloned_alignments = Vec::new();
+    for slot in isolated_array_constructors(function, &plan.body, &plan.preheader.stmts)? {
+        let fresh = Slot::try_from(function.slots.len().checked_add(cloned_slots.len())?).ok()?;
+        slot_map.insert(slot, fresh);
+        cloned_slots.push(*function.slots.get(slot as usize)?);
+        cloned_alignments.push(*function.slot_align.get(slot as usize)?);
+    }
+
     let mut clones = Vec::new();
     for block in &plan.body {
         let mut cloned = function.blocks[*block as usize].clone();
         cloned.id = *block_map.get(block)?;
         for stmt in &mut cloned.stmts {
+            if let Stmt::StoreIndex(slot, _, _) | Stmt::Let(_, Rvalue::Load(slot)) = stmt
+                && let Some(fresh) = slot_map.get(slot)
+            {
+                *slot = *fresh;
+            }
             if let Stmt::Let(value, _) = stmt {
                 *value = *value_map.get(value)?;
             }
@@ -2759,6 +2962,8 @@ fn apply(function: &mut Function, header: BlockId, plan: Plan) -> Option<Applied
         stmts: plan.preheader.stmts,
         term: Term::Branch(plan.admit, *block_map.get(&header)?, header),
     };
+    function.slots.extend(cloned_slots);
+    function.slot_align.extend(cloned_alignments);
     function.value_tys.extend(plan.preheader.new_tys);
     function.value_tys.extend(cloned_tys);
     function.blocks.extend(clones);
@@ -3135,6 +3340,168 @@ mod tests {
         lowered.fns.remove(0)
     }
 
+    #[test]
+    fn versioned_array_construction_preserves_private_alignment() {
+        let mut function = unchecked_source(
+            "fn run() -> i64 { mut at := 0; mut sum := 0; loop { if at >= 4 { break }; values := [0, 1, 2, 3]; sum = sum + values[at]; at = at + 1 }; return sum }",
+        );
+        let original_slots = function.slots.len();
+        let source = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .find_map(|statement| match statement {
+                Stmt::StoreIndex(slot, _, _) => Some(*slot),
+                _ => None,
+            })
+            .unwrap();
+        function.slot_align[source as usize] = Some(64);
+        let (decisions, _) = version_loops(&mut function, &[]);
+        assert!(
+            decisions
+                .iter()
+                .any(|decision| matches!(decision, LoopDecision::Versioned { .. })),
+            "{decisions:?}"
+        );
+        assert_eq!(function.slots.len(), original_slots + 1);
+        assert_eq!(function.slot_align.len(), function.slots.len());
+        assert_eq!(function.slot_align[original_slots], Some(64));
+        assert_eq!(
+            function.slots[original_slots],
+            function.slots[source as usize]
+        );
+        for slot in [source as usize, original_slots] {
+            assert_eq!(function.blocks.iter().flat_map(|block| &block.stmts).filter(|statement| matches!(statement, Stmt::StoreIndex(destination, _, _) if *destination as usize == slot)).count(), 4);
+            assert_eq!(function.blocks.iter().flat_map(|block| &block.stmts).filter(|statement| matches!(statement, Stmt::Let(_, Rvalue::Load(destination)) if *destination as usize == slot)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn isolated_array_construction_requires_complete_confined_storage() {
+        let original =
+            unchecked_source("fn run(n: i64) -> [i64; 2] { values := [n, 2]; return values }");
+        let body = original
+            .blocks
+            .iter()
+            .map(|block| block.id)
+            .collect::<Vec<_>>();
+        let slots = isolated_array_constructors(&original, &body, &[]).unwrap();
+        assert_eq!(slots.len(), 1);
+        let slot = slots[0];
+        let (block, store) = original.blocks.iter().enumerate().find_map(|(block, body)| body.stmts.iter().enumerate().find_map(|(at, statement)| matches!(statement, Stmt::StoreIndex(destination, _, _) if *destination == slot).then_some((block, at)))).unwrap();
+        let load = original.blocks[block].stmts.iter().position(|statement| matches!(statement, Stmt::Let(_, Rvalue::Load(source)) if *source == slot)).unwrap();
+        assert!(
+            isolated_array_constructors(&original, &[], &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            isolated_array_constructors(&original, &body, &[Stmt::Let(0, Rvalue::Load(slot))])
+                .unwrap()
+                .is_empty()
+        );
+        for mutation in 0..16 {
+            let mut function = original.clone();
+            let extra = match mutation {
+                0 => {
+                    function.blocks[block].stmts.remove(store);
+                    None
+                }
+                1 => Some(function.blocks[block].stmts[store].clone()),
+                2 => {
+                    let statement = function.blocks[block].stmts.remove(store);
+                    function.blocks[block].stmts.push(statement);
+                    None
+                }
+                3 => {
+                    function.params.push(slot);
+                    None
+                }
+                4 => {
+                    function.borrow_mut_cleanup_slots.push(Some(slot));
+                    None
+                }
+                5 => Some(Stmt::Let(0, Rvalue::Index(slot, int(0)))),
+                6 => Some(Stmt::Let(0, Rvalue::MakeSlice(slot, 2))),
+                7 => Some(Stmt::Let(0, Rvalue::MakeFieldSlice(slot, vec![0], 2))),
+                8 => Some(Stmt::Let(0, Rvalue::Field(slot, vec![0]))),
+                9 => Some(Stmt::Let(0, Rvalue::IndexField(slot, int(0), vec![0]))),
+                10 => Some(Stmt::Let(
+                    0,
+                    Rvalue::SoaColumn {
+                        base: slot,
+                        struct_id: 0,
+                        field: 0,
+                    },
+                )),
+                11 => Some(Stmt::Let(
+                    0,
+                    Rvalue::Use(Operand::BorrowedPlace(Box::new(crate::BorrowedPlace {
+                        slot,
+                        path: Vec::new(),
+                        ty: function.slots[slot as usize],
+                        cleanup: None,
+                    }))),
+                )),
+                12 => Some(Stmt::Let(0, Rvalue::OsHost { out: slot })),
+                13 => {
+                    let Stmt::StoreIndex(_, index, _) = &mut function.blocks[block].stmts[store]
+                    else {
+                        unreachable!()
+                    };
+                    *index = int(2);
+                    None
+                }
+                14 => {
+                    let Stmt::StoreIndex(_, _, input) = &mut function.blocks[block].stmts[store]
+                    else {
+                        unreachable!()
+                    };
+                    *input = Operand::Const(Const::Bool(false));
+                    None
+                }
+                15 => {
+                    let Stmt::Let(value, _) = function.blocks[block].stmts[load] else {
+                        unreachable!()
+                    };
+                    function.value_tys[value as usize] = Ty::Bool;
+                    None
+                }
+                _ => unreachable!(),
+            };
+            if let Some(extra) = extra {
+                function.blocks[block].stmts.push(extra);
+            }
+            assert!(
+                isolated_array_constructors(&function, &body, &[])
+                    .is_none_or(|slots| !slots.contains(&slot)),
+                "mutation {mutation}"
+            );
+        }
+        // A write on just one side of a branch is not complete construction at the join.
+        let mut branch = original.clone();
+        let entry = branch.blocks[block].clone();
+        assert_eq!(branch.blocks.len(), 1);
+        branch.blocks[block].stmts.truncate(store);
+        branch.blocks[block].term = Term::Branch(Operand::Const(Const::Bool(true)), 1, 2);
+        branch.blocks.push(Block {
+            id: 1,
+            stmts: vec![entry.stmts[store].clone()],
+            stmt_lines: Vec::new(),
+            term: Term::Goto(2),
+        });
+        branch.blocks.push(Block {
+            id: 2,
+            stmts: entry.stmts[store + 1..].to_vec(),
+            stmt_lines: Vec::new(),
+            term: entry.term,
+        });
+        assert!(
+            isolated_array_constructors(&branch, &[0, 1, 2], &[])
+                .unwrap()
+                .is_empty()
+        );
+    }
     #[test]
     fn eliminated_byte_guard_record_is_authenticated_field_by_field() {
         let source = "fn any_nonzero(view: slice<u8>) -> bool {\n  mut at := 0\n  loop {\n    if at >= view.len() / 1 { break }\n    if view.u8(at * 1) != 0 { return true }\n    at = at + 1\n  }\n  return false\n}\n";

@@ -1528,7 +1528,7 @@ fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
     )
 }
 
-fn xml_plain_fixed_array_element(element: Scalar) -> bool {
+pub(crate) fn xml_plain_fixed_array_element(element: Scalar) -> bool {
     matches!(
         element,
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
@@ -3762,13 +3762,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     ) {
                         equation.invalid = true;
                     } else if length == 0
-                        && if xml_plain_fixed_array_element(element) {
-                            matches!(xml_plain_array_initialization_at(self.graph, slot, result_ty, value),
-                                Some(PlainArrayInitialization::Empty))
-                        } else {
-                            !self.graph.function.params.contains(&slot)
-                                && self.graph.slot_stores.roots.get(slot as usize).is_some_and(Vec::is_empty)
-                        }
+                        && !self.graph.function.params.contains(&slot)
+                        && self.graph.slot_stores.roots.get(slot as usize).is_some_and(Vec::is_empty)
                     {
                         // A checked empty literal has no element edge to found its zero bits.
                         equation.seed = Some(XmlAccessProvenance::Owned);
@@ -7238,22 +7233,19 @@ impl<'a> XmlAccessAnalyzer<'a> {
         {
             return false;
         }
-        if xml_plain_fixed_array_element(element) {
-            return xml_plain_array_initialization_at(self.graph, *array_slot, expected, *value).is_some();
-        }
-        if self.graph.function.params.contains(array_slot)
-            || self
-                .graph
-                .slot_stores
-                .roots
-                .get(*array_slot as usize)
-                .is_some_and(|stores| !stores.is_empty())
-        {
-            // This is an ordinary initialized array slot, not an anonymous literal-construction
-            // temporary. The caller's exact projected dependency authenticates its root
-            // stores and later element writes; applying the construction-cardinality scan here
-            // would reject parameters, copies, joins, and mutations as duplicate initialization.
+        if self.graph.function.params.contains(array_slot) {
             return true;
+        }
+        if self.graph.slot_stores.roots.get(*array_slot as usize)
+            .is_some_and(|stores| !stores.is_empty())
+            || (length > 0 && xml_plain_fixed_array_element(element)
+                && self.graph.function.blocks.iter().flat_map(|block| &block.stmts).any(|statement|
+                    matches!(statement, Stmt::StoreConstArray { slot, .. } if slot == array_slot)))
+        {
+            // Whole values retain their projected input checks. Plain named roots also need
+            // a complete publication on every path before this load, including branch joins.
+            return !xml_plain_fixed_array_element(element)
+                || xml_plain_array_root_initialized_at(self.graph, *array_slot, expected, *value);
         }
         let mut load_site = None;
         for block in &self.graph.function.blocks {
@@ -7490,6 +7482,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !self.check_fixed_array_construction_operand(&mut equation, &operand, stored_ty) {
                     equation.invalid = true;
                     continue;
+                }
+                if matches!(stored_ty, Ty::Array(element, _) if xml_plain_fixed_array_element(element)) {
+                    // An owned-sibling projection must not discard this array's typed inputs.
+                    self.check_whole_operand(&mut equation, &operand, stored_ty);
                 }
             } else {
                 self.check_whole_operand(&mut equation, &operand, stored_ty);
@@ -7975,120 +7971,99 @@ fn xml_borrowed_access(
     }
 }
 
-#[derive(Clone, Copy)]
-enum PlainArrayInitialization { Empty, Stored }
-
-/// Authenticate plain inline storage at one use without recursively building a
-/// producer analyzer. Stored inputs remain dependencies in the caller's graph.
-fn xml_plain_array_initialization_at(
+/// Prove that every path to a local use has published one complete inline value.
+/// Anonymous literal construction retains its separate strict producer proof.
+fn xml_plain_array_root_initialized_at(
     graph: &ValidatedProducerGraph<'_>,
     slot: Slot,
     array: Ty,
-    value_id: ValueId,
-) -> Option<PlainArrayInitialization> {
-    let Ty::Array(element, length) = array else { return None };
-    let (Ok(slot_index), Ok(value_index)) = (usize::try_from(slot), usize::try_from(value_id))
-        else { return None };
-    if !xml_plain_fixed_array_element(element)
-        || graph.function.slots.get(slot_index) != Some(&array)
+    use_value: ValueId,
+) -> bool {
+    let (Ok(slot_index), Ok(value_index)) = (usize::try_from(slot), usize::try_from(use_value))
+    else {
+        return false;
+    };
+    if graph.function.slots.get(slot_index) != Some(&array)
         || graph.duplicate_values.get(value_index) != Some(&false)
     {
-        return None;
-    }
-    if graph.function.params.contains(&slot) {
-        return Some(PlainArrayInitialization::Stored);
+        return false;
     }
     let mut use_site = None;
     for block in &graph.function.blocks {
         for (position, statement) in block.stmts.iter().enumerate() {
-            if matches!(statement, Stmt::Let(value, _) if *value == value_id)
+            if matches!(statement, Stmt::Let(value, _) if *value == use_value)
                 && use_site.replace((block.id, position)).is_some()
             {
-                return None;
+                return false;
             }
         }
     }
-    let Some((use_block, use_position)) = use_site else { return None };
+    let Some((use_block, use_position)) = use_site else {
+        return false;
+    };
     if mir_block_reachable_avoiding(graph.function, use_block, None) != Some(true) {
-        return None;
+        return false;
     }
-    let mut initialized = HashSet::new();
-    let mut whole_blocks = HashSet::new();
-    let mut has_writes = false;
-    let mut only_empty_constants = length == 0;
-    let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
-    let element_ty = scalar_to_ty(element);
+    let Ty::Array(element, length) = array else {
+        return false;
+    };
+    // Pooling and ordinary whole-value initialization are disjoint. A forged mixed writer
+    // set must never fall through to the more general mutable-root graph.
+    let pooled = graph.function.blocks.iter().flat_map(|block| &block.stmts).any(|statement|
+        matches!(statement, Stmt::StoreConstArray { slot: destination, .. } if *destination == slot));
+    let mut initialized_blocks = HashSet::new();
     for block in &graph.function.blocks {
-        let mut dominates = None;
         for (position, statement) in block.stmts.iter().enumerate() {
-            let precedes = |cached: &mut Option<bool>| {
-                if block.id == use_block {
-                    position < use_position
-                } else {
-                    *cached.get_or_insert_with(|| {
-                        mir_block_reachable_avoiding(graph.function, use_block, Some(block.id))
-                            == Some(false)
-                    })
+            let complete = if pooled {
+                match statement {
+                    Stmt::StoreConstArray {
+                        slot: destination,
+                        elems,
+                        elem,
+                    } if *destination == slot => {
+                        if length == 0
+                            || *elem != scalar_to_ty(element)
+                            || usize::try_from(length) != Ok(elems.len())
+                            || elems
+                                .iter()
+                                .any(|value| !xml_const_element_matches_ty(value, *elem))
+                        {
+                            return false;
+                        }
+                        true
+                    }
+                    Stmt::Store(destination, _)
+                    | Stmt::StoreIndex(destination, _, _)
+                    | Stmt::StoreField(destination, _, _)
+                    | Stmt::StoreElemField(destination, _, _, _)
+                        if *destination == slot =>
+                    {
+                        return false;
+                    }
+                    Stmt::Let(_, rvalue)
+                        if xml_written_slots(rvalue)
+                            .iter()
+                            .any(|(destination, _)| *destination == slot) =>
+                    {
+                        return false;
+                    }
+                    _ => false,
                 }
+            } else {
+                matches!(statement, Stmt::Store(destination, input)
+                    if *destination == slot && xml_operand_base_ty(graph.function, input) == Some(array))
             };
-            match statement {
-                Stmt::Store(destination, input) if *destination == slot => {
-                    has_writes = true;
-                    only_empty_constants = false;
-                    if (block.id != use_block || position < use_position)
-                        && xml_operand_base_ty(graph.function, input) == Some(array)
-                    {
-                        whole_blocks.insert(block.id);
-                    }
-                }
-                Stmt::StoreIndex(destination, index, _) if *destination == slot => {
-                    has_writes = true;
-                    only_empty_constants = false;
-                    if precedes(&mut dominates)
-                        && let Operand::Const(Const::Int(index, ty)) = index
-                        && *ty == i64_ty && *index >= 0 && *index < i128::from(length)
-                    {
-                        initialized.insert(*index);
-                    }
-                }
-                Stmt::StoreConstArray { slot: destination, elems, elem } if *destination == slot => {
-                    has_writes = true;
-                    let valid = *elem == element_ty && usize::try_from(length) == Ok(elems.len())
-                        && elems.iter().all(|value| xml_const_element_matches_ty(value, element_ty));
-                    only_empty_constants &= valid;
-                    if valid && (block.id != use_block || position < use_position) {
-                        whole_blocks.insert(block.id);
-                    }
-                }
-                Stmt::StoreField(destination, ..) | Stmt::StoreElemField(destination, ..)
-                    if *destination == slot => {
-                        has_writes = true;
-                        only_empty_constants = false;
-                    }
-                Stmt::Let(_, value)
-                    if xml_written_slots(value).iter().any(|(destination, _)| *destination == slot) =>
-                {
-                    has_writes = true;
-                    only_empty_constants = false;
-                }
-                _ => {}
+            if complete && (block.id != use_block || position < use_position) {
+                initialized_blocks.insert(block.id);
             }
         }
     }
-    // Branch joins may each store the complete value. Every path to this use must
-    // cross one such store; no single branch's store need dominate the join alone.
-    let whole = !whole_blocks.is_empty()
-        && mir_block_reachable_without(graph.function, use_block, |block| whole_blocks.contains(&block))
-            == Some(false);
-    if length == 0 && (!has_writes || (only_empty_constants && whole)) {
-        // Exact zero-element constants also initialize no bytes and have no input
-        // producers. Every other writer must retain the ordinary graph dependencies.
-        return Some(PlainArrayInitialization::Empty);
-    }
-    if !whole && (length == 0 || usize::try_from(length) != Ok(initialized.len())) {
-        return None;
-    }
-    Some(PlainArrayInitialization::Stored)
+    // Either branch (including duplicated fast/slow loop bodies) may publish the complete
+    // value; every path must cross a store before this use.
+    !initialized_blocks.is_empty()
+        && mir_block_reachable_without(graph.function, use_block, |block| {
+            initialized_blocks.contains(&block)
+        }) == Some(false)
 }
 
 /// Keep readable element payload and exclusive storage authority independent.
@@ -8097,24 +8072,27 @@ fn xml_plain_array_borrow_at_call(
     operand: &Operand,
     call: ValueId,
 ) -> Option<XmlProducerState> {
-    let Operand::BorrowedPlace(place) = operand else { return None };
-    let Ty::Array(element, length) = place.ty else { return None };
-    if !place.path.is_empty() || !xml_plain_fixed_array_element(element)
+    let Operand::BorrowedPlace(place) = operand else {
+        return None;
+    };
+    let Ty::Array(element, length) = place.ty else {
+        return None;
+    };
+    if !place.path.is_empty()
+        || !xml_plain_fixed_array_element(element)
         || graph.function.params.contains(&place.slot)
     {
         return None;
     }
-    match xml_plain_array_initialization_at(graph, place.slot, place.ty, call) {
-        None => Some(XmlProducerState::Invalid),
-        Some(PlainArrayInitialization::Empty) => {
-            Some(XmlProducerState::Present(XmlAccessProvenance::Shared))
-        }
-        Some(PlainArrayInitialization::Stored) => {
-            let (selected, path) = if length == 0 { (place.ty, Vec::new()) }
-                else { (scalar_to_ty(element), vec![XmlAccessPathSegment::Element]) };
-            Some(xml_slot_path_access(graph, place.slot, selected, path))
-        }
+    if !xml_plain_array_root_initialized_at(graph, place.slot, place.ty, call) {
+        return Some(XmlProducerState::Invalid);
     }
+    let (selected, path) = if length == 0 {
+        (place.ty, Vec::new())
+    } else {
+        (scalar_to_ty(element), vec![XmlAccessPathSegment::Element])
+    };
+    Some(xml_slot_path_access(graph, place.slot, selected, path))
 }
 
 fn xml_borrowed_storage_access(

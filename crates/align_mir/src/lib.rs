@@ -7090,6 +7090,16 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                     }
                 }
                 hir::ExprKind::StructLit { .. } => store_value_at(b, *local, &mut Vec::new(), init),
+                hir::ExprKind::ArrayLit { pooled, .. }
+                    if matches!(init.ty, Ty::Array(element, length)
+                        if producer::xml_plain_fixed_array_element(element) && (!pooled || length == 0)) =>
+                {
+                    // Keep immutable construction storage separate from the named mutable root.
+                    // The ordinary whole-value edge retains the strict construction proof even
+                    // when later indexed mutations are optimized or the local is borrowed.
+                    let Some((value, _, _)) = materialize_array_literal(b, init) else { return };
+                    b.push(Stmt::Store(*local, value));
+                }
                 // An array literal stores its elements into the slot. A pooled all-constant literal
                 // (doc-13 §8.4, S3) instead copies once from a per-unit rodata global (the #514
                 // mechanism) — sema sets `pooled` only for a non-`mut`, non-`align(N)`, fixed

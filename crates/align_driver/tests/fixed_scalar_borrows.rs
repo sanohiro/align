@@ -113,9 +113,98 @@ fn fixed_scalar_borrow_keeps_inline_storage() {
     }
 }
 
+#[test]
+fn fixed_scalar_construction_preserves_pooling_and_alignment() {
+    use align_mir::{Rvalue, Stmt};
+    let elements = (0..37)
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let program = checked(&format!(
+        "fn inspect(borrow values: [i64; 37]) -> i64 = values[0]\n\
+         fn pooled() -> i64 {{ values := [{elements}]; return inspect(values) }}\n\
+         fn aligned() -> i64 {{ align(64) values := [{elements}]; return inspect(values) }}\n\
+         fn main() {{ print(pooled()); print(aligned()) }}"
+    ));
+    certify(&program, true, "pooling and alignment");
+    let pooled = program
+        .fns
+        .iter()
+        .find(|function| function.name.as_str() == "pooled")
+        .unwrap();
+    assert_eq!(
+        pooled
+            .blocks
+            .iter()
+            .flat_map(|block| &block.stmts)
+            .filter(|statement| matches!(statement, Stmt::StoreConstArray { .. }))
+            .count(),
+        1
+    );
+    let aligned = program
+        .fns
+        .iter()
+        .find(|function| function.name.as_str() == "aligned")
+        .unwrap();
+    let destination = aligned
+        .slot_align
+        .iter()
+        .position(|alignment| *alignment == Some(64))
+        .unwrap();
+    assert!(aligned.blocks.iter().flat_map(|block| &block.stmts).any(
+        |statement| matches!(statement, Stmt::Store(slot, _) if *slot as usize == destination)
+    ));
+    assert!(aligned.blocks.iter().flat_map(|block| &block.stmts)
+        .any(|statement| matches!(statement, Stmt::Let(_, Rvalue::Load(slot)) if *slot as usize != destination)));
+    let raw = align_driver::emit_llvm_ir(
+        &program,
+        BuildTarget::Baseline,
+        Profile::Release,
+        false,
+        &[],
+        false,
+    )
+    .unwrap();
+    assert!(raw.contains("alloca [37 x i64], align 64"), "{raw}");
+    let optimized = align_driver::emit_llvm_ir(
+        &program,
+        BuildTarget::Baseline,
+        Profile::Release,
+        true,
+        &[],
+        false,
+    )
+    .unwrap();
+    assert!(
+        !optimized
+            .lines()
+            .any(|line| line.contains("call ") && line.contains("llvm.memcpy")),
+        "qualified constant initializations retain no runtime copy: {optimized}"
+    );
+}
+
 const MAIN: &str = r#"module main
 import model
 fn computed() -> i64 = 1
+Owned { label: string, values: [i64; 4] }
+fn affine() -> i64 {
+  mut values := [0, 0, 0, 0]
+  mut at := 0
+  loop { if at >= 4 { break }; values[at] = at; at = at + 1 }
+  copied := model.copied(values)
+  return model.inspect(values) + copied[1] + values[2] + values[3]
+}
+fn owned_sibling() -> i64 {
+  mut values := [1, 2, 3, 4]
+  model.mark(values)
+  stored := Owned { label: "owned".clone(), values: values }
+  return stored.values[0] + stored.label.len()
+}
+fn terminating(stop: bool) -> i64 {
+  mut values := [{ if stop { return 17 }; 1 }, 2, 3, 4]
+  model.mark(values)
+  return values[0]
+}
 fn choice(flag: bool) -> i64 {
   first := [1, 2, 3, 4]
   second := [5, 6, 7, 8]
@@ -145,6 +234,7 @@ fn exercise(iterations: i64, early: bool) -> i64 {
 }
 fn main() -> i32 {
   if choice(true) != 2 || choice(false) != 6 { return 10 }
+  if owned_sibling() != 7 || affine() != 6 || terminating(true) != 17 || terminating(false) != 2 { return 11 }
   if exercise(0, true) != 4 || exercise(1, false) != 6 || exercise(3, true) != 7 { return 1 }
   mut values := [computed(), 2, 3, 4]
   match model.fallible(values, true) { Err(error) => { if error != 7 { return 2 } } Ok(value) => { return 3 } }
@@ -166,7 +256,11 @@ fn main() -> i32 {
 }
 "#;
 
-fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
+fn execute_output(
+    stage: &Path,
+    programs: &[align_mir::Program],
+    label: &str,
+) -> std::process::Output {
     let mut objects = Vec::new();
     let mut libraries = Vec::new();
     for (index, program) in programs.iter().enumerate() {
@@ -205,7 +299,11 @@ fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
     )
     .unwrap();
     // owned_fixture owns the complete compile/link/run process group and deadline.
-    let result = std::process::Command::new(binary).output().unwrap();
+    std::process::Command::new(binary).output().unwrap()
+}
+
+fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
+    let result = execute_output(stage, programs, label);
     assert!(
         result.status.success() && result.stdout.is_empty() && result.stderr.is_empty(),
         "{label}: {result:?}"
@@ -228,7 +326,20 @@ fn imported_fixed_scalar_borrows_execute_and_replay() {
                 "{}",
                 align_driver::format_diagnostics(&sources, &checked.diags)
             );
-            execute(stage, &[lower_to_mir(&checked.hir)], "whole");
+            let whole = lower_to_mir(&checked.hir);
+            assert!(
+                whole
+                    .loop_facts
+                    .iter()
+                    .any(|function| function.function == "affine"
+                        && function.loops.iter().any(|decision| matches!(
+                            decision,
+                            align_mir::loop_facts::LoopDecision::Versioned { .. }
+                        ))),
+                "affine mutation must exercise the optimized fast loop: {:?}",
+                whole.loop_facts
+            );
+            execute(stage, &[whole], "whole");
             let mut sources = SourceMap::new();
             let built = build_per_unit(&mut sources, entry, MAIN);
             assert!(
@@ -458,7 +569,7 @@ fn fixed_scalar_borrows_reject_incomplete_or_forged_storage() {
             certify(&bad, false, &format!("{length}/{mode:?}"));
         }
         if length == 0 {
-            for (name, statement, valid) in [
+            for (name, mut statement, valid) in [
                 (
                     "exact empty bulk",
                     Stmt::StoreConstArray {
@@ -502,7 +613,25 @@ fn fixed_scalar_borrows_reject_incomplete_or_forged_storage() {
                     .iter_mut()
                     .find(|function| function.name.as_str() == "main")
                     .unwrap();
-                assert!(matches!(function.slots[0], Ty::Array(_, 0)));
+                let construction = function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.stmts)
+                    .find_map(|statement| match statement {
+                        Stmt::Let(_, Rvalue::Load(slot))
+                            if matches!(function.slots[*slot as usize], Ty::Array(_, 0)) =>
+                        {
+                            Some(*slot)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                match &mut statement {
+                    Stmt::StoreConstArray { slot, .. } | Stmt::StoreIndex(slot, ..) => {
+                        *slot = construction
+                    }
+                    _ => unreachable!(),
+                }
                 function.blocks[0].stmts.insert(0, statement);
                 certify(&modified, valid, name);
                 assert_eq!(
@@ -530,6 +659,10 @@ fn fixed_scalar_borrows_reject_incomplete_or_forged_storage() {
                 .iter()
                 .position(|ty| matches!(ty, Ty::Array(_, 0)))
                 .unwrap();
+            // Remove the valid canonical publication so this is truly ungrounded.
+            for block in &mut function.blocks {
+                block.stmts.retain(|statement| !matches!(statement, Stmt::Store(destination, _) if *destination as usize == slot));
+            }
             let value = u32::try_from(function.value_tys.len()).unwrap();
             function.value_tys.push(function.slots[slot]);
             function.blocks[0].stmts.insert(
@@ -573,6 +706,220 @@ fn fixed_scalar_borrows_reject_incomplete_or_forged_storage() {
         |statement| !matches!(statement, Stmt::Store(destination, _) if *destination == slot),
     );
     certify(&missing, false, "one branch omits initialization");
+}
+
+#[test]
+fn fixed_scalar_construction_rejects_extra_writers_and_unselected_payloads() {
+    use align_mir::{Const, ConstElem, Operand, Rvalue, Stmt};
+    use align_sema::{IntTy, Ty};
+    let integer = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    for (name, declaration, result, publication) in [
+        (
+            "borrow",
+            "fn inspect(borrow values: [i64; 2]) -> i64 = values[0]",
+            "i64",
+            "inspect(values)",
+        ),
+        (
+            "buffer-sibling",
+            "Value { bytes: buffer, counts: [i64; 2] }",
+            "Value",
+            "Value { bytes: buffer.filled(8, 0 as u8), counts: values }",
+        ),
+        (
+            "string-sibling",
+            "Value { text: string, counts: [i64; 2] }",
+            "Value",
+            "Value { text: \"owned\".clone(), counts: values }",
+        ),
+    ] {
+        let original = checked(&format!(
+            "{declaration}\nfn make(n: i64) -> {result} {{ mut values := [n, 7]; return {publication} }}\nfn main() {{}}"
+        ));
+        certify(&original, true, name);
+        for mutation in 0..11 {
+            let mut program = original.clone();
+            let function = program
+                .fns
+                .iter_mut()
+                .find(|function| function.name.as_str() == "make")
+                .unwrap();
+            let (block, first, slot) = function
+                .blocks
+                .iter()
+                .enumerate()
+                .find_map(|(block, body)| {
+                    body.stmts
+                        .iter()
+                        .enumerate()
+                        .find_map(|(at, statement)| match statement {
+                            Stmt::StoreIndex(slot, ..) => Some((block, at, *slot)),
+                            _ => None,
+                        })
+                })
+                .unwrap();
+            assert!(!function.blocks.iter().flat_map(|body| &body.stmts)
+                .any(|statement| matches!(statement, Stmt::Store(destination, _) if *destination == slot)),
+                "mutation must target anonymous construction, not mutable named storage");
+            let before_load = function.blocks[block].stmts.iter().position(|statement|
+                matches!(statement, Stmt::Let(_, Rvalue::Load(source)) if *source == slot)).unwrap();
+            let value = Operand::Const(Const::Int(9, integer));
+            let extra = match mutation {
+                0 | 1 => Some(Stmt::StoreIndex(
+                    slot,
+                    Operand::Const(Const::Int(if mutation == 0 { 2 } else { -1 }, integer)),
+                    value,
+                )),
+                2 => {
+                    let id = u32::try_from(function.value_tys.len()).unwrap();
+                    function.value_tys.push(integer);
+                    function.blocks[block].stmts.insert(
+                        before_load,
+                        Stmt::Let(id, Rvalue::Use(Operand::Const(Const::Int(2, integer)))),
+                    );
+                    function.blocks[block].stmts.insert(
+                        before_load + 1,
+                        Stmt::StoreIndex(slot, Operand::Value(id), value),
+                    );
+                    None
+                }
+                3 => Some(Stmt::StoreIndex(slot, Operand::Arg(0), value)),
+                4 => {
+                    function.blocks[block].stmts.push(Stmt::StoreIndex(
+                        slot,
+                        Operand::Const(Const::Int(0, integer)),
+                        value,
+                    ));
+                    None
+                }
+                5 => {
+                    let Stmt::StoreIndex(_, _, value) = &mut function.blocks[block].stmts[first]
+                    else {
+                        unreachable!()
+                    };
+                    *value = Operand::Const(Const::Bool(true));
+                    None
+                }
+                6 => {
+                    function.param_modes[0] = align_ast::ParamMode::Out;
+                    None
+                }
+                7 => Some(Stmt::StoreConstArray {
+                    slot,
+                    elems: vec![ConstElem::Int(1)],
+                    elem: integer,
+                }),
+                8 => Some(Stmt::StoreConstArray {
+                    slot,
+                    elems: vec![ConstElem::Int(1), ConstElem::Bool(false)],
+                    elem: integer,
+                }),
+                9 => Some(Stmt::Store(slot, Operand::Const(Const::Bool(false)))),
+                10 => Some(Stmt::StoreIndex(
+                    slot,
+                    Operand::Const(Const::Bool(false)),
+                    value,
+                )),
+                _ => unreachable!(),
+            };
+            if let Some(extra) = extra {
+                function.blocks[block].stmts.insert(before_load, extra);
+            }
+            certify(&program, false, &format!("{name}/{mutation}"));
+            assert!(
+                align_driver::emit_llvm_ir(
+                    &program,
+                    BuildTarget::Baseline,
+                    Profile::Dev,
+                    false,
+                    &[],
+                    false
+                )
+                .is_err(),
+                "codegen accepted {name}/{mutation}"
+            );
+        }
+    }
+    let mut empty = checked(
+        "Value { text: string, counts: [i64; 0] }\nfn make() -> Value { values: [i64; 0] := []; return Value { text: \"owned\".clone(), counts: values } }\nfn main() {}",
+    );
+    certify(&empty, true, "empty owned sibling");
+    let function = empty
+        .fns
+        .iter_mut()
+        .find(|function| function.name.as_str() == "make")
+        .unwrap();
+    let slot = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.stmts)
+        .find_map(|statement| match statement {
+            Stmt::Let(_, Rvalue::Load(slot))
+                if matches!(function.slots[*slot as usize], Ty::Array(_, 0)) =>
+            {
+                Some(*slot)
+            }
+            _ => None,
+        })
+        .unwrap();
+    let value = u32::try_from(function.value_tys.len()).unwrap();
+    function.value_tys.push(function.slots[slot as usize]);
+    function.blocks[0]
+        .stmts
+        .insert(0, Stmt::Let(value, Rvalue::Load(slot)));
+    function.blocks[0]
+        .stmts
+        .insert(1, Stmt::Store(slot, Operand::Value(value)));
+    certify(&empty, false, "empty unselected sibling cycle");
+    assert!(
+        align_driver::emit_llvm_ir(
+            &empty,
+            BuildTarget::Baseline,
+            Profile::Dev,
+            false,
+            &[],
+            false
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn fixed_scalar_mutations_keep_runtime_bounds_failure() {
+    owned_fixture::run(
+        "fixed_scalar_mutations_keep_runtime_bounds_failure",
+        |stage| {
+            for (name, source) in [
+                (
+                    "constant-high",
+                    "fn touch(borrow mut values: [i64; 2]) { values[0] = 7 }\nfn main() { mut values := [1, 2]; touch(values); values[2] = 9; print(99) }",
+                ),
+                (
+                    "constant-negative",
+                    "fn touch(borrow mut values: [i64; 2]) { values[0] = 7 }\nfn main() { mut values := [1, 2]; touch(values); values[-1] = 9; print(99) }",
+                ),
+                (
+                    "dynamic",
+                    "fn touch(borrow mut values: [i64; 2]) { values[0] = 7 }\nfn run(index: i64) { mut values := [1, 2]; touch(values); values[index] = 9; print(99) }\nfn main() { run(2) }",
+                ),
+                (
+                    "empty",
+                    "fn touch(borrow mut values: [i64; 0]) { values[0] = 7 }\nfn main() { mut values: [i64; 0] := []; touch(values); print(99) }",
+                ),
+            ] {
+                let result = execute_output(stage, &[checked(source)], name);
+                assert!(
+                    !result.status.success()
+                        && result.stdout.is_empty()
+                        && String::from_utf8_lossy(&result.stderr).contains("bounds"),
+                    "{name}: {result:?}"
+                );
+            }
+        },
+    );
 }
 
 #[test]
@@ -630,4 +977,135 @@ fn fixed_scalar_borrow_source_boundaries_remain_closed() {
             }
         },
     );
+}
+
+#[test]
+fn fixed_scalar_construction_inside_versioned_loop() {
+    owned_fixture::run("fixed_scalar_construction_inside_versioned_loop", |stage| {
+        for length in [4, 37] {
+            let elems = (0..length)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source = format!(
+                "fn inspect(borrow values: [i64; {length}]) -> i64 = values[0]\nfn run() -> i64 {{ mut at := 0; mut sum := 0; loop {{ if at >= {length} {{ break }}; values := [{elems}]; sum = sum + values[at] + inspect(values); at = at + 1 }}; return sum }}\nfn main() -> i32 {{ if run() != {} {{ return 1 }}; return 0 }}",
+                length * (length - 1) / 2
+            );
+            let program = checked(&source);
+            assert!(
+                program
+                    .loop_facts
+                    .iter()
+                    .any(|function| function.function == "run"
+                        && function.loops.iter().any(|decision| matches!(
+                            decision,
+                            align_mir::loop_facts::LoopDecision::Versioned { .. }
+                        ))),
+                "N={length}: {:?}",
+                program.loop_facts
+            );
+            certify(&program, true, &format!("inside-loop/{length}"));
+            execute(stage, &[program], &format!("inside-loop-{length}"));
+        }
+    });
+}
+
+#[test]
+fn fixed_scalar_pooled_borrows_require_sealed_writers() {
+    use align_mir::{Const, Operand, Rvalue, Stmt};
+    let elements = (0..37)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let original = checked(&format!(
+        "fn inspect(borrow values: [i64; 37]) -> i64 = values[0]\nfn run(index: i64) -> i64 {{ values := [{elements}]; return inspect(values) }}\nfn main() {{}}"
+    ));
+    certify(&original, true, "sealed pooled original");
+    for mutation in 0..9 {
+        let mut program = original.clone();
+        let function = program
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "run")
+            .unwrap();
+        let (block, at, slot, element) = function
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block, body)| {
+                body.stmts
+                    .iter()
+                    .enumerate()
+                    .find_map(|(at, statement)| match statement {
+                        Stmt::StoreConstArray { slot, elem, .. } => Some((block, at, *slot, *elem)),
+                        _ => None,
+                    })
+            })
+            .unwrap();
+        let value = Operand::Const(Const::Int(1, element));
+        let extra = match mutation {
+            0 | 1 => Stmt::StoreIndex(
+                slot,
+                Operand::Const(Const::Int(if mutation == 0 { 37 } else { -1 }, element)),
+                value,
+            ),
+            2 => {
+                let id = u32::try_from(function.value_tys.len()).unwrap();
+                function.value_tys.push(element);
+                function.blocks[block].stmts.insert(
+                    at + 1,
+                    Stmt::Let(id, Rvalue::Use(Operand::Const(Const::Int(37, element)))),
+                );
+                Stmt::StoreIndex(slot, Operand::Value(id), value)
+            }
+            3 => Stmt::StoreIndex(slot, Operand::Arg(0), value),
+            4 => Stmt::StoreField(slot, vec![0], value),
+            5 => {
+                let id = u32::try_from(function.value_tys.len()).unwrap();
+                function.value_tys.push(function.slots[slot as usize]);
+                function.blocks[block]
+                    .stmts
+                    .insert(at + 1, Stmt::Let(id, Rvalue::Load(slot)));
+                Stmt::Store(slot, Operand::Value(id))
+            }
+            6 | 7 => {
+                let Stmt::StoreConstArray { elems, .. } = &mut function.blocks[block].stmts[at]
+                else {
+                    unreachable!()
+                };
+                if mutation == 6 {
+                    elems.pop();
+                } else {
+                    elems[0] = align_mir::ConstElem::Bool(false);
+                }
+                Stmt::StoreConstArray {
+                    slot,
+                    elems: Vec::new(),
+                    elem: element,
+                }
+            }
+            8 => {
+                let id = u32::try_from(function.value_tys.len()).unwrap();
+                function.value_tys.push(align_sema::Ty::Unit);
+                Stmt::Let(id, Rvalue::OsHost { out: slot })
+            }
+            _ => unreachable!(),
+        };
+        function.blocks[block]
+            .stmts
+            .insert(at + if matches!(mutation, 2 | 5) { 2 } else { 1 }, extra);
+        certify(&program, false, &format!("sealed pooled/{mutation}"));
+        assert!(
+            align_driver::emit_llvm_ir(
+                &program,
+                BuildTarget::Baseline,
+                Profile::Dev,
+                false,
+                &[],
+                false
+            )
+            .is_err(),
+            "codegen accepted pooled/{mutation}"
+        );
+    }
 }
