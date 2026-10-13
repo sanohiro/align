@@ -20,6 +20,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan179](docs/impl/179-form-output-prefix.md) maps admitted same-width
+  prefixes in expanded form output, preserving space-to-plus conversion and the
+  scalar remainder. Native byte/extent/allocation and source owners qualify the
+  unchanged contract. The encoding record retains both the adopted out-of-line
+  wrapper and rejected inlined experiment, with all local gains and costs.
 - [Plan178](docs/impl/178-percent-output-prefix.md) bulk-copies admitted ordinary
   prefixes in expanded percent/component and percent/path output. The existing
   exact allocation and scalar remainder writer remain; native extent/allocation
