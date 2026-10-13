@@ -16,6 +16,46 @@ bytes before timing. Each case warms for 100 ms, then emits nine samples
 including final output allocation/free. Returned lengths, calls and output
 bytes are observed, and empty/nonempty pointer shape is checked.
 
+## Unchanged-output count reuse, 2026-10-13
+
+Plan176 compares baseline `6372e8a610d30306c851f0a22c1b847e3528a673`
+with complete input copies when the existing checked percent/component,
+percent/path or HTML count equals input length. Every transformed byte in those
+encoders expands. Form remains unchanged because space-to-plus preserves length.
+HTML template append uses the same proof; this probe measures the standalone
+entries, not template or application throughput.
+
+macOS ARM64, Apple M1, Rust 1.96.1 and Apple Clang 21.0.0. Both ordinary release
+archives were rebuilt and linked against the identical current C harness with
+`-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. No build/test work overlapped the
+ABBA runs; `native_probe.run_phase` bounded every link and probe. All 200 cases
+have eighteen samples per arm. The independent oracle, actual returned extents
+and observed call/output-byte counts agree in every run. No sample is excluded.
+The [complete 7,200 observations](zero-expansion-macos-samples.csv) are retained.
+
+Harness SHA256: `7dcda15d4272f82bc5a6bd500a38985d6ddbd2bc48913dc7baf60b61b7365c54`.
+Baseline/candidate archive SHA256:
+`b9f6c0c01a8c2b4c81812472fb9c8fa76ccfd0b88f0a3ffcb51bc342cd2d8b6e` /
+`d5ee15c53451fb633303f7a6169bf77a30b600689335922c7783d72e87b9fd52`.
+
+Median microseconds per complete encode/free call at approximately 64 KiB:
+
+| Input | Component before → after | Path before → after | HTML before → after |
+| --- | ---: | ---: | ---: |
+| unreserved | 47.641 → 6.891 | 47.922 → 7.578 | 52.414 → 46.656 |
+| plain path | 49.953 → 49.906 | 53.344 → 7.688 | 58.797 → 52.602 |
+| dense space/slash/plus/percent | 95.891 → 96.422 | 83.766 → 84.836 | 53.188 → 47.266 |
+
+Across the 4/64-KiB unchanged-output cases, component/path improve 83.4–85.6%
+and HTML 10.5–12.6%. Expanded-input cases range from -2.7% to +2.0%; the
+largest increase is 1.859 microseconds (dense HTML entities in component
+encoding at 64 KiB). The largest short increase is 2.45 ns (65 bytes of HTML
+entities in path encoding: 120.70 → 123.15 ns). The unchanged form control's
+long medians range from -0.16% to +1.16%, with a largest short increase of
+1.20 ns. Accept these explicit costs with the unchanged-output gains. Host
+scheduling and code placement remain limitations; no portable, template,
+application-throughput or RSS improvement follows, and timings are not gates.
+
 ## Percent/form narrow-count qualification, 2026-10-13
 
 Plan169 compares baseline `68fc7796bf6e33e4b961f44d5bbeb45f8062ff35`
