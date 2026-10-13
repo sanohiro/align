@@ -18280,6 +18280,114 @@ fn hir_body_validator_loop_and_break() {
 }
 
 #[test]
+fn named_arena_loop_binding_inventory_matches_all_lexical_declarations() {
+    for (name, body) in [
+        ("statement", "arena region {}"),
+        ("operand", "value := (arena region { 1 }) + 2"),
+        ("branch", "if true { arena region {} }"),
+        (
+            "match",
+            "match Some(1) { Some(payload) => arena region { payload }, None => 0 }",
+        ),
+        ("nested", "arena outer { loop { arena inner {}; break } }"),
+        (
+            "tuple",
+            "(left, right) := (1, 2); arena region { value := left + right }",
+        ),
+        (
+            "lifted",
+            "callback := fn value:i64 { arena lifted { local := value + 1; local } }; arena region { callback(2) }",
+        ),
+        ("unreachable", "return 0; arena region {}"),
+    ] {
+        let source = format!("fn main()->i32 {{ loop {{ {body}; break }}; return 0 }}\n");
+        let program = checked_source_program(&source);
+        assert!(
+            validate_hir::body_only_metadata_is_valid(&program),
+            "{name}"
+        );
+        for per_unit in [false, true] {
+            assert!(
+                lower_program_checked(&program, per_unit, None).is_ok(),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn named_arena_loop_inventory_rejects_inexact_or_forged_bindings() -> Result<(), &'static str> {
+    fn loop_expr(function: &mut hir::Fn) -> Result<&mut hir::Expr, &'static str> {
+        function
+            .body
+            .stmts
+            .iter_mut()
+            .find_map(|statement| match statement {
+                hir::Stmt::Expr(expression)
+                    if matches!(expression.kind, hir::ExprKind::Loop { .. }) =>
+                {
+                    Some(expression)
+                }
+                _ => None,
+            })
+            .ok_or("loop statement")
+    }
+    let base = checked_source_program(
+        "fn main()->i32 { outside := 0; loop { arena first {}; arena second {}; break }; return outside }\n",
+    );
+    assert!(validate_hir::body_only_metadata_is_valid(&base));
+    for mutation in 0..10 {
+        let mut invalid = base.clone();
+        let function = invalid
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "main")
+            .ok_or("main function")?;
+        let first = function
+            .locals
+            .iter()
+            .position(|local| local.name == "first")
+            .ok_or("first arena local")?;
+        match mutation {
+            7 => function.locals[first].ty = Ty::Bool,
+            8 => function.locals[first].is_mut = true,
+            9 => function.locals[first].is_param = true,
+            _ => {
+                let hir::ExprKind::Loop {
+                    body, body_locals, ..
+                } = &mut loop_expr(function)?.kind
+                else {
+                    panic!("loop fixture")
+                };
+                match mutation {
+                    0 => body_locals.start += 1,
+                    1 => body_locals.end -= 1,
+                    2 => body_locals.start = 0,
+                    3 => body_locals.end += 1,
+                    4 => body_locals.start = body_locals.end + 1,
+                    5 | 6 => {
+                        let hir::Stmt::Expr(expression) = &mut body.stmts[1] else {
+                            panic!("arena statement")
+                        };
+                        let hir::ExprKind::NamedArena { local, .. } = &mut expression.kind else {
+                            panic!("arena expression")
+                        };
+                        *local = if mutation == 5 {
+                            hir::LocalId::try_from(first).map_err(|_| "local index")?
+                        } else {
+                            99
+                        };
+                    }
+                    _ => return Err("unknown mutation"),
+                }
+            }
+        }
+        assert_body_entrypoints_empty(&format!("named arena loop mutation {mutation}"), &invalid);
+    }
+    Ok(())
+}
+
+#[test]
 fn hir_body_validator_loop_break_reachability_matches_diverges() {
     let unit = Ty::Unit;
     let unreachable_loop = body_test_expr(
