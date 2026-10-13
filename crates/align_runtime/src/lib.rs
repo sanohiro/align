@@ -13802,10 +13802,32 @@ fn percent_encoded_len(data: &[u8]) -> Option<usize> {
 }
 
 fn percent_encoded_len_with_slash(data: &[u8], preserve_slash: bool) -> Option<usize> {
-    let escaped = data.iter()
-        .filter(|&&b| !(is_unreserved(b) || (preserve_slash && b == b'/')))
-        .count();
+    let escaped = if preserve_slash {
+        escaped_byte_count::<true, false>(data)
+    } else {
+        escaped_byte_count::<false, false>(data)
+    };
     data.len().checked_add(escaped.checked_mul(2)?)
+}
+
+/// Each chunk contributes at most 128 one-bit counts. Narrow reductions permit
+/// vectorization without widening every byte; the total cannot exceed data.len().
+fn escaped_byte_count<const SLASH: bool, const SPACE: bool>(data: &[u8]) -> usize {
+    let mut total = 0;
+    for chunk in data.chunks(128) {
+        let mut count = 0u8;
+        for &byte in chunk {
+            // Spell the same unreserved set as independent lane comparisons for
+            // vector reduction; writers retain their scalar short-circuit test.
+            let unescaped = ((byte | 0x20).wrapping_sub(b'a') <= 25)
+                | (byte.wrapping_sub(b'0') <= 9)
+                | (byte == b'-') | (byte == b'.') | (byte == b'_') | (byte == b'~')
+                | (SLASH && byte == b'/') | (SPACE && byte == b' ');
+            count += u8::from(!unescaped);
+        }
+        total += usize::from(count);
+    }
+    total
 }
 
 /// Write `data` percent-encoded into `out` (exactly [`percent_encoded_len`] bytes). Upper-case hex
@@ -14353,7 +14375,7 @@ pub unsafe extern "C" fn align_rt_template_html_free_v1(builder_ptr: *mut Templa
 /// Encoded length under `application/x-www-form-urlencoded`: identical to percent-encoding except a
 /// space costs 1 byte (`+`) rather than 3.
 fn form_encoded_len(data: &[u8]) -> Option<usize> {
-    let escaped = data.iter().filter(|&&b| !(is_unreserved(b) || b == b' ')).count();
+    let escaped = escaped_byte_count::<false, true>(data);
     data.len().checked_add(escaped.checked_mul(2)?)
 }
 
