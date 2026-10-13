@@ -18,12 +18,13 @@ Align v0.9.0 is released; Requests138–141 are included. The workspace version 
 [release notes](RELEASE_NOTES_0.9.0.md) own that checkpoint. A release build does
 not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI state.
 
-Next bounded candidate: reduce ordinary-prefix writes in expanded percent
-output, retaining the existing byte grammar and exact allocation. Author its
-closure matrix before implementation and adopt only measured gains with costs.
-
 ## Recent completed capabilities
 
+- [Plan178](docs/impl/178-percent-output-prefix.md) bulk-copies admitted ordinary
+  prefixes in expanded percent/component and percent/path output. The existing
+  exact allocation and scalar remainder writer remain; native extent/allocation
+  and source owners pass. Local gains, control costs and the rejected experiment
+  are retained in the encoding measurement record.
 - [Plan177](docs/impl/177-form-same-length-output.md) maps same-length form
   output through its existing checked count, preserving space-to-plus conversion
   and expanded percent escapes. Native byte/allocation and source owners qualify

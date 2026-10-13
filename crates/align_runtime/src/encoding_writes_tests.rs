@@ -4,6 +4,22 @@ use core::mem::MaybeUninit;
 
 type Writer = fn(&[u8], &mut [MaybeUninit<u8>]);
 
+fn percent_prefix_inputs() -> Vec<Vec<u8>> {
+    let mut inputs = Vec::new();
+    for length in [511, 512, 513, 639, 640, 641, 4096] {
+        for seed in [b'a', b'/'] {
+            for byte in [b'+', b'%', b'/', 0, 255] {
+                for position in [0, length / 2, length - 1] {
+                    let mut input = vec![seed; length];
+                    input[position] = byte;
+                    inputs.push(input);
+                }
+            }
+        }
+    }
+    inputs
+}
+
 #[test]
 fn percent_form_lengths_cover_every_byte_at_reduction_boundaries() {
     for byte in 0u8..=255 {
@@ -97,8 +113,8 @@ fn html_discriminator_search_has_bounded_work_for_every_entity_group() {
 #[test]
 fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
     let writers: [Writer; 4] = [
-        percent_encode_into,
-        |input, output| percent_encode_into_with_slash(input, output, true),
+        percent_encode_expanded_into::<false>,
+        percent_encode_expanded_into::<true>,
         html_escape_into,
         form_encode_into,
     ];
@@ -116,6 +132,9 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
             "日本語é🦀".as_bytes().to_vec(),
             b"<& a/b >".repeat(1024),
         ];
+        if kind < 2 {
+            cases.extend(percent_prefix_inputs());
+        }
         for length in [
             1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
         ] {
@@ -199,6 +218,7 @@ fn public_encoding_entries_preserve_exact_owned_output() {
         align_rt_form_encode,
     ];
     let mut inputs = vec![Vec::new(), (0u8..=127).collect()];
+    inputs.extend(percent_prefix_inputs());
     for byte in 0u8..=255 {
         for length in [1, 129] {
             inputs.push(vec![byte; length]);

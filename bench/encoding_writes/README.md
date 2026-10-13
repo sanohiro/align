@@ -17,6 +17,56 @@ bytes before timing. Each case warms for 100 ms, then emits nine samples
 including final output allocation/free. Returned lengths, calls and output
 bytes are observed, and empty/nonempty pointer shape is checked.
 
+## Expanded percent output prefixes, 2026-10-13
+
+Plan178 compares baseline `02c9584467f31fb1b65702d089aec5fbd53e6746`
+with bulk initialization of admitted ordinary prefixes in expanded component/
+path output. Inputs below 512 bytes skip the scan. Complete 128-byte chunks use
+existing exact classifiers; the first escaping chunk and remainder use the
+unchanged scalar writer. A separate wrapper keeps prefix preparation outside
+that loop. Whole unchanged-output copies, HTML and form keep their paths.
+
+macOS ARM64, Apple M1, Rust 1.96.1 and Apple Clang 21.0.0. Both ordinary release
+archives were rebuilt and linked to the same 240-case C harness with
+`-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. Each link/probe uses
+`native_probe.run_phase`; no build/test overlaps timing. ABBA supplies eighteen
+samples per arm/case. Independent exact bytes, native returned extents and
+observed calls/output bytes agree in every run, including empty output.
+All 8,640 [final observations](percent-prefix-macos-samples.csv) are retained.
+
+Harness SHA256: `1a3324ca61b01ac9d5183b73937c1408aaeff634526f0af414a767bf2743c779`.
+Baseline/final archive SHA256:
+`741b73ed49e2ff4e7bef7a7747fbeafd66451b2829aaafe4bb0080612c3b8ba1` /
+`186e39ee312825eab297059d18e4b37987f312b022399b7e821c6417b2a0bfa7`.
+
+Median microseconds per complete encode/free call:
+
+| Input | Bytes | Component before → after | Path before → after |
+| --- | ---: | ---: | ---: |
+| late apostrophe | 4,096 | 3.064 → 0.920 | 3.106 → 1.023 |
+| late apostrophe | 65,536 | 47.602 → 12.828 | 48.820 → 14.414 |
+| double-quote offset runs | 65,552 | 49.297 → 49.250 | 62.414 → 62.039 |
+| dense HTML entities | 65,540 | 96.844 → 96.734 | 96.727 → 97.500 |
+| unreserved, unchanged-output control | 65,536 | 7.164 → 7.703 | 7.758 → 7.617 |
+
+Long late-escape cases improve 67.1–73.1%. Other long percent cases range
+from −2.04% to +7.52%; the largest percentage increase is the unchanged-output
+component control above, costing 0.539 microseconds. The largest absolute
+increase is 0.773 microseconds for dense HTML entities in path encoding. The
+largest short percent increase is 4.25 ns (65-byte dense HTML entities, path:
+120.35 → 124.60 ns). Long HTML/form controls range from −6.11% to +4.43%, with a
+largest short increase of 6.80 ns. Accept these explicit costs with the long
+prefix gains. Scheduling and code placement limit the inference; there is no
+portable, application-throughput or RSS promise and no timing correctness gate.
+
+The rejected experiment performed prefix preparation inside the scalar writer.
+It improved long late-escape cases 67.2–72.1% but regressed one repeated-quote
+component case 29.3% and cost up to 12.5 ns on short percent inputs. Its archive
+SHA256 is `517824331748bd83e55de2529cb3ec1e78b97980f5ff1c70f2459280ab2ec293`.
+All 8,640 [rejected observations](percent-prefix-private-writer-macos-samples.csv)
+are retained with their own ABBA baseline samples. The unchanged harness and
+baseline archive are shared; no observations from either comparison are removed.
+
 ## Same-length form mapping, 2026-10-13
 
 Plan177 compares baseline `8ba130f75f17a3ffb33d87afdf5aec22b39cbf9d`
