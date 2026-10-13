@@ -3341,7 +3341,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_array_construction_preserves_private_alignment() {
+    fn versioned_array_construction_preserves_private_alignment() -> Result<(), String> {
         let mut function = unchecked_source(
             "fn run() -> i64 { mut at := 0; mut sum := 0; loop { if at >= 4 { break }; values := [0, 1, 2, 3]; sum = sum + values[at]; at = at + 1 }; return sum }",
         );
@@ -3354,7 +3354,7 @@ mod tests {
                 Stmt::StoreIndex(slot, _, _) => Some(*slot),
                 _ => None,
             })
-            .unwrap();
+            .ok_or("expected valid construction fixture")?;
         function.slot_align[source as usize] = Some(64);
         let (decisions, _) = version_loops(&mut function, &[]);
         assert!(
@@ -3374,10 +3374,11 @@ mod tests {
             assert_eq!(function.blocks.iter().flat_map(|block| &block.stmts).filter(|statement| matches!(statement, Stmt::StoreIndex(destination, _, _) if *destination as usize == slot)).count(), 4);
             assert_eq!(function.blocks.iter().flat_map(|block| &block.stmts).filter(|statement| matches!(statement, Stmt::Let(_, Rvalue::Load(destination)) if *destination as usize == slot)).count(), 1);
         }
+        Ok(())
     }
 
     #[test]
-    fn isolated_array_construction_requires_complete_confined_storage() {
+    fn isolated_array_construction_requires_complete_confined_storage() -> Result<(), String> {
         let original =
             unchecked_source("fn run(n: i64) -> [i64; 2] { values := [n, 2]; return values }");
         let body = original
@@ -3385,19 +3386,19 @@ mod tests {
             .iter()
             .map(|block| block.id)
             .collect::<Vec<_>>();
-        let slots = isolated_array_constructors(&original, &body, &[]).unwrap();
+        let slots = isolated_array_constructors(&original, &body, &[]).ok_or("expected valid construction fixture")?;
         assert_eq!(slots.len(), 1);
         let slot = slots[0];
-        let (block, store) = original.blocks.iter().enumerate().find_map(|(block, body)| body.stmts.iter().enumerate().find_map(|(at, statement)| matches!(statement, Stmt::StoreIndex(destination, _, _) if *destination == slot).then_some((block, at)))).unwrap();
-        let load = original.blocks[block].stmts.iter().position(|statement| matches!(statement, Stmt::Let(_, Rvalue::Load(source)) if *source == slot)).unwrap();
+        let (block, store) = original.blocks.iter().enumerate().find_map(|(block, body)| body.stmts.iter().enumerate().find_map(|(at, statement)| matches!(statement, Stmt::StoreIndex(destination, _, _) if *destination == slot).then_some((block, at)))).ok_or("expected valid construction fixture")?;
+        let load = original.blocks[block].stmts.iter().position(|statement| matches!(statement, Stmt::Let(_, Rvalue::Load(source)) if *source == slot)).ok_or("expected valid construction fixture")?;
         assert!(
             isolated_array_constructors(&original, &[], &[])
-                .unwrap()
+                .ok_or("expected valid construction fixture")?
                 .is_empty()
         );
         assert!(
             isolated_array_constructors(&original, &body, &[Stmt::Let(0, Rvalue::Load(slot))])
-                .unwrap()
+                .ok_or("expected valid construction fixture")?
                 .is_empty()
         );
         for mutation in 0..16 {
@@ -3447,7 +3448,7 @@ mod tests {
                 13 => {
                     let Stmt::StoreIndex(_, index, _) = &mut function.blocks[block].stmts[store]
                     else {
-                        unreachable!()
+                        return Err("expected indexed construction fixture".into())
                     };
                     *index = int(2);
                     None
@@ -3455,19 +3456,19 @@ mod tests {
                 14 => {
                     let Stmt::StoreIndex(_, _, input) = &mut function.blocks[block].stmts[store]
                     else {
-                        unreachable!()
+                        return Err("expected indexed construction fixture".into())
                     };
                     *input = Operand::Const(Const::Bool(false));
                     None
                 }
                 15 => {
                     let Stmt::Let(value, _) = function.blocks[block].stmts[load] else {
-                        unreachable!()
+                        return Err("expected indexed construction fixture".into())
                     };
                     function.value_tys[value as usize] = Ty::Bool;
                     None
                 }
-                _ => unreachable!(),
+                _ => return Err("expected indexed construction fixture".into()),
             };
             if let Some(extra) = extra {
                 function.blocks[block].stmts.push(extra);
@@ -3498,9 +3499,10 @@ mod tests {
         });
         assert!(
             isolated_array_constructors(&branch, &[0, 1, 2], &[])
-                .unwrap()
+                .ok_or("expected valid construction fixture")?
                 .is_empty()
         );
+        Ok(())
     }
     #[test]
     fn eliminated_byte_guard_record_is_authenticated_field_by_field() {
