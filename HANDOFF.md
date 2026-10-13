@@ -7,6 +7,12 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan177](docs/impl/177-form-same-length-output.md) maps same-length form output
+through its existing checked count, preserving space-to-plus transformation and
+expanded percent escapes. Native byte/allocation and source owners qualify the
+unchanged contract; the local 240-case corpus retains same-length gains and
+short/expanded/control costs without a portable performance promise.
+
 [Plan176](docs/impl/176-unchanged-escaped-output.md) reuses exact expansion
 counts to bulk-copy unchanged percent/path/HTML output, including template
 appends. Form's space-to-plus transform and all expanded writers remain intact.

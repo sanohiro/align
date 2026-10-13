@@ -8,13 +8,57 @@ no optional native codec/crypto libraries are needed.
 
 Kind 0 is percent/component, 1 percent/path, 2 HTML, and 3 form. Plain and mixed
 UTF-8 seeds join unreserved, dense reserved-byte, dense five-entity HTML,
-sparse-entity, late-entity and repeated quote/apostrophe controls. Requested sizes are 0, 1, 8, 64, 4096
+sparse-entity, late-entity, repeated quote/apostrophe and form space-only/mixed-space
+controls. Requested sizes are 0, 1, 8, 64, 4096
 and 65536 bytes; whole seed repetitions preserve UTF-8, and CSV records actual
 lengths. Empty input appears once per encoder, and repeated rounded lengths
-are skipped, leaving 200 distinct cases. An independent oracle checks exact
+are skipped, leaving 240 distinct cases. An independent oracle checks exact
 bytes before timing. Each case warms for 100 ms, then emits nine samples
 including final output allocation/free. Returned lengths, calls and output
 bytes are observed, and empty/nonempty pointer shape is checked.
+
+## Same-length form mapping, 2026-10-13
+
+Plan177 compares baseline `8ba130f75f17a3ffb33d87afdf5aec22b39cbf9d`
+with direct byte-to-slot mapping when the checked form output length equals
+input length. That proof admits only unreserved bytes and spaces; spaces still
+become plus. Expanded output uses the existing writer. Both arms use the same
+extended corpus with space-only and mixed unreserved/space seeds; all prior
+cases remain. The three unchanged encoder entries are controls.
+
+macOS ARM64, Apple M1, Rust 1.96.1 and Apple Clang 21.0.0. Rebuilt ordinary
+release archives link the identical C harness using
+`-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. Every link/probe uses
+`native_probe.run_phase`; no build/test overlaps ABBA timing. All 240 cases
+have eighteen samples per arm, with identical independent-oracle bytes,
+returned extents and observed calls/output bytes. No sample is excluded.
+The [complete 8,640 observations](form-same-length-macos-samples.csv) use LF.
+
+Harness SHA256: `1a3324ca61b01ac9d5183b73937c1408aaeff634526f0af414a767bf2743c779`.
+Baseline/candidate archive SHA256:
+`d5ee15c53451fb633303f7a6169bf77a30b600689335922c7783d72e87b9fd52` /
+`741b73ed49e2ff4e7bef7a7747fbeafd66451b2829aaafe4bb0080612c3b8ba1`.
+
+Median microseconds per complete form encode/free call near 64 KiB:
+
+| Input | Baseline | Candidate |
+| --- | ---: | ---: |
+| unreserved | 69.789 | 8.008 |
+| spaces only | 38.219 | 8.383 |
+| mixed unreserved/spaces | 79.961 | 8.398 |
+| plain path, expanded | 76.109 | 76.469 |
+| mixed UTF-8, expanded | 93.898 | 94.086 |
+| dense reserved bytes, expanded | 91.547 | 91.297 |
+
+At 4/64 KiB, same-length form cases improve 78.1–89.5%. Long expanded form
+cases range from -1.70% to +3.84%; the largest percentage increase is sparse
+HTML entities at 4 KiB (4.559 → 4.734 microseconds), and the largest absolute
+increase is 0.406 microseconds for repeated double quotes at 64 KiB.
+The largest short form increase is 3.65 ns (64-byte sparse HTML entities:
+91.05 → 94.70 ns). Unchanged encoders' long controls range from -7.07% to
++5.83%, with a largest short increase of 3.35 ns. Accept these local costs
+with the same-length gains. Scheduling and code placement limit the inference;
+there is no portable, application-throughput or RSS claim, and no timing gate.
 
 ## Unchanged-output count reuse, 2026-10-13
 
@@ -26,7 +70,7 @@ HTML template append uses the same proof; this probe measures the standalone
 entries, not template or application throughput.
 
 macOS ARM64, Apple M1, Rust 1.96.1 and Apple Clang 21.0.0. Both ordinary release
-archives were rebuilt and linked against the identical current C harness with
+archives were rebuilt and linked against the identical C harness at that revision with
 `-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. No build/test work overlapped the
 ABBA runs; `native_probe.run_phase` bounded every link and probe. All 200 cases
 have eighteen samples per arm. The independent oracle, actual returned extents
@@ -64,8 +108,8 @@ The scalar writers remain unchanged. The three count specializations preserve
 the component, slash-preserving path and space-preserving length rules.
 
 macOS ARM64, Apple M1, Rust 1.96.1 and Apple Clang 21.0.0. Both ordinary
-release archives were rebuilt, then linked against the identical current C
-harness with `-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. No build/test work
+release archives were rebuilt, then linked against the identical C
+harness at that revision with `-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. No build/test work
 overlapped any ABBA run; each link and probe used `native_probe.run_phase`.
 The 200 cases have eighteen samples per arm, with identical oracle bytes,
 returned extents and observed call/output-byte counts. No sample is excluded.

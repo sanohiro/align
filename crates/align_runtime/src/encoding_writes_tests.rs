@@ -211,6 +211,17 @@ fn public_encoding_entries_preserve_exact_owned_output() {
         inputs.push(seed.to_vec());
         inputs.push(seed.repeat(1024));
     }
+    for length in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4096] {
+        let input: Vec<u8> = b" Az09-._~ ".iter().copied().cycle().take(length).collect();
+        inputs.push(input.clone());
+        if length != 0 {
+            for byte in [b'+', b'%', b'/', 0, 255] {
+                let mut expanded = input.clone();
+                expanded[length / 2] = byte;
+                inputs.push(expanded);
+            }
+        }
+    }
     for (kind, encode) in encoders.into_iter().enumerate() {
         for input in &inputs {
             if kind == 2 && std::str::from_utf8(input).is_err() {
