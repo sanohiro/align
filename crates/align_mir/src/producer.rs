@@ -1528,7 +1528,7 @@ fn xml_const_element_matches_ty(element: &ConstElem, ty: Ty) -> bool {
     )
 }
 
-fn xml_plain_fixed_array_element(element: Scalar) -> bool {
+pub(crate) fn xml_plain_fixed_array_element(element: Scalar) -> bool {
     matches!(
         element,
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
@@ -3755,7 +3755,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     && xml_fixed_array_load_needs_construction_proof(element)
                 {
                     // A whole inline scalar array copies its elements, not a backing header.
-                    // Keep the literal completeness proof and every reaching element producer;
+                    // Keep the initialization proof and every reaching element producer;
                     // the copied-bits transform below changes only the resulting SSA authority.
                     if !self.check_fixed_array_construction_operand(
                         &mut equation, &Operand::Value(value), result_ty,
@@ -7233,19 +7233,19 @@ impl<'a> XmlAccessAnalyzer<'a> {
         {
             return false;
         }
-        if self.graph.function.params.contains(array_slot)
-            || self
-                .graph
-                .slot_stores
-                .roots
-                .get(*array_slot as usize)
-                .is_some_and(|stores| !stores.is_empty())
-        {
-            // This is an ordinary initialized array slot, not an anonymous literal-construction
-            // temporary. The caller's exact projected dependency authenticates its root
-            // stores and later element writes; applying the construction-cardinality scan here
-            // would reject parameters, copies, joins, and mutations as duplicate initialization.
+        if self.graph.function.params.contains(array_slot) {
             return true;
+        }
+        if self.graph.slot_stores.roots.get(*array_slot as usize)
+            .is_some_and(|stores| !stores.is_empty())
+            || (length > 0 && xml_plain_fixed_array_element(element)
+                && self.graph.function.blocks.iter().flat_map(|block| &block.stmts).any(|statement|
+                    matches!(statement, Stmt::StoreConstArray { slot, .. } if slot == array_slot)))
+        {
+            // Whole values retain their projected input checks. Plain named roots also need
+            // a complete publication on every path before this load, including branch joins.
+            return !xml_plain_fixed_array_element(element)
+                || xml_plain_array_root_initialized_at(self.graph, *array_slot, expected, *value);
         }
         let mut load_site = None;
         for block in &self.graph.function.blocks {
@@ -7482,6 +7482,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !self.check_fixed_array_construction_operand(&mut equation, &operand, stored_ty) {
                     equation.invalid = true;
                     continue;
+                }
+                if matches!(stored_ty, Ty::Array(element, _) if xml_plain_fixed_array_element(element)) {
+                    // An owned-sibling projection must not discard this array's typed inputs.
+                    self.check_whole_operand(&mut equation, &operand, stored_ty);
                 }
             } else {
                 self.check_whole_operand(&mut equation, &operand, stored_ty);
@@ -7965,6 +7969,130 @@ fn xml_borrowed_access(
     } else {
         xml_slot_path_access(graph, slot, expected, path)
     }
+}
+
+/// Prove that every path to a local use has published one complete inline value.
+/// Anonymous literal construction retains its separate strict producer proof.
+fn xml_plain_array_root_initialized_at(
+    graph: &ValidatedProducerGraph<'_>,
+    slot: Slot,
+    array: Ty,
+    use_value: ValueId,
+) -> bool {
+    let (Ok(slot_index), Ok(value_index)) = (usize::try_from(slot), usize::try_from(use_value))
+    else {
+        return false;
+    };
+    if graph.function.slots.get(slot_index) != Some(&array)
+        || graph.duplicate_values.get(value_index) != Some(&false)
+    {
+        return false;
+    }
+    let mut use_site = None;
+    for block in &graph.function.blocks {
+        for (position, statement) in block.stmts.iter().enumerate() {
+            if matches!(statement, Stmt::Let(value, _) if *value == use_value)
+                && use_site.replace((block.id, position)).is_some()
+            {
+                return false;
+            }
+        }
+    }
+    let Some((use_block, use_position)) = use_site else {
+        return false;
+    };
+    if mir_block_reachable_avoiding(graph.function, use_block, None) != Some(true) {
+        return false;
+    }
+    let Ty::Array(element, length) = array else {
+        return false;
+    };
+    // Pooling and ordinary whole-value initialization are disjoint. A forged mixed writer
+    // set must never fall through to the more general mutable-root graph.
+    let pooled = graph.function.blocks.iter().flat_map(|block| &block.stmts).any(|statement|
+        matches!(statement, Stmt::StoreConstArray { slot: destination, .. } if *destination == slot));
+    let mut initialized_blocks = HashSet::new();
+    for block in &graph.function.blocks {
+        for (position, statement) in block.stmts.iter().enumerate() {
+            let complete = if pooled {
+                match statement {
+                    Stmt::StoreConstArray {
+                        slot: destination,
+                        elems,
+                        elem,
+                    } if *destination == slot => {
+                        if length == 0
+                            || *elem != scalar_to_ty(element)
+                            || usize::try_from(length) != Ok(elems.len())
+                            || elems
+                                .iter()
+                                .any(|value| !xml_const_element_matches_ty(value, *elem))
+                        {
+                            return false;
+                        }
+                        true
+                    }
+                    Stmt::Store(destination, _)
+                    | Stmt::StoreIndex(destination, _, _)
+                    | Stmt::StoreField(destination, _, _)
+                    | Stmt::StoreElemField(destination, _, _, _)
+                        if *destination == slot =>
+                    {
+                        return false;
+                    }
+                    Stmt::Let(_, rvalue)
+                        if xml_written_slots(rvalue)
+                            .iter()
+                            .any(|(destination, _)| *destination == slot) =>
+                    {
+                        return false;
+                    }
+                    _ => false,
+                }
+            } else {
+                matches!(statement, Stmt::Store(destination, input)
+                    if *destination == slot && xml_operand_base_ty(graph.function, input) == Some(array))
+            };
+            if complete && (block.id != use_block || position < use_position) {
+                initialized_blocks.insert(block.id);
+            }
+        }
+    }
+    // Either branch (including duplicated fast/slow loop bodies) may publish the complete
+    // value; every path must cross a store before this use.
+    !initialized_blocks.is_empty()
+        && mir_block_reachable_without(graph.function, use_block, |block| {
+            initialized_blocks.contains(&block)
+        }) == Some(false)
+}
+
+/// Keep readable element payload and exclusive storage authority independent.
+fn xml_plain_array_borrow_at_call(
+    graph: &ValidatedProducerGraph<'_>,
+    operand: &Operand,
+    call: ValueId,
+) -> Option<XmlProducerState> {
+    let Operand::BorrowedPlace(place) = operand else {
+        return None;
+    };
+    let Ty::Array(element, length) = place.ty else {
+        return None;
+    };
+    if !place.path.is_empty()
+        || !xml_plain_fixed_array_element(element)
+        || graph.function.params.contains(&place.slot)
+    {
+        return None;
+    }
+    if !xml_plain_array_root_initialized_at(graph, place.slot, place.ty, call) {
+        return Some(XmlProducerState::Invalid);
+    }
+    let (selected, path) = if length == 0 {
+        (place.ty, Vec::new())
+    } else {
+        (scalar_to_ty(element), vec![XmlAccessPathSegment::Element])
+    };
+    Some(xml_slot_path_access(graph, place.slot, selected, path))
 }
 
 fn xml_borrowed_storage_access(
@@ -8950,7 +9078,7 @@ fn validate_resource_rvalues_component(
             )
         };
         let xml_call_arguments_valid =
-            |args: &[Operand], params: &[Ty], modes: &[align_ast::ParamMode]| {
+            |args: &[Operand], params: &[Ty], modes: &[align_ast::ParamMode], call: ValueId| {
                 args.len() == params.len()
                     && modes.len() == params.len()
                     && args
@@ -8998,7 +9126,8 @@ fn validate_resource_rvalues_component(
                                 if !canonical_borrow_path {
                                     return false;
                                 }
-                                let payload = xml_borrowed_access(&access_graph, operand);
+                                let payload = xml_plain_array_borrow_at_call(&access_graph, operand, call)
+                                    .unwrap_or_else(|| xml_borrowed_access(&access_graph, operand));
                                 let storage =
                                     xml_borrowed_storage_access(&access_graph, operand);
                                 if leaves.is_empty() {
@@ -9132,6 +9261,7 @@ fn validate_resource_rvalues_component(
                                         args,
                                         &declaration.params,
                                         &declaration.param_modes,
+                                        *value,
                                     )
                                 } else {
                                     false
@@ -9149,7 +9279,7 @@ fn validate_resource_rvalues_component(
                                     program,
                                 );
                                 let producer_valid =
-                                    xml_call_arguments_valid(args, &facts.params, &facts.modes);
+                                    xml_call_arguments_valid(args, &facts.params, &facts.modes, *value);
                                 mode_valid && producer_valid
                             },
                         )
@@ -9170,6 +9300,7 @@ fn validate_resource_rvalues_component(
                                     &call.args,
                                     &facts.params,
                                     &facts.modes,
+                                    *value,
                                 )
                             },
                         )
@@ -9193,6 +9324,7 @@ fn validate_resource_rvalues_component(
                                 args,
                                 param_tys,
                                 &signature.param_modes,
+                                *value,
                             )
                     }
                     Rvalue::CallIndirectWithCleanup(call) => {
@@ -9210,6 +9342,7 @@ fn validate_resource_rvalues_component(
                             &call.args,
                             &call.param_tys,
                             &call.signature.param_modes,
+                            *value,
                         )
                     }
                     _ => true,
@@ -9557,6 +9690,7 @@ fn validate_resource_rvalues_component(
                                 std::slice::from_ref(data),
                                 &[Ty::Str],
                                 &[align_ast::ParamMode::ByValue],
+                                *value,
                             )
                     }
                     Rvalue::TemplateHtmlToString { resource, output } => {
@@ -11411,10 +11545,18 @@ fn mir_block_reachable_avoiding(
     target: BlockId,
     avoided: Option<BlockId>,
 ) -> Option<bool> {
+    mir_block_reachable_without(function, target, |block| avoided == Some(block))
+}
+
+fn mir_block_reachable_without(
+    function: &Function,
+    target: BlockId,
+    avoided: impl Fn(BlockId) -> bool,
+) -> Option<bool> {
     let mut seen = vec![false; function.blocks.len()];
     let mut pending = vec![function.entry];
     while let Some(block) = pending.pop() {
-        if avoided == Some(block) {
+        if avoided(block) {
             continue;
         }
         let index = usize::try_from(block).ok()?;

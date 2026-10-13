@@ -7,6 +7,15 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan170](docs/impl/170-fixed-scalar-array-borrows.md) repairs Request148's local
+fixed scalar-array borrows through complete inline construction and separate
+readable-payload/exclusive-storage checks. Strict literal validation, pooled
+rodata access and isolated construction in versioned loops are preserved.
+Repeated mutation, whole Copy loads and record publication share the initialized
+root proof. Whole/per-unit native execution,
+cache replay and malformed-input owners qualify the existing inline contract;
+owned/view/callable array expansion and K1 remain deferred.
+
 [Plan169](docs/impl/169-percent-form-length-count.md) uses bounded narrow counts
 and independent lane comparisons for percent/form output sizing. The scalar
 writers, exact output, allocation and publication remain unchanged. Native and
