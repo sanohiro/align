@@ -14472,7 +14472,16 @@ pub unsafe extern "C" fn align_rt_form_encode(ptr: *const u8, len: i64) -> Align
     let Some(out_len) = form_encoded_len(data) else {
         align_rt_alloc_size_fail();
     };
-    unsafe { owned_str_exact(out_len, |out| form_encode_into(data, out)) }
+    unsafe { owned_str_exact(out_len, |out| {
+        // Equal checked lengths admit only unreserved bytes and spaces, which still become plus.
+        if out_len == data.len() {
+            for (&byte, slot) in data.iter().zip(out) {
+                slot.write(if byte == b' ' { b'+' } else { byte });
+            }
+        } else {
+            form_encode_into(data, out);
+        }
+    }) }
 }
 
 /// `encoding.form_decode(s)` — the inverse: `+` to space, `%XX` to a byte. A malformed escape is
