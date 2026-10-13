@@ -1763,7 +1763,15 @@ with no UTF-8 guarantee; invalid encoded input returns `Error.Invalid`.
 `utf8_valid` tests byte-view validity without converting it. `std.rand`
 (non-cryptographic): `rand.seed()`/`seed_with(s)` produce a **Copy** `rng` value (state-only, no
 fd — unlike `reader`/`writer`); `r.next()`/`r.range(lo, hi)`/`r.shuffle(out xs)`/`r.sample(xs, k)`
-take a `mut` receiver. Only `rand.seed()` is OS-seeded (via `getrandom`/`urandom`; a failure aborts
+require a bound mutable local receiver. Ordinary concrete, nested and generic
+record fields may hold `rng`. Copies preserve the exact four-word state (internal
+size 32, alignment 8) without allocation or reseeding; other fields keep their
+ownership/lifetime rules. Advance a field through an ordinary `borrow mut rng`
+function parameter, preserving mutable-place exclusivity; direct
+`state.random.next()` receivers remain excluded. Containing records compose in
+existing record positions without granting direct RNG scalar collection/tagged
+payloads, SoA, JSON, C layout/FFI, RegionPlain or heap record builder admission.
+Only `rand.seed()` is OS-seeded (via `getrandom`/`urandom`; a failure aborts
 rather than surfacing a `Result`) — `seed_with(s)` is **deterministic**, for tests and
 reproducibility. `lo >= hi` (`range`) and `k < 0` or
 `k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.

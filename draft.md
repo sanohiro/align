@@ -4205,7 +4205,18 @@ r.sample(xs: slice<T>, k: i64) -> array<T>   // k items, without replacement
 
 `rng` is a **Copy** value — a small state-only struct, no fd/ownership — deliberately unlike the
 Move `reader`/`writer` handles: it holds no external resource, so Copy is the right default, not a
-special case. Methods take a `mut` receiver to advance the state. The OS seed comes from
+special case. Ordinary record fields, including nested and generic fields, may
+hold `rng`; copying or replacing a field copies its exact four-word state without
+allocation or reseeding. Other fields retain their existing ownership and
+lifetime rules. RNG state has internal size 32 bytes and natural alignment 8;
+this grants no C layout or raw-state export. Methods require a bound mutable
+local receiver. To advance a stored field, pass its mutable place to an ordinary
+function with a `borrow mut value: rng` parameter; that function calls
+`value.next()` (or the other methods). `state.random.next()` itself is not an
+admitted receiver. Shared/immutable or overlapping mutable borrows reject.
+Containing records use existing supported record positions; direct RNG scalar
+arrays/slices/tagged payloads, SoA, JSON, RegionPlain and heap record builders
+remain excluded. Methods take a `mut` receiver to advance the state. The OS seed comes from
 `getrandom`/`urandom` — never raw `RDRAND`/`RNDR` (outside the x86-64-v2/armv8-a baseline, `SIGILL`
 on older silicon; `docs/open-questions.md` #342). `rand.seed`'s OS call is assumed not to fail in
 practice; a real failure **aborts** (it is not surfaced as a `Result` — seeding is not a fallible

@@ -7,6 +7,14 @@ widths still fail ordinary type validation. Raw fields remain non-owning Copy
 values with no inferred pointee authority. The parameterized raw-field placement
 owner rejects non-C/raw and C/non-scalar mutations before MIR.
 
+Ordinary field placement also admits the existing Copy `Rng` leaf (plan175),
+including generic substitution and nested records. Semantic layout is exactly
+32 bytes with natural alignment 8, matching LLVM's four-word state. The existing
+C, collection-scalar, SoA, JSON, RegionPlain and heap-builder predicates still
+apply. `Rand*` rows retain SourceMutLocal; ordinary BorrowMut field paths supply
+the pointer to a helper's mutable local parameter. No native-place record or
+interface tag changes.
+
 ## Checked typed byte views (plan 78; implemented)
 
 `BytesView` authenticates an exact `slice<u8>` receiver, one of the eight

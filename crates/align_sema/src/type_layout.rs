@@ -82,6 +82,7 @@ impl<'a> TypeLayoutCache<'a> {
                     }
                     Ty::Bool => built.push((1, 1)),
                     Ty::Char => built.push((4, 4)),
+                    Ty::Rng => built.push((32, 8)),
                     Ty::Unit => built.push((0, 1)),
                     Ty::Array(element, length) => {
                         work.push(Work::ExitArray(length));

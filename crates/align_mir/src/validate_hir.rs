@@ -1612,7 +1612,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Param(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
-            Ty::Bool | Ty::Char | Ty::Str | Ty::String => true,
+            Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Rng => true,
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Resource(id) | Ty::ResourceRef(id) => {
                 self.program.resources.get(id as usize).is_some()

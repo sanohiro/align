@@ -38805,7 +38805,7 @@ fn main() -> i32 = 0
     /// alignment and the padded size) must still equal LLVM's `(abi_size, abi_alignment)` of the
     /// size-padded type. This pins the padding math on both sides.
     #[test]
-    fn sema_and_codegen_struct_layout_agree() {
+    fn sema_and_codegen_struct_layout_agree() -> Result<(), std::num::TryFromIntError> {
         fn i(bits: u8, signed: bool) -> Ty {
             Ty::Int(IntTy { bits, signed })
         }
@@ -38940,6 +38940,22 @@ fn main() -> i32 = 0
             ),
         ];
 
+        // RNG records preserve the four-word state in every enclosing storage shape.
+        let rng_id = u32::try_from(structs.len())?;
+        structs.extend([
+            sdef("RngState", false, &[Ty::Rng]),
+            sdef("RngMixed", false, &[Ty::Bool, Ty::Rng, i(8, true), f(64)]),
+            sdef("RngNested", false, &[i(8, true), Ty::Struct(rng_id), Ty::Bool]),
+            adef("RngAligned", 64, &[Ty::Bool, Ty::Rng]),
+            sdef("RngOptional", false, &[opt(Ty::Struct(rng_id)), Ty::Bool]),
+            sdef("RngResult", false, &[Ty::Result(Scalar::Struct(rng_id), Scalar::Bool)]),
+            sdef("RngDynamic", false, &[Ty::DynStructArray(rng_id, Layout::Aos)]),
+        ]);
+        for length in [0, 1, 2, 4, 37] {
+            structs.push(sdef(&format!("RngFixed{length}"), false,
+                &[Ty::Bool, Ty::StructArray(rng_id, length), i(64, true)]));
+        }
+
         // Fixed-array storage must agree for primitive, text and function elements. Unit's
         // stored i32 element deliberately differs from an omitted tagged Unit payload.
         for element in [
@@ -39063,6 +39079,7 @@ fn main() -> i32 = 0
                 s.name
             );
         }
+        Ok(())
     }
 
     #[test]
