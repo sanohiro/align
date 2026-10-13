@@ -16,6 +16,64 @@ bytes before timing. Each case warms for 100 ms, then emits nine samples
 including final output allocation/free. Returned lengths, calls and output
 bytes are observed, and empty/nonempty pointer shape is checked.
 
+## Percent/form narrow-count qualification, 2026-10-13
+
+Plan169 compares baseline `68fc7796bf6e33e4b961f44d5bbeb45f8062ff35`
+with independent byte-lane comparisons and bounded 128-byte/u8 count reductions.
+The scalar writers remain unchanged. The three count specializations preserve
+the component, slash-preserving path and space-preserving length rules.
+
+macOS ARM64, Apple M1, Rust 1.96.1 and Apple Clang 21.0.0. Both ordinary
+release archives were rebuilt, then linked against the identical current C
+harness with `-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. No build/test work
+overlapped any ABBA run; each link and probe used `native_probe.run_phase`.
+The 200 cases have eighteen samples per arm, with identical oracle bytes,
+returned extents and observed call/output-byte counts. No sample is excluded.
+
+Harness SHA256: `7dcda15d4272f82bc5a6bd500a38985d6ddbd2bc48913dc7baf60b61b7365c54`.
+Baseline/candidate archive SHA256:
+`71fbe5056c1e989c1e65d1348794e9e6c0c8f45ccad8465103bd886d01a95e90` /
+`b9f6c0c01a8c2b4c81812472fb9c8fa76ccfd0b88f0a3ffcb51bc342cd2d8b6e`.
+
+Median microseconds per complete encode/free call at approximately 64 KiB:
+
+| Input | Component before → after | Path before → after | Form before → after |
+| --- | ---: | ---: | ---: |
+| plain | 87.156 → 51.539 | 88.570 → 55.328 | 112.391 → 78.977 |
+| mixed | 122.391 → 74.852 | 126.055 → 81.430 | 142.859 → 95.516 |
+| unreserved | 81.516 → 48.820 | 82.047 → 48.992 | 103.516 → 69.859 |
+| dense reserved bytes | 176.977 → 97.148 | 151.398 → 85.633 | 152.141 → 90.695 |
+| dense HTML entities | 164.438 → 104.500 | 162.180 → 101.367 | 174.438 → 112.883 |
+
+Across every 4/64-KiB case, component improves 36.5–45.1%, path 35.4–43.8%
+and form 26.1–42.3%. The largest short increase is 1.9 ns (one unreserved
+byte: component 14.6 → 16.5 ns; form 15.1 → 17.0 ns). The unchanged HTML
+control's long medians range from -19.0% to +11.4%, with a largest short
+increase of 9.4 ns. Scheduling and code placement remain limitations; this
+does not establish unchanged control throughput or a portable/application gain.
+The count improvements exceed that control spread, and the short costs are
+accepted. Timing remains separate from correctness gates.
+
+Three rejected experiments each retain all 7,200 observations. Changing only
+the counter width gave no consistent gain. Rewriting the shared scalar predicate
+as fully independent comparisons, or retaining its alphanumeric shortcut with
+independent punctuation comparisons, improved form but regressed ordinary
+component/path output. The final implementation changes counting only.
+Their archive SHA256 values, respectively, are
+`8ed64781af830fa737d0711355f9e4f6364dffbaba142cc14aacd1d6a6fbf466`,
+`7757b93fb63b4c309e5a8acbeac1916ee39e0e8ec441505b3fed158fa6df1cad`, and
+`13d3457532a35bd5e5610c3278d6796e78c3dc7befcd7bd22e41ac9ffb26201c`.
+All experiments use the same baseline archive and harness; each has its own
+ABBA baseline samples.
+
+All 28,800 observations: [final](percent-count-macos-samples.csv),
+[counter only](percent-count-narrow-only-macos-samples.csv),
+[shared independent comparisons](percent-count-shared-bitwise-macos-samples.csv),
+[shared scalar shortcut](percent-count-shared-shortcut-macos-samples.csv).
+Reproduce the final comparison with the baseline and candidate runtime archives,
+the unchanged harness and flags above, in baseline/candidate/candidate/baseline
+order. Linux and x86_64 performance are unmeasured for this refinement.
+
 ## HTML ordinary-run copying, 2026-10-10
 
 Baseline: `b0aa0fec8619b6e86f61bb62901ead20017d86b6`. Plan168 keeps the

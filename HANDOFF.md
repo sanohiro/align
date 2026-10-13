@@ -7,6 +7,13 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan169](docs/impl/169-percent-form-length-count.md) uses bounded narrow counts
+and independent lane comparisons for percent/form output sizing. The scalar
+writers, exact output, allocation and publication remain unchanged. Native and
+source owners pass on macOS ARM64; the local corpus improves long inputs while
+retaining short/control costs and all rejected measurements. No portable speed
+or application-throughput claim follows.
+
 [Plan168](docs/impl/168-html-ordinary-runs.md) bulk-copies long ordinary HTML
 output runs through safe slice initialization. The checked size, five entities,
 allocation and publication remain unchanged for encoding and template callers.

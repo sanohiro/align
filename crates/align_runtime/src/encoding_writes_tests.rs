@@ -4,6 +4,23 @@ use core::mem::MaybeUninit;
 
 type Writer = fn(&[u8], &mut [MaybeUninit<u8>]);
 
+#[test]
+fn percent_form_lengths_cover_every_byte_at_reduction_boundaries() {
+    for byte in 0u8..=255 {
+        for length in [0, 1, 15, 16, 127, 128, 129, 255, 256, 257, 4096] {
+            let input = vec![byte; length];
+            for (kind, actual) in [
+                (0, percent_encoded_len(&input)),
+                (1, percent_encoded_len_with_slash(&input, true)),
+                (3, form_encoded_len(&input)),
+            ] {
+                assert_eq!(actual, Some(reference(&input, kind).len()),
+                    "kind={kind}, byte={byte}, length={length}");
+            }
+        }
+    }
+}
+
 fn reference(input: &[u8], kind: usize) -> Vec<u8> {
     let mut output = Vec::new();
     for &byte in input {
