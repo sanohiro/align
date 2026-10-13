@@ -90,6 +90,29 @@ The random-number API follows these rules:
 - Drawing a number changes the generator state, so an rng-using closure is **rejected by `par_map`** at compile time. For parallel simulations, use per-task generators with `task_group`, or generate a column of random numbers first and then process it through a pipeline.
 - `range` is half-open `[lo, hi)` and bias-free; `range(1, 7)` models a six-sided die. Invalid arguments (`lo >= hi`, or `sample` with `k > len`) abort as programming errors.
 
+Store an `rng` in an ordinary record, including a nested or generic field. A copy
+preserves the complete state without allocating or reseeding. Advance a stored
+field through an explicit `borrow mut rng` helper:
+
+```align
+import std.rand
+State { random: rng }
+fn advance(borrow mut value: rng) -> i64 = value.next()
+fn main() {
+  mut state := State { random: rand.seed_with(42) }
+  mut copy := state
+  print(advance(state.random))
+  print(advance(copy.random))  // the same first value; independent state
+}
+```
+
+The helper mutates the selected field in place. The root must be mutable and
+borrows must not overlap. Intrinsic methods still require a bound mutable local,
+so `state.random.next()` is not accepted directly. Other fields keep their usual
+ownership and lifetime rules. This does not add RNG elements to scalar arrays,
+slices or tagged payloads, or enable C/FFI, JSON, SoA, RegionPlain or heap record
+builders for RNG-containing records.
+
 ## `std.cli`
 
 For more than a positional argument or two, register flags on a command and parse the one argv source, `main(args: array<str>)`:

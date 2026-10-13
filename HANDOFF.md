@@ -7,6 +7,14 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan175](docs/impl/175-rng-record-composition.md) admits Copy RNG fields in
+ordinary concrete/generic/nested records and aligns semantic size with the
+existing 32-byte LLVM state. Existing explicit mutable borrowing advances a
+stored field without copy-back; native receiver-local and specialized placement
+restrictions remain. Counted whole/per-unit/cache execution and real LLVM layout
+parity qualify state isolation, recursive containers and cleanup. Request145's
+consumer adoption remains external; K1 is unchanged.
+
 [Plan174](docs/impl/174-named-arena-loop-validation.md) includes named-arena
 handles in the checked-HIR loop-local inventory. Legal nested/repeated uses now
 lower; exact range, duplicate, type, scope and region-exit restrictions remain.

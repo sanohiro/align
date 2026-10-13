@@ -20139,3 +20139,48 @@ fn buffer_page_policy_hir_authenticates_builtin_definition() -> Result<(), &'sta
     }
     Ok(())
 }
+
+#[test]
+fn rng_record_fields_preserve_placement_boundaries() -> Result<(), &'static str> {
+    let base = checked_source_program(
+        "import std.rand\nState {random:rng}\nfn advance(borrow mut value:rng)->i64 = value.next()\nfn main(){mut state:=State{random:rand.seed_with(42)};print(advance(state.random))}\n",
+    );
+    for per_unit in [false, true] {
+        assert!(lower_program_checked(&base, per_unit, None).is_ok());
+    }
+    let id = base
+        .structs
+        .iter()
+        .position(|record| record.name == "State")
+        .ok_or("State record")?;
+    let struct_id = u32::try_from(id).map_err(|_| "struct id")?;
+    for mutation in 0..4 {
+        let mut bad = base.clone();
+        match mutation {
+            0 => bad.structs[id].c_repr = true,
+            1 => bad.structs[id].fields[0].ty = Ty::Soa(struct_id),
+            2 => bad.structs[id].fields[0].ty = Ty::DynArray(Scalar::Struct(struct_id)),
+            _ => bad.structs[id].fields[0].ty = Ty::RunBytes,
+        }
+        assert!(
+            !validate_hir::type_placement_metadata_is_valid(&bad),
+            "mutation {mutation}"
+        );
+        for per_unit in [false, true] {
+            assert!(lower_program_checked(&bad, per_unit, None).is_err());
+        }
+        let source_map = SourceMap::new();
+        for lowered in [
+            lower_program(&bad),
+            lower_program_per_unit(&bad),
+            lower_program_located(&bad, &source_map),
+            lower_program_per_unit_located(&bad, &source_map),
+        ] {
+            assert!(
+                is_empty(&lowered),
+                "mutation {mutation} published partial MIR"
+            );
+        }
+    }
+    Ok(())
+}

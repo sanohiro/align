@@ -2343,3 +2343,13 @@ serve the resident-weight consumer without turning Align into a model/GPU manage
 The supported OS view and macOS estimate are explicit; cgroup admission, placement
 and allocation success remain separate. Primitive Copy results need no new owner
 or lifetime rule. Native queries use bounded scratch and no observation cache.
+
+## RNG state in records
+
+The existing Copy RNG stores four words and owns no external resource. Ordinary
+record composition preserves that state without a clone, allocation or reseed.
+Existing pointer-based `borrow mut rng` parameters advance a stored field using
+the normal place/exclusion rules; no receiver copy-back convention is needed.
+The semantic layout must match the existing LLVM `[4 x i64]` representation.
+[Plan175](impl/175-rng-record-composition.md) owns the closure and specialized
+placement exclusions.

@@ -75930,7 +75930,8 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
         | Ty::CodecI64Column
         | Ty::CodecF64Column
         | Ty::CodecBoolColumn
-        | Ty::CodecStrColumn => {}
+        | Ty::CodecStrColumn
+        | Ty::Rng => {}
         // A sum-type (`enum`) field — the JSON `oneOf`/union shape (`Message { content: Content }`,
         // J1b). The recursive DropPlan distinguishes Copy enums from Move enums with owned payloads;
         // `drop_struct_fields` tag-switches the latter. A `str`-bearing enum field region-ties the

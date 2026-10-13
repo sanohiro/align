@@ -90,6 +90,28 @@ pub fn main() -> i32 {
 - 乱数の生成は状態を変更するので、rng を使うクロージャを `par_map` に渡すと**コンパイル時に拒否されます**。並列シミュレーションでは、`task_group` の各タスクに生成器を持たせるか、乱数列を先に生成してからパイプラインで処理します。
 - `range` は偏りのない半開区間 `[lo, hi)` です。`range(1, 7)` なら6面のサイコロに相当します。`lo >= hi` や、`sample` の `k > len` はプログラミングエラーとして異常終了します。
 
+`rng` は通常のレコードのフィールドに格納でき、入れ子やジェネリックなフィールドにも
+使えます。コピーは割り当てや再シードを行わず、状態全体を保持します。格納した状態は
+明示的な `borrow mut rng` ヘルパーで進めます。
+
+```align
+import std.rand
+State { random: rng }
+fn advance(borrow mut value: rng) -> i64 = value.next()
+fn main() {
+  mut state := State { random: rand.seed_with(42) }
+  mut copy := state
+  print(advance(state.random))
+  print(advance(copy.random))  // 同じ最初の値。状態は互いに独立
+}
+```
+
+ヘルパーは選択したフィールドをその場で更新します。ルートは可変である必要があり、
+借用は重複できません。組み込みメソッドには引き続き束縛済みの可変ローカルが必要なので、
+`state.random.next()` を直接呼ぶことはできません。他のフィールドの所有権とライフタイムの
+規則は変わりません。スカラー配列・スライス・タグ付き型のペイロードへの `rng` の直接格納や、
+RNGを含むレコードのC/FFI・JSON・SoA・RegionPlain・ヒープレコードビルダー対応は追加しません。
+
 ## `std.cli`
 
 位置引数が1つか2つで済まない場合は、コマンドにフラグを登録して `main(args: array<str>)` で受け取った引数を解析します。

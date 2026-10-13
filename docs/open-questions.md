@@ -13,6 +13,15 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Copy RNG record composition (SETTLED 2026-10-13)
+
+Ordinary records admit the existing `rng` state, including nested/generic fields.
+Copies preserve exact state without allocation or reseeding. Explicit mutable
+function borrowing advances a field; intrinsic methods retain their bound-local
+receiver rule. Existing collection, C/FFI, JSON, SoA, RegionPlain and heap builder
+shape restrictions remain. [Plan175](impl/175-rng-record-composition.md) fixes the
+32-byte internal layout and the source/native acceptance boundary.
+
 ### Complete-input decompression (SETTLED 2026-10-06)
 
 `std.compress` consumes all borrowed input, concatenating complete gzip members or current
