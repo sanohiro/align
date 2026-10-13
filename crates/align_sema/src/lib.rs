@@ -33714,6 +33714,45 @@ impl BorrowState {
         }
     }
 
+    /// Lifetime of this backing generation only; stored element values have independent roots.
+    /// Keep this identical for whole-value resolution and delayed indexed destination access.
+    fn generation_lifetime_roots(&self, generation: &StorageGeneration) -> BorrowRoots {
+        let mut owners = match generation {
+            StorageGeneration::CallerStorage { parameter, .. } => {
+                [BorrowRoot::ParamStorage(*parameter)].into_iter().collect()
+            }
+            StorageGeneration::Current(_)
+            | StorageGeneration::Prior(_)
+            | StorageGeneration::ParameterValue { .. } => BorrowRoots::new(),
+        };
+        if let Some(entry) = self.storage.directory.entries.get(generation) {
+            if entry.descriptor.is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque) {
+                owners = [BorrowRoot::Observation(generation.clone())].into();
+            } else {
+                owners.extend(
+                    entry
+                        .releases
+                        .iter()
+                        .filter_map(|release| BorrowRoot::release(generation, release)),
+                );
+            }
+            if let Some(how) = entry.ended {
+                owners = if owners.is_empty() {
+                    // Staging/arena/loop-result/returned releases have no user-facing
+                    // local root. Preserve their ended state as an anonymous diagnostic
+                    // marker; generation identity remains the directory key.
+                    [BorrowRoot::EndedIterTemp(0, how)].into_iter().collect()
+                } else {
+                    owners
+                        .into_iter()
+                        .map(|owner| owner.ended(how))
+                        .collect()
+                };
+            }
+        }
+        owners
+    }
+
     fn resolve_headers(&self, headers: &ProjectedHeaderFact) -> MoveValueFact {
         fn resolve(
             state: &BorrowState,
@@ -33742,39 +33781,7 @@ impl BorrowState {
                         let resolved = selected.join(&nested);
                         result.non_storage.join_at(path, &resolved.non_storage);
                     }
-                    let mut owners = match generation {
-                        StorageGeneration::CallerStorage { parameter, .. } => {
-                            [BorrowRoot::ParamStorage(*parameter)].into_iter().collect()
-                        }
-                        StorageGeneration::Current(_)
-                        | StorageGeneration::Prior(_)
-                        | StorageGeneration::ParameterValue { .. } => BorrowRoots::new(),
-                    };
-                    if let Some(entry) = state.storage.directory.entries.get(generation) {
-                        if entry.descriptor.is_some_and(|d| d.kind == StorageHeaderKind::OwnedOpaque) {
-                            owners = [BorrowRoot::Observation(generation.clone())].into();
-                        } else {
-                            owners.extend(
-                                entry
-                                    .releases
-                                    .iter()
-                                    .filter_map(|release| BorrowRoot::release(generation, release)),
-                            );
-                        }
-                        if let Some(how) = entry.ended {
-                            owners = if owners.is_empty() {
-                                // Staging/arena/loop-result/returned releases have no user-facing
-                                // local root. Preserve their ended state as an anonymous diagnostic
-                                // marker; generation identity remains the directory key.
-                                [BorrowRoot::EndedIterTemp(0, how)].into_iter().collect()
-                            } else {
-                                owners
-                                    .into_iter()
-                                    .map(|owner| owner.ended(how))
-                                    .collect()
-                            };
-                        }
-                    }
+                    let owners = state.generation_lifetime_roots(generation);
                     if !owners.is_empty() {
                         result
                             .non_storage
@@ -42788,6 +42795,53 @@ impl<'a> MoveCheck<'a> {
         body_locals.clone().filter(|&id| self.is_dropped_local(id)).collect()
     }
 
+    /// Indexed lowering reads its destination after both eager operands. Recheck the live
+    /// shell at that point, without treating an overwritten payload or unrelated sibling as
+    /// destination storage. A completed replacement may legitimately install a fresh header.
+    fn check_indexed_assignment_target(
+        &mut self,
+        base: LocalId,
+        path: &[u32],
+        moved: &MovedSet,
+        span: Span,
+    ) {
+        if moved.contains(&MovedKey::Whole(base))
+            || path.first().is_some_and(|field| {
+                moved.contains(&MovedKey::Field(base, *field))
+            })
+        {
+            let name = self.f.locals.get(base as usize).map_or("<target>", |local| local.name.as_str());
+            self.diags.error(format!("use of moved value '{name}'"), span);
+            return;
+        }
+        let target_ty = self.f.locals.get(base as usize).map(|local| local.ty)
+            .and_then(|ty| path.iter().try_fold(ty, |ty, &field| {
+                self.projection_ty(ty, BorrowProjection::StructField(field))
+            }))
+            .map(|ty| expand_tagged_ty(ty, self.tagged_types));
+        // Type formation belongs to source checking and the checked-HIR shape gates. This
+        // analysis checks only lifetime: inline backing survives an old payload's consumption.
+        if matches!(target_ty, Some(Ty::Array(..) | Ty::StructArray(..))) {
+            return;
+        }
+        let projection = path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
+        let headers = self.local_headers(base);
+        let Some(header) = headers.leaves.get(&projection) else {
+            // Existing projected/callback views may retain only the conservative local fact.
+            // Do not require a new header producer; recheck that established lifetime authority
+            // after eager effects. This fallback does not mint a generation or ignore endings.
+            self.check_borrow_use(base, span);
+            return;
+        };
+        let mut roots = header.fallback_roots.clone();
+        for reference in &header.generations {
+            roots.extend(self.borrows.generation_lifetime_roots(&reference.generation));
+        }
+        if let Some((root, how)) = roots.iter().find_map(BorrowRoot::ended_source) {
+            self.emit_invalid_borrow(base, root, how, span);
+        }
+    }
+
     fn check_borrow_use(&mut self, local: LocalId, span: Span) {
         if let Some(headers) = self.borrows.headers.get(&local).cloned() {
             let resolved = self.borrows.resolve_headers(&headers).non_storage;
@@ -43371,6 +43425,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, false, false);
+                    self.check_indexed_assignment_target(*base, path, moved, value.span);
                     if path.is_empty() {
                         self.record_view_element_store(*base, value, true);
                     }
@@ -43396,6 +43451,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
+                    self.check_indexed_assignment_target(*base, &[], moved, value.span);
                     self.record_view_element_store(*base, value, false);
                     if self.is_move_ty(value.ty) {
                         self.invalidate_collection_content_owner(*base);
@@ -43412,6 +43468,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     move_expr!(self, index, moved, false, false);
                     move_expr!(self, value, moved, true, true);
+                    self.check_indexed_assignment_target(*base, &[], moved, value.span);
                     self.record_view_element_store(*base, value, true);
                     if let ExprKind::Int(value) = index.kind
                         && value >= 0
@@ -46775,6 +46832,7 @@ impl<'a> MoveCheck<'a> {
                             value_consuming,
                         );
                         if falls_through {
+                            self.check_indexed_assignment_target(base, collection_path, moved, value.span);
                             if collection_path.is_empty() {
                                 self.record_view_element_store(base, value, element_path.is_empty());
                             }
@@ -46807,6 +46865,7 @@ impl<'a> MoveCheck<'a> {
                     ..
                 } => {
                     if index_complete && falls_through {
+                        self.check_indexed_assignment_target(base, collection_path, moved, value.span);
                         if collection_path.is_empty() {
                             self.record_view_element_store(base, value, element_path.is_empty());
                         }
