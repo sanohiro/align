@@ -56,8 +56,9 @@ check or content transition. No new provenance seed or summary is introduced.
 
 ### Exact backing check
 
-A post-operand check must not call whole-value `check_borrow_use` or recursively
-resolve the target's stored element values. Refactor the existing outer-header
+An exact-header post-operand check must not call whole-value `check_borrow_use`
+or recursively resolve the target's stored element values. Type formation stays
+with source checking and the checked-HIR shape gates; MoveCheck owns lifetime. Refactor the existing outer-header
 owner calculation in `BorrowState::resolve_headers` into a shared helper: each
 referenced generation supplies its current release/caller roots, marked ended
 using the directory's `ended` state; header fallback roots remain separate.
@@ -65,6 +66,13 @@ Retain the existing anonymous ended marker when a generation has no named owner.
 The ordinary resolver still recursively joins contents; the new indexed check
 uses only the selected outer header's roots. No new generation or lifetime is
 inferred, and unknown/fallback lifetime markers retain their current semantics.
+Some established projected/callback views have only a conservative local fact,
+without an outer projected header. Recheck that existing local borrowing fact
+in this case; absence of newer header metadata is not itself an error.
+`conservative_view_backing_survives_without_header_metadata` pairs live and
+consumed owners through materialized record arrays, builders, reductions and
+returned views, in both eager operand positions. The existing readonly-origin,
+validated-text and deep-HIR owners retain their original acceptance rules.
 
 For a fixed inline array, no payload-owned header supplies the destination bytes;
 check only the exact root/ancestor Move state. For a dynamic array, slice or SoA,

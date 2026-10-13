@@ -142,6 +142,31 @@ fn eager_owner_invalidation_rejects() {
 }
 
 #[test]
+fn conservative_view_backing_survives_without_header_metadata() {
+    for materializer in [
+        "copied := [Bytes {data: input}].to_array(); mut view := copied[0].data",
+        "mut builder: array_builder<Bytes> := array_builder(out); builder.push(Bytes {data: input}); copied := builder.build(); mut view := copied[0].data",
+        "result := [1].reduce(Bytes {data: input}, keep); mut view := result.data",
+        "mut view := choose_bytes(Bytes {data: input})",
+    ] {
+        for invalidates in [false, true] {
+            for in_index in [false, true] {
+                let operand = if invalidates { "consume(owner)" } else { "0" };
+                let (index, value) = if in_index {
+                    (operand.to_owned(), "65 as u8".to_owned())
+                } else {
+                    ("0".to_owned(), format!("{{ {operand}; 65 as u8 }}"))
+                };
+                let source = format!(
+                    "Bytes {{ data: slice<u8> }}\nfn keep(acc: Bytes, value: i64) -> Bytes = acc\nfn choose_bytes(value: Bytes) -> slice<u8> = value.data\nfn consume(value: array<u8>) -> i64 = 0\nfn main() {{ owner := \"xx\".bytes().to_array(); input: slice<u8> := owner; arena out {{ {materializer}; view[{index}] = {value} }} }}"
+                );
+                assert_check(&source, !invalidates, materializer);
+            }
+        }
+    }
+}
+
+#[test]
 fn eager_control_paths() {
     for operand in [
         "consume(values)",

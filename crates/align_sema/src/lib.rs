@@ -42819,19 +42819,18 @@ impl<'a> MoveCheck<'a> {
                 self.projection_ty(ty, BorrowProjection::StructField(field))
             }))
             .map(|ty| expand_tagged_ty(ty, self.tagged_types));
-        match target_ty {
-            // Inline backing remains in its root slot even if an old payload was consumed.
-            Some(Ty::Array(..) | Ty::StructArray(..)) => return,
-            Some(Ty::Slice(..) | Ty::DynArray(..) | Ty::DynStructArray(..) | Ty::Soa(..)) => {}
-            _ => {
-                self.diags.error("invalid indexed assignment target".to_string(), span);
-                return;
-            }
+        // Type formation belongs to source checking and the checked-HIR shape gates. This
+        // analysis checks only lifetime: inline backing survives an old payload's consumption.
+        if matches!(target_ty, Some(Ty::Array(..) | Ty::StructArray(..))) {
+            return;
         }
         let projection = path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
         let headers = self.local_headers(base);
         let Some(header) = headers.leaves.get(&projection) else {
-            self.diags.error("indexed assignment target has no backing lifetime".to_string(), span);
+            // Existing projected/callback views may retain only the conservative local fact.
+            // Do not require a new header producer; recheck that established lifetime authority
+            // after eager effects. This fallback does not mint a generation or ignore endings.
+            self.check_borrow_use(base, span);
             return;
         };
         let mut roots = header.fallback_roots.clone();
