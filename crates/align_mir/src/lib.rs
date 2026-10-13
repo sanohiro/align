@@ -5391,10 +5391,6 @@ struct Builder {
     /// Locals whose declaration initializer is individually owned (the initial flag value after
     /// their `let`; parameters in this set are live at entry).
     drop_individual_locals: Vec<Slot>,
-    /// Move fields already installed into fresh aggregate destinations that have not yet become
-    /// complete values. Reached exits drop these in reverse source order before ordinary locals;
-    /// successful construction truncates the corresponding suffix and publishes the whole flag.
-    partial_fields: Vec<PartialField>,
     /// Static per-expression allocation provenance produced by escape analysis. Branch lowering
     /// combines these constants with path-local flags loaded from moved locals.
     drop_individual_exprs: std::collections::HashMap<Span, bool>,
@@ -5447,6 +5443,10 @@ struct BuilderCtx {
     value_borrow_owners: Vec<Vec<Slot>>,
     /// Borrow-owner unions accumulated for value-carrying control-flow result slots.
     slot_borrow_owners: std::collections::HashMap<Slot, Vec<Slot>>,
+    /// Evaluated source transfers selected by a deferred control result. These are private
+    /// lowering records; only their ordinary guarded clear statements enter MIR.
+    slot_pending_moves: std::collections::HashMap<Slot, Vec<PendingSourceMove>>,
+    value_pending_moves: std::collections::HashMap<ValueId, Vec<PendingSourceMove>>,
     /// Optional source-line tracking state.
     dbg: Option<Box<LineCtx>>,
     /// Located-only current-plan collector. `None` on every ordinary build path, so normal
@@ -5477,10 +5477,55 @@ struct BuilderCtx {
 }
 
 #[derive(Clone)]
-struct PartialField {
-    destination: Slot,
-    path: Vec<u32>,
-    flag: Slot,
+struct PendingSourceMove {
+    /// Outer guards precede inner guards, so a skipped nested selection never reads its flag.
+    guards: Vec<Slot>,
+    clears: Vec<Stmt>,
+}
+
+#[derive(Default)]
+struct PendingConsumption {
+    owners: Vec<Slot>,
+    moves: Vec<PendingSourceMove>,
+}
+
+impl PendingConsumption {
+    fn extend(&mut self, other: Self) {
+        self.owners.extend(other.owners);
+        self.moves.extend(other.moves);
+    }
+
+    fn finish(self, b: &mut Builder) {
+        for source in self.moves {
+            let next = (!source.guards.is_empty()).then(|| b.new_block());
+            for guard in source.guards {
+                let live = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(live, Rvalue::Load(guard)));
+                let selected = b.new_block();
+                if let Some(next) = next {
+                    b.terminate(Term::Branch(Operand::Value(live), selected, next));
+                }
+                b.cur = selected;
+            }
+            for clear in source.clears {
+                b.push(clear);
+            }
+            if let Some(next) = next {
+                b.terminate(Term::Goto(next));
+                b.cur = next;
+            }
+        }
+        for owner in self.owners {
+            b.set_drop_flag(owner, false);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ControlResultMode {
+    Move,
+    Borrow,
+    Deferred(BlockId),
 }
 
 /// Located-lowering state carried through one function's [`BuilderCtx`].
@@ -5613,9 +5658,6 @@ struct LoopFrame {
     /// Owned locals declared inside the loop body (a subset of `drop_locals`). Their live flags are
     /// conditionally dropped at the back-edge and at each `break`.
     iter_drops: Vec<Slot>,
-    /// Partial fields already active outside this loop. A `break` drops only the suffix formed in
-    /// the loop body; an enclosing aggregate whose field expression is this loop stays live.
-    partial_fields_base: usize,
 }
 
 impl Builder {
@@ -5629,7 +5671,6 @@ impl Builder {
             self.push(Stmt::TgWait(Operand::Value(h)));
             self.push(Stmt::TgEnd(Operand::Value(h)));
         }
-        self.emit_partial_field_cleanup_from(0);
         for s in self.drop_locals.clone().into_iter().rev() {
             self.emit_drop_if_live(s);
         }
@@ -5804,26 +5845,6 @@ impl Builder {
         self.set_drop_flag(slot, false);
         self.terminate(Term::Goto(next_bb));
         self.cur = next_bb;
-    }
-
-    fn emit_drop_field_if_live(&mut self, field: PartialField) {
-        let live = self.fresh_value(Ty::Bool);
-        self.push(Stmt::Let(live, Rvalue::Load(field.flag)));
-        let drop_bb = self.new_block();
-        let next_bb = self.new_block();
-        self.terminate(Term::Branch(Operand::Value(live), drop_bb, next_bb));
-        self.cur = drop_bb;
-        self.push(Stmt::DropField(field.destination, field.path));
-        self.push(Stmt::Store(field.flag, Operand::Const(Const::Bool(false))));
-        self.terminate(Term::Goto(next_bb));
-        self.cur = next_bb;
-    }
-
-    fn emit_partial_field_cleanup_from(&mut self, base: usize) {
-        let fields = self.partial_fields[base..].to_vec();
-        for field in fields.into_iter().rev() {
-            self.emit_drop_field_if_live(field);
-        }
     }
 
     /// Drop an owned value only when its containing aggregate is individually owned. Unlike
@@ -6123,7 +6144,6 @@ fn lower_fn(
         drop_locals: f.drop_locals.clone(),
         drop_flags,
         drop_individual_locals: f.drop_individual_locals.clone(),
-        partial_fields: Vec::new(),
         drop_individual_exprs: f.drop_individual_exprs.clone(),
         borrowed_bindings: std::collections::HashMap::new(),
         tuples: tuples.to_vec(),
@@ -6139,6 +6159,8 @@ fn lower_fn(
             synthetic_drop_slots: Vec::new(),
             value_borrow_owners: Vec::new(),
             slot_borrow_owners: std::collections::HashMap::new(),
+            slot_pending_moves: Default::default(),
+            value_pending_moves: Default::default(),
             dbg: lines.map(|l| {
                 Box::new(LineCtx {
                     lines: Rc::clone(l),
@@ -6314,9 +6336,17 @@ fn field_path_leaf_ty(structs: &[hir::StructDef], struct_id: u32, path: &[u32]) 
 /// their own join store, so this walk must not re-enter their arms. The canonical cleanup predicate
 /// covers every free-standing owner; arena-regioned `box<T>` has no individual Drop.
 fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
+    let mut clears = Vec::new();
+    source_move_statements(b, e, &mut clears);
+    for clear in clears {
+        b.push(clear);
+    }
+}
+
+fn source_move_statements(b: &Builder, e: &hir::Expr, out: &mut Vec<Stmt>) {
     match &e.kind {
         // The nullary RAM observation has only Copy scalar/error payloads.
-        hir::ExprKind::OsMemory { .. } => {},
+        hir::ExprKind::OsMemory { .. } => {}
         hir::ExprKind::Local(id) => {
             let moved = match b.slots.get(*id as usize) {
                 // Share the exact sema/MIR ownership predicate. A handwritten type list previously
@@ -6329,8 +6359,8 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 let Some(flag) = b.drop_flags.get(*id as usize).copied().flatten() else {
                     return;
                 };
-                b.push(Stmt::DropFlagMoveOut { slot: *id, flag });
-                b.set_drop_flag(*id, false);
+                out.push(Stmt::DropFlagMoveOut { slot: *id, flag });
+                out.push(Stmt::Store(flag, Operand::Const(Const::Bool(false))));
             }
         }
         hir::ExprKind::Block(blk)
@@ -6340,36 +6370,14 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
         | hir::ExprKind::Unsafe(blk)
         | hir::ExprKind::TaskGroup(blk) => {
             if let Some(v) = &blk.value {
-                null_moved_source(b, v);
+                source_move_statements(b, v, out);
             }
         }
         // `t.get()` moves an owned result out of the task; null the task slot so its exit `Drop`
         // doesn't double-free the buffer the gotten value now owns.
-        hir::ExprKind::TaskGet(inner) => null_moved_source(b, inner),
-        // A bound owned local moved into a wrapper (`return Ok(xs)` / `Some(xs)` / `Err(xs)`) is
-        // consumed by the construction — see through the wrapper to null the source slot, else the
-        // local's exit `Drop` double-frees the buffer now owned by the aggregate.
-        hir::ExprKind::ResultOk(inner)
-        | hir::ExprKind::ResultErr(inner)
-        | hir::ExprKind::OptionSome(inner) => {
-            null_moved_source(b, inner);
-        }
-        // A bound owned local moved into a sum-type variant (`Content.Parts(xs)`, J2) is consumed by
-        // the construction — null each payload source slot, else the local's exit `Drop` and the
-        // enum's tag-switched `Drop` both free the same buffer.
-        hir::ExprKind::EnumValue { payload, .. } => {
-            for p in payload {
-                null_moved_source(b, p);
-            }
-        }
-        // A tuple literal moves each owned-local element into the tuple (its consumer — a
-        // destructure target, or the returned tuple's caller — now owns the buffer), so null those
-        // source slots, else both the source local and the new owner would free the same buffer.
-        hir::ExprKind::Tuple { elems, .. } => {
-            for el in elems {
-                null_moved_source(b, el);
-            }
-        }
+        hir::ExprKind::TaskGet(inner) => source_move_statements(b, inner, out),
+        // Structural constructors commit their own recorded transfers. Never replay their
+        // payload syntax here: a completed child action may have consumed a different generation.
         // A partial field move (`a := t.0`) took the owned element's buffer; null that one field of
         // the tuple slot so the tuple's exit `Drop` frees null there, not the now-aliased buffer.
         hir::ExprKind::TupleIndex { recv, index } => {
@@ -6377,7 +6385,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 let owned = matches!(b.slots.get(*t as usize), Some(&Ty::Tuple(tid))
                     if b.tuples[tid as usize].elems.get(*index as usize).is_some_and(|s| s.is_move()));
                 if owned {
-                    b.push(Stmt::NullTupleField(*t, *index));
+                    out.push(Stmt::NullTupleField(*t, *index));
                 }
             }
         }
@@ -6395,7 +6403,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                             .needs_drop())
                     || align_sema::is_move_handle(e.ty)) =>
         {
-            b.push(Stmt::NullStructField(*root, path[0]));
+            out.push(Stmt::NullStructField(*root, path[0]));
         }
         hir::ExprKind::ElemField { .. } if matches!(e.ty, Ty::Resource(_)) => {
             if let Some((slot, index, path)) = b
@@ -6404,7 +6412,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
                 .get(&(e as *const hir::Expr as usize))
                 .cloned()
             {
-                b.push(Stmt::NullElemField(slot, index, path));
+                out.push(Stmt::NullElemField(slot, index, path));
             }
         }
         // Matching a **Move**-enum struct field (`match m.content { Parts(ps) => … }`, J3) binds and
@@ -6416,7 +6424,7 @@ fn null_moved_source(b: &mut Builder, e: &hir::Expr) {
             if path.len() == 1
                 && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.enums, &b.tagged_types)) =>
         {
-            b.push(Stmt::NullStructField(*root, path[0]));
+            out.push(Stmt::NullStructField(*root, path[0]));
         }
         _ => {}
     }
@@ -6558,12 +6566,12 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
         return Operand::Const(Const::Unit);
     }
     match &e.kind {
-        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, true),
+        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, ControlResultMode::Borrow),
         hir::ExprKind::Match {
             scrutinee, arms, ..
-        } => lower_match(b, scrutinee, arms, e.ty, true),
+        } => lower_match(b, scrutinee, arms, e.ty, ControlResultMode::Borrow),
         hir::ExprKind::ElseUnwrap { opt, fallback } => {
-            lower_else_unwrap(b, opt, fallback, e.ty, true)
+            lower_else_unwrap(b, opt, fallback, e.ty, ControlResultMode::Borrow)
         }
         hir::ExprKind::Block(block)
         | hir::ExprKind::FloatScope { block, .. }
@@ -6615,6 +6623,93 @@ fn lower_expr_for_borrow(b: &mut Builder, e: &hir::Expr) -> Operand {
         // `lower_expr` at the top of this function.
         _ => unreachable!("borrow_mode_differs admitted a kind with no borrow-mode lowering"),
     }
+}
+
+/// Deferred result mode affects only selected bound tails. A constructor or call in an arm
+/// remains its own completed action; only its finished value is delivered to the outer action.
+fn lower_expr_for_deferred(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let mode = ControlResultMode::Deferred(b.cur);
+    match &e.kind {
+        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, mode),
+        hir::ExprKind::Match {
+            scrutinee, arms, ..
+        } => lower_match(b, scrutinee, arms, e.ty, mode),
+        hir::ExprKind::ElseUnwrap { opt, fallback } => {
+            lower_else_unwrap(b, opt, fallback, e.ty, mode)
+        }
+        hir::ExprKind::Block(block)
+        | hir::ExprKind::FloatScope { block, .. }
+        | hir::ExprKind::Unsafe(block) => {
+            lower_block_for_result_mode(b, block, mode).unwrap_or(Operand::Const(Const::Unit))
+        }
+        hir::ExprKind::Arena(block)
+        | hir::ExprKind::NamedArena { block, .. }
+        | hir::ExprKind::TaskGroup(block) => {
+            let task = matches!(e.kind, hir::ExprKind::TaskGroup(_));
+            let handle = b.fresh_value(Ty::ArenaHandle);
+            b.push(Stmt::Let(
+                handle,
+                if task {
+                    Rvalue::TgBegin
+                } else {
+                    Rvalue::ArenaBegin
+                },
+            ));
+            if let hir::ExprKind::NamedArena { local, .. } = e.kind {
+                b.push(Stmt::Store(local, Operand::Value(handle)));
+            }
+            if task {
+                b.task_groups.push(handle);
+            } else {
+                b.arenas.push(handle);
+            }
+            let value = lower_block_for_result_mode(b, block, mode);
+            if task {
+                b.task_groups.pop();
+            } else {
+                b.arenas.pop();
+            }
+            if !lowering_continues(b) {
+                return terminated_operand();
+            }
+            if task {
+                b.push(Stmt::TgWait(Operand::Value(handle)));
+                b.push(Stmt::TgEnd(Operand::Value(handle)));
+            } else {
+                b.push(Stmt::ArenaEnd(Operand::Value(handle)));
+            }
+            value.unwrap_or(Operand::Const(Const::Unit))
+        }
+        _ => lower_expr(b, e),
+    }
+}
+
+fn lower_expr_for_result_mode(b: &mut Builder, e: &hir::Expr, mode: ControlResultMode) -> Operand {
+    match mode {
+        ControlResultMode::Move => lower_expr(b, e),
+        ControlResultMode::Borrow => lower_expr_for_borrow(b, e),
+        ControlResultMode::Deferred(_) => lower_expr_for_deferred(b, e),
+    }
+}
+
+fn lower_block_for_result_mode(
+    b: &mut Builder,
+    block: &hir::Block,
+    mode: ControlResultMode,
+) -> Option<Operand> {
+    if !lowering_continues(b) {
+        return None;
+    }
+    for statement in &block.stmts {
+        lower_stmt(b, statement);
+        if !lowering_continues(b) {
+            return None;
+        }
+    }
+    block.value.as_deref().map(|value| {
+        b.set_span(value.span);
+        lower_expr_for_result_mode(b, value, mode)
+    })
 }
 
 /// Lower an owned expression used only through a borrow. Fresh unbound values move into a hidden
@@ -6927,17 +7022,24 @@ fn store_control_result(
     temp_flag_slot: Option<Slot>,
     expr: &hir::Expr,
     operand: Operand,
-    borrow_result: bool,
+    result_mode: ControlResultMode,
 ) {
     if let Some(slot) = value_slot {
+        let mut direct_clears = Vec::new();
+        if matches!(result_mode, ControlResultMode::Deferred(_)) {
+            source_move_statements(b, expr, &mut direct_clears);
+        }
         if let Some(flag_slot) = flag_slot {
             let flag =
                 lowered_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
             b.push(Stmt::Store(flag_slot, flag));
         }
         if let Some(temp_flag_slot) = temp_flag_slot {
-            let flag = temporary_drop_flag(b, expr, &operand)
-                .unwrap_or(Operand::Const(Const::Bool(false)));
+            let flag = if direct_clears.is_empty() {
+                temporary_drop_flag(b, expr, &operand).unwrap_or(Operand::Const(Const::Bool(false)))
+            } else {
+                Operand::Const(Const::Bool(false))
+            };
             b.push(Stmt::Store(temp_flag_slot, flag));
         }
         let owners = b.borrow_owners(&operand);
@@ -6947,9 +7049,48 @@ fn store_control_result(
                 result_owners.push(owner);
             }
         }
+        if let ControlResultMode::Deferred(origin) = result_mode {
+            let mut pending = match &operand {
+                Operand::Value(value) => {
+                    b.ctx.value_pending_moves.remove(value).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            if !direct_clears.is_empty() {
+                pending.push(PendingSourceMove {
+                    guards: Vec::new(),
+                    clears: direct_clears,
+                });
+            }
+            if !pending.is_empty() {
+                let selected = b.new_slot(Ty::Bool);
+                let line = b.cur_line();
+                let Some(entry) = b.blocks.get_mut(origin as usize) else {
+                    b.terminate(Term::Unreachable);
+                    return;
+                };
+                entry
+                    .stmts
+                    .push(Stmt::Store(selected, Operand::Const(Const::Bool(false))));
+                entry.stmt_lines.push(line);
+                b.push(Stmt::Store(selected, Operand::Const(Const::Bool(true))));
+                for source in &mut pending {
+                    source.guards.insert(0, selected);
+                }
+                b.ctx
+                    .slot_pending_moves
+                    .entry(slot)
+                    .or_default()
+                    .extend(pending);
+            }
+        }
         b.push(Stmt::Store(slot, operand));
-        if !borrow_result || may_need_synthetic_owner(expr) {
-            null_moved_source(b, expr);
+        match result_mode {
+            ControlResultMode::Move => null_moved_source(b, expr),
+            ControlResultMode::Borrow if may_need_synthetic_owner(expr) => {
+                null_moved_source(b, expr)
+            }
+            _ => {}
         }
     }
 }
@@ -6979,6 +7120,9 @@ fn load_control_result(
     }
     if let Some(owners) = b.ctx.slot_borrow_owners.get(&value_slot).cloned() {
         b.attach_borrow_owners(value, owners);
+    }
+    if let Some(pending) = b.ctx.slot_pending_moves.remove(&value_slot) {
+        b.ctx.value_pending_moves.insert(value, pending);
     }
     Operand::Value(value)
 }
@@ -7081,9 +7225,8 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                         &b.tagged_types,
                     ) =>
                 {
-                    // A fresh Move local is its final construction destination. Each completed
-                    // Move leaf is registered before the next expression is evaluated, so a
-                    // reached early exit drops exactly that prefix without a whole-value scratch.
+                    // A fresh local is its final inline destination. Component staging keeps
+                    // retained sources readable and fresh members owned until every field succeeds.
                     inherited_flag = store_fresh_struct_fields(b, *local, init);
                     if !lowering_continues(b) {
                         return;
@@ -7476,10 +7619,9 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 b.terminate(Term::Unreachable);
                 return;
             };
-            let (result_slot, iter_drops, partial_fields_base, exit) = (
+            let (result_slot, iter_drops, exit) = (
                 frame.result_slot,
                 frame.iter_drops.clone(),
-                frame.partial_fields_base,
                 frame.exit,
             );
             let op = match value {
@@ -7492,11 +7634,6 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             if let Some(e) = value {
                 null_moved_source(b, e);
             }
-            // A construction started inside this loop will never publish its whole-value flag on
-            // this edge. Drop only that loop-local suffix; partial fields of an enclosing
-            // construction survive when this loop is itself one field expression.
-            b.emit_partial_field_cleanup_from(partial_fields_base);
-            b.partial_fields.truncate(partial_fields_base);
             // Conditionally drop this iteration's owned locals and clear their flags, so function
             // cleanup cannot drop the same values again. A moved-out `break` value already has a
             // clear flag. Sema forbids a
@@ -8091,7 +8228,7 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
         else {
             unreachable!("a wildcard match spine starts at Match")
         };
-        return lower_match(b, scrutinee, arms, root.ty, false);
+        return lower_match(b, scrutinee, arms, root.ty, ControlResultMode::Move);
     }
 
     let mut operand = if terminated_while_descending {
@@ -8108,7 +8245,7 @@ fn lower_wildcard_match_spine(b: &mut Builder, root: &hir::Expr) -> Operand {
                 frame.result_temp_flag,
                 frame.body,
                 operand,
-                false,
+                ControlResultMode::Move,
             );
             b.terminate(Term::Goto(frame.join));
         }
@@ -8310,13 +8447,19 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
 /// Entering it here produced two copies of the same `if` / `match` / `else`: the non-borrow copy
 /// nulled a bound arm's source local, and the borrow copy's join stored the non-borrow copy's
 /// per-arm SSA values from blocks that do not dominate them (`docs/impl/05-backend-llvm.md` §1).
-fn eager_worklist_children(parent: &hir::Expr) -> Vec<&hir::Expr> {
+fn eager_worklist_children<'e>(b: &Builder, parent: &'e hir::Expr) -> Vec<&'e hir::Expr> {
     let mut children = align_sema::direct_expr_children(parent);
     if matches!(
         parent.kind,
         hir::ExprKind::StrBorrow(_) | hir::ExprKind::StrClone(_)
     ) {
         children.retain(|child| !borrow_mode_differs(child));
+    }
+    if matches!(
+        parent.kind,
+        hir::ExprKind::OptionSome(_) | hir::ExprKind::ResultOk(_) | hir::ExprKind::ResultErr(_)
+    ) {
+        children.retain(|child| !consumed_mode_differs(b, child));
     }
     children
 }
@@ -8336,10 +8479,10 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::CallFnValue { .. } => lower_call_fn_value(b, e),
         hir::ExprKind::RawCall { .. } => lower_raw_call(b, e),
         hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
-        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
+        hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, ControlResultMode::Move),
         hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
         hir::ExprKind::ElseUnwrap { opt, fallback } => {
-            lower_else_unwrap(b, opt, fallback, e.ty, false)
+            lower_else_unwrap(b, opt, fallback, e.ty, ControlResultMode::Move)
         }
         hir::ExprKind::Loop { .. } => lower_loop(b, e),
         hir::ExprKind::Block(_) | hir::ExprKind::FloatScope { .. } | hir::ExprKind::Unsafe(_) => {
@@ -8657,7 +8800,7 @@ fn lower_expr(b: &mut Builder, root: &hir::Expr) -> Operand {
                     continue;
                 }
                 work.push(Work::Exit(expression));
-                let children = eager_worklist_children(expression);
+                let children = eager_worklist_children(b, expression);
                 work.extend(children.into_iter().rev().map(Work::Enter));
             }
             Work::Exit(expression) => {
@@ -9989,7 +10132,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.terminate(Term::Unreachable);
                 Operand::Const(Const::Unit)
             }
-            hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, false),
+            hir::ExprKind::If { cond, then, els } => lower_if(b, cond, then, els, e.ty, ControlResultMode::Move),
             // Delegated to an out-of-line (`#[inline(never)]`) helper taking only `(b, e)` — no locals in
             // this arm — so it does not enlarge this giant recursive `lower_expr` frame (the `expr_depth`
             // headroom lesson: rustc reserves every arm's locals per level at opt-0).
@@ -10021,7 +10164,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     b.attach_value_drop_flag(v, flag.clone());
                     b.attach_value_temp_drop_flag(v, flag);
                 }
-                finish_consumed_aggregate(b, payload, owners);
+                finish_consumed_aggregate(b, owners);
                 Operand::Value(v)
             }
             hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
@@ -10078,7 +10221,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     b.attach_value_drop_flag(v, flag.clone());
                     b.attach_value_temp_drop_flag(v, flag);
                 }
-                finish_consumed_aggregate(b, elems, owners);
+                finish_consumed_aggregate(b, owners);
                 Operand::Value(v)
             }
             hir::ExprKind::TupleIndex { recv, index } => {
@@ -10416,6 +10559,9 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::OptionSome(inner) => {
+                if needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
+                    return lower_completed_constructor(b, e);
+                }
                 lower_required_binding!(b, op = lower_expr(b, inner), Operand::Const(Const::Unit));
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::OptionSome(op)));
@@ -10427,15 +10573,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::ElseUnwrap { opt, fallback } => {
-                lower_else_unwrap(b, opt, fallback, e.ty, false)
+                lower_else_unwrap(b, opt, fallback, e.ty, ControlResultMode::Move)
             }
             hir::ExprKind::ResultOk(inner) => {
+                if needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
+                    return lower_completed_constructor(b, e);
+                }
                 lower_required_binding!(b, op = lower_expr(b, inner), Operand::Const(Const::Unit));
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::ResultOk(op)));
                 Operand::Value(v)
             }
             hir::ExprKind::ResultErr(inner) => {
+                if needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
+                    return lower_completed_constructor(b, e);
+                }
                 lower_required_binding!(b, op = lower_expr(b, inner), Operand::Const(Const::Unit));
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::ResultErr(op)));
@@ -11421,7 +11573,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             // straight into its own slot — see `lower_stmt` — avoiding this copy.)
             hir::ExprKind::StructLit { .. } => {
                 let slot = b.new_slot(e.ty);
-                let mut owners = Vec::new();
+                let mut owners = PendingConsumption::default();
                 let mut drop_flag = None;
                 if !store_consumed_struct_fields(
                     b,
@@ -11439,10 +11591,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     b.attach_value_drop_flag(v, flag.clone());
                     b.attach_value_temp_drop_flag(v, flag);
                 }
-                null_consumed_struct_sources(b, e);
-                for owner in owners {
-                    b.set_drop_flag(owner, false);
-                }
+                owners.finish(b);
                 Operand::Value(v)
             }
         }
@@ -11454,7 +11603,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
 /// drops those completed temporaries while bound source locals remain live for normal exit cleanup.
 struct LoweredAggregateParts {
     operands: Vec<Operand>,
-    owners: Vec<Vec<Slot>>,
+    owners: Vec<PendingConsumption>,
     drop_flag: Option<Operand>,
 }
 
@@ -11500,12 +11649,9 @@ fn lower_consumed_aggregate_parts(
 /// Transfer every completed part into its now-materialized aggregate. Direct bound sources are
 /// nulled only after all parts succeed; hidden owners are then cleared because the aggregate is the
 /// sole owner.
-fn finish_consumed_aggregate(b: &mut Builder, parts: &[hir::Expr], owners: Vec<Vec<Slot>>) {
-    for part in parts {
-        null_consumed_struct_sources(b, part);
-    }
-    for owner in owners.into_iter().flatten() {
-        b.set_drop_flag(owner, false);
+fn finish_consumed_aggregate(b: &mut Builder, owners: Vec<PendingConsumption>) {
+    for owner in owners {
+        owner.finish(b);
     }
 }
 
@@ -11517,7 +11663,7 @@ fn store_consumed_struct_fields(
     slot: Slot,
     path: &mut Vec<u32>,
     value: &hir::Expr,
-    owners: &mut Vec<Slot>,
+    owners: &mut PendingConsumption,
     aggregate_drop_flag: &mut Option<Operand>,
 ) -> bool {
     match &value.kind {
@@ -11530,24 +11676,6 @@ fn store_consumed_struct_fields(
                 if !complete {
                     return false;
                 }
-            }
-        }
-        hir::ExprKind::ArrayLit { .. } => {
-            let Some((owner, live)) = store_array_field_literal(b, slot, path, value) else {
-                return false;
-            };
-            if let Some(live) = live {
-                *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
-                    None => live,
-                    Some(previous) => {
-                        let both = b.fresh_value(Ty::Bool);
-                        b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, live)));
-                        Operand::Value(both)
-                    }
-                });
-            }
-            if let Some(owner) = owner {
-                owners.push(owner);
             }
         }
         _ => {
@@ -11574,127 +11702,16 @@ fn store_consumed_struct_fields(
     true
 }
 
-/// Construct a fresh Move struct directly in `slot`. The active partial-field suffix is a
-/// lowering-time ownership record: every reached exit emitted while a later field is evaluated
-/// observes the completed prefix and drops it in reverse order. Hard traps and divergence emit no
-/// successor cleanup. On success the suffix is retired and the caller publishes the whole flag.
+/// Fresh locals use the same component ownership as value-position construction, while storing
+/// directly into their final inline slot. Retained sources stay live until every field succeeds.
 fn store_fresh_struct_fields(b: &mut Builder, slot: Slot, value: &hir::Expr) -> Option<Operand> {
-    fn store(
-        b: &mut Builder,
-        slot: Slot,
-        path: &mut Vec<u32>,
-        value: &hir::Expr,
-        aggregate_drop_flag: &mut Option<Operand>,
-    ) -> bool {
-        match &value.kind {
-            hir::ExprKind::StructLit { fields, .. } => {
-                for (index, field) in fields.iter().enumerate() {
-                    path.push(index as u32);
-                    let complete = store(b, slot, path, field, aggregate_drop_flag);
-                    path.pop();
-                    if !complete {
-                        return false;
-                    }
-                }
-            }
-            hir::ExprKind::ArrayLit { .. } => {
-                let Some((owner, live)) = store_array_field_literal(b, slot, path, value) else {
-                    return false;
-                };
-                if let Some(live) = live {
-                    let flag = b.new_slot(Ty::Bool);
-                    b.push(Stmt::Store(flag, live.clone()));
-                    *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
-                        None => live,
-                        Some(previous) => {
-                            let both = b.fresh_value(Ty::Bool);
-                            b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, live)));
-                            Operand::Value(both)
-                        }
-                    });
-                    b.partial_fields.push(PartialField {
-                        destination: slot,
-                        path: path.clone(),
-                        flag,
-                    });
-                }
-                if let Some(owner) = owner {
-                    b.set_drop_flag(owner, false);
-                }
-            }
-            _ => {
-                let operand = lower_expr(b, value);
-                if !lowering_continues(b) {
-                    return false;
-                }
-                let move_field = needs_drop_flag(
-                    value.ty,
-                    &b.structs,
-                    &b.tuples,
-                    &b.enums,
-                    &b.tagged_types,
-                );
-                let live = move_field.then(|| {
-                    lowered_drop_flag(b, value, &operand)
-                        .unwrap_or(Operand::Const(Const::Bool(false)))
-                });
-                b.push(Stmt::StoreField(slot, path.clone(), operand));
-                if let Some(live) = live {
-                    // Ownership transfers only after the destination store completes. From this
-                    // point every reached exit sees the field record; the source is no longer live.
-                    null_moved_source(b, value);
-                    let flag = b.new_slot(Ty::Bool);
-                    b.push(Stmt::Store(flag, live.clone()));
-                    b.partial_fields.push(PartialField {
-                        destination: slot,
-                        path: path.clone(),
-                        flag,
-                    });
-                    *aggregate_drop_flag = Some(match aggregate_drop_flag.take() {
-                        None => live,
-                        Some(previous) => {
-                            let both = b.fresh_value(Ty::Bool);
-                            b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, live)));
-                            Operand::Value(both)
-                        }
-                    });
-                }
-            }
-        }
-        true
-    }
-
-    let first_partial = b.partial_fields.len();
-    let mut aggregate_drop_flag = None;
-    if !store(
-        b,
-        slot,
-        &mut Vec::new(),
-        value,
-        &mut aggregate_drop_flag,
-    ) {
-        // The reached transfer already emitted cleanup on its edge. Restore the lowering-time
-        // lexical stack before another CFG arm or a loop exit resumes construction.
-        b.partial_fields.truncate(first_partial);
+    let mut pending = PendingConsumption::default();
+    let mut flag = None;
+    if !store_consumed_struct_fields(b, slot, &mut Vec::new(), value, &mut pending, &mut flag) {
         return None;
     }
-    b.partial_fields.truncate(first_partial);
-    aggregate_drop_flag
-}
-
-/// Complete the delayed source transfer for a materialized struct literal. `null_moved_source`
-/// intentionally has no `StructLit` arm because ordinary local initialization stores and nulls
-/// leaves through `store_value_at`; value-position literals use the guarded materializer above and
-/// must recurse over the same leaves only after every field has succeeded.
-fn null_consumed_struct_sources(b: &mut Builder, value: &hir::Expr) {
-    match &value.kind {
-        hir::ExprKind::StructLit { fields, .. } => {
-            for field in fields {
-                null_consumed_struct_sources(b, field);
-            }
-        }
-        _ => null_moved_source(b, value),
-    }
+    pending.finish(b);
+    flag
 }
 
 fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMode) -> Operand {
@@ -12057,7 +12074,7 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
         let (op, owner) = if borrowed {
             (
                 lower_borrowed_place(b, arg, signature.param_modes[index]),
-                Vec::new(),
+                PendingConsumption::default(),
             )
         } else {
             lower_consumed_call_arg(b, arg)
@@ -12075,18 +12092,8 @@ fn lower_call_fn_value(b: &mut Builder, e: &hir::Expr) -> Operand {
     // callee now owns. Without this a bound owned local passed indirectly is double-freed (an inline
     // temporary was safe only because it has no source local to null). No-op for a Copy / borrowed
     // argument. An indirect call has no borrow-only intrinsics, so every argument transfers.
-    for (index, arg) in args.iter().enumerate() {
-        if !matches!(
-            signature.param_modes.get(index),
-            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
-        ) {
-            null_consumed_struct_sources(b, arg);
-        }
-    }
-    // Every argument succeeded, so the outer call takes ownership. The hidden owners only protect
-    // temporaries while later arguments are being evaluated.
-    for owner in arg_owners.into_iter().flatten() {
-        b.set_drop_flag(owner, false);
+    for owner in arg_owners {
+        owner.finish(b);
     }
     let result = emit_indirect_call(b, c.clone(), ops.clone(), param_tys, e.ty, signature);
     // A mutable destination may now hold a view into any argument. Leave hidden owners under their
@@ -12155,7 +12162,7 @@ fn lower_raw_call(b: &mut Builder, e: &hir::Expr) -> Operand {
         let (operand, owner) = if borrowed {
             (
                 lower_borrowed_place(b, argument, param_modes[index]),
-                Vec::new(),
+                PendingConsumption::default(),
             )
         } else {
             lower_consumed_call_arg(b, argument)
@@ -12166,16 +12173,8 @@ fn lower_raw_call(b: &mut Builder, e: &hir::Expr) -> Operand {
             return Operand::Const(Const::Unit);
         }
     }
-    for (index, argument) in args.iter().enumerate() {
-        if !matches!(
-            param_modes.get(index),
-            Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
-        ) {
-            null_consumed_struct_sources(b, argument);
-        }
-    }
-    for owner in owners.into_iter().flatten() {
-        b.set_drop_flag(owner, false);
+    for owner in owners {
+        owner.finish(b);
     }
     let value = b.fresh_value(e.ty);
     b.push(Stmt::Let(
@@ -12381,128 +12380,148 @@ fn direct_call_target(func: &str, args: &[hir::Expr]) -> DirectCall {
     )
 }
 
+/// The consumed-value protocol differs from ordinary eager lowering for every Move value.
+/// The eager worklist uses this same gate before lowering a constructor payload ahead of its parent.
+fn consumed_mode_differs(b: &Builder, e: &hir::Expr) -> bool {
+    needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
+}
+
 /// Lower an argument whose value will transfer into a call. A fresh Move temporary needs a hidden
 /// owner while later arguments are evaluated: if one of them returns or diverges, function cleanup
 /// drops the already-created value. Once every argument succeeds, the caller clears the owner flag
 /// immediately before emitting the call and the callee becomes the sole owner.
-fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, Vec<Slot>) {
+fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, PendingConsumption) {
     if !lowering_continues(b) {
-        return (Operand::Const(Const::Unit), Vec::new());
+        return (terminated_operand(), PendingConsumption::default());
     }
-    if !needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
-        || !may_need_synthetic_owner(e)
-    {
-        return (lower_expr(b, e), Vec::new());
+    if !consumed_mode_differs(b, e) {
+        return (lower_expr(b, e), PendingConsumption::default());
     }
-    // An aggregate may combine individually owned and arena-owned members. A single hidden owner
-    // cannot represent that mixed provenance: dropping the whole value would free arena storage,
-    // while suppressing it would leak heap members. Keep each fresh member's owner separately and
-    // leave bound sources live until every outer argument succeeds. A later early exit then cleans
-    // each component through its own exact flag.
     match &e.kind {
-        hir::ExprKind::Tuple { tuple_id, elems } => {
+        hir::ExprKind::Tuple { elems, .. } | hir::ExprKind::EnumValue { payload: elems, .. } => {
             let Some(LoweredAggregateParts {
                 operands,
                 owners,
                 drop_flag,
             }) = lower_consumed_aggregate_parts(b, elems)
             else {
-                return (Operand::Const(Const::Unit), Vec::new());
+                return (terminated_operand(), PendingConsumption::default());
             };
             let value = b.fresh_value(e.ty);
-            b.push(Stmt::Let(
-                value,
-                Rvalue::MakeTuple {
+            let made = match &e.kind {
+                hir::ExprKind::Tuple { tuple_id, .. } => Rvalue::MakeTuple {
                     tuple_id: *tuple_id,
                     elems: operands,
                 },
-            ));
-            if let Some(flag) = drop_flag {
-                b.attach_value_drop_flag(value, flag.clone());
-                b.attach_value_temp_drop_flag(value, flag);
-            }
-            return (
-                Operand::Value(value),
-                owners.into_iter().flatten().collect(),
-            );
-        }
-        hir::ExprKind::EnumValue {
-            enum_id,
-            variant,
-            payload,
-        } => {
-            let Some(LoweredAggregateParts {
-                operands,
-                owners,
-                drop_flag,
-            }) = lower_consumed_aggregate_parts(b, payload)
-            else {
-                return (Operand::Const(Const::Unit), Vec::new());
-            };
-            let value = b.fresh_value(e.ty);
-            b.push(Stmt::Let(
-                value,
-                Rvalue::MakeEnum {
+                hir::ExprKind::EnumValue {
+                    enum_id, variant, ..
+                } => Rvalue::MakeEnum {
                     enum_id: *enum_id,
                     variant: *variant,
                     payload: operands,
                 },
-            ));
-            if let Some(flag) = drop_flag {
-                b.attach_value_drop_flag(value, flag.clone());
-                b.attach_value_temp_drop_flag(value, flag);
+                _ => return (terminated_operand(), PendingConsumption::default()),
+            };
+            b.push(Stmt::Let(value, made));
+            attach_consumed_flag(b, value, drop_flag);
+            let mut pending = PendingConsumption::default();
+            for owner in owners {
+                pending.extend(owner);
             }
-            return (
-                Operand::Value(value),
-                owners.into_iter().flatten().collect(),
-            );
+            return (Operand::Value(value), pending);
+        }
+        hir::ExprKind::OptionSome(inner)
+        | hir::ExprKind::ResultOk(inner)
+        | hir::ExprKind::ResultErr(inner) => {
+            let (operand, pending) = lower_consumed_call_arg(b, inner);
+            if !lowering_continues(b) {
+                return (terminated_operand(), pending);
+            }
+            let flag = lowered_drop_flag(b, inner, &operand);
+            let made = match &e.kind {
+                hir::ExprKind::OptionSome(_) => Rvalue::OptionSome(operand),
+                hir::ExprKind::ResultOk(_) => Rvalue::ResultOk(operand),
+                _ => Rvalue::ResultErr(operand),
+            };
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, made));
+            attach_consumed_flag(b, value, flag);
+            return (Operand::Value(value), pending);
         }
         hir::ExprKind::StructLit { .. } => {
             let slot = b.new_slot(e.ty);
-            let mut owners = Vec::new();
-            let mut drop_flag = None;
-            if !store_consumed_struct_fields(
-                b,
-                slot,
-                &mut Vec::new(),
-                e,
-                &mut owners,
-                &mut drop_flag,
-            ) {
-                return (Operand::Const(Const::Unit), Vec::new());
+            let mut pending = PendingConsumption::default();
+            let mut flag = None;
+            if !store_consumed_struct_fields(b, slot, &mut Vec::new(), e, &mut pending, &mut flag) {
+                return (terminated_operand(), pending);
             }
             let value = b.fresh_value(e.ty);
             b.push(Stmt::Let(value, Rvalue::Load(slot)));
-            if let Some(flag) = drop_flag {
-                b.attach_value_drop_flag(value, flag.clone());
-                b.attach_value_temp_drop_flag(value, flag);
-            }
-            return (Operand::Value(value), owners);
+            attach_consumed_flag(b, value, flag);
+            return (Operand::Value(value), pending);
+        }
+        hir::ExprKind::ArrayLit { elems, .. } => {
+            let slot = b.new_slot(e.ty);
+            let Some((pending, flag)) = store_consumed_array_elems(b, slot, elems) else {
+                return (terminated_operand(), PendingConsumption::default());
+            };
+            let value = b.fresh_value(e.ty);
+            b.push(Stmt::Let(value, Rvalue::Load(slot)));
+            attach_consumed_flag(b, value, Some(flag));
+            return (Operand::Value(value), pending);
         }
         _ => {}
     }
-    let owner = b.new_synthetic_owner(e.ty);
-    let operand = lower_expr(b, e);
+    let owner = may_need_synthetic_owner(e).then(|| b.new_synthetic_owner(e.ty));
+    let operand = lower_expr_for_deferred(b, e);
     if !lowering_continues(b) {
-        return (operand, vec![owner]);
+        return (operand, PendingConsumption::default());
     }
-    // This is a transferring context, not a borrow. Transparent region wrappers may end with a
-    // bound local whose ownership is moving into this hidden slot, so preserve its ordinary
-    // runtime bit (the borrow-only classifier would deliberately report that local as not owned).
-    let live = lowered_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
-    b.push(Stmt::Store(owner, operand.clone()));
-    b.set_drop_flag_operand(owner, live.clone());
+    let mut pending = PendingConsumption::default();
+    let mut clears = Vec::new();
+    source_move_statements(b, e, &mut clears);
+    let direct_source = !clears.is_empty();
+    if direct_source {
+        pending.moves.push(PendingSourceMove {
+            guards: Vec::new(),
+            clears,
+        });
+    }
     if let Operand::Value(value) = &operand {
-        // Downstream aggregate/map_err lowering may query provenance after the wrapped source has
-        // been cleared. Carry the captured pre-clear bit on the SSA value as well as the owner.
-        b.attach_value_drop_flag(*value, live.clone());
-        b.attach_value_temp_drop_flag(*value, live);
+        pending
+            .moves
+            .extend(b.ctx.value_pending_moves.remove(value).unwrap_or_default());
     }
-    // The hidden owner now holds the completed argument. Transfer any wrapped local sources into it
-    // immediately, before a later argument can return and run cleanup; otherwise both the source
-    // local and owner would drop the same buffer.
-    null_moved_source(b, e);
-    (operand, vec![owner])
+    if let Some(owner) = owner {
+        // A selected fresh result needs staging; a bound result remains owned by its source.
+        // Task-group bound tails deliberately differ from their borrow-only temporary classifier.
+        let live = if direct_source {
+            Operand::Const(Const::Bool(false))
+        } else {
+            temporary_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)))
+        };
+        b.push(Stmt::Store(owner, operand.clone()));
+        b.set_drop_flag_operand(owner, live);
+        pending.owners.push(owner);
+    }
+    (operand, pending)
+}
+
+fn attach_consumed_flag(b: &mut Builder, value: ValueId, flag: Option<Operand>) {
+    if let Some(flag) = flag {
+        b.attach_value_drop_flag(value, flag.clone());
+        b.attach_value_temp_drop_flag(value, flag);
+    }
+}
+
+/// Complete a standalone structural constructor. Consuming parents call the deferred producer
+/// directly, so nested structural members participate in exactly one outer action.
+fn lower_completed_constructor(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let (operand, pending) = lower_consumed_call_arg(b, e);
+    if lowering_continues(b) {
+        pending.finish(b);
+    }
+    operand
 }
 
 /// Lower a named call out-of-line for the same recursive-stack reason as
@@ -12532,10 +12551,10 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
                     arg,
                     param_modes.as_ref().expect("program call modes")[index],
                 ),
-                Vec::new(),
+                PendingConsumption::default(),
             )
         } else if borrows_args {
-            (lower_borrowed_owned(b, arg), Vec::new())
+            (lower_borrowed_owned(b, arg), PendingConsumption::default())
         } else {
             lower_consumed_call_arg(b, arg)
         };
@@ -12558,16 +12577,8 @@ fn lower_direct_call(b: &mut Builder, e: &hir::Expr) -> Operand {
     // A by-value owned-array argument is moved into the callee. Borrow-only intrinsics retain the
     // source, matching their sema contract.
     if !borrows_args {
-        for (index, arg) in args.iter().enumerate() {
-            if !matches!(
-                param_modes.as_ref().and_then(|modes| modes.get(index)),
-                Some(align_ast::ParamMode::Borrow | align_ast::ParamMode::BorrowMut)
-            ) {
-                null_consumed_struct_sources(b, arg);
-            }
-        }
-        for owner in arg_owners.into_iter().flatten() {
-            b.set_drop_flag(owner, false);
+        for owner in arg_owners {
+            owner.finish(b);
         }
     }
     let result = match direct_call_target(func, args) {
@@ -14635,6 +14646,38 @@ fn store_const_array_pooled(b: &mut Builder, slot: Slot, elems: &[hir::Expr], el
     });
 }
 
+/// A fixed Move literal aliases its retained sources and exact fresh owners until publication.
+fn store_consumed_array_elems(
+    b: &mut Builder,
+    slot: Slot,
+    elems: &[hir::Expr],
+) -> Option<(PendingConsumption, Operand)> {
+    let mut pending = PendingConsumption::default();
+    let mut array_flag = None;
+    for (index, element) in elems.iter().enumerate() {
+        let (operand, owner) = lower_consumed_call_arg(b, element);
+        if !lowering_continues(b) {
+            return None;
+        }
+        let flag =
+            lowered_drop_flag(b, element, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
+        array_flag = Some(match array_flag {
+            None => flag,
+            Some(previous) => {
+                let both = b.fresh_value(Ty::Bool);
+                b.push(Stmt::Let(both, Rvalue::Bin(BinOp::And, previous, flag)));
+                Operand::Value(both)
+            }
+        });
+        b.push(Stmt::StoreIndex(slot, index_const(index), operand));
+        pending.extend(owner);
+    }
+    Some((
+        pending,
+        array_flag.unwrap_or(Operand::Const(Const::Bool(true))),
+    ))
+}
+
 fn store_array_elems(
     b: &mut Builder,
     slot: Slot,
@@ -14642,42 +14685,9 @@ fn store_array_elems(
     elem: Ty,
 ) -> Option<Operand> {
     if needs_drop_flag(elem, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
-        // A fixed Move array has one cleanup bit for every element. Keep each completed
-        // element's fresh members under their exact hidden owners until the whole array succeeds;
-        // bound source values likewise remain live until that point. A later element that returns
-        // then cleans every completed member without treating the still-incomplete array as live.
-        let mut owners = Vec::new();
-        let mut array_drop_flag = None;
-        for (i, e) in elems.iter().enumerate() {
-            let (operand, element_owners) = lower_consumed_call_arg(b, e);
-            if !lowering_continues(b) {
-                return None;
-            }
-            let element_flag =
-                lowered_drop_flag(b, e, &operand).unwrap_or(Operand::Const(Const::Bool(false)));
-            array_drop_flag = Some(match array_drop_flag {
-                None => element_flag,
-                Some(previous) => {
-                    let both = b.fresh_value(Ty::Bool);
-                    b.push(Stmt::Let(
-                        both,
-                        Rvalue::Bin(BinOp::And, previous, element_flag),
-                    ));
-                    Operand::Value(both)
-                }
-            });
-            b.push(Stmt::StoreIndex(slot, index_const(i), operand));
-            owners.extend(element_owners);
-        }
-        for e in elems {
-            null_consumed_struct_sources(b, e);
-        }
-        for owner in owners {
-            b.set_drop_flag(owner, false);
-        }
-        // A completed empty owner is the identity for enclosing aggregate cleanup. False would
-        // suppress destruction of unrelated owned siblings when their flags are combined.
-        return Some(array_drop_flag.unwrap_or(Operand::Const(Const::Bool(true))));
+        let (pending, flag) = store_consumed_array_elems(b, slot, elems)?;
+        pending.finish(b);
+        return Some(flag);
     }
 
     if matches!(elem, Ty::Struct(_)) {
@@ -23730,7 +23740,7 @@ fn lower_else_unwrap(
     opt: &hir::Expr,
     fallback: &hir::Expr,
     ty: Ty,
-    borrow_result: bool,
+    result_mode: ControlResultMode,
 ) -> Operand {
     // `else` unwraps an `Option` (Some/None) or a `Result` (Ok/Err) — the same two-way shape, just
     // a different discriminant/unwrap rvalue. A Move container is consumed into one hidden owner:
@@ -23764,6 +23774,10 @@ fn lower_else_unwrap(
         Rvalue::OptionIsSome(opt_op.clone())
     };
     b.push(Stmt::Let(is_pos, test));
+    let result_mode = match result_mode {
+        ControlResultMode::Deferred(_) => ControlResultMode::Deferred(b.cur),
+        mode => mode,
+    };
     let some_bb = b.new_block();
     let none_bb = b.new_block();
     let join_bb = b.new_block();
@@ -23821,11 +23835,7 @@ fn lower_else_unwrap(
     if let Some(owner) = opt_owner {
         b.emit_drop_if_live(owner);
     }
-    let fb = if borrow_result {
-        lower_expr_for_borrow(b, fallback)
-    } else {
-        lower_expr(b, fallback)
-    };
+    let fb = lower_expr_for_result_mode(b, fallback, result_mode);
     if lowering_continues(b) {
         store_control_result(
             b,
@@ -23834,7 +23844,7 @@ fn lower_else_unwrap(
             result_temp_flag,
             fallback,
             fb,
-            borrow_result,
+            result_mode,
         );
         b.terminate(Term::Goto(join_bb));
     }
@@ -23853,7 +23863,7 @@ fn lower_match(
     scrutinee: &hir::Expr,
     arms: &[hir::MatchArm],
     ty: Ty,
-    borrow_result: bool,
+    result_mode: ControlResultMode,
 ) -> Operand {
     // A zero-arm `match` is already a (non-exhaustive) sema error; lower the scrutinee for its
     // effects and yield unit so we never panic on the indexing below.
@@ -23924,6 +23934,10 @@ fn lower_match(
         }
         owner
     });
+    let result_mode = match result_mode {
+        ControlResultMode::Deferred(_) => ControlResultMode::Deferred(b.cur),
+        mode => mode,
+    };
     let join_bb = b.new_block();
     match scrutinee.ty {
         Ty::Int(_) | Ty::Char => lower_match_value(
@@ -23936,7 +23950,7 @@ fn lower_match(
                 result_flag,
                 result_temp_flag,
                 join_bb,
-                borrow_result,
+                result_mode,
             ),
         ),
         Ty::Str | Ty::String => lower_match_string(
@@ -23948,7 +23962,7 @@ fn lower_match(
                 result_flag,
                 result_temp_flag,
                 join_bb,
-                borrow_result,
+                result_mode,
                 scrut_owner,
             ),
         ),
@@ -23962,7 +23976,7 @@ fn lower_match(
                     result_flag,
                     result_temp_flag,
                     join_bb,
-                    borrow_result,
+                    result_mode,
                     scrut_owner,
                 ),
                 scrutinee,
@@ -23978,7 +23992,7 @@ fn lower_match(
                     result_flag,
                     result_temp_flag,
                     join_bb,
-                    borrow_result,
+                    result_mode,
                     scrut_owner,
                 ),
                 scrutinee,
@@ -24006,11 +24020,11 @@ fn lower_match_string(
         Option<Slot>,
         Option<Slot>,
         BlockId,
-        bool,
+        ControlResultMode,
         Option<Slot>,
     ),
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, result_mode, scrut_owner) = target;
     if arms.is_empty() {
         b.terminate(Term::Goto(join_bb));
         return;
@@ -24052,7 +24066,7 @@ fn lower_match_string(
             result_flag,
             result_temp_flag,
             join_bb,
-            borrow_result,
+            result_mode,
         );
     }
 }
@@ -24094,13 +24108,13 @@ fn lower_match_enum(
         Option<Slot>,
         Option<Slot>,
         BlockId,
-        bool,
+        ControlResultMode,
         Option<Slot>,
     ),
     scrutinee: &hir::Expr,
     scrut_flag: Option<Operand>,
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, result_mode, scrut_owner) = target;
     // The default arm is the `_` wildcard (no variants); absent it, the last arm — exhaustiveness
     // guarantees the scrutinee must be one of its variants by the time control reaches it.
     let default_idx = arms
@@ -24184,7 +24198,7 @@ fn lower_match_enum(
             result_flag,
             result_temp_flag,
             join_bb,
-            borrow_result,
+            result_mode,
         );
         leave_borrowed_match_arm(b, arm);
         b.cur = next_bb;
@@ -24212,7 +24226,7 @@ fn lower_match_enum(
         result_flag,
         result_temp_flag,
         join_bb,
-        borrow_result,
+        result_mode,
     );
     leave_borrowed_match_arm(b, d);
 }
@@ -24230,13 +24244,13 @@ fn lower_match_binary(
         Option<Slot>,
         Option<Slot>,
         BlockId,
-        bool,
+        ControlResultMode,
         Option<Slot>,
     ),
     scrutinee: &hir::Expr,
     scrut_flag: Option<Operand>,
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result, scrut_owner) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, result_mode, scrut_owner) = target;
     let wild = arms.iter().find(|a| a.variants.is_empty());
     let pos = arms
         .iter()
@@ -24259,7 +24273,7 @@ fn lower_match_binary(
             result_flag,
             result_temp_flag,
             join_bb,
-            borrow_result,
+            result_mode,
         );
         return;
     }
@@ -24297,7 +24311,7 @@ fn lower_match_binary(
         result_flag,
         result_temp_flag,
         join_bb,
-        borrow_result,
+        result_mode,
     );
     leave_borrowed_match_arm(b, pos);
     b.cur = neg_bb;
@@ -24323,7 +24337,7 @@ fn lower_match_binary(
         result_flag,
         result_temp_flag,
         join_bb,
-        borrow_result,
+        result_mode,
     );
     leave_borrowed_match_arm(b, neg);
 }
@@ -24447,10 +24461,10 @@ fn lower_match_value(
         Option<Slot>,
         Option<Slot>,
         BlockId,
-        bool,
+        ControlResultMode,
     ),
 ) {
-    let (result_slot, result_flag, result_temp_flag, join_bb, borrow_result) = target;
+    let (result_slot, result_flag, result_temp_flag, join_bb, result_mode) = target;
     if arms.is_empty() {
         b.terminate(Term::Goto(join_bb));
         return;
@@ -24531,7 +24545,7 @@ fn lower_match_value(
             result_flag,
             result_temp_flag,
             join_bb,
-            borrow_result,
+            result_mode,
         );
         b.cur = next_bb;
     }
@@ -24544,7 +24558,7 @@ fn lower_match_value(
             result_flag,
             result_temp_flag,
             join_bb,
-            borrow_result,
+            result_mode,
         );
     }
 }
@@ -24557,13 +24571,9 @@ fn finish_arm(
     result_flag: Option<Slot>,
     result_temp_flag: Option<Slot>,
     join_bb: BlockId,
-    borrow_result: bool,
+    result_mode: ControlResultMode,
 ) {
-    let av = if borrow_result {
-        lower_expr_for_borrow(b, body)
-    } else {
-        lower_expr(b, body)
-    };
+    let av = lower_expr_for_result_mode(b, body, result_mode);
     if lowering_continues(b) {
         store_control_result(
             b,
@@ -24572,7 +24582,7 @@ fn finish_arm(
             result_temp_flag,
             body,
             av,
-            borrow_result,
+            result_mode,
         );
         b.terminate(Term::Goto(join_bb));
     }
@@ -24607,10 +24617,7 @@ fn lower_map_err(b: &mut Builder, result: &hir::Expr, f: &hir::Expr, out_ty: Ty)
     };
     // `map_err` unwraps the result on both branches — if it was an owned local, null its slot so
     // the exit cleanup doesn't double-free the moved-out payload.
-    null_moved_source(b, result);
-    for owner in result_owners {
-        b.set_drop_flag(owner, false);
-    }
+    result_owners.finish(b);
     let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, out_ty);
     let is_ok = b.fresh_value(Ty::Bool);
     b.push(Stmt::Let(is_ok, Rvalue::ResultIsOk(rv.clone())));
@@ -24750,12 +24757,10 @@ fn lower_loop(b: &mut Builder, e: &hir::Expr) -> Operand {
     let exit = b.new_block();
     b.terminate(Term::Goto(header));
     b.cur = header;
-    let partial_fields_base = b.partial_fields.len();
     b.loops.push(LoopFrame {
         exit,
         result_slot,
         iter_drops,
-        partial_fields_base,
     });
     let _ = lower_block(b, body); // the body's trailing value is discarded each iteration
     // Fall-through end of an iteration: conditionally drop this pass's per-iteration owned locals
@@ -24802,22 +24807,22 @@ fn lower_if(
     then: &hir::Block,
     els: &hir::Block,
     ty: Ty,
-    borrow_result: bool,
+    result_mode: ControlResultMode,
 ) -> Operand {
     let (result_slot, result_flag, result_temp_flag) = control_result_slots(b, ty);
 
     let c = lower_required!(b, lower_expr(b, cond), Operand::Const(Const::Unit));
+    let result_mode = match result_mode {
+        ControlResultMode::Deferred(_) => ControlResultMode::Deferred(b.cur),
+        mode => mode,
+    };
     let then_bb = b.new_block();
     let else_bb = b.new_block();
     let join_bb = b.new_block();
     b.terminate(Term::Branch(c, then_bb, else_bb));
 
     b.cur = then_bb;
-    let tv = if borrow_result {
-        lower_block_for_borrow(b, then)
-    } else {
-        lower_block(b, then)
-    };
+    let tv = lower_block_for_result_mode(b, then, result_mode);
     if lowering_continues(b) {
         if let Some(op) = tv
             && let Some(value) = &then.value
@@ -24829,18 +24834,14 @@ fn lower_if(
                 result_temp_flag,
                 value,
                 op,
-                borrow_result,
+                result_mode,
             );
         }
         b.terminate(Term::Goto(join_bb));
     }
 
     b.cur = else_bb;
-    let ev = if borrow_result {
-        lower_block_for_borrow(b, els)
-    } else {
-        lower_block(b, els)
-    };
+    let ev = lower_block_for_result_mode(b, els, result_mode);
     if lowering_continues(b) {
         if let Some(op) = ev
             && let Some(value) = &els.value
@@ -24852,7 +24853,7 @@ fn lower_if(
                 result_temp_flag,
                 value,
                 op,
-                borrow_result,
+                result_mode,
             );
         }
         b.terminate(Term::Goto(join_bb));
@@ -27203,7 +27204,6 @@ fn main() -> i32 {
             drop_locals: Vec::new(),
             drop_flags: Vec::new(),
             drop_individual_locals: Default::default(),
-            partial_fields: Vec::new(),
             drop_individual_exprs: Default::default(),
             borrowed_bindings: Default::default(),
             tuples: Vec::new(),
@@ -27219,6 +27219,8 @@ fn main() -> i32 {
                 synthetic_drop_slots: Vec::new(),
                 value_borrow_owners: Vec::new(),
                 slot_borrow_owners: Default::default(),
+                slot_pending_moves: Default::default(),
+                value_pending_moves: Default::default(),
                 dbg: None,
                 plans: None,
                 fn_types: Rc::from(Vec::<hir::FnTy>::new()),
@@ -31406,7 +31408,7 @@ fn main() -> i32 = 0
     }
 
     #[test]
-    fn direct_struct_and_array_lets_guard_partial_fields_and_forward_ownership() {
+    fn direct_struct_and_array_lets_guard_components_and_forward_ownership() {
         let p = lower(
             "Wrap { xs: array<i64>, n: i64 }\nfn make() -> array<i64> = [1].to_array()\nfn partial() -> i32 {\n  w := Wrap { xs: make(), n: { return 0 } }\n  return 1\n}\nfn partial_array() -> i32 {\n  rows := [Wrap { xs: make(), n: { return 0 } }]\n  return 1\n}\nfn joined(c: bool) -> i64 {\n  arena {\n    mut xs := make()\n    if c {\n      xs = [2].to_array()\n    }\n    w := Wrap { xs: xs, n: 0 }\n    return w.xs.len()\n  }\n}\nfn main() -> i32 = 0\n",
         );
@@ -31422,8 +31424,8 @@ fn main() -> i32 = 0
                 .blocks
                 .iter()
                 .flat_map(|block| &block.stmts)
-                .any(|stmt| matches!(stmt, Stmt::DropField(_, path) if path == &[0])),
-            "a fresh struct destination must drop its completed field on a later return:\n{}",
+                .any(|stmt| matches!(stmt, Stmt::Drop(slot) if partial.slots[*slot as usize] == Ty::DynArray(scalar_of(i64_ty())))),
+            "a partial fresh struct must drop its completed component on a later return:\n{}",
             print::function_to_string(partial)
         );
         assert!(
@@ -31595,7 +31597,7 @@ fn main() -> i32 = 0
                     )
                 })
             }),
-            "a consumed arena tail must arm its hidden owner before a later argument exits:\n{}",
+            "a retained arena tail must keep an armed source owner before a later argument exits:\n{}",
             print::function_to_string(arena_exit)
         );
     }
