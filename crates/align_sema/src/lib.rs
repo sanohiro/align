@@ -44981,6 +44981,9 @@ impl<'a> MoveCheck<'a> {
                 ExprKind::Match { arms, .. } => {
                     work.extend(arms.iter().rev().map(|arm| &arm.body));
                 }
+                // The container was consumed while selecting the edge. A bound fallback was
+                // only observed then, and transfers with this enclosing successful action.
+                ExprKind::ElseUnwrap { fallback, .. } => work.push(fallback),
                 _ => self.consume_match_result(value, moved, true),
             }
         }
@@ -45435,6 +45438,7 @@ impl<'a> MoveCheck<'a> {
                         pending.extend(els.value.as_deref());
                     }
                     ExprKind::Match { arms, .. } => pending.extend(arms.iter().map(|arm| &arm.body)),
+                    ExprKind::ElseUnwrap { fallback, .. } => pending.push(fallback),
                     // A call, unwrap or loop result has already established its own transfer.
                     _ => {}
                 }

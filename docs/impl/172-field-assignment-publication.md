@@ -75,8 +75,8 @@ bound source may be moved into a hidden owner before a later outer member reads
 that source. The issue also exists in whole-value construction and the former
 incremental field route. No new admitted stale-source clearing was identified
 from reusing the canonical producer. Preserve current wrapped-source cleanup
-parity here; qualify and repair the general deferred wrapper-transfer boundary
-in a separate capability rather than claiming this destination repair fixes it.
+parity here; Plan173 repairs the general deferred wrapper-transfer boundary as a separate
+producer/consumer capability. This destination repair does not own that change.
 
 The boundary is independently useful: it removes partial destination publication
 and restores old aggregate Drop using an already-shipped value producer. It is
