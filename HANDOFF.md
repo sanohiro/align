@@ -7,6 +7,13 @@ finish each capability through PR and merge, then continue until asked to stop.
 Align v0.9.0 is released. Requests138–141 are included; release artifacts cover
 Linux x86_64/aarch64 and macOS aarch64.
 
+[Plan176](docs/impl/176-unchanged-escaped-output.md) reuses exact expansion
+counts to bulk-copy unchanged percent/path/HTML output, including template
+appends. Form's space-to-plus transform and all expanded writers remain intact.
+Native exact-byte/allocation/malformed and whole/per-unit source owners pass;
+`bench/encoding_writes` retains the local unchanged-input gains, expanded/short
+costs and all samples without a portable or application-throughput claim.
+
 [Plan175](docs/impl/175-rng-record-composition.md) admits Copy RNG fields in
 ordinary concrete/generic/nested records and aligns semantic size with the
 existing 32-byte LLVM state. Existing explicit mutable borrowing advances a

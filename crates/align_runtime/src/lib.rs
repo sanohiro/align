@@ -14052,7 +14052,14 @@ pub unsafe extern "C" fn align_rt_html_escape(ptr: *const u8, len: i64) -> Align
     let Some(out_len) = html_escaped_len(data) else {
         align_rt_alloc_size_fail();
     };
-    unsafe { owned_str_exact(out_len, |out| html_escape_into(data, out)) }
+    unsafe { owned_str_exact(out_len, |out| {
+        // Every entity expands: the checked count proves that equal lengths need no escaping.
+        if out_len == data.len() {
+            out.write_copy_of_slice(data);
+        } else {
+            html_escape_into(data, out);
+        }
+    }) }
 }
 
 const TEMPLATE_HTML_VERSION: u32 = 1;
@@ -14296,7 +14303,12 @@ pub unsafe extern "C" fn align_rt_template_html_write_v1(
             additional,
         )
     };
-    html_escape_into(input, out);
+    // The exact HTML count above proves that no entity occurs when lengths agree.
+    if additional == input.len() {
+        out.write_copy_of_slice(input);
+    } else {
+        html_escape_into(input, out);
+    }
     builder.len = u64::try_from(old_len + additional)
         .unwrap_or_else(|_| template_html_abort("template html builder length invalid"));
 }
@@ -14484,7 +14496,14 @@ pub unsafe extern "C" fn align_rt_percent_encode(ptr: *const u8, len: i64) -> Al
     let Some(out_len) = percent_encoded_len(data) else {
         align_rt_alloc_size_fail();
     };
-    unsafe { owned_str_exact(out_len, |out| percent_encode_into(data, out)) }
+    unsafe { owned_str_exact(out_len, |out| {
+        // Every percent escape adds two bytes; equal checked lengths prove an unchanged input.
+        if out_len == data.len() {
+            out.write_copy_of_slice(data);
+        } else {
+            percent_encode_into(data, out);
+        }
+    }) }
 }
 
 /// Slash-preserving percent encoding. No decoding or path normalization.
@@ -14497,7 +14516,14 @@ pub unsafe extern "C" fn align_rt_percent_encode_path(ptr: *const u8, len: i64) 
     let Some(out_len) = percent_encoded_len_with_slash(data, true) else {
         align_rt_alloc_size_fail();
     };
-    unsafe { owned_str_exact(out_len, |out| percent_encode_into_with_slash(data, out, true)) }
+    unsafe { owned_str_exact(out_len, |out| {
+        // This count uses the slash-preserving classifier, not the component classifier.
+        if out_len == data.len() {
+            out.write_copy_of_slice(data);
+        } else {
+            percent_encode_into_with_slash(data, out, true);
+        }
+    }) }
 }
 
 /// `encoding.percent_decode(s)` — RFC 3986 percent-decoding; a `%` not followed by two hex digits is
@@ -53416,7 +53442,9 @@ mod regex_tests {
         let escaped = "&<>\"'&amp;\0\r\n雪".as_bytes();
         let raw = b"<b>trusted</b>";
         unsafe {
+            align_rt_template_html_write_v1(builder, b"prefix".as_ptr(), 6);
             align_rt_template_html_write_v1(builder, escaped.as_ptr(), escaped.len() as i64);
+            align_rt_template_html_write_v1(builder, b"suffix".as_ptr(), 6);
             align_rt_template_html_raw_v1(builder, raw.as_ptr(), raw.len() as i64);
         }
         let payload = unsafe { (*builder).ptr };
@@ -53431,7 +53459,7 @@ mod regex_tests {
         };
         assert_eq!(
             bytes,
-            b"&amp;&lt;&gt;&quot;&#39;&amp;amp;\0\r\n\xe9\x9b\xaa<b>trusted</b>"
+            b"prefix&amp;&lt;&gt;&quot;&#39;&amp;amp;\0\r\n\xe9\x9b\xaasuffix<b>trusted</b>"
         );
         unsafe { align_rt_free(finished.ptr.cast_mut()) };
 
@@ -53609,6 +53637,7 @@ mod regex_tests {
         assert_eq!(align_rt_requested_live_bytes(), capacity as i64);
         unsafe {
             align_rt_template_html_raw_v1(builder, b"x".as_ptr(), 1);
+            align_rt_template_html_write_v1(builder, b"ok".as_ptr(), 2);
         }
         assert_eq!(unsafe { (*builder).cap }, capacity);
         assert_eq!(align_rt_requested_live_bytes(), capacity as i64);

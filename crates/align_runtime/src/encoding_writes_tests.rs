@@ -181,3 +181,61 @@ fn encoding_writers_initialize_exact_destinations_and_reject_mismatches() {
         }
     }
 }
+
+#[test]
+fn public_encoding_entries_preserve_exact_owned_output() {
+    #[cfg(feature = "alloc-count")]
+    let Some(_isolated) = crate::allocation_test::enter() else { return; };
+    struct Owned(AlignStr);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            unsafe { align_rt_free(self.0.ptr.cast_mut()) };
+        }
+    }
+    let encoders: [unsafe extern "C" fn(*const u8, i64) -> AlignStr; 4] = [
+        align_rt_percent_encode,
+        align_rt_percent_encode_path,
+        align_rt_html_escape,
+        align_rt_form_encode,
+    ];
+    let mut inputs = vec![Vec::new(), (0u8..=127).collect()];
+    for byte in 0u8..=255 {
+        for length in [1, 129] {
+            inputs.push(vec![byte; length]);
+        }
+    }
+    for seed in [
+        b"Alpha09-._~".as_slice(), b"a/b//./../", b" ", b"&<>\"'", b"\0",
+        "日本語é🦀".as_bytes(),
+    ] {
+        inputs.push(seed.to_vec());
+        inputs.push(seed.repeat(1024));
+    }
+    for (kind, encode) in encoders.into_iter().enumerate() {
+        for input in &inputs {
+            if kind == 2 && std::str::from_utf8(input).is_err() {
+                continue; // Invalid HTML text has its separate abort/admission owner.
+            }
+            let expected = reference(input, kind);
+            #[cfg(feature = "alloc-count")]
+            let counts = (align_rt_alloc_count(), align_rt_free_count());
+            let pointer = if input.is_empty() { core::ptr::null() } else { input.as_ptr() };
+            let output = Owned(unsafe { encode(pointer, i64::try_from(input.len()).unwrap()) });
+            assert_eq!(usize::try_from(output.0.len).unwrap(), expected.len(), "kind={kind}");
+            if expected.is_empty() {
+                assert!(output.0.ptr.is_null());
+            } else {
+                assert!(!output.0.ptr.is_null());
+                assert_ne!(output.0.ptr, input.as_ptr(), "output must own independent storage");
+                let actual = unsafe { core::slice::from_raw_parts(output.0.ptr, expected.len()) };
+                assert_eq!(actual, expected, "kind={kind}, input={input:?}");
+            }
+            #[cfg(feature = "alloc-count")]
+            assert_eq!(align_rt_alloc_count()-counts.0, i64::from(!expected.is_empty()));
+            drop(output);
+            #[cfg(feature = "alloc-count")]
+            assert_eq!(align_rt_free_count()-counts.1, i64::from(!expected.is_empty()));
+            assert_eq!(reference(input, kind), expected, "input survives output Drop");
+        }
+    }
+}
