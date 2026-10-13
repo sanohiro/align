@@ -13836,6 +13836,28 @@ fn percent_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     percent_encode_into_with_slash(data, out, false);
 }
 
+/// Admit only complete ordinary chunks; the first escaping chunk stays with the scalar writer.
+fn percent_literal_prefix<const SLASH: bool>(data: &[u8]) -> usize {
+    if data.len() < 512 { return 0; }
+    let mut prefix = 0;
+    for chunk in data.chunks_exact(128) {
+        if escaped_byte_count::<SLASH, false>(chunk) != 0 { break; }
+        prefix += chunk.len(); // Disjoint complete chunks cannot exceed data.len().
+    }
+    prefix
+}
+
+fn percent_encode_expanded_into<const SLASH: bool>(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    let prefix = percent_literal_prefix::<SLASH>(data);
+    let (ordinary, remaining) = out.split_at_mut(prefix);
+    ordinary.write_copy_of_slice(&data[..prefix]);
+    if SLASH {
+        percent_encode_into_with_slash(&data[prefix..], remaining, true);
+    } else {
+        percent_encode_into(&data[prefix..], remaining);
+    }
+}
+
 fn percent_encode_into_with_slash(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>], preserve_slash: bool) {
     const HEX: [u8; 16] = *b"0123456789ABCDEF";
     let mut o = 0;
@@ -14510,7 +14532,7 @@ pub unsafe extern "C" fn align_rt_percent_encode(ptr: *const u8, len: i64) -> Al
         if out_len == data.len() {
             out.write_copy_of_slice(data);
         } else {
-            percent_encode_into(data, out);
+            percent_encode_expanded_into::<false>(data, out);
         }
     }) }
 }
@@ -14530,7 +14552,7 @@ pub unsafe extern "C" fn align_rt_percent_encode_path(ptr: *const u8, len: i64) 
         if out_len == data.len() {
             out.write_copy_of_slice(data);
         } else {
-            percent_encode_into_with_slash(data, out, true);
+            percent_encode_expanded_into::<true>(data, out);
         }
     }) }
 }
