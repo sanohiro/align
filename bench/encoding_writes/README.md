@@ -9,13 +9,79 @@ no optional native codec/crypto libraries are needed.
 Kind 0 is percent/component, 1 percent/path, 2 HTML, and 3 form. Plain and mixed
 UTF-8 seeds join unreserved, dense reserved-byte, dense five-entity HTML,
 sparse-entity, late-entity, repeated quote/apostrophe and form space-only/mixed-space
-controls. Requested sizes are 0, 1, 8, 64, 4096
+controls, including form prefixes ending in a percent byte.
+Requested sizes are 0, 1, 8, 64, 4096
 and 65536 bytes; whole seed repetitions preserve UTF-8, and CSV records actual
 lengths. Empty input appears once per encoder, and repeated rounded lengths
-are skipped, leaving 240 distinct cases. An independent oracle checks exact
+are skipped, leaving 280 distinct cases. An independent oracle checks exact
 bytes before timing. Each case warms for 100 ms, then emits nine samples
 including final output allocation/free. Returned lengths, calls and output
 bytes are observed, and empty/nonempty pointer shape is checked.
+
+## Expanded form output prefixes, 2026-10-13
+
+Plan179 compares baseline `117df79543b1959a05f83aa5a601da91339db5fc`
+with same-width prefix mapping in expanded form output. Complete 128-byte
+chunks use the existing form classifier; admitted spaces become plus. Inputs
+below 512 bytes skip this scan. The first expanding chunk and remainder use
+the unchanged scalar writer. The complete expanded wrapper stays out of line;
+the native entry's checked count and complete same-width mapping retain their
+own path. The three other encoders remain controls.
+
+macOS ARM64, Apple M1, Rust 1.96.1 and Apple Clang 21.0.0. Both rebuilt ordinary
+release archives link the identical extended 280-case C harness with
+`-O3 -Wall -Wextra -Werror -Wl,-dead_strip`. Both arms include all previous cases
+and the added space-only/mixed-space prefixes ending in percent. ABBA provides
+eighteen samples per arm/case, using `native_probe.run_phase` with its existing
+phase deadlines and no concurrent local build/test work. Independent exact
+bytes, returned extents and observed calls/output bytes agree. All 10,080
+[final observations](form-prefix-macos-samples.csv) remain, with explicit LF.
+
+Harness SHA256: `5adf07f42afbe398e2e5f61c1d205aa421a014d021f46a77def4e3d1cdb3d1f9`.
+Baseline/final archive SHA256:
+`186e39ee312825eab297059d18e4b37987f312b022399b7e821c6417b2a0bfa7` /
+`faff621ea6e51c5df47b7e99c75d51d461f3a5a32c446c62acc78dbbf8716068`.
+
+Median microseconds per complete form encode/free call:
+
+| Input | Bytes | Baseline | Candidate |
+| --- | ---: | ---: | ---: |
+| ordinary prefix, late apostrophe | 4,096 | 4.471 | 1.047 |
+| ordinary prefix, late apostrophe | 65,536 | 70.055 | 14.813 |
+| spaces, late percent | 4,096 | 2.449 | 1.002 |
+| spaces, late percent | 65,536 | 38.305 | 14.828 |
+| mixed unreserved/spaces, late percent | 4,096 | 5.078 | 1.053 |
+| mixed unreserved/spaces, late percent | 65,536 | 80.930 | 14.836 |
+| mixed UTF-8 control | 65,550 | 93.742 | 94.609 |
+| unreserved, same-width control | 65,536 | 7.914 | 8.336 |
+| double-quote offset runs | 65,552 | 84.648 | 83.250 |
+| apostrophe offset runs | 65,552 | 84.922 | 82.641 |
+
+All preregistered local limits in Plan179 pass. Long late-escape form cases
+improve 59.1–81.7%. Other long form cases range from −9.76% to +5.33%; the
+largest absolute increase is 0.867 microseconds on mixed UTF-8 above, while the
+largest percentage increase is the unchanged-output unreserved control.
+Short form cost rises by at most 2.25 ns (90-byte plain input: 127.05 → 129.30 ns).
+Other encoders' long controls range from −14.28% to +5.83%; the largest absolute
+increase is 2.078 microseconds (64-KiB mixed unreserved/spaces, HTML:
+48.063 → 50.141 microseconds). Their largest short increase is 2.50 ns.
+Both linked probes have 278,528-byte Mach-O __TEXT and 16,384-byte __DATA
+segments, with no __mod_init_func section. These are linked segment sizes,
+not startup timings or an application-size guarantee.
+
+The first shape inlined the expanded wrapper in the native entry, whose
+entry disassembly grew from 393 to 591 lines. It improved the primary cases
+60.2–82.0%, but two long quote controls cost 2.617 and 1.984 microseconds,
+exceeding the preregistered 1-microsecond bound. Reject it and retain all 10,080
+[inlined observations](form-prefix-inlined-macos-samples.csv), including its
+own ABBA baseline. Its archive SHA256 is
+`43eafebebf4f34793afefcc06b7aed1096a6f2cc7236c0c8560820f55d56a079`.
+The final native entry has 300 disassembly lines and calls the expanded wrapper.
+That code-shape observation does not establish the cause of timing differences;
+control and baseline variation remain visible. No sample is removed and no
+adoption limit is relaxed. Scheduling and code placement limit inference;
+there is no portable, application-throughput or RSS promise, and timing is not
+a correctness or CI gate.
 
 ## Expanded percent output prefixes, 2026-10-13
 

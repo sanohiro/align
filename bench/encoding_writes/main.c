@@ -53,12 +53,12 @@ static size_t expected(const unsigned char *input, size_t length, int kind, unsi
     return written;
 }
 int main(void) {
-    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'", "A", " /+%", "&<>\"'", "a", "a", "aaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaa'", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'", " ", " A0~"};
-    const char *names[] = {"plain", "mixed", "unreserved", "dense", "html_dense", "html_sparse", "html_late", "double_quote_runs", "apostrophe_runs", "double_quote_offset_runs", "apostrophe_offset_runs", "form_spaces", "form_mixed_spaces"};
+    const char *seeds[] = {"Alpha09-file_name/path~segment", "<item key=\"日本語\">two words & a/b?</item>'", "A", " /+%", "&<>\"'", "a", "a", "aaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaa'", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'", " ", " A0~", " ", " A0~"};
+    const char *names[] = {"plain", "mixed", "unreserved", "dense", "html_dense", "html_sparse", "html_late", "double_quote_runs", "apostrophe_runs", "double_quote_offset_runs", "apostrophe_offset_runs", "form_spaces", "form_mixed_spaces", "form_spaces_late", "form_mixed_spaces_late"};
     size_t sizes[] = {0, 1, 8, 64, 4096, 65536};
     Encode encoders[] = {align_rt_percent_encode, align_rt_percent_encode_path, align_rt_html_escape, align_rt_form_encode};
     puts("input,input_bytes,kind,trial,calls,output_bytes,ns_per_call");
-    for (int seed = 0; seed < 13; ++seed) {
+    for (int seed = 0; seed < 15; ++seed) {
         size_t unit = strlen(seeds[seed]);
         size_t previous_length = SIZE_MAX;
         for (int size = 0; size < 6; ++size) {
@@ -74,6 +74,9 @@ int main(void) {
             } else if (seed == 6) {
                 require(length != 0, "late HTML fixture extent");
                 input[length - 1] = '\'';
+            } else if (seed == 13 || seed == 14) {
+                require(length != 0, "late form fixture extent");
+                input[length - 1] = '%';
             }
             size_t repeats = 4 * 1024 * 1024 / (length + 64);
             if (repeats < 64) repeats = 64;

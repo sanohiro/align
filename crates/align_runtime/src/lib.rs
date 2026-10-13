@@ -13836,19 +13836,19 @@ fn percent_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
     percent_encode_into_with_slash(data, out, false);
 }
 
-/// Admit only complete ordinary chunks; the first escaping chunk stays with the scalar writer.
-fn percent_literal_prefix<const SLASH: bool>(data: &[u8]) -> usize {
+/// Admit only complete same-width chunks; the first expanding chunk stays with the scalar writer.
+fn escaped_same_width_prefix<const SLASH: bool, const SPACE: bool>(data: &[u8]) -> usize {
     if data.len() < 512 { return 0; }
     let mut prefix = 0;
     for chunk in data.chunks_exact(128) {
-        if escaped_byte_count::<SLASH, false>(chunk) != 0 { break; }
+        if escaped_byte_count::<SLASH, SPACE>(chunk) != 0 { break; }
         prefix += chunk.len(); // Disjoint complete chunks cannot exceed data.len().
     }
     prefix
 }
 
 fn percent_encode_expanded_into<const SLASH: bool>(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
-    let prefix = percent_literal_prefix::<SLASH>(data);
+    let prefix = escaped_same_width_prefix::<SLASH, false>(data);
     let (ordinary, remaining) = out.split_at_mut(prefix);
     ordinary.write_copy_of_slice(&data[..prefix]);
     if SLASH {
@@ -14413,6 +14413,23 @@ fn form_encoded_len(data: &[u8]) -> Option<usize> {
     data.len().checked_add(escaped.checked_mul(2)?)
 }
 
+/// The caller's checked form count admits only unreserved bytes and spaces.
+fn form_same_width_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    assert_eq!(data.len(), out.len(), "form same-width destination length mismatch");
+    for (&byte, slot) in data.iter().zip(out) {
+        slot.write(if byte == b' ' { b'+' } else { byte });
+    }
+}
+
+// Keep prefix preparation and scalar expansion out of the count/same-width entry path.
+#[inline(never)]
+fn form_encode_expanded_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
+    let prefix = escaped_same_width_prefix::<false, true>(data);
+    let (same_width, remaining) = out.split_at_mut(prefix);
+    form_same_width_into(&data[..prefix], same_width);
+    form_encode_into(&data[prefix..], remaining);
+}
+
 /// Write `data` form-urlencoded into `out` (exactly [`form_encoded_len`] bytes): space becomes `+`,
 /// every other non-unreserved byte becomes `%XX`.
 fn form_encode_into(data: &[u8], out: &mut [core::mem::MaybeUninit<u8>]) {
@@ -14497,11 +14514,9 @@ pub unsafe extern "C" fn align_rt_form_encode(ptr: *const u8, len: i64) -> Align
     unsafe { owned_str_exact(out_len, |out| {
         // Equal checked lengths admit only unreserved bytes and spaces, which still become plus.
         if out_len == data.len() {
-            for (&byte, slot) in data.iter().zip(out) {
-                slot.write(if byte == b' ' { b'+' } else { byte });
-            }
+            form_same_width_into(data, out);
         } else {
-            form_encode_into(data, out);
+            form_encode_expanded_into(data, out);
         }
     }) }
 }
