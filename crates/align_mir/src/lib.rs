@@ -12,7 +12,7 @@
 
 use align_ast::{BinOp, UnOp};
 use align_sema::{
-    FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, enum_is_move, hir,
+    FloatTy, IntTy, Layout, Scalar, Ty, drop_plan, hir,
     may_need_synthetic_owner, needs_drop_flag, owns_hidden_string, struct_is_move,
 };
 use align_span::{SourceMap, Span};
@@ -6403,19 +6403,13 @@ fn source_move_statements(b: &Builder, e: &hir::Expr, out: &mut Vec<Stmt>) {
                 }
             }
         }
-        // A partial owned-field move out of a struct (`n := u.name`) took the `string` field's
-        // buffer; null that depth-1 field of the struct slot so the struct's recursive `Drop` frees
-        // null there, not the buffer the new binding now owns. Sema allows this for a depth-1
-        // `string`, `Option<Move>`, or Move-handle field; deeper paths / Move-struct fields stay
-        // rejected, so `path` is `[idx]`.
+        // Clear the complete selected field only after its value has been read. The
+        // shared Drop-plan predicate covers every already-admitted owning field family.
         hir::ExprKind::Field { root, path }
             if path.len() == 1
-                && (e.ty == Ty::String
-                    || matches!(e.ty, Ty::Resource(_))
-                    || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                        && align_sema::drop_plan(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
-                            .needs_drop())
-                    || align_sema::is_move_handle(e.ty)) =>
+                && align_sema::owned_field_extraction_is_valid(
+                    e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types,
+                ) =>
         {
             out.push(Stmt::NullStructField(*root, path[0]));
         }
@@ -6429,22 +6423,11 @@ fn source_move_statements(b: &Builder, e: &hir::Expr, out: &mut Vec<Stmt>) {
                 out.push(Stmt::NullElemField(slot, index, path));
             }
         }
-        // Matching a **Move**-enum struct field (`match m.content { Parts(ps) => … }`, J3) binds and
-        // moves the live variant's owned buffer out into `ps`; null that depth-1 enum field of the
-        // struct slot (the whole `{ tag, payloads }` aggregate) so the struct's exit `Drop` →
-        // `drop_enum` reads tag 0 and frees null, not the buffer `ps` now owns. Mirrors the `string`
-        // field case above, one level up (the scrutinee is the field place, so `path` is `[idx]`).
-        hir::ExprKind::Field { root, path }
-            if path.len() == 1
-                && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.tuples, &b.enums, &b.tagged_types)) =>
-        {
-            out.push(Stmt::NullStructField(*root, path[0]));
-        }
         _ => {}
     }
 }
 
-/// Capture the runtime ownership bit forwarded by a direct local move. This is read before
+/// Capture the runtime ownership bit forwarded by a local or complete direct field move. This is read before
 /// [`null_moved_source`] clears the source, so a destination reached after an Arena/heap join
 /// inherits the exact path's provenance instead of the escape lattice's conservative joined region.
 fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
@@ -6458,7 +6441,8 @@ fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
             .and_then(|value| moved_drop_flag(b, value))
     } else {
         match &e.kind {
-            hir::ExprKind::Local(id) => {
+            hir::ExprKind::Local(id)
+            | hir::ExprKind::Field { root: id, path: _ } => {
                 let flag = b.drop_flags.get(*id as usize).copied().flatten()?;
                 let live = b.fresh_value(Ty::Bool);
                 b.push(Stmt::Let(live, Rvalue::Load(flag)));
@@ -12520,6 +12504,10 @@ fn lower_consumed_call_arg(b: &mut Builder, e: &hir::Expr) -> (Operand, PendingC
         }
         hir::ExprKind::ArrayLit { elems, .. } => {
             let slot = b.new_slot(e.ty);
+            // Materialize a real inline value even when there are no element stores. This is
+            // construction evidence, not a cleanup owner: pending parts retain cleanup until
+            // the containing action publishes the completed value.
+            b.push(Stmt::DropFlagInit(slot));
             let Some((pending, flag)) = store_consumed_array_elems(b, slot, elems) else {
                 return (terminated_operand(), PendingConsumption::default());
             };
@@ -25058,6 +25046,59 @@ mod tests {
     use align_lexer::tokenize;
     use align_parser::parse_file;
     use align_sema::check_file;
+
+    #[test]
+    fn owned_field_extraction_checked_hir() -> Result<(), Box<dyn std::error::Error>> {
+        let source = "Inner { name:string }\nR { value:Inner, marker:i64 }\nfn extract(owner:R)->Inner = owner.value\nfn main()->i32=0\n";
+        let mut diagnostics = Diagnostics::new();
+        let file = parse_file(tokenize(0, source, &mut diagnostics), &mut diagnostics);
+        let checked = check_file(&file, &mut diagnostics);
+        assert!(
+            !diagnostics.has_errors(),
+            "{:?}",
+            diagnostics.iter().collect::<Vec<_>>()
+        );
+        let mir =
+            lower_program_checked(&checked, false, None).map_err(|error| format!("{error:?}"))?;
+        let function = mir
+            .fns
+            .iter()
+            .find(|function| function.name.as_str() == "extract")
+            .ok_or("extract")?;
+        assert!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.stmts)
+                .any(|stmt| matches!(stmt, Stmt::NullStructField(_, 0)))
+        );
+        for mutation in 0..4 {
+            let mut forged = checked.clone();
+            let function = forged
+                .fns
+                .iter_mut()
+                .find(|function| function.name == "extract")
+                .ok_or("extract")?;
+            if mutation == 0 {
+                function.param_modes[0] = align_ast::ParamMode::Borrow;
+            } else {
+                let field = function.body.value.as_deref_mut().ok_or("field tail")?;
+                let hir::ExprKind::Field { root, path } = &mut field.kind else {
+                    return Err("field tail kind".into());
+                };
+                match mutation {
+                    1 => *root = 99,
+                    2 => path[0] = 99,
+                    _ => field.ty = Ty::Bool,
+                }
+            }
+            assert!(
+                lower_program_checked(&forged, false, None).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn sqlite_callback_effects_render_in_target_order() {

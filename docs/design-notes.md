@@ -443,6 +443,14 @@ but it needs the same explicit pointer-to-caller-storage mode when a large struc
 producer-generated typed callback must avoid a hidden by-value copy. This is one general ABI rule,
 not a package exemption, and it still rejects temporaries.
 
+**Direct owning fields use the existing move rule.** A complete direct field already has a
+recursive layout and Drop plan, so extraction uses that plan's exact zero and forwards the
+parent's cleanup bit. Arrays, nested records and tuples need no container-specific extraction
+API or hidden clone. Projected storage distinguishes allocated generations that transfer from
+inline backing that materializes elsewhere; sibling ownership remains independent. Plan192
+completes this composition without widening field formation, deeper extraction or exclusive
+partial-field borrowing.
+
 **Borrowed sum matching is a projection, not a copy.** The same distinction matters when a library
 must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
 a stable place whose exact root/path pair is directly shared- or exclusively-borrowed reads the tag

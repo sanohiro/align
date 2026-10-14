@@ -123,7 +123,7 @@ fn tuple_partial_move_nulls_exact_element_layout() -> TestResult {
 }
 
 #[test]
-fn struct_partial_move_nulls_each_existing_owned_layout() -> TestResult {
+fn partial_field_nulling_covers_each_owned_layout() -> TestResult {
     let mut program = fixture(Scalar::String)?;
     program.enums.push(EnumDef {
         name: "Content".into(),
@@ -137,6 +137,22 @@ fn struct_partial_move_nulls_each_existing_owned_layout() -> TestResult {
     program
         .tagged_types
         .push(hir::TaggedType::Option(Scalar::String));
+    program.structs.push(StructDef {
+        name: "Inner".into(),
+        source_name: "Inner".into(),
+        align: None,
+        c_repr: false,
+        fields: vec![
+            hir::FieldDef {
+                name: "name".into(),
+                ty: Ty::String,
+            },
+            hir::FieldDef {
+                name: "marker".into(),
+                ty: Ty::Bool,
+            },
+        ],
+    });
     let mut types = align_sema::MOVE_HANDLE_TYPES.to_vec();
     let pointer_count = types.len();
     types.extend([
@@ -145,6 +161,34 @@ fn struct_partial_move_nulls_each_existing_owned_layout() -> TestResult {
         Ty::Option(Scalar::String),
         Ty::Result(Scalar::String, Scalar::Bool),
         Ty::Tagged(0),
+        Ty::Struct(0),
+        Ty::Tuple(0),
+        Ty::Array(Scalar::String, 2),
+        Ty::Array(Scalar::String, 0),
+        Ty::StructArray(0, 2),
+        Ty::DynArray(Scalar::String),
+        Ty::DynStructArray(0, Layout::Aos),
+        Ty::DynVecArray(
+            Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            2,
+        ),
+        Ty::DynMaskArray(
+            Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            2,
+        ),
+        Ty::DynFixedArray(
+            Scalar::Int(IntTy {
+                bits: 64,
+                signed: true,
+            }),
+            2,
+        ),
     ]);
     program.structs.push(StructDef {
         name: "Owners".into(),
@@ -161,7 +205,7 @@ fn struct_partial_move_nulls_each_existing_owned_layout() -> TestResult {
             .collect(),
     });
     let function = program.fns.first_mut().ok_or("missing fixture function")?;
-    function.slots = vec![Ty::Struct(0)];
+    function.slots = vec![Ty::Struct(1)];
     let block = function.blocks.first_mut().ok_or("missing fixture block")?;
     block.stmts = vec![Stmt::DropFlagInit(0)];
     for index in 0..types.len() {
@@ -264,7 +308,7 @@ fn partial_field_nulling_rejects_malformed_metadata_before_emission() -> TestRes
             ty: Ty::String,
         }],
     });
-    for field in [0, 1, 99] {
+    for field in [0, 99] {
         let mut program = record.clone();
         let function = program.fns.first_mut().ok_or("missing fixture function")?;
         function.slots = vec![Ty::Struct(0)];
@@ -278,6 +322,22 @@ fn partial_field_nulling_rejects_malformed_metadata_before_emission() -> TestRes
             .first_mut()
             .ok_or("missing fixture block")?
             .stmt_lines = vec![(0, 0)];
+        malformed.push(program);
+    }
+    for ty in [
+        Ty::Struct(99),
+        Ty::Tuple(99),
+        Ty::Enum(99),
+        Ty::Tagged(99),
+        Ty::Struct(0),
+    ] {
+        let mut program = record.clone();
+        program.structs[0].fields[1].ty = ty;
+        let function = program.fns.first_mut().ok_or("fixture function")?;
+        function.slots = vec![Ty::Struct(0)];
+        let block = function.blocks.first_mut().ok_or("fixture block")?;
+        block.stmts = vec![Stmt::NullStructField(0, 1)];
+        block.stmt_lines = vec![(0, 0)];
         malformed.push(program);
     }
     let mut unreachable = original.clone();

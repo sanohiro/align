@@ -64,7 +64,8 @@ then forwards it through existing value/return/control cleanup transport. It
 zeros only the exact field after a reached transfer. The enclosing parent's
 cleanup bit remains unchanged. LLVM already derives NullStructField's zero from
 the exact field type; broaden eligibility only with producer validation and
-layout owners. No untyped pointer/length store or new runtime mechanism is needed.
+layout owners. Deferred fixed literals initialize their inline slot even at zero length, so a
+containing record has the same construction proof as a direct fixed binding. No untyped pointer/length store or new runtime mechanism is needed.
 
 ## Closure matrix and exact owners
 

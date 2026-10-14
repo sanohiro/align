@@ -4668,9 +4668,20 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
     }
 }
 
-/// Whether a local of `ty` owns a heap buffer that must be freed by a per-binding `Drop` (when its
-/// region is `Static`) — the predicate the drop set is built from. A free-standing owned
-/// collection/string/builder, or an `Option`/`Result` carrying a Move payload.
+/// Whether an already-formed direct record field has a valid owning cleanup plan.
+/// Formation remains responsible for placement restrictions and native resource identities.
+pub fn owned_field_extraction_is_valid(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let plan = drop_plan(ty, structs, tuples, enums, tagged_types);
+    plan.is_valid() && plan.needs_drop()
+}
+
+/// Whether a local owns storage requiring an individual drop outside an arena.
 fn is_owned_droppable(
     ty: Ty,
     structs: &[StructDef],
@@ -30858,10 +30869,6 @@ impl BorrowRoot {
         }
     }
 
-    fn belongs_to_local(&self, local: LocalId) -> bool {
-        matches!(self, Self::Local(owner) | Self::StorageLocal(_, owner, _) if *owner == local)
-    }
-
     fn ended(&self, how: BorrowEnd) -> Self {
         match self {
             Self::ReadOnly => Self::ReadOnly,
@@ -34009,7 +34016,7 @@ impl BorrowState {
         &mut self,
         headers: &ProjectedHeaderFact,
         typed: &[StorageTypedPath],
-        source: Option<LocalId>,
+        source: Option<&(LocalId, StoragePath)>,
         destination: LocalId,
         destination_prefix: &[BorrowProjection],
     ) {
@@ -34037,9 +34044,10 @@ impl BorrowState {
                                     | MoveReleasePlace::Staging { .. }
                                     | MoveReleasePlace::LoopResult { .. }
                             ),
-                            |source| matches!(
+                            |(source, prefix)| matches!(
                                 release,
-                                MoveReleasePlace::Local { local, .. } if *local == source
+                                MoveReleasePlace::Local { local, path }
+                                    if local == source && path.starts_with(prefix)
                             ),
                         )
                     })
@@ -40532,7 +40540,8 @@ impl<'a> MoveCheck<'a> {
                             self.tagged_types,
                         )
                     })
-                    && let Some(source) = self.direct_storage_move_source(argument)
+                    && let Some((source, prefix)) = self.direct_storage_move_source(argument)
+                    && prefix.is_empty()
                 {
                     fact = fact.without_root_sources(
                         &[BorrowRoot::Local(source)].into_iter().collect(),
@@ -41369,7 +41378,8 @@ impl<'a> MoveCheck<'a> {
                     self.tuples,
                     self.enums,
                     self.tagged_types,
-                ) && let Some(source) = self.direct_storage_move_source(result)
+                ) && let Some((source, prefix)) = self.direct_storage_move_source(result)
+                    && prefix.is_empty()
                 {
                     input_error = input_error.without_root_sources(
                         &[BorrowRoot::Local(source)].into_iter().collect(),
@@ -41569,7 +41579,8 @@ impl<'a> MoveCheck<'a> {
                             self.enums,
                             self.tagged_types,
                         )
-                        && let Some(source) = self.direct_storage_move_source(value)
+                        && let Some((source, prefix)) = self.direct_storage_move_source(value)
+                        && prefix.is_empty()
                     {
                         fact = fact.without_root_sources(
                             &[BorrowRoot::Local(source)].into_iter().collect(),
@@ -42159,12 +42170,20 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn direct_storage_move_source(&self, value: &Expr) -> Option<LocalId> {
+    fn direct_storage_move_source(&self, value: &Expr) -> Option<(LocalId, StoragePath)> {
         if let Some(inner) = borrow_transparent_value(value) {
             return self.direct_storage_move_source(inner);
         }
         match &value.kind {
-            ExprKind::Local(local) => Some(*local),
+            ExprKind::Local(local) => Some((*local, Vec::new())),
+            ExprKind::Field { root, path } if path.len() == 1 => Some((
+                *root,
+                path.iter().copied().map(BorrowProjection::StructField).collect(),
+            )),
+            ExprKind::TupleIndex { recv, index } => match recv.kind {
+                ExprKind::Local(local) => Some((local, vec![BorrowProjection::TupleElement(*index)])),
+                _ => None,
+            },
             ExprKind::Block(block)
             | ExprKind::FloatScope { block, .. }
             | ExprKind::Arena(block)
@@ -42180,9 +42199,10 @@ impl<'a> MoveCheck<'a> {
 
     fn detach_legacy_storage_root(
         &mut self,
-        source: LocalId,
+        source: (LocalId, StoragePath),
         headers: &ProjectedHeaderFact,
     ) {
+        let (source, source_prefix) = source;
         let generations = headers
             .leaves
             .values()
@@ -42219,7 +42239,10 @@ impl<'a> MoveCheck<'a> {
                 .iter()
                 .filter_map(|generation| self.borrows.storage.directory.entries.get(generation))
                 .flat_map(|entry| entry.historical_release_roots.iter())
-                .filter(|root| root.belongs_to_local(source))
+                .filter(|root| matches!(root,
+                    BorrowRoot::StorageLocal(_, local, path)
+                        if *local == source && path.starts_with(&source_prefix)
+                ))
                 .cloned(),
         );
         for (local, paths) in affected {
@@ -42323,7 +42346,7 @@ impl<'a> MoveCheck<'a> {
         local: LocalId,
         destination_prefix: &[BorrowProjection],
         incoming: ProjectedHeaderFact,
-        source: Option<LocalId>,
+        source: Option<(LocalId, StoragePath)>,
         replacing: bool,
         owns_selected_value: bool,
     ) {
@@ -42474,7 +42497,7 @@ impl<'a> MoveCheck<'a> {
             self.borrows.transfer_owned_releases(
                 &transferable,
                 &typed.headers,
-                source,
+                source.as_ref(),
                 local,
                 destination_prefix,
             );
@@ -42547,7 +42570,10 @@ impl<'a> MoveCheck<'a> {
                 *local,
                 &[],
                 headers.project_path(&selector),
-                source,
+                source.clone().map(|(local, mut path)| {
+                    path.extend(selector);
+                    (local, path)
+                }),
                 false,
                 owns_selected,
             );
@@ -44266,29 +44292,9 @@ impl<'a> MoveCheck<'a> {
                 }
                 ExprKind::Field { root, path } if path.len() == 1 => {
                     let field = path[0];
-                    if expression.ty == Ty::String
-                        || (matches!(
-                            expression.ty,
-                            Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_)
-                        ) && drop_plan(
-                            expression.ty,
-                            self.structs, self.tuples,
-                            self.enums,
-                            self.tagged_types,
-                        )
-                        .needs_drop())
-                        || is_move_handle(expression.ty)
-                        || matches!(expression.ty, Ty::Resource(_))
-                        || matches!(
-                            expression.ty,
-                            Ty::Enum(id)
-                                if enum_is_move(
-                                    id,
-                                    self.structs, self.tuples,
-                                    self.enums,
-                                    self.tagged_types,
-                                )
-                        )
+                    if owned_field_extraction_is_valid(
+                        expression.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+                    )
                     {
                         if self.borrowed_projection_owners.contains_key(root) {
                             self.diags.error(
@@ -44308,11 +44314,13 @@ impl<'a> MoveCheck<'a> {
                         }
                         self.reject_live_resource_dependents(*root, moved, expression.span);
                         self.invalidate_mutable_place(*root, &[field]);
-                        self.invalidate_owner(*root);
+                        if !self.completed_value_transfers_storage(expression) {
+                            self.invalidate_owner(*root);
+                        }
                         moved.insert(MovedKey::Field(*root, field));
                     } else if self.is_move_ty(expression.ty) {
                         self.diags.error(
-                            "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
+                            "cannot move a field with an invalid cleanup plan".to_string(),
                             expression.span,
                         );
                     }
@@ -47975,7 +47983,10 @@ impl<'a> MoveCheck<'a> {
                     *binding,
                     &[],
                     selected_headers,
-                    scrutinee_source,
+                    scrutinee_source.clone().map(|(local, mut path)| {
+                        path.extend(projection);
+                        (local, path)
+                    }),
                     false,
                     arm_moves_payload && !borrowed,
                 );
@@ -48098,13 +48109,9 @@ impl<'a> MoveCheck<'a> {
                         };
                         self.diags.error(msg, e.span);
                     } else if consuming
-                        && (e.ty == Ty::String
-                            || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                                && drop_plan(e.ty, self.structs, self.tuples, self.enums, self.tagged_types)
-                                    .needs_drop())
-                            || is_move_handle(e.ty)
-                            || matches!(e.ty, Ty::Resource(_))
-                            || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types)))
+                        && owned_field_extraction_is_valid(
+                            e.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+                        )
                     {
                         if self.borrowed_projection_owners.contains_key(base) {
                             self.diags.error(
@@ -48122,35 +48129,24 @@ impl<'a> MoveCheck<'a> {
                             );
                             return true;
                         }
-                        // A partial move of a depth-1 owned `string`/`Option<Move>` field (`n := u.name`,
-                        // `f(u.name)` by value, `return u.name`) — or of a Move **handle** field
-                        // (`c.req.respond(rb)`, the pkg.web `Ctx` consuming its request handle), or
-                        // a Move enum field materialized through control flow:
-                        // mark just that field moved. The
-                        // struct's recursive `Drop` frees null there (MIR nulls the field on move);
-                        // the struct can no longer move as a whole, and the field can't be reused,
-                        // but its other fields stay readable. A *borrow* (`u.name.len()`, a `str`
-                        // argument) reaches here non-consuming (wrapped in `StrBorrow`/`Len`), so it
-                        // is allowed and moves nothing.
+                        // Transfer only this complete direct field. MIR clears its exact type;
+                        // sibling fields and their allocation generations remain live.
                         self.reject_live_resource_dependents(*base, moved, e.span);
                         self.invalidate_mutable_place(*base, &[fld]);
-                        self.invalidate_owner(*base);
+                        if !self.completed_value_transfers_storage(e) {
+                            self.invalidate_owner(*base);
+                        }
                         moved.insert(MovedKey::Field(*base, fld));
                     } else if consuming && self.is_move_ty(e.ty) {
-                        // A whole nested Move-struct field (`a := u.addr`) moved out is still
-                        // deferred — it needs the whole sub-struct nulled, not a single `{ptr,len}`.
                         self.diags.error(
-                            "moving a nested struct field out of a struct is not supported yet — clone it, or move the whole struct".to_string(),
+                            "cannot move a field with an invalid cleanup plan".to_string(),
                             e.span,
                         );
                     }
                 } else {
-                    // Depth ≥ 2 (`u.addr.name`): a borrow is fine; the read is invalid only if the
-                    // root struct was moved (as a whole or in any field — conservative for deep
-                    // reads). Moving a field out through a nested path is deferred.
-                    if whole_moved(moved, *base) {
-                        // A deep read is blocked by a whole-struct move or — conservatively — any
-                        // partial field move; distinguish the two for a clearer message.
+                    // Deep reads remain available under an unmoved sibling. Consuming a
+                    // deeper field still requires a distinct nested partial-move design.
+                    if path.first().is_some_and(|field| field_moved(moved, *base, *field)) {
                         let name = &self.f.locals[*base as usize].name;
                         let msg = if moved.contains(&MovedKey::Whole(*base)) {
                             format!("use of moved value '{name}'")
@@ -77323,6 +77319,95 @@ fn parse_mask_name(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_field_extraction_families_and_invalid_plans() {
+        for ty in [
+            "string",
+            "array<i64>",
+            "array<str>",
+            "array<string>",
+            "array<Entry>",
+            "array<vec2<i64>>",
+            "array<[i64;2]>",
+            "[string;2]",
+            "[string;0]",
+            "[array<i64>;2]",
+            "[Entry;2]",
+            "Inner",
+            "(string,array<i64>)",
+            "Option<string>",
+            "Result<string,Error>",
+            "buffer",
+        ] {
+            let source = format!(
+                "Entry {{ name:string }}\nInner {{ items:array<Entry>, fixed:[i64;2] }}\nR {{ value:{ty}, marker:i64 }}\nfn extract(owner:R)->{ty} = owner.value\nfn main()->i32=0\n"
+            );
+            let (program, diagnostics) = check(&source);
+            assert!(
+                !diagnostics.has_errors(),
+                "{ty}: {:?}",
+                diagnostics.iter().collect::<Vec<_>>()
+            );
+            assert!(
+                checked_hir_body_facts_are_valid(&program),
+                "{ty}: semantic replay"
+            );
+            let record = program
+                .structs
+                .iter()
+                .find(|record| record.name == "R")
+                .expect("R");
+            assert!(
+                owned_field_extraction_is_valid(
+                    record.fields[0].ty,
+                    &program.structs,
+                    &program.tuples,
+                    &program.enums,
+                    &program.tagged_types
+                ),
+                "{ty}"
+            );
+        }
+        let fields = |ty| {
+            vec![FieldDef {
+                name: "value".into(),
+                ty,
+            }]
+        };
+        let mut records = vec![StructDef {
+            name: "Cycle".into(),
+            source_name: "Cycle".into(),
+            align: None,
+            c_repr: false,
+            fields: fields(Ty::Struct(0)),
+        }];
+        for ty in [
+            Ty::Bool,
+            Ty::Str,
+            Ty::Struct(0),
+            Ty::Struct(99),
+            Ty::Tuple(99),
+            Ty::Enum(99),
+            Ty::Tagged(99),
+        ] {
+            assert!(
+                !owned_field_extraction_is_valid(ty, &records, &[], &[], &[]),
+                "{ty:?}"
+            );
+        }
+        records[0].fields = fields(Ty::String);
+        for ty in [
+            Ty::Struct(0),
+            Ty::StructArray(0, 0),
+            Ty::Array(Scalar::String, 0),
+        ] {
+            assert!(
+                owned_field_extraction_is_valid(ty, &records, &[], &[], &[]),
+                "{ty:?}"
+            );
+        }
+    }
+
     #[test]
     fn tuple_carrier_layout_and_drop_plans() {
         let integer = |bits| {

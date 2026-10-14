@@ -11799,11 +11799,7 @@ pub(crate) fn struct_field_nulling_type_is_valid(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    ty == Ty::String
-        || matches!(ty, Ty::Resource(_))
-        || align_sema::is_move_handle(ty)
-        || (matches!(ty, Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-            && align_sema::drop_plan(ty, structs, tuples, enums, tagged_types).needs_drop())
+    align_sema::owned_field_extraction_is_valid(ty, structs, tuples, enums, tagged_types)
 }
 
 /// Authenticate partial source nulling before publication or LLVM construction.
