@@ -2012,7 +2012,8 @@ pub enum Rvalue {
         out: Slot,
     },
     /// `fs.open_ro(path)`: O_RDONLY|O_CLOEXEC, same private File output and i32 status.
-    FileOpenRo { path: Operand, out: Slot },
+    /// `regular_only` selects same-descriptor regular admission before File publication.
+    FileOpenRo { path: Operand, out: Slot, regular_only: bool },
     /// Exclusive final-entry creation with the existing read/write File owner.
     FileCreateRwExclusive { path: Operand, out: Slot },
     /// `f.pread(b, off)` — one positionless read at file offset `off` into the `buffer` `b`,
@@ -20501,8 +20502,8 @@ fn lower_file_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::FileOpenRw { path } => {
             lower_open_handle(b, path, Ty::File, result_ty, |path, out| Rvalue::FileOpenRw { path, out })
         }
-        hir::ExprKind::FileOpenRo { path } => {
-            lower_open_handle(b, path, Ty::File, result_ty, |path, out| Rvalue::FileOpenRo { path, out })
+        hir::ExprKind::FileOpenRo { path, regular_only } => {
+            lower_open_handle(b, path, Ty::File, result_ty, |path, out| Rvalue::FileOpenRo { path, out, regular_only: *regular_only })
         }
         hir::ExprKind::FileCreateRwExclusive { path } => {
             lower_open_handle(b, path, Ty::File, result_ty, |path, out| Rvalue::FileCreateRwExclusive { path, out })

@@ -165,6 +165,19 @@ NUL は Invalid、空パスは通常の OS エラー変換となる。不在は 
 しない。既存の読み書きコンストラクタと全量書き込み成功の契約は同じ。
 
 
+`fs.open_ro_regular(path: str) -> Result<file, Error>` は、regular file の位置指定
+読み取り用の Impure な Linux/macOS constructor（plan 185）。`open_regular` と
+同じ通常のパス解決・descriptor 検証を共有する。O_RDONLY|O_NONBLOCK|O_CLOEXEC
+で一度だけ開き、fstat で regular を確認し、F_GETFL/F_SETFL で O_NONBLOCK を
+解除した同じ descriptor を既存の Move File として返す。directory/device/FIFO は
+FIFO writer を待たず Invalid。パスの事前 stat や再 open は行わない。UTF-8/NUL を
+filesystem 操作前に検証し、空パスと native error は既存の対応に従う。各 admission
+syscall は EINTR のみ再試行し、失敗時には取得済み fd を一度 close して元の error を
+返す。一時的な native path と既存の File shell のみ allocate し、借用した path は
+保持しない。既存の位置指定操作・short read・EOF・read-only pwrite の Denied・Drop
+が適用される。検証後のパス差し替えで descriptor は変わらないが、内容の不変性・
+パスの閉じ込め・remote filesystem 操作の中断可能性は保証しない。
+
 ### `create_exclusive`
 
 `create_exclusive` は、受理する Unix ターゲットで

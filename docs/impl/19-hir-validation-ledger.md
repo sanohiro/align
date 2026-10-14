@@ -1325,7 +1325,7 @@ merely because its `Ty` matches.
 | `FileCreateRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FileCreateRwExclusive` | `env[]; child[path]`; `Str; result ERR(File); new exclusive read/write owned fd; Impure`. |
 | `FileOpenRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
-| `FileOpenRo` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
+| `FileOpenRo` | `env[regular_only: bool]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. False selects `fs.open_ro`; true selects `fs.open_ro_regular`, using the shared regular-kind admission and blocking restoration before File publication. Replay/MIR preserve the discriminator; ABI remains A08 (plan185). |
 | `FilePread` | `env[]; child[file,buffer,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64; result ERR(i64); handles borrowed, buffer mutated; Impure`. |
 | `FilePreadInto` | `env[]; child[file,buffer,destination_offset,length,offset]`; `LocalHandle(File,file), SourceMutLocal(Buffer,buffer), i64 × 3; result ERR(i64); both handles borrowed, buffer exclusively mutated; Impure`. |
 | `FilePwrite` | `env[]; child[file,data,offset]`; `File, byte-view, i64; result ERR(i64); borrowed; Impure`. |

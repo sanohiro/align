@@ -3653,6 +3653,7 @@ fs.create_rw(path: str) -> Result<file, Error>   // O_RDWR|O_CREAT|O_TRUNC — a
 fs.create_rw_exclusive(path: str) -> Result<file, Error>   // atomic exclusive random-access create
 fs.open_rw(path: str)   -> Result<file, Error>   // O_RDWR, must exist — in-place update (see std.io `file`)
 fs.open_ro(path: str)   -> Result<file, Error>   // O_RDONLY|O_CLOEXEC, must exist — bounded random reads
+fs.open_ro_regular(path: str) -> Result<file, Error> // same-descriptor regular admission
 fs.create_dir(path: str) -> Result<(), Error>
 fs.is_dir(path: str) -> Result<bool, Error>
 fs.exists(path: str) -> bool
@@ -3683,6 +3684,21 @@ other failures Code(errno) through the fixed table. It allocates the existing na
 and ephemeral NUL-terminated native path, with no read buffer or mapping. The result is the same
 owned `file` and retains no path lifetime. The M12 deferred non-mmap random-read trigger is met by
 align-llm's read-only model, transcript and KV inputs (plan 84).
+
+`fs.open_ro_regular(path: str) -> Result<file, Error>` is the Impure Linux/macOS
+constructor for positional reads of an admitted regular file (plan 185). It shares
+`open_regular`'s ordinary path resolution and exact descriptor admission: one
+O_RDONLY|O_NONBLOCK|O_CLOEXEC open, fstat regular-kind check, F_GETFL and F_SETFL
+clearing O_NONBLOCK, then publication of that same descriptor as the existing Move
+File. Directories, devices and FIFOs return Invalid without waiting for a FIFO
+writer. No pathname pre-stat or reopen is used. UTF-8/NUL validation precedes
+filesystem work; empty paths and native errors keep their existing mapping.
+Each admission syscall retries EINTR; failure closes an acquired fd once and
+preserves the primary error. Only transient native path storage and the existing
+File shell allocate. The borrowed path is not retained. Existing positional
+methods, short reads, EOF, read-only pwrite denial and Drop apply unchanged.
+Path replacement cannot switch the descriptor after admission; content stability,
+path confinement and remote-filesystem interruptibility are not promised.
 
 `fs.create_exclusive` creates one new regular file entry with the native
 exclusive-create operation (`O_CREAT|O_EXCL`, plus close-on-exec and final

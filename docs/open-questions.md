@@ -4051,6 +4051,16 @@ retain their mapping. Input UTF-8/NUL validation precedes filesystem work. No pa
 sandbox, content stability or remote-operation interruptibility is promised. Plan 58 owns the
 exact native ABI and acceptance. Plan 59 supersedes the J3b bare dynamic-array encoding restriction following explicit owner approval.
 
+### Regular-file positional admission (2026-10-14)
+
+`fs.open_ro_regular(path: str) -> Result<file, Error>` publishes the existing Move
+File from the exact regular descriptor admitted by the shared `open_regular`
+state machine. Ordinary path resolution, UTF-8/NUL validation, native error
+mapping, nonblocking regular-kind check and blocking restoration apply; no second
+open or new handle model is introduced. Positional methods, readonly denial and
+Drop retain their contracts. Plan 185 owns the public ledger and typed native
+publication; media AM-R03 supplies the consumer need.
+
 ## Open (to be decided)
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)

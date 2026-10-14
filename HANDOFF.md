@@ -24,6 +24,10 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan185](docs/impl/185-read-only-regular-file.md) adds `fs.open_ro_regular`
+  for media AM-R03: regular-file admission and positional I/O share one owned
+  descriptor and the existing File model. Consumer adoption remains external.
+
 - [Plan184](docs/impl/184-record-array-subslice-producer.md) certifies existing
   AoS record-array subslices beside fallible owned returns for media AM-R06.
   Exact source/result/stride checks retain shared backing authority and cleanup;

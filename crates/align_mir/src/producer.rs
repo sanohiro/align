@@ -1706,7 +1706,7 @@ pub fn native_owner_mir_contract<'a>(
                 (value, Ty::Int(IntTy { bits: 8, signed: false }), read)];
         }
         Rvalue::FileCreateRw { path, out } | Rvalue::FileOpenRw { path, out }
-        | Rvalue::FileOpenRo { path, out } | Rvalue::FileCreateRwExclusive { path, out } => {
+        | Rvalue::FileOpenRo { path, out, .. } | Rvalue::FileCreateRwExclusive { path, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::File)];
             contract.operands = vec![(path, Ty::Str, read)];

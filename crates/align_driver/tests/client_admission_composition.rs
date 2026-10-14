@@ -1,5 +1,7 @@
 //! R84–R88 provider owners; consumer policy and managed-pin adoption remain external.
 mod common;
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
 use common::*;
 
 fn run_both(name: &str, helper: &str, main: &str, expected: &str) {
@@ -356,24 +358,21 @@ fn main() -> Result<(), Error> {{
 
 #[test]
 fn regular_reader_requires_import_and_exact_path_type() {
-    for source in [
-        "fn main() { fs.open_regular(\"x\") }",
-        "import std.fs\nfn main() { fs.open_regular(3) }",
-        "import std.fs\nfn main() { fs.open_regular() }",
-        "import std.fs\nfn main() { fs.open_regular(\"x\", 1) }",
-    ] {
-        let checked = diff_check_multi(
-            "r88-invalid-source",
-            &[("main.align", source)],
-            "main.align",
-        );
-        assert!(
-            checked.whole_errors && checked.per_unit_errors,
-            "{}\n{}",
-            checked.whole_diags,
-            checked.per_unit_diags
-        );
-    }
+    owned_fixture::run(
+        "regular_reader_requires_import_and_exact_path_type",
+        |stage| {
+            for constructor in ["open_regular", "open_ro_regular"] {
+                for source in [
+                    "fn main() { fs.open_regular(\"x\") }",
+                    "import std.fs\nfn main() { fs.open_regular(3) }",
+                    "import std.fs\nfn main() { fs.open_regular() }",
+                    "import std.fs\nfn main() { fs.open_regular(\"x\", 1) }",
+                ] {
+                    regular_source_errors(stage, &source.replace("open_regular", constructor));
+                }
+            }
+        },
+    );
 }
 
 fn private_fixture() -> Proj {
@@ -649,4 +648,209 @@ fn main() -> Result<(), Error> {
 }
 "#;
     run_both("r87-arena-result", helper, main, "true\n[\"view\"]\n0\n");
+}
+
+// Plan185: imported construction, temporary path lifetime and cached discriminator replay.
+#[test]
+fn regular_file_positional_lifecycle_and_replay() {
+    owned_fixture::run("regular_file_positional_lifecycle_and_replay", |stage| {
+        let path = stage.join("input");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let helper = r#"module helper
+import std.fs
+pub fn open<T>(path:str, tag:T, way:i64)->Result<file,Error> {
+  if way==0 { return fs.open_ro_regular(path.clone()) }
+  if way==1 { return fs.open_ro_regular(if true {path.clone()} else {"unused".clone()}) }
+  if way==2 { return fs.open_ro_regular(match way {2=>path.clone(),_=>"unused".clone()}) }
+  if way==3 { return fs.open_ro_regular(loop {break path.clone()}) }
+  return arena {fs.open_ro_regular(path.clone())}
+}
+pub fn skipped(path:str)->Result<file,Error> {
+  pending:=fs.open_ro_regular({return Err(Error.Invalid);path.clone()})
+  return pending
+}
+pub fn mapped(error:Error)->Error = error
+pub fn observe(borrow input:file)->Result<(),Error> {
+  mut bytes:=buffer(8)
+  if input.len()?!=10 {return Err(Error.Invalid)}
+  if input.pread_into(bytes,0,4,6)?!=4 {return Err(Error.Invalid)}
+  if bytes.bytes().as_str()?!="6789" {return Err(Error.Invalid)}
+  if input.pread_into(bytes,4,4,0)?!=4 {return Err(Error.Invalid)}
+  if bytes.bytes().as_str()?!="67890123" {return Err(Error.Invalid)}
+  if input.pread_into(bytes,0,8,10)?!=0 || bytes.len()!=8 {return Err(Error.Invalid)}
+  if input.pread(bytes,8)?!=2 {return Err(Error.Invalid)}
+  if bytes.bytes().as_str()?!="89" {return Err(Error.Invalid)}
+  match input.pwrite("",0) {Err(error)=>{match error {Denied=>{},_=>{return Err(error)}}},Ok(count)=>{return Err(Error.Invalid)}}
+  return Ok(())
+}
+"#;
+        let main = format!(
+            r#"module main
+import helper
+import std.fs
+fn exercise()->Result<(),Error> {{
+  path:={path:?}
+  mut way:=0
+  loop {{
+    if way==5 {{break}}
+    mut input:=helper.open(path,way,way).map_err(helper.mapped)?
+    helper.observe(input)?
+    input=helper.open(path,true,way) else {{return Err(Error.Invalid)}}
+    helper.observe(input)?
+    match helper.open(path,"tag",way) {{Ok(selected)=>{{helper.observe(selected)?}},Err(error)=>{{return Err(error)}}}}
+    discarded:=helper.open(path,way,way)
+    way=way+1
+  }}
+  match helper.skipped(path) {{Err(error)=>{{match error {{Invalid=>{{}},_=>{{return Err(error)}}}}}},Ok(unexpected)=>{{return Err(Error.Invalid)}}}}
+  match fs.open_ro_regular({directory:?}) {{Err(error)=>{{match error {{Invalid=>{{}},_=>{{return Err(error)}}}}}},Ok(unexpected)=>{{return Err(Error.Invalid)}}}}
+  match fs.open_ro_regular({missing:?}) {{Err(error)=>{{match error {{NotFound=>{{}},_=>{{return Err(error)}}}}}},Ok(unexpected)=>{{return Err(Error.Invalid)}}}}
+  return Ok(())
+}}
+fn main()->i32 {{return match exercise() {{Ok(value)=>0,Err(error)=>1}}}}
+"#,
+            path = path.to_str().unwrap(),
+            directory = stage.to_str().unwrap(),
+            missing = stage.join("missing").to_str().unwrap()
+        );
+        std::fs::write(stage.join("helper.align"), helper).unwrap();
+        let entry = stage.join("main.align");
+        std::fs::write(&entry, &main).unwrap();
+        let entry = entry.to_str().unwrap();
+        let mut sources = align_span::SourceMap::new();
+        let checked = align_driver::check(&mut sources, entry, &main);
+        assert!(
+            !checked.diags.has_errors(),
+            "{}",
+            align_driver::format_diagnostics(&sources, &checked.diags)
+        );
+        let whole = align_mir::lower_program_checked(&checked.hir, false, Some(&sources)).unwrap();
+        regular_file_execute(stage, &[whole], "whole");
+        let mut sources = align_span::SourceMap::new();
+        let built = align_driver::build_per_unit(&mut sources, entry, &main);
+        assert!(
+            !built.diags.has_errors(),
+            "{}",
+            align_driver::format_diagnostics(&sources, &built.diags)
+        );
+        regular_file_execute(
+            stage,
+            &built
+                .units
+                .into_iter()
+                .map(|unit| unit.mir)
+                .collect::<Vec<_>>(),
+            "units",
+        );
+        let cache = align_driver::CacheContext::at(stage.join("cache"));
+        for round in 0..2 {
+            let mut sources = align_span::SourceMap::new();
+            let mut built = align_driver::build_package(
+                &mut sources,
+                entry,
+                &main,
+                &cache,
+                align_driver::UnitReuse::Allowed,
+            );
+            assert!(
+                !built.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sources, &built.diags)
+            );
+            assert_eq!(built.units.len(), 2);
+            assert!(
+                built
+                    .units
+                    .iter()
+                    .all(|unit| unit.frontend.as_ref().unwrap().hit == (round == 1))
+            );
+            let programs = (0..built.units.len())
+                .map(|i| built.materialize(i).unwrap().clone())
+                .collect::<Vec<_>>();
+            if round == 1 {
+                regular_file_execute(stage, &programs, "cache-hit")
+            }
+        }
+    });
+}
+
+fn regular_file_execute(stage: &std::path::Path, programs: &[align_mir::Program], label: &str) {
+    let mut objects = Vec::new();
+    let mut libraries = Vec::new();
+    for (i, program) in programs.iter().enumerate() {
+        let object = stage.join(format!("{label}-{i}.o"));
+        align_driver::emit_object_file(
+            program,
+            &object,
+            align_driver::BuildTarget::Baseline,
+            align_driver::Profile::Release,
+            &[],
+            false,
+        )
+        .unwrap();
+        objects.push(object);
+        for library in &program.link_libs {
+            if !libraries.contains(library) {
+                libraries.push(library.clone());
+            }
+        }
+    }
+    let binary = stage.join(label);
+    align_driver::link_objects(
+        &align_driver::CDriver::default(),
+        &objects.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
+        &binary,
+        &libraries,
+        align_driver::Profile::Release,
+    )
+    .unwrap();
+    let output = std::process::Command::new(binary).output().unwrap();
+    assert!(
+        output.status.success() && output.stdout.is_empty() && output.stderr.is_empty(),
+        "{label}: {output:?}"
+    );
+}
+
+#[test]
+fn regular_file_preserves_effect_type_and_move_rules() {
+    owned_fixture::run(
+        "regular_file_preserves_effect_type_and_move_rules",
+        |stage| {
+            for (source, diagnostic) in [
+                (
+                    "fn inspect(x:i64)->i64 { result:=fs.open_ro_regular(\"input\"); return x }\nfn main(){ values:=[1,2].par_map(inspect); print(values.sum()) }",
+                    "requires a Pure function",
+                ),
+                (
+                    "fn take(value:file) {}\nfn main()->Result<(),Error> { value:=fs.open_ro_regular(\"input\")?; take(value); value.len()?; return Ok(()) }",
+                    "moved",
+                ),
+                (
+                    "fn main()->Result<(),Error> { value:reader:=fs.open_ro_regular(\"input\")?; return Ok(()) }",
+                    "type mismatch",
+                ),
+            ] {
+                let source = format!("import std.fs\n{source}\n");
+                for errors in regular_source_errors(stage, &source) {
+                    assert!(errors.contains(diagnostic), "{errors}");
+                }
+            }
+        },
+    );
+}
+
+fn regular_source_errors(stage: &std::path::Path, source: &str) -> [String; 2] {
+    let entry = stage.join("main.align");
+    std::fs::write(&entry, source).unwrap();
+    let entry = entry.to_str().unwrap();
+    let mut sources = align_span::SourceMap::new();
+    let whole = align_driver::check(&mut sources, entry, source);
+    assert!(whole.diags.has_errors(), "whole-program accepted {source}");
+    let whole_errors = align_driver::format_diagnostics(&sources, &whole.diags);
+    let mut sources = align_span::SourceMap::new();
+    let units = align_driver::check_per_unit(&mut sources, entry, source);
+    assert!(units.diags.has_errors(), "per-unit accepted {source}");
+    [
+        whole_errors,
+        align_driver::format_diagnostics(&sources, &units.diags),
+    ]
 }

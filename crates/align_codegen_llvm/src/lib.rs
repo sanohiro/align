@@ -23893,7 +23893,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(match rv {
             Rvalue::FileCreateRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileCreate, path, *out)?,
             Rvalue::FileOpenRw { path, out } => self.gen_open_handle(RuntimeKey::IoFileOpen, path, *out)?,
-            Rvalue::FileOpenRo { path, out } => self.gen_open_handle(RuntimeKey::IoFileOpenRo, path, *out)?,
+            Rvalue::FileOpenRo { path, out, regular_only } => self.gen_open_handle(
+                if *regular_only { RuntimeKey::IoFileOpenRoRegular } else { RuntimeKey::IoFileOpenRo }, path, *out)?,
             Rvalue::FileCreateRwExclusive { path, out } => self.gen_open_handle(RuntimeKey::IoFileCreateExclusive, path, *out)?,
             // f.pread(b, off) — the runtime fills the buffer window at `off`, returns i64 count-or-status.
             Rvalue::FilePread { file, buffer, offset } => {
@@ -32268,10 +32269,28 @@ fn main() -> i32 = 0
 
     #[test]
     fn file_constructors_mir_gate_requires_exact_native_slots() -> Result<(), &'static str> {
-        for constructor in ["create_rw", "open_rw", "open_ro", "create_rw_exclusive"] {
+        for constructor in ["create_rw", "open_rw", "open_ro", "open_ro_regular", "create_rw_exclusive"] {
             let base = mir(&format!("import std.fs\nfn f(path: str, spare: file) -> Result<file, Error> = fs.{constructor}(path)\nfn main() -> i32 = 0\n"));
             assert!(validate_resource_rvalues(&base).is_ok());
             let index = xml_test_function(&base, "f");
+            if matches!(constructor, "open_ro" | "open_ro_regular") {
+                for regular in [false, true] {
+                    let mut selected = base.clone();
+                    let policy = selected.fns[index].blocks.iter_mut().flat_map(|block| &mut block.stmts)
+                        .find_map(|statement| match statement {
+                            Stmt::Let(_, Rvalue::FileOpenRo { regular_only, .. }) => Some(regular_only),
+                            _ => None,
+                        }).ok_or("read-only policy")?;
+                    assert_eq!(*policy, constructor == "open_ro_regular");
+                    *policy = regular; // Both policies are valid; the Boolean must select its exact native row.
+                    let ir = emit_llvm_ir(&selected, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                        .map_err(|_| "read-only policy lowering")?;
+                    let regular_call = "call i32 @align_rt_io_file_open_ro_regular(";
+                    let ordinary_call = "call i32 @align_rt_io_file_open_ro(";
+                    assert_eq!(ir.contains(regular_call), regular);
+                    assert_eq!(ir.contains(ordinary_call), !regular);
+                }
+            }
             let (value, out) = base.fns[index].blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
                 Stmt::Let(value, Rvalue::FileCreateRw { out, .. } | Rvalue::FileOpenRw { out, .. }
                     | Rvalue::FileOpenRo { out, .. } | Rvalue::FileCreateRwExclusive { out, .. }) => Some((*value, *out)), _ => None,
@@ -32281,7 +32300,7 @@ fn main() -> i32 = 0
                 let spare = *wrong.fns[index].params.get(1).ok_or("file spare parameter")?;
                 let (path, output) = wrong.fns[index].blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
                     Stmt::Let(_, Rvalue::FileCreateRw { path, out } | Rvalue::FileOpenRw { path, out }
-                        | Rvalue::FileOpenRo { path, out } | Rvalue::FileCreateRwExclusive { path, out }) => Some((path, out)), _ => None,
+                        | Rvalue::FileOpenRo { path, out, .. } | Rvalue::FileCreateRwExclusive { path, out }) => Some((path, out)), _ => None,
                 }).ok_or("file mutable fixture")?;
                 match mutation {
                     0 => *path = Operand::Const(Const::Bool(true)),

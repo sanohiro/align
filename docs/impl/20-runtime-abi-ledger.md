@@ -8,8 +8,8 @@ ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
 returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Plan 65's
 SIMD-surface consistency capability adds `BufferAppendFilled`. Unsigned integer display adds `PrintU64`, a non-retaining `u64` input with
 `void(i64)` native ABI and the same stdout/flush behavior as signed display.
-Current inventory: 466 keyed,
-484 base, 491 alloc-count, 488 par-map-probe and 495 maximum exports.
+Current inventory: 467 keyed,
+485 base, 492 alloc-count, 489 par-map-probe and 496 maximum exports.
 
 **R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
@@ -79,7 +79,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 466 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 467 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -92,7 +92,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 484 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 485 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
 (A127–A130), including separate finite-only f32/f64 writers.
 The explicit `alloc-count` runtime feature may expose seven
 test/benchmark-only definitions: the allocation/free and finder counters plus
@@ -104,10 +104,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 484 base records.
+The compiler-visible native registry is always exactly the 485 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 495.
+records extend only the verification-time maximum runtime-export table to 496.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -126,14 +126,14 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 466 keyed records, 484 base records, and 495 records in the maximum optional-probe export table.
+are 467 keyed records, 485 base records, and 496 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
 
 ## Runtime effect classification
 
-Every one of the 484 base rows has one `RuntimeEffects` record in
+Every one of the 485 base rows has one `RuntimeEffects` record in
 `align_codegen_llvm::runtime_abi`. The record is a total match over
 `RuntimeAbiId`; there is no unclassified/default arm. Its exact fields are
 `class`, `argmem`, per-pointer `params`, `escapes`, `releases`,
@@ -423,6 +423,7 @@ declaration golden owns the emitted declaration and the class token together.
 | `IoFileLen` | `align_rt_io_file_len` | `HostState` |
 | `IoFileOpen` | `align_rt_io_file_open` | `HostState` |
 | `IoFileOpenRo` | `align_rt_io_file_open_ro` | `HostState` |
+| `IoFileOpenRoRegular` | `align_rt_io_file_open_ro_regular` | `HostState` |
 | `IoFilePread` | `align_rt_io_file_pread` | `HostState` |
 | `IoFilePreadInto` | `align_rt_io_file_pread_into` | `HostState` |
 | `IoFilePwrite` | `align_rt_io_file_pwrite` | `HostState` |
@@ -1737,24 +1738,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 466 keys, mapped symbols, LLVM declaration types, and derived effects
+- all 467 keys, mapped symbols, LLVM declaration types, and derived effects
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 484 base native symbols against default-feature `align_runtime` exports,
+- the 485 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 491 `alloc-count` and 488 `par-map-probe` native symbols against
+- the 492 `alloc-count` and 489 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 495 maximum native symbols against `align_runtime` built with
+- the 496 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 466 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  466 exact registry function types through the production compatibility
+- all 467 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  467 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; explicit `ArgsBuild` exact status/out-pointer source
@@ -2079,6 +2080,22 @@ source access and returns Denied for read-only access, including empty data;
 negative offset still aborts first. No File layout, ABI shape or attribute policy
 changes. Runtime flags/path/read/denial and existing cycle owners, typed producer
 mutations, the declaration golden and native exports close this boundary.
+
+## Regular read-only File (media AM-R03)
+
+Plan 185 adds `IoFileOpenRoRegular` / `align_rt_io_file_open_ro_regular`, A08
+`i32(ptr path, i64 byte_len, ptr out_file)`, HostState / ArgMem Unstated, uncurated
+parameters, escapes [0,2], no release/fresh return/divergence, matching FileOpenRo.
+The typed File publisher shares the regular-reader numerical/text/acquisition
+helper. Output nonnull/alignment/range, signed input length including NUL scratch,
+positive-null/input range and input/output disjointness precede all memory access.
+Numerical/overlap rejection leaves output untouched; later failures leave null.
+UTF-8 then embedded NUL are checked before open/stat/getflags/setflags. Success
+alone publishes a File owning the same blocking, close-on-exec regular fd.
+Input stays call-scoped; the live-storage obligation remains with native callers.
+No File layout, Drop or ABI shape changes. Both publisher owners, positional
+path-replacement witnesses, malformed compiler owners and native signature/export
+checks close this boundary.
 
 ## Exclusive random-access File (Request 30)
 
