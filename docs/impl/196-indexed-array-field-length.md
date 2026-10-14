@@ -49,7 +49,11 @@ separately requires the exact selected `element_ty` to be an ordinary array.
 
 ## Implementation closure
 
-All named owners live in `crates/align_driver/tests/indexed_array_field_length.rs`.
+The source/native owners live in `crates/align_driver/tests/indexed_array_field_length.rs`.
+The MIR unit owner `indexed_array_field_length_permission_stops_at_calls` directly
+checks the body validator: neither direct nor function-value calls may pass the
+length-only permission to their argument children. Its fixed runtime-index twins
+fail on the uncorrected implementation, independently of later MIR rejection.
 Sema's `check_index_field` admits only the immediate Len receiver. MoveCheck
 reserves the source before the index; both its eager worklist and transparent
 spine preserve that action boundary. Existing escape analysis walks the same

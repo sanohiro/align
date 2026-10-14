@@ -70085,10 +70085,10 @@ impl<'a, 't> Checker<'a, 't> {
                 Ty::Slice(Scalar::Struct(_)) | Ty::DynStructArray(_, Layout::Aos)
             ) || (matches!(r.ty, Ty::StructArray(..))
                 && matches!(index.kind, ast::ExprKind::Int(_))));
-        if drop_plan(leaf_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()
-            && !(matches!(leaf_ty, Ty::Resource(_)) && matches!(r.ty, Ty::StructArray(..)))
-            && !indexed_move_borrow
-            && !length_observation
+        let admitted_move_field = indexed_move_borrow || length_observation
+            || matches!((r.ty, leaf_ty), (Ty::StructArray(..), Ty::Resource(_)));
+        if !admitted_move_field
+            && drop_plan(leaf_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()
         {
             self.diags.error(
                 format!(

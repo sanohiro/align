@@ -20736,3 +20736,33 @@ fn dynamic_array_field_mir_selected_header() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[test]
+fn indexed_array_field_length_permission_stops_at_calls() -> Result<(), String> {
+    let mut accepted = Vec::new();
+    for indirect in [false, true] {
+        let (setup, target) = if indirect { ("callback:=text;", "callback") } else { ("", "text") };
+        let source = format!(
+            "R {{ids:array<i64>}}\nfn text(borrow ids:array<i64>)->str=\"ok\"\n\
+             fn observed(borrow rows:[R;1],i:i64)->i64 {{{setup}return {target}(rows[0].ids).len()}}\nfn main(){{}}"
+        );
+        let mut program = checked_source_program(&source);
+        assert!(body_core_metadata_is_valid(&program), "valid literal/{indirect}");
+        let function = program.fns.iter_mut().find(|f| f.name == "observed").ok_or("missing observed function")?;
+        let index_local = function.params[1];
+        let expression = function.body.stmts.iter_mut().find_map(|stmt| {
+            if let hir::Stmt::Return(Some(value)) = stmt { Some(value) } else { None }
+        }).ok_or("missing observed return")?;
+        let hir::ExprKind::Len(call) = &mut expression.kind else { panic!("length") };
+        let argument = match &mut call.kind {
+            hir::ExprKind::Call { args, .. } | hir::ExprKind::CallFnValue { args, .. } => &mut args[0],
+            _ => panic!("call"),
+        };
+        let hir::ExprKind::ElemField { index, .. } = &mut argument.kind else { panic!("field") };
+        index.kind = hir::ExprKind::Local(index_local);
+        // Assert this exact HIR boundary: a later MIR refusal must not mask leaked permission.
+        accepted.push(body_core_metadata_is_valid(&program));
+    }
+    assert_eq!(accepted, [false, false], "direct/indirect nested shared calls");
+    Ok(())
+}

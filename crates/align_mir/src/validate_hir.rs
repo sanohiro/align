@@ -6824,6 +6824,7 @@ impl<'a> BodyValidator<'a> {
                     let mut arg_context = context.clone();
                     arg_context.pooled_initializer = None;
                     arg_context.signed_min_magnitude = false;
+                    arg_context.allow_indexed_array_field_length = false;
                     arg_context.allow_indexed_move_field_borrow = self
                         .function_value_arg_is_shared_borrow(callee, index);
                     work.push(BodyWork::EnterExpr(arg, arg_context));
@@ -6885,6 +6886,7 @@ impl<'a> BodyValidator<'a> {
                     let mut arg_context = context.clone();
                     arg_context.pooled_initializer = None;
                     arg_context.signed_min_magnitude = false;
+                    arg_context.allow_indexed_array_field_length = false;
                     arg_context.allow_indexed_move_field_borrow =
                         self.direct_call_arg_is_shared_borrow(func, index);
                     work.push(BodyWork::EnterExpr(arg, arg_context));
