@@ -698,7 +698,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::JsonStrHole(o) => format!("json_str({})", operand_str(o)),
                     crate::TemplatePiece::OwnedJsonRecords { value, plan } => {
                         format!(
-                            "owned_json_records_v3(root=struct#{}, graph={:?}, {})",
+                            "owned_json_records_v4(root=struct#{}, graph={:?}, {})",
                             plan.root,
                             plan.records,
                             operand_str(value)
@@ -730,9 +730,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecode { struct_id, input, out, .. } => {
             format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
-        Rvalue::JsonOwnedDecode { root_kind, plan, input, out } => {
+        Rvalue::JsonOwnedDecode { root_kind, plan, input, out, arena } => {
             format!(
-                "json_owned_decode_v3({root_kind:?} struct#{}, graph={:?}, {}, -> _{out})",
+                "json_owned_decode_v4({root_kind:?} struct#{}, graph={:?}, {}, -> _{out}, arena={arena:?})",
                 plan.root,
                 plan.records,
                 operand_str(input)

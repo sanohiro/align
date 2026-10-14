@@ -65,14 +65,28 @@ language/runtime contract を定義しない。
 
 ## Owned JSON record
 
-**所有レコード配列のデコード（R133）。** `json.decode(input)` は、レコード単体や
-埋め込み配列と同じ閉じた V3 所有レコードのスキーマで `Result<array<R>, Error>` を
-推論する。arena 内でも各要素と到達可能な文字列・配列を独立して所有し、呼び出し後に
-入力を破棄できる。空配列は確保しない。JSON 配列全体の構文をデコード領域の確保前に
-検証し、スキーマ不一致では完成済み要素と途中の要素を解放して `Error.Code(1)` を返す。
-要素から借りる view の寿命は配列所有者に従う。所有・借用の混在、SoA、scanner の
-スキーマは拡張しない。ルート受理と解放は Plan188 に従い、既存 V3 要素グラフ・
-native ABI・interface format は変更しない。
+**所有・借用が混在するグラフ（AM-R02）。** 既存の再帰 JSON グラフで `str` と `string`
+を併用できる。Option、動的配列、入れ子のレコード内でも同じで、レコードと AoS レコード配列の
+ルートが対象となる。到達可能な所有 string がこの経路を選び、その他の型・layout・深さ制限、
+SoA、scanner は変わらない。両エンコーダーは上限評価中も含めて入力と推移的な文字列を共有借用し、
+独立した所有 `Result<string, Error>` を返す。bounded 成功時の出力バイトは通常版と一致する。
+
+decode は arena 内でも各 string と配列本体を個別に所有する。通常の `str` は入力を借用し、
+選択されたエスケープ付き `str` は明示的な enclosing arena を使う。arena がなければ
+`Error.Code(1)` を返す。mixed 結果は入力と arena の両方の寿命を保守的に保持する。
+完全所有の結果はどちらにも依存しない。途中失敗も含め、Drop は所有領域だけを解放する。
+`array<str>` が所有するのは配列本体であり、文字列ではない。暗黙 clone、隠れた arena、
+別の所有モデルは導入しない。Plan193 が V4 descriptor/envelope と interface19 を規定し、
+同じ機械表現でも Str/String を識別する。native ABI は変わらない。
+以下の従来の mixed-view 除外と JSON transport version はこの契約が置き換える。
+
+**所有レコード配列のデコード（R133）。** `json.decode(input)` はレコード単体と同じ
+V4 グラフで `Result<array<R>, Error>` を推論する。arena 内でも各所有領域は個別に確保する。
+完全所有の結果は入力の破棄後も使え、mixed 結果は上記の文字列の寿命に従う。空配列は確保しない。
+配列全体の構文を確保前に検証し、スキーマ不一致では完成済み要素と途中の要素を解放して
+`Error.Code(1)` を返す。要素 view は配列所有者と借用文字列の寿命に従う。
+Plan188 がルート受理と解放を規定し、Plan193 が mixed-view 除外と graph version を置き換える。
+SoA と scanner は変わらない。
 
 **所有文字列配列のデコード（V005）。** `json.decode(input)` の推論対象に
 `array<string>` を指定できる。UTF-8 JSON の文字列配列全体をデコードし、arena 内でも
@@ -90,7 +104,7 @@ Result・再帰的 Drop を使う。単独の `string` と `array<str>` の
 入力の寿命を越えられる。上限との完全一致は成功し、負の上限・超過・選択された非有限浮動小数点は
 部分出力を公開せず `Error.Invalid` を返す。暗黙のコピー・ラッパー・新しい要素構成・decode の拡張はない。
 オーナーが明示的に制限を再検討し、plan 59 が従来の bare 動的配列 encode の除外を置き換える。
-V3 グラフは引き続き要素レコードを表し、型付き入力が配列コンテナを検証する。
+V4 グラフは引き続き要素レコードを表し、型付き入力が配列コンテナを検証する。
 
 **R63 の契約（2026-09-10）。**
 [詳細契約](../../47-json-numeric-contract.md) を数値変換と encode の正本とする。
@@ -176,8 +190,8 @@ declaration 順の bytes を生成する。bounded success は byte-identical �
 置き換える。interface format 8 は format 7 を atomic に置き換え、compatibility decoder や parallel
 runtime route は追加しない。A103 decode と A80 encode の ABI は変えない。accepted grammar、exact V2
 bytes、validation order、C6 fixture scope、implementation matrix の正本は
-[`../../25-recursive-owned-json-plan.md`](../../25-recursive-owned-json-plan.md) である。implementation は
-pending であり、直前の Request 9 section が現在 shipped している compiler behavior である。
+[`../../25-recursive-owned-json-plan.md`](../../25-recursive-owned-json-plan.md) である。この歴史的な
+境界は実装済みであり、上記 amendment が指定する軸については新しい契約に置き換えられている。
 
 ## Signatures
 
@@ -322,7 +336,7 @@ region-tie される（`struct_has_str` が再帰する）。上で説明した�
 - 確定した R63 契約では両 encode が入力を呼び出し中だけ借用し、arena 内でも独立した
   owned string を Result で返す。伸長バッファを移し、最後の全体コピーはしない。
   失敗時は部分 string を公開せず内部バッファを解放する。bounded 版では伸長前に
-  inclusive な UTF-8 バイト上限も検査する。両 API は V3 graph/writer を共有する。
+  inclusive な UTF-8 バイト上限も検査する。両 API は V4 graph/writer を共有する。
 - `array<T>` / `array<Struct>` への `decode` は、所有権を持つ Move 配列を生成する（破棄時は deep-drop される）。
 - `soa<T>` への `decode` は、外側の arena に列（カラム）を割り当てる（`align_rt_json_decode_soa` により、1 回のカウント用パスと 1 回の値パース用パスが `FieldDst` を介して Mison の投機的実行（speculation）パスを共有する）。
 - デコードされた `str` フィールドや列は、**入力された `str` へのビュー（参照）** である。そのため、入力データはデコード結果よりも長生きしなければならず、これは region チェッカによって強制される。

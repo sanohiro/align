@@ -16628,8 +16628,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 out,
                 arena,
             } => self.gen_json_decode(*struct_id, input, *out, arena.as_ref())?,
-            Rvalue::JsonOwnedDecode { root_kind, plan, input, out } => {
-                self.gen_json_owned_decode(*root_kind, plan, input, *out)?
+            Rvalue::JsonOwnedDecode { root_kind, plan, input, out, arena } => {
+                self.gen_json_owned_decode(*root_kind, plan, input, *out, arena.as_ref())?
             }
             Rvalue::JsonDecodeArray { elem, input, out } => {
                 self.gen_json_decode_array(*elem, input, *out)?
@@ -21466,12 +21466,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
             ),
             Ty::Float(float) if matches!(float.bits, 32 | 64) => ((2 << 8) | u64::from(float.bits / 8), null),
             Ty::Bool => ((1 << 8) | 1, null),
+            Ty::Str => ((3 << 8) | 16, null),
             Ty::String => ((8 << 8) | 16, null),
             Ty::Struct(id) => (
                 4 << 8,
                 subtables.get(&id).copied().ok_or_else(|| {
                     self.err(format!(
-                        "owned JSON V3 record {id} was not emitted before its parent"
+                        "owned JSON V4 record {id} was not emitted before its parent"
                     ))
                 })?,
             ),
@@ -21479,12 +21480,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 (5 << 8) | 16,
                 subtables.get(&id).copied().ok_or_else(|| {
                     self.err(format!(
-                        "owned JSON V3 record {id} was not emitted before its parent"
+                        "owned JSON V4 record {id} was not emitted before its parent"
                     ))
                 })?,
             ),
             Ty::DynArray(Scalar::String) => ((9 << 8) | 16, null),
-            Ty::DynArray(element @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool)) => {
+            Ty::DynArray(element @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Str)) => {
                 let (element_tag, _) = self.json_payload_tag_sub(scalar_to_ty(element), null)?;
                 let kind = (element_tag >> 8) & 0xff;
                 let width = element_tag & 0xff;
@@ -21496,7 +21497,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             }
             other => {
                 return Err(self.err(format!(
-                    "owned JSON V3 descriptor: {other:?} is outside the closed graph"
+                    "owned JSON V4 descriptor: {other:?} is outside the closed graph"
                 )));
             }
         })
@@ -21651,7 +21652,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .struct_types
             .get(struct_id as usize)
             .copied()
-            .ok_or_else(|| self.err(format!("unknown owned JSON V3 record id {struct_id}")))?;
+            .ok_or_else(|| self.err(format!("unknown owned JSON V4 record id {struct_id}")))?;
         let store_size = self.element_allocation_size(struct_ty.into());
         let i64t = self.ctx.i64_type();
         let subtable_ty = self.json_subtable_ty();
@@ -21665,7 +21666,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         ]);
         let global = self
             .module
-            .add_global(subtable_ty, None, "owned_json_v3_sub");
+            .add_global(subtable_ty, None, "owned_json_v4_sub");
         global.set_initializer(&value);
         global.set_constant(true);
         mark_private_unnamed_addr(global);
@@ -21680,12 +21681,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
         }
     }
 
-    /// Emit a complete V3 descriptor graph without following the source record graph on the Rust
+    /// Emit a complete V4 descriptor graph without following the source record graph on the Rust
     /// call stack. Checked HIR has already proved the graph acyclic and bounded; this pass still
     /// fails closed if no dependency-ready record remains.
     fn emit_owned_desc_graph(
         &mut self,
-        plan: &hir::OwnedJsonGraphPlanV3,
+        plan: &hir::OwnedJsonGraphPlanV4,
     ) -> Result<DescTable<'c>, CodegenError> {
         let mut subtables = HashMap::new();
         let mut tables = HashMap::new();
@@ -21710,13 +21711,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 progressed = true;
             }
             if !progressed {
-                return Err(self.err("owned JSON V3 descriptor graph is cyclic or incomplete"));
+                return Err(self.err("owned JSON V4 descriptor graph is cyclic or incomplete"));
             }
         }
         tables
             .get(&plan.root)
             .copied()
-            .ok_or_else(|| self.err("owned JSON V3 descriptor graph omits its root"))
+            .ok_or_else(|| self.err("owned JSON V4 descriptor graph omits its root"))
     }
 
     /// Emit the field-descriptor table for decoding struct `struct_id`, wrapping [`emit_desc_table`]
@@ -21728,7 +21729,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn decode_field_table_for_plan(
         &mut self,
         struct_id: u32,
-        owned: Option<&hir::OwnedJsonGraphPlanV3>,
+        owned: Option<&hir::OwnedJsonGraphPlanV4>,
     ) -> Result<DecodeTable<'c>, CodegenError> {
         let sty = self
             .struct_types
@@ -21898,13 +21899,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
     fn gen_json_owned_decode(
         &mut self,
         root_kind: hir::JsonOwnedRoot,
-        plan: &hir::OwnedJsonGraphPlanV3,
+        plan: &hir::OwnedJsonGraphPlanV4,
         input: &Operand,
         out: Slot,
+        arena: Option<&Operand>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         match root_kind {
-            hir::JsonOwnedRoot::Record => self.gen_json_decode_record(plan.root, input, out, None, Some(plan)),
-            hir::JsonOwnedRoot::Array => self.gen_json_decode_struct_array(plan.root, input, out, None, Some(plan)),
+            hir::JsonOwnedRoot::Record => self.gen_json_decode_record(plan.root, input, out, arena, Some(plan)),
+            hir::JsonOwnedRoot::Array => self.gen_json_decode_struct_array(plan.root, input, out, arena, Some(plan)),
         }
     }
 
@@ -21914,7 +21916,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         input: &Operand,
         out: Slot,
         arena: Option<&Operand>,
-        owned: Option<&hir::OwnedJsonGraphPlanV3>,
+        owned: Option<&hir::OwnedJsonGraphPlanV4>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let sty = self
             .struct_types
@@ -22094,7 +22096,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         input: &Operand,
         out: Slot,
         arena: Option<&Operand>,
-        owned: Option<&hir::OwnedJsonGraphPlanV3>,
+        owned: Option<&hir::OwnedJsonGraphPlanV4>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let out_ptr = self.slots[&out];
         // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop frees null).
@@ -24187,10 +24189,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 align_mir::TemplatePiece::OwnedJsonRecords { value, plan } => {
                     let ty = self.f.operand_ty(value);
                     if !matches!(ty, Ty::Struct(id) | Ty::DynStructArray(id, Layout::Aos) if id == plan.root) {
-                        return Err(self.err("owned JSON V3 root operand type does not match its plan"));
+                        return Err(self.err("owned JSON V4 root operand type does not match its plan"));
                     }
                     let sty = self.struct_types.get(plan.root as usize).copied()
-                        .ok_or_else(|| self.err("owned JSON V3 plan references an unknown root"))?;
+                        .ok_or_else(|| self.err("owned JSON V4 plan references an unknown root"))?;
                     let root = self.operand(value)?;
                     let table = self.emit_owned_desc_graph(plan)?;
                     let count = i64t.const_int(table.n_fields, false);
@@ -24203,7 +24205,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             &[bptr.into(), ptr.into(), len.into(), table.descs.into(), count.into(), stride.into()], "")
                             .map_err(|e| self.err(e))?;
                     } else {
-                        let slot = self.alloca_at_entry(sty.into(), "owned_json_v3_root")?;
+                        let slot = self.alloca_at_entry(sty.into(), "owned_json_v4_root")?;
                         self.builder.build_store(slot, root).map_err(|e| self.err(e))?;
                         self.builder.build_call(self.runtime(RuntimeKey::JsonEncodeObject),
                             &[bptr.into(), slot.into(), table.descs.into(), count.into()], "")

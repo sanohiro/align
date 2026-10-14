@@ -361,6 +361,7 @@ fn resolved_owned_json_type(
         align_sema::Ty::Float(value) => named(value.name(), Vec::new()),
         align_sema::Ty::Bool => named("bool".to_string(), Vec::new()),
         align_sema::Ty::String => named("string".to_string(), Vec::new()),
+        align_sema::Ty::Str => named("str".to_string(), Vec::new()),
         align_sema::Ty::Struct(id) => structs
             .get(id as usize)
             .map(|definition| named(definition.name.clone(), Vec::new()))

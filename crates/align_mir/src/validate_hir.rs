@@ -6030,8 +6030,8 @@ impl<'a> BodyValidator<'a> {
         })
     }
 
-    fn owned_json_plan_ok(&self, plan: &hir::OwnedJsonGraphPlanV3) -> bool {
-        align_sema::owned_json_graph_plan_v3(&self.program.structs, plan.root)
+    fn owned_json_plan_ok(&self, plan: &hir::OwnedJsonGraphPlanV4) -> bool {
+        plan.owns_text() && align_sema::owned_json_graph_plan_v4(&self.program.structs, plan.root)
             .is_ok_and(|rebuilt| rebuilt == *plan)
             && {
                 let drop = align_sema::drop_plan(
@@ -6047,7 +6047,7 @@ impl<'a> BodyValidator<'a> {
     fn owned_json_source_ok(
         &self,
         base: hir::LocalId,
-        plan: &hir::OwnedJsonGraphPlanV3,
+        plan: &hir::OwnedJsonGraphPlanV4,
         context: &BodyContext,
     ) -> bool {
         self.local_ok(context, base)
@@ -12104,7 +12104,7 @@ impl<'a> BodyValidator<'a> {
     fn derive_owned_json_encode_expression(
         &self,
         base: hir::LocalId,
-        plan: &hir::OwnedJsonGraphPlanV3,
+        plan: &hir::OwnedJsonGraphPlanV4,
         context: &BodyContext,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
         if !self.owned_json_source_ok(base, plan, context) {

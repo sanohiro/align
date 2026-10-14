@@ -1364,10 +1364,10 @@ pub enum ExprKind {
     /// struct at runtime. The expression `ty` is `Result<Struct, Error>`.
     JsonDecode { struct_id: u32, input: Box<Expr> },
     /// `json.decode(input)` for a record or record-array root containing owned text. Materialization is
-    /// always free-standing and therefore carries no input or arena region.
+    /// individually owned; mixed graphs additionally retain input/arena text lifetimes.
     JsonOwnedDecode {
         root_kind: JsonOwnedRoot,
-        plan: OwnedJsonGraphPlanV3,
+        plan: OwnedJsonGraphPlanV4,
         input: Box<Expr>,
     },
     /// `json.decode(input)` targeting an owned `array<T>` (MMv2 slice 8c) — parse a JSON array of
@@ -2712,21 +2712,43 @@ impl JsonOwnedRoot {
 }
 
 /// Checked, deterministic root-first record graph for the recursive owned-JSON route.
-/// Record ids are compiler-local; interface transport uses its independent structural V3 bytes.
+/// Record ids are compiler-local; interface transport uses its independent structural V4 bytes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct OwnedJsonGraphPlanV3 {
+pub struct OwnedJsonGraphPlanV4 {
     pub root: u32,
-    pub records: Vec<OwnedJsonGraphRecordV3>,
+    pub records: Vec<OwnedJsonGraphRecordV4>,
+}
+
+impl OwnedJsonGraphPlanV4 {
+    /// The owning route is selected by transitive string leaves, not by array spines alone.
+    pub fn owns_text(&self) -> bool {
+        self.records.iter().flat_map(|record| &record.fields).any(|field| matches!(
+            field.ty,
+            crate::Ty::String | crate::Ty::Option(crate::Scalar::String)
+                | crate::Ty::DynArray(crate::Scalar::String)
+                | crate::Ty::Option(crate::Scalar::DynArray(crate::PrimScalar::String))
+        ))
+    }
+
+    /// Records enumerate the complete reachable graph; views may also sit below Option/Array.
+    pub fn borrows_text(&self) -> bool {
+        self.records.iter().flat_map(|record| &record.fields).any(|field| matches!(
+            field.ty,
+            crate::Ty::Str | crate::Ty::Option(crate::Scalar::Str)
+                | crate::Ty::DynArray(crate::Scalar::Str)
+                | crate::Ty::Option(crate::Scalar::DynArray(crate::PrimScalar::Str))
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct OwnedJsonGraphRecordV3 {
+pub struct OwnedJsonGraphRecordV4 {
     pub id: u32,
-    pub fields: Vec<OwnedJsonGraphFieldV3>,
+    pub fields: Vec<OwnedJsonGraphFieldV4>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct OwnedJsonGraphFieldV3 {
+pub struct OwnedJsonGraphFieldV4 {
     pub name: String,
     pub ty: crate::Ty,
 }
@@ -2734,7 +2756,7 @@ pub struct OwnedJsonGraphFieldV3 {
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum JsonEncodePlan {
     Pieces(Vec<TemplatePart>),
-    Owned(OwnedJsonGraphPlanV3),
+    Owned(OwnedJsonGraphPlanV4),
 }
 
 #[derive(Clone, Debug, serde::Serialize)]

@@ -2056,14 +2056,14 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
     match rvalue {
         Rvalue::JsonEncode { max_bytes, .. } => max_bytes.iter().collect(),
         Rvalue::JsonDecode { input, arena, .. }
+        | Rvalue::JsonOwnedDecode { input, arena, .. }
         | Rvalue::JsonDecodeStructArray { input, arena, .. }
         | Rvalue::JsonDecodeUnion { input, arena, .. } => {
             let mut operands = vec![input];
             operands.extend(arena.iter());
             operands
         }
-        Rvalue::JsonOwnedDecode { input, .. }
-        | Rvalue::JsonDecodeArray { input, .. }
+        Rvalue::JsonDecodeArray { input, .. }
         | Rvalue::StrParseI64 { input, .. }
         | Rvalue::JsonDecodeScalar { input, .. }
         | Rvalue::FsReadFile { path: input, .. }
@@ -6961,20 +6961,24 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     },
                 )
             }
-            Rvalue::JsonOwnedDecode { root_kind, plan, input, out } => {
-                let canonical = align_sema::owned_json_graph_plan_v3(
+            Rvalue::JsonOwnedDecode { root_kind, plan, input, out, arena } => {
+                let canonical = align_sema::owned_json_graph_plan_v4(
                         &self.graph.program.structs,
                         plan.root,
                     )
                     .is_ok_and(|canonical| canonical == *plan);
                 if slot_ty != root_kind.ty(plan.root)
                     || !canonical
+                    || !plan.owns_text()
+                    || (arena.is_some() && !plan.borrows_text())
+                    || arena.as_ref().is_some_and(|value| xml_operand_base_ty(self.graph.function, value) != Some(Ty::ArenaHandle))
                     || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
                 {
                     equation.invalid = true;
                     return;
                 }
                 self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena { self.check_operand(equation, arena, Ty::ArenaHandle); }
                 (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::JsonDecodeArray { elem, input, out } => {
@@ -7290,7 +7294,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
         if expected_out != slot || access != recorded_access {
             equation.invalid = true;
         } else {
-            equation.seed = merge_xml_access(equation.seed, access);
+            // The output slot owns its record/array, while an exact Str projection borrows
+            // input or arena text. Never promote that text to exclusive storage authority.
+            let selected_access = if matches!(rvalue, Rvalue::JsonOwnedDecode { .. })
+                && selected_ty == Ty::Str
+            {
+                XmlAccessProvenance::Shared
+            } else {
+                access
+            };
+            equation.seed = merge_xml_access(equation.seed, selected_access);
         }
     }
 
@@ -8734,11 +8747,75 @@ fn validate_partition_scope(
     Ok(())
 }
 
+// Mixed decode's optional arena is exactly the active lexical arena, never a typed but
+// expired/foreign capability. Check CFG paths before producer trust, including partition peers.
+fn validate_json_decode_arenas(program: &Program) -> Result<(), ProducerError> {
+    for function in &program.fns {
+        if !function.blocks.iter().flat_map(|block| &block.stmts)
+            .any(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { .. })))
+        {
+            continue;
+        }
+        let fail = || ProducerError::Lowering(format!(
+            "mixed JSON arena in function '{}' is not the active lexical capability", function.name,
+        ));
+        let mut entries: Vec<Option<Vec<ValueId>>> = vec![None; function.blocks.len()];
+        let entry_index = usize::try_from(function.entry).map_err(|_| fail())?;
+        let Some(entry) = entries.get_mut(entry_index) else { return Err(fail()); };
+        *entry = Some(Vec::new());
+        let mut work = VecDeque::from([entry_index]);
+        while let Some(index) = work.pop_front() {
+            let block = function.blocks.get(index).ok_or_else(&fail)?;
+            let mut stack = entries.get(index).and_then(Clone::clone).ok_or_else(&fail)?;
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Let(value, Rvalue::ArenaBegin) => {
+                        if function.value_tys.get(*value as usize) != Some(&Ty::ArenaHandle)
+                            || stack.contains(value)
+                        { return Err(fail()); }
+                        stack.push(*value);
+                    }
+                    Stmt::ArenaEnd(Operand::Value(value)) if stack.last() == Some(value) => {
+                        stack.pop();
+                    }
+                    Stmt::ArenaEnd(_) => return Err(fail()),
+                    Stmt::Let(_, Rvalue::JsonOwnedDecode { plan, arena, .. }) => {
+                        let expected = if plan.borrows_text() { stack.last().copied() } else { None };
+                        if !match (arena, expected) {
+                            (None, None) => true,
+                            (Some(Operand::Value(actual)), Some(expected)) => *actual == expected,
+                            _ => false,
+                        } { return Err(fail()); }
+                    }
+                    _ => {}
+                }
+            }
+            for successor in crate::byte_ranges::successors(&block.term) {
+                let successor = usize::try_from(successor).map_err(|_| fail())?;
+                let entry = entries.get_mut(successor).ok_or_else(&fail)?;
+                if let Some(previous) = entry {
+                    if *previous != stack { return Err(fail()); }
+                } else {
+                    *entry = Some(stack.clone());
+                    work.push_back(successor);
+                }
+            }
+        }
+        for (block, entry) in function.blocks.iter().zip(entries) {
+            if entry.is_none() && block.stmts.iter().any(|stmt|
+                matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { arena: Some(_), .. })))
+            { return Err(fail()); }
+        }
+    }
+    Ok(())
+}
+
 fn validate_resource_rvalues_inner(
     program: &Program,
     defined: Option<&BTreeSet<ProgramCall>>,
 ) -> Result<(), ProducerError> {
     validate_host_mir(program)?;
+    validate_json_decode_arenas(program)?;
     validate_template_html_mir_signatures(program)?;
     let components = xml_local_call_components(program)?;
     // A partition peer carries its real signature in `program.fns`; seeding it grants the same
@@ -11860,7 +11937,8 @@ pub fn template_piece_is_type_safe(
         crate::TemplatePiece::JsonStrHole(operand) => operand_ty(operand) == Some(Ty::Str),
         crate::TemplatePiece::OwnedJsonRecords { value, plan } => {
             matches!(operand_ty(value), Some(Ty::Struct(id) | Ty::DynStructArray(id, align_sema::Layout::Aos)) if id == plan.root)
-                && align_sema::owned_json_graph_plan_v3(&program.structs, plan.root)
+                && plan.owns_text()
+                && align_sema::owned_json_graph_plan_v4(&program.structs, plan.root)
                     .is_ok_and(|rebuilt| rebuilt == *plan)
         }
         crate::TemplatePiece::BoolHole(operand) => operand_ty(operand) == Some(Ty::Bool),
@@ -12062,8 +12140,10 @@ mod tests {
 
     #[test]
     fn producer_json_owned_root_output() -> Result<(), Box<dyn std::error::Error>> {
+        for mixed in [false, true] {
         for root in ["Owned", "array<Owned>"] {
             let source = format!("import core.json\nOwned {{text:string}}\nfn decode(input:str)->Result<{root},Error> = json.decode(input)\n");
+            let source = if mixed { source.replace("text:string", "text:string,borrowed:str,tags:array<str>") } else { source };
             let mut diagnostics = align_diag::Diagnostics::new();
             let tokens = align_lexer::tokenize(0, &source, &mut diagnostics);
             let ast = align_parser::parse_file(tokens, &mut diagnostics);
@@ -12073,13 +12153,54 @@ mod tests {
             let defined = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
             validate_mir_producers(&base)?;
             validate_partition_resource_rvalues(&base, &defined)?;
-            for mutation in 0..7 {
+            if mixed {
+                // Query exact selected storage from a real lowered decoder. Aggregate ownership
+                // must not promote a direct or indexed Str; array spines still own their buffer.
+                let function = base.fns.iter().find(|f| f.name.as_str() == "decode").ok_or("decode fixture")?;
+                let mut definitions = vec![None; function.value_tys.len()];
+                let mut counts = vec![0; function.value_tys.len()];
+                let mut stores = XmlSlotStores {
+                    roots: vec![Vec::new(); function.slots.len()], fields: vec![Vec::new(); function.slots.len()],
+                    elements: vec![Vec::new(); function.slots.len()], element_fields: vec![Vec::new(); function.slots.len()],
+                    constant_elements: vec![Vec::new(); function.slots.len()], producers: vec![Vec::new(); function.slots.len()],
+                };
+                let mut output = None;
+                for stmt in function.blocks.iter().flat_map(|block| &block.stmts) {
+                    match stmt {
+                        Stmt::Let(value, rvalue) => {
+                            definitions[*value as usize] = Some(rvalue);
+                            counts[*value as usize] += 1;
+                            if let Rvalue::JsonOwnedDecode { out, .. } = rvalue {
+                                output = Some(*out);
+                                stores.producers[*out as usize].push((*value, rvalue));
+                            }
+                        }
+                        Stmt::Store(slot, value) => stores.roots[*slot as usize].push(value),
+                        _ => {}
+                    }
+                }
+                let graph = ValidatedProducerGraph {
+                    function, program: &base, local_contracts: &HashSet::new(), value_definitions: &definitions,
+                    auxiliary_value_definitions: &vec![None; counts.len()], duplicate_values: &vec![false; counts.len()],
+                    slot_stores: &stores, primary_definitions: &counts, auxiliary_definitions: &vec![0; counts.len()],
+                };
+                for (ty, mut path, access) in [
+                    (Ty::String, vec![XmlAccessPathSegment::StructField(0)], XmlAccessProvenance::Owned),
+                    (Ty::Str, vec![XmlAccessPathSegment::StructField(1)], XmlAccessProvenance::Shared),
+                    (Ty::DynArray(Scalar::Str), vec![XmlAccessPathSegment::StructField(2)], XmlAccessProvenance::Owned),
+                    (Ty::Str, vec![XmlAccessPathSegment::StructField(2), XmlAccessPathSegment::Element], XmlAccessProvenance::Shared),
+                ] {
+                    if root.starts_with("array") { path.insert(0, XmlAccessPathSegment::Element); }
+                    assert_eq!(xml_slot_path_access(&graph, output.ok_or("output")?, ty, path), XmlProducerState::Present(access));
+                }
+            }
+            for mutation in 0..10 {
                 let mut malformed = base.clone();
                 let function = malformed.fns.iter_mut().find(|f| f.name.as_str() == "decode").ok_or("decode fixture")?;
                 let operation = function.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| {
                     if let Stmt::Let(_, r @ Rvalue::JsonOwnedDecode { .. }) = s { Some(r) } else { None }
                 }).ok_or("owned operation")?;
-                let Rvalue::JsonOwnedDecode { root_kind, plan, input, out } = operation else { return Err("owned fixture".into()); };
+                let Rvalue::JsonOwnedDecode { root_kind, plan, input, out, arena } = operation else { return Err("owned fixture".into()); };
                 match mutation {
                     0 => *root_kind = match root_kind {
                         hir::JsonOwnedRoot::Record => hir::JsonOwnedRoot::Array,
@@ -12090,10 +12211,62 @@ mod tests {
                     3 => *out = u32::MAX,
                     4 => *input = Operand::Const(Const::Bool(true)),
                     5 => *function.slots.get_mut(usize::try_from(*out)?).ok_or("output slot")? = Ty::DynArray(Scalar::Bool),
+                    7 => *arena = Some(Operand::Const(Const::Bool(true))),
+                    8 => *arena = Some(Operand::Value(u32::MAX)),
+                    9 => {
+                        // Canonical layout alone cannot select the owning route without string.
+                        malformed.structs.get_mut(usize::try_from(plan.root)?).ok_or("root")?
+                            .fields.get_mut(0).ok_or("field")?.ty = Ty::Str;
+                        plan.records.get_mut(0).ok_or("graph record")?.fields.get_mut(0).ok_or("graph field")?.ty = Ty::Str;
+                    }
                     _ => plan.records.get_mut(0).ok_or("graph record")?.fields.get_mut(0).ok_or("graph field")?.ty = Ty::Str,
                 }
                 assert!(validate_mir_producers(&malformed).is_err(), "{root}: mutation {mutation}");
                 assert!(validate_partition_resource_rvalues(&malformed, &defined).is_err(), "{root}: partition mutation {mutation}");
+            }
+        }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn producer_mixed_json_arena_is_current_on_every_cfg_path() -> Result<(), Box<dyn std::error::Error>> {
+        for root in ["Mixed", "array<Mixed>"] {
+            let source = format!("import core.json\nMixed {{owned:string,text:str}}\nfn probe(input:str)->Result<string,Error> {{ arena outer {{ arena inner {{ value:{root}:=json.decode(input)?;return json.encode(value) }} }} }}\nfn main()->i32=0\n");
+            let mut diagnostics = align_diag::Diagnostics::new();
+            let tokens = align_lexer::tokenize(0, &source, &mut diagnostics);
+            let ast = align_parser::parse_file(tokens, &mut diagnostics);
+            let hir = align_sema::check_file(&ast, &mut diagnostics);
+            assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+            let base = crate::lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?;
+            let defined = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+            let peer_only = base.fns.iter().filter(|f| f.name.as_str() == "main").map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+            for mutation in 0..6 {
+                let mut malformed = base.clone();
+                let function = malformed.fns.iter_mut().find(|f| f.name.as_str() == "probe").ok_or("probe fixture")?;
+                let arenas = function.blocks.iter().flat_map(|b| &b.stmts).filter_map(|stmt|
+                    if let Stmt::Let(value, Rvalue::ArenaBegin) = stmt { Some(*value) } else { None }
+                ).collect::<Vec<_>>();
+                assert_eq!(arenas.len(), 2);
+                let (block, statement) = function.blocks.iter().enumerate().find_map(|(b, block)|
+                    block.stmts.iter().position(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { .. }))).map(|s| (b, s))
+                ).ok_or("decode fixture")?;
+                if mutation == 5 {
+                    function.blocks[block].stmts.insert(statement, Stmt::ArenaEnd(Operand::Value(arenas[1])));
+                } else {
+                    let Stmt::Let(_, Rvalue::JsonOwnedDecode { arena, .. }) = &mut function.blocks[block].stmts[statement] else { return Err("decode shape".into()); };
+                    *arena = match mutation {
+                        0 => None,
+                        1 => Some(Operand::Const(Const::Bool(true))),
+                        2 => Some(Operand::Value(u32::MAX)),
+                        3 => Some(Operand::Value(arenas[0])),
+                        _ => Some(Operand::Arg(0)),
+                    };
+                }
+                assert!(validate_mir_producers(&malformed).is_err(), "{root}/{mutation}");
+                for definitions in [&defined, &peer_only] {
+                    assert!(validate_partition_resource_rvalues(&malformed, definitions).is_err(), "{root}/{mutation}: partition");
+                }
             }
         }
         Ok(())

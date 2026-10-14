@@ -395,8 +395,8 @@ cache-friendly fast path — borrow the input bytes, process, discard — is ide
 way; the difference is only the rare escape, where a copy is physically unavoidable. Making
 it explicit honors **Nothing hidden** (allocation is visible) and **Predictable performance**
 (a small edit that starts escaping a value does not silently jump its cost class). This is the
-hardware-aligned choice: predictable allocation beats convenience, and an in-arena clone is a
-bump allocation, not a malloc cliff. (Convenience-first auto-copy was rejected for the same
+hardware-aligned choice: the text clone explicitly allocates an independent owned string,
+even when the call occurs inside an arena. (Convenience-first auto-copy was rejected for the same
 reason exceptions and GC were — it hides cost.)
 JSON follows the same boundary for escaped text: a clean token remains an input view, while a
 selected escaped token is decoded once into the caller's visible arena. The result therefore
@@ -1023,7 +1023,8 @@ the codec reports `Error.Invalid`. Moving the grow buffer into the result expose
 ownership without another full copy and makes failure cleanup one normal Result
 path. The finite spelling and integer fast path remain; performance is measured
 before merge. This supersedes historical float exclusions and infallible encoder
-results below, not the separate Copy-only scanner or view-free owned grammar.
+results below; Plan193 subsequently admits mixed text in the owning graph. The separate
+Copy-only scanner remains unchanged.
 
 
 JSON is the de facto assembly language of modern APIs.
@@ -1078,15 +1079,12 @@ competing for the same job ("one way" per job). Three deliberate rejections defi
   `Drop`, so semantic checking admits only rows whose complete reachable definition graph is
   recursively Copy under the canonical `DropPlan`. This is a scanner-only restriction; ordinary
   JSON decode and the declaration's other uses retain their own explicit ownership contracts.
-- **Owned decode is ownership-directed, not escape-directed.** A declared record whose closed graph
-  contains owned text selects a free-standing materializer at `json.decode`; a borrowed graph
-  keeps the zero-copy input/arena path, and a mixed graph rejects. The target's `string` types expose
-  the allocation choice before execution, so the result can outlive both input and an enclosing
-  arena without a hidden copy-on-escape. `encode` and `encode_bounded` consume the same graph and
-  ordered plan. The shipped flat graph is deliberately narrow. Its accepted recursive successor is
-  still a closed, acyclic, view-free grammar with a 128-level bound; it replaces the flat descriptor
-  and runtime route rather than creating a second JSON ownership model. This lets C6 persist nested
-  records/options/arrays while keeping every allocation mode visible in the declared types.
+- **Decoded text follows its declared ownership.** A transitive `string` selects one recursive
+  materializer; each string and array spine is individually owned, while `str` retains the existing
+  input/explicit-arena rule. Mixed graphs need no clones to compose those types. Fully owned results
+  outlive input and arena; mixed results retain both conservatively. Encoding shared-borrows either
+  graph and produces independent output. Plan193 extends the same acyclic depth-128 graph and V4
+  descriptor rather than introducing another API, allocator choice or ownership model.
 - **A target-local JSON descriptor is never ambiently authenticated.** Per-unit serialization wraps
   it in the canonical target triple, object format, and complete relevant ABI tuple and validates
   that envelope before reading an offset. The frontend target cache key remains redundant
@@ -2154,14 +2152,14 @@ See [plan 58](impl/58-r84-r88-client-batch-plan.md).
 
 ### JSON owned-record array decoding (R133)
 
-Root position adds no ownership distinction to an accepted V3 record graph.
+Root position adds no ownership distinction to an accepted V4 record graph.
 Plan188 admits the existing inferred `json.decode` operation for `array<R>`;
-each row owns its reachable strings/arrays independently of input and arena.
-The explicit Record/Array IR kind authenticates the result and output storage;
-the canonical element graph and native descriptor ABI remain unchanged.
-Full array grammar precedes decoded allocation, partial failures clean every
-owner, and indexed views retain the array lifetime. Mixed-view graphs and
-SoA/scanner admission remain separate capabilities.
+each row individually owns its reachable strings/arrays. Plan193 preserves borrowed
+text lifetimes for mixed rows; fully owned rows remain independent of input and arena.
+The explicit Record/Array IR kind authenticates the result and output storage.
+Full array grammar precedes decoded allocation, partial failures clean every owner,
+and indexed views retain the array and borrowed-text lifetimes. SoA/scanner admission
+remains unchanged.
 
 ### JSON owned-string array decoding (V005)
 

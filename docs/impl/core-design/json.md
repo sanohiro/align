@@ -76,15 +76,33 @@ separate trusted measurement boundary; it does not define this language or runti
 
 ## Owned JSON records
 
+**Mixed borrowed and owned graphs (AM-R02).** One selected recursive JSON graph
+admits `str` beside `string`, including Option, dynamic-array and nested-record
+positions, for record and AoS record-array roots. A transitive owned string still
+selects this route; other roots, constructors, layout/depth restrictions, SoA and
+scanner admission stay unchanged. Both encoders shared-borrow the complete input,
+including transitive text through cap evaluation, and return an independent owned
+`Result<string, Error>` with identical bytes on bounded success.
+
+Decode individually owns every string and array spine, including inside arenas.
+Clean `str` borrows input; selected escaped `str` uses the explicit enclosing arena
+or returns `Error.Code(1)` when none exists. A mixed result conservatively retains
+both input and arena lifetimes; fully owned graphs retain neither. Drop releases
+owners only, including on partial failure; `array<str>` owns its spine, not its text.
+No implicit clone, hidden arena or second ownership model is introduced. Plan193
+owns the exact V4 descriptor/envelope and interface19 transition, including distinct
+Str/String identity despite equal machine headers; the native ABI is unchanged.
+This replaces earlier mixed-view exclusions and JSON transport versions below.
+
 **Owned record-array decoding (R133).** `json.decode(input)` also infers
-`Result<array<R>, Error>` for the same closed V3 owned record graph used by
-record decoding and embedded arrays. Every row and its reachable strings/arrays
-are independently owned, including inside arenas; input may expire after the call.
-Empty arrays allocate nothing. Full JSON array syntax is validated before decoded
-allocation; schema failure frees completed rows and the partial row before returning
-`Error.Code(1)`. Element views remain bounded by the array owner. Mixed views, SoA
-and scanner schemas do not widen. Plan188 owns root admission and cleanup; the
-existing V3 element graph, native ABI and interface format remain unchanged.
+`Result<array<R>, Error>` for the same closed V4 graph used by record decoding and
+embedded arrays. Every reachable owner is individually allocated, including inside
+arenas; fully owned results allow input to expire after the call, while mixed
+results retain the text lifetimes above. Empty arrays allocate nothing. Full JSON
+array syntax precedes decoded allocation; schema failure frees completed rows and
+the partial row before `Error.Code(1)`. Element views remain bounded by the array
+owner and any borrowed text. Plan188 owns root admission and cleanup; Plan193
+supersedes its mixed-view exclusion and graph version. SoA/scanner stay unchanged.
 
 **Owned string-array decoding (V005).** The inferred target of `json.decode(input)`
 may be `array<string>`. A complete UTF-8 JSON array of strings produces an
@@ -105,7 +123,7 @@ owned output may outlive it. Exact-fit bounds succeed; negative/exceeded bounds
 and selected nonfinite floats return `Error.Invalid` without partial output.
 There is no implicit copy, wrapper, new element constructor or decode expansion.
 The owner reopened this restriction explicitly; plan 59 supersedes earlier bare
-dynamic-array encoding exclusions. Its V3 graph still describes the element
+dynamic-array encoding exclusions. Its V4 graph still describes the element
 record, while the typed source authenticates the array container.
 
 **R63 contract (2026-09-10).**
@@ -195,8 +213,8 @@ descriptor-driven declaration-order writer; bounded success is byte-identical an
 owned root. Interface format 8 replaces format 7 atomically; there is no compatibility decoder or
 parallel runtime route. A103 decode and A80 encode keep their ABIs. The accepted grammar, exact V2
 bytes, validation order, C6 fixture scope, and implementation matrix are authoritative in
-[`../25-recursive-owned-json-plan.md`](../25-recursive-owned-json-plan.md). Implementation is
-pending; the preceding Request 9 section remains the current shipped compiler behavior.
+[`../25-recursive-owned-json-plan.md`](../25-recursive-owned-json-plan.md). This historical
+boundary was implemented and is superseded on the axes named by the amendments above.
 
 ## Signatures
 
@@ -351,7 +369,7 @@ The later Option, array-field, and union slices described above compose with thi
   and return one free-standing owned string in Result, even inside an arena.
   The grow buffer transfers without a final copy; failure publishes no partial
   string and frees private storage. Bounded encoding additionally enforces an
-  inclusive UTF-8 byte cap before growth. Both APIs share the V3 graph/writer.
+  inclusive UTF-8 byte cap before growth. Both APIs share the V4 graph/writer.
 - `decode` into `array<T>`/`array<Struct>` produces an owned Move array (deep-dropped).
 - `decode` into `soa<T>` allocates columns in the enclosing arena (`align_rt_json_decode_soa`,
   one count pass + one value-parse pass sharing the Mison speculation via `FieldDst`).

@@ -1177,6 +1177,25 @@ Request 9 introduced the dedicated owned route. Request 13 atomically replaced
 its flat V1 plan, template-part variants, and interface format; no V1 producer,
 consumer, or compatibility decoder remains.
 
+#### AM-R02 mixed JSON graph (Plan193)
+
+`OwnedJsonGraphPlanV4` replaces every V3 graph. Canonical reconstruction admits
+Str beside String at all existing text positions and preserves exact field types,
+root kind and the complete reachable schema. Mixed decode retains input plus the
+explicit lexical arena as content lifetimes; all strings and array spines remain
+individual owners. Fresh allocation facts cover string-only records as well as
+dynamic headers; loop break snapshots preserve that allocation mode separately
+from borrowed content. Fully owned graphs retain no input/arena dependency.
+
+MIR `JsonOwnedDecode` carries `arena: Option<Operand>`: the current lexical arena
+for view-bearing graphs, None otherwise. CFG validation requires the exact active
+capability across joins and rejects missing/expired/foreign/ill-typed handles,
+including unused bodies and partition peers. Output provenance certifies owning
+leaves and spines independently while an exact Str projection stays Shared.
+`mixed_json`, the extended owned HIR/producer sweeps, independent V4 interface
+vectors and native mixed cleanup matrix own these rules. The historical V2/V3
+rows below are superseded only on these axes.
+
 #### Request133 owned JSON root kind
 
 Plan188 adds explicit `Record`/`Array` root kind to `JsonOwnedDecode`. The canonical
@@ -2295,7 +2314,7 @@ existing native-owner provenance validation applies before LLVM. The same
 exact declared array/element type. Scalar encoding admits valid integer/float
 widths, bool, str and string; this allowance does not widen decode descriptors.
 `JsonEncodePlan::Owned` authenticates exactly `Struct(plan.root)` or
-`DynStructArray(plan.root, Aos)` against the rebuilt V3 record graph. The MIR
+`DynStructArray(plan.root, Aos)` against the rebuilt V4 record graph. The MIR
 `OwnedJsonRecords` piece preserves this union, borrowed-place provenance and
 initialization. LLVM selects the existing object/array writer from that type.
 Plan 59 owns the public boundary; `json_array_root_checked_hir_requires_exact_source_and_element`,

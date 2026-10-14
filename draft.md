@@ -2211,15 +2211,33 @@ one explicit unescaped append. Contextual language-template parsing remains defe
 
 ## 14. JSON
 
+**Mixed borrowed and owned graphs (AM-R02).** One selected recursive JSON graph
+admits `str` beside `string`, including Option, dynamic-array and nested-record
+positions, for record and AoS record-array roots. A transitive owned string still
+selects this route; other roots, constructors, layout/depth restrictions, SoA and
+scanner admission stay unchanged. Both encoders shared-borrow the complete input,
+including transitive text through cap evaluation, and return an independent owned
+`Result<string, Error>` with identical bytes on bounded success.
+
+Decode individually owns every string and array spine, including inside arenas.
+Clean `str` borrows input; selected escaped `str` uses the explicit enclosing arena
+or returns `Error.Code(1)` when none exists. A mixed result conservatively retains
+both input and arena lifetimes; fully owned graphs retain neither. Drop releases
+owners only, including on partial failure; `array<str>` owns its spine, not its text.
+No implicit clone, hidden arena or second ownership model is introduced. Plan193
+owns the exact V4 descriptor/envelope and interface19 transition, including distinct
+Str/String identity despite equal machine headers; the native ABI is unchanged.
+This replaces earlier mixed-view exclusions and JSON transport versions below.
+
 **Owned record-array decoding (R133).** `json.decode(input)` also infers
-`Result<array<R>, Error>` for the same closed V3 owned record graph used by
-record decoding and embedded arrays. Every row and its reachable strings/arrays
-are independently owned, including inside arenas; input may expire after the call.
-Empty arrays allocate nothing. Full JSON array syntax is validated before decoded
-allocation; schema failure frees completed rows and the partial row before returning
-`Error.Code(1)`. Element views remain bounded by the array owner. Mixed views, SoA
-and scanner schemas do not widen. Plan188 owns root admission and cleanup; the
-existing V3 element graph, native ABI and interface format remain unchanged.
+`Result<array<R>, Error>` for the same closed V4 graph used by record decoding and
+embedded arrays. Every reachable owner is individually allocated, including inside
+arenas; fully owned results allow input to expire after the call, while mixed
+results retain the text lifetimes above. Empty arrays allocate nothing. Full JSON
+array syntax precedes decoded allocation; schema failure frees completed rows and
+the partial row before `Error.Code(1)`. Element views remain bounded by the array
+owner and any borrowed text. Plan188 owns root admission and cleanup; Plan193
+supersedes its mixed-view exclusion and graph version. SoA/scanner stay unchanged.
 
 **Owned string-array decoding (V005).** The inferred target of `json.decode(input)`
 may be `array<string>`. A complete UTF-8 JSON array of strings produces an
@@ -2240,7 +2258,7 @@ owned output may outlive it. Exact-fit bounds succeed; negative/exceeded bounds
 and selected nonfinite floats return `Error.Invalid` without partial output.
 There is no implicit copy, wrapper, new element constructor or decode expansion.
 The owner reopened this restriction explicitly; plan 59 supersedes earlier bare
-dynamic-array encoding exclusions. Its V3 graph still describes the element
+dynamic-array encoding exclusions. Its V4 graph still describes the element
 record, while the typed source authenticates the array container.
 
 **R63 contract (2026-09-10).**
@@ -2284,9 +2302,9 @@ user: User := json.decode(data)?
 
 ### Zero Copy
 
-A decoded clean `str` or string-bearing `array` / nested field remains a view into the input buffer
-(no allocation), region-tied to that input. Numeric scalar arrays are copied into their owned
-buffer. JSON string tokens accept the RFC 8259 escapes `\"`, `\\`, `\/`, `\b`,
+Decoded clean `str` leaves remain views into the input buffer without text allocation,
+including leaves inside arrays or nested fields. Array spines have their own allocation;
+numeric scalar arrays copy their elements into the owned buffer. JSON string tokens accept the RFC 8259 escapes `\"`, `\\`, `\/`, `\b`,
 `\f`, `\n`, `\r`, `\t`, and `\uXXXX`; raw C0 bytes, malformed escapes, and invalid
 surrogate sequences are errors.
 A selected escaped `str` is materialized exactly once in the caller's enclosing arena and the
@@ -2307,55 +2325,25 @@ first_name := arena {
 ```
 
 The compiler never silently inserts a copy on escape — allocation stays visible in source
-("Nothing hidden") and the cost class stays predictable. A `.clone()` inside an arena is a
-bump allocation (bulk-freed), so escaping is not a sudden heap cost.
+("Nothing hidden") and the cost class stays predictable. Text `.clone()` allocates an
+independent owned string even inside an arena; `.clone_in(region)` explicitly selects
+region-owned text instead.
 
-### Direct owned records
+### Recursive borrowed and owned records
 
-A direct declared record containing `string`, `Option<string>`, or `array<string>` selects the
-owned JSON route. The route is closed and flat: every
-other field is a required signed/unsigned 8/16/32/64-bit integer or `bool`. Borrowed text, floats,
-nested records/arrays/enums, other optional forms, and explicit record layout/alignment are rejected
-before allocation. A record without an owned text leaf keeps the existing borrowed route.
+A natural-layout record or AoS record-array root selects the materializing route
+when its complete reachable graph contains an owned `string`. The shared graph
+admits fixed-width integers, f32/f64, bool, str/string, nonempty natural-layout
+records, non-nested Options and dynamic arrays of supported scalars or records.
+Arrays of options/arrays, char, sums, fixed arrays and explicit layout/alignment
+remain excluded. The graph is acyclic with at most 128 record/option/array levels.
+A graph with no owned text retains the existing route.
 
-Owned decode materializes every text value into free-standing storage. `array<string>` owns its
-spine and every element, and `Option<string>` owns only `Some`. The result has no input or arena
-dependency and remains free-standing when the call occurs inside `arena {}`. This is not a hidden
-copy: the declared owned field types plus `json.decode` select the materializing boundary. A mixed
-owned/borrowed graph is rejected instead of converted.
-
-`json.decode`, `json.encode`, and `json.encode_bounded` accept the same owned graph. Encode preserves
-declaration order and the existing JSON string grammar; bounded encode retains its inclusive byte
-ceiling and owned `Result<string, Error>`. Decode range-checks the exact integer width and supports
-the full unsigned 64-bit range. Missing and `null` map to `None`, encode omits `None`, and
-`Some("")` remains distinct. Recoverable failure drops every initialized direct owner exactly once;
-overflow and allocation failure retain the terminal-abort policy.
-
-The exact descriptor, error precedence, ownership matrix, and golden vectors are specified by
-`docs/impl/24-owned-json-plan.md`. AoS, SoA, union, scalar-array, `json.doc`, and `json.scan` routes
-are unchanged.
-
-### Recursive owned records
-
-The accepted Request 13 extension replaces that flat implementation boundary with one recursive,
-view-free graph. A direct natural-layout record selects the owned route when any reachable field is
-an owned `string`. The complete graph may contain fixed-width signed/unsigned integers, bool,
-`string`, nonempty natural-layout records, `Option<T>` payloads, and dynamic `array<T>`. An option
-payload may not itself be an option because missing and `null` are one absence state. Array elements
-are integers, bool, `string`, or an accepted record; arrays of options/arrays remain outside the
-language's element representation. The graph must be acyclic and at most 128
-record/option/dynamic-array constructor levels.
-`str`, floats, char, enums, fixed arrays, explicit layout/alignment, and every other constructor
-reject before descriptor construction or allocation.
-
-All decoded owners are free-standing, including nested option payloads, array spines, strings, and
-record elements. Partial construction and recoverable failure recursively drop live fields in
-declaration order and array elements in ascending order exactly once. `json.decode`, `json.encode`,
-and `json.encode_bounded` share the same graph and declaration-order canonical bytes. The V2
-structural graph descriptor replaces V1 for flat and recursive roots, travels only in a target-bound
-V2 envelope, and atomically advances the compiler interface format from 7 to 8; there is no
-flat/recursive compatibility path. The exact accepted design and implementation closure matrix are
-`docs/impl/25-recursive-owned-json-plan.md`; implementation is pending.
+Declared `string` fields expose materialization before execution; declared `str`
+fields preserve input/arena borrowing. Missing and null become None, encoding omits
+None, and Some("") remains distinct. Range checks, declaration-order bytes and
+partial owner cleanup are shared by decode and both encoders. Plans25/47 fix the
+unchanged recursive/numeric contract; Plan193 fixes mixed lifetimes and V4 identity.
 
 ### Struct as Schema
 
