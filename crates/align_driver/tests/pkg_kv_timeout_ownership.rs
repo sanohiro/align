@@ -53,19 +53,16 @@ DynamicClosure {
   reader_view: slice<ReaderHolder>,
   choices: array<ReaderChoice>,
   choice_view: slice<ReaderChoice>,
-  reader_batches: array<array<ReaderHolder>>,
   reader_batch_view: slice<array<ReaderHolder>>,
   optional: Option<array<ReaderHolder>>,
   result: Result<array<ReaderHolder>, Error>,
   writers: array<WriterHolder>,
   writer_view: slice<WriterHolder>,
-  writer_batches: array<array<WriterHolder>>,
   writer_batch_view: slice<array<WriterHolder>>,
   optional_writers: Option<array<WriterHolder>>,
   result_writers: Result<array<WriterHolder>, Error>,
   loggers: array<LoggerHolder>,
   logger_view: slice<LoggerHolder>,
-  logger_batches: array<array<LoggerHolder>>,
   logger_batch_view: slice<array<LoggerHolder>>,
   optional_loggers: Option<array<LoggerHolder>>,
   result_loggers: Result<array<LoggerHolder>, Error>,
@@ -82,7 +79,6 @@ fn nameable(
   reader_view: slice<ReaderHolder>,
   choices: array<ReaderChoice>,
   choice_view: slice<ReaderChoice>,
-  reader_batches: array<array<ReaderHolder>>,
   reader_batch_view: slice<array<ReaderHolder>>,
   pair: (array<ReaderHolder>, i64),
   optional: Option<array<ReaderHolder>>,
@@ -218,6 +214,15 @@ fn target_retainers(plan: &DropPlan, value: &LiveValue) -> usize {
                 .zip(values)
                 .map(|((_, child), value)| target_retainers(child, value))
                 .sum()
+        }
+        DropPlan::Tuple { elements, .. } => {
+            // Struct state models ordered product fields; tuples use positional order.
+            let LiveValue::Struct(values) = value else {
+                panic!("tuple Drop node did not receive product state: {value:?}");
+            };
+            assert_eq!(elements.len(), values.len(), "tuple element topology drifted");
+            elements.iter().zip(values)
+                .map(|(child, value)| target_retainers(child, value)).sum()
         }
         DropPlan::FixedArray { element, length } => {
             fixed_array_target_retainers(element, usize::try_from(*length).unwrap(), value)
@@ -915,6 +920,13 @@ fn formation_and_no_live_producer_edges_stay_closed() {
     // graph classifier above.
     let _ = checked_formation();
 
+    // Nested owned arrays are closed; borrowed views of array headers above remain valid.
+    for holder in ["ReaderHolder", "WriterHolder", "LoggerHolder"] {
+        let source = format!("{FORMATION_SOURCE}\nfn bad(value: array<array<{holder}>>) {{}}\n");
+        assert!(check_errs("pkg-kv-timeout-nested-owned-array", &source),
+            "nested owned {holder} arrays must remain a formation negative");
+    }
+
     for (name, ty, prelude) in [
         ("reader", "reader", ""),
         ("writer", "writer", ""),
@@ -1091,12 +1103,6 @@ TaggedChoiceArrayField { values: array<TaggedChoice> }
                     format!("fn bad(rows: array<{ty}>) {{ batches := [rows].to_array() }}"),
                 ),
                 (
-                    "nested-dynamic-slice",
-                    format!(
-                        "fn bad(rows: array<{ty}>) {{ batches := [rows]; view := batches[..] }}"
-                    ),
-                ),
-                (
                     "tuple-wrapper-materializer",
                     format!(
                         "fn bad({params}) {{ rows := [{value}].to_array(); wrapped := (rows, 1) }}"
@@ -1128,6 +1134,21 @@ TaggedChoiceArrayField { values: array<TaggedChoice> }
         }
         if !struct_array_wrappers {
             continue;
+        }
+        // Plan165 admits fixed arrays of existing dynamic headers and shared views of them.
+        // This transfers an incoming owner; it does not create a retaining dynamic array.
+        let header_view = format!(
+            "fn ok(rows: array<{ty}>) {{ batches := [rows]; view := batches[..] }}"
+        );
+        assert!(!check_errs("pkg-kv-timeout-header-view",
+            &format!("{prelude}{header_view}\nfn main() -> i32 = 0\n")));
+        for body in [
+            format!("fn bad(rows: array<{ty}>) -> slice<array<{ty}>> {{ batches := [rows]; return batches[..] }}"),
+            format!("fn bad(rows: array<{ty}>) -> i64 {{ batches := [rows]; view := batches[..]; moved := batches; return view.len() }}"),
+        ] {
+            assert!(check_errs("pkg-kv-timeout-header-view-guard",
+                &format!("{prelude}{body}\nfn main() -> i32 = 0\n")),
+                "{label}/header view must retain its owning fixed array");
         }
         // `44-move-record-slice-plan.md` (#1013) admits borrowing an in-place fixed array of Move
         // records as `slice<RetainingStruct>`. That is a *view*, not a producer: the slice is the

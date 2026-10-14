@@ -2261,7 +2261,7 @@ run before any side effect.
 The following producer sets are exact:
 
 - `ty-scalar` is `ty_to_scalar`: integer, float, bool, char, unit, struct,
-  owned string, primitive-element owned array, AoS struct array, response array, `str`,
+  flat tuple (Plan190), owned string, primitive-element owned array, AoS struct array, response array, `str`,
   primitive-element slice, reader, writer, regex, captures, file, parsed CLI, TCP connection,
   TCP listener, UDP socket, child, HTTP response, HTTP server, HTTP request context, response
   builder, HTTP stream, run output, SoA, JSON document, enum, concrete tagged value, or a template
@@ -2270,7 +2270,7 @@ The following producer sets are exact:
 - `payload-scalar` is `scalar_arg(..., allow_param=true)`: `ty-scalar` minus `Buffer`, with nested
   `Option`/`Result` interned as `Tagged`. `Param` is legal only in an abstract template.
 - `collection-scalar` is `scalar_arg(..., allow_param=false)` plus `Fn`: `ty-scalar` minus
-  `Buffer`, `Reader`, `Writer`, `Regex`, `Captures`, `CliParsed`, `TcpConn`, `TcpListener`,
+  `Tuple`, `Buffer`, `Reader`, `Writer`, `Regex`, `Captures`, `CliParsed`, `TcpConn`, `TcpListener`,
   `UdpSocket`, `Child`, `File`, `HttpResponse`, `HttpServer`, `HttpRequestCtx`, `HttpStream`,
   `ResponseBuilder`, and `RunOutput`, then plus `Fn`. Owned I/O handles are never collection
   elements because element reads copy the handle without a move-out and the generic array Drop path
