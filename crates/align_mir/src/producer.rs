@@ -5753,6 +5753,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     Some(Ty::Array(element, _)) => {
                         result_ty == Ty::Slice(element) && elem == scalar_to_ty(element)
                     }
+                    Some(Ty::DynStructArray(id, Layout::Aos)) => {
+                        result_ty == Ty::Slice(Scalar::Struct(id)) && elem == Ty::Struct(id)
+                    }
                     _ => false,
                 };
                 let source_path = if path.is_empty() {
@@ -11973,6 +11976,10 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
 #[cfg(test)]
 #[path = "producer_copy_tests.rs"]
 mod copy_tests;
+
+#[cfg(test)]
+#[path = "producer_subslice_tests.rs"]
+mod subslice_tests;
 
 #[cfg(test)]
 mod tests {

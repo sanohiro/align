@@ -24,6 +24,10 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan184](docs/impl/184-record-array-subslice-producer.md) certifies existing
+  AoS record-array subslices beside fallible owned returns for media AM-R06.
+  Exact source/result/stride checks retain shared backing authority and cleanup;
+  GPU/image qualification and consumer adoption remain external.
 - [Plan183](docs/impl/183-json-string-array-root.md) adds the inferred JSON
   `array<string>` root using independent string owners and complete prefix
   cleanup. Voice V005 consumer adoption remains external.
