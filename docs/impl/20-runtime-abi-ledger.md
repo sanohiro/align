@@ -400,16 +400,18 @@ declaration golden owns the emitted declaration and the class token together.
 | `HttpResponseNew` | `align_rt_http_response_new` | `AllocNew` |
 | `HttpServe` | `align_rt_http_serve` | `Callback` |
 | `HttpServeShared` | `align_rt_http_serve_shared` | `Callback` |
+| `HttpServerAcceptTimeoutNs` | `align_rt_http_server_accept_timeout_ns` | `HostState` |
 | `HttpServerFree` | `align_rt_http_server_free` | `HostState` |
 | `HttpServerMaxRequestBodyBytes` | `align_rt_http_server_max_request_body_bytes` | `HostState` |
 | `HttpSseStreamLastEventId` | `align_rt_http_sse_stream_last_event_id` | `HostState` |
 | `HttpSseStreamNext` | `align_rt_http_sse_stream_next` | `HostState` |
 | `HttpSseStreamRetryMs` | `align_rt_http_sse_stream_retry_ms` | `HostState` |
+| `HttpStreamWriteTimeoutNs` | `align_rt_http_stream_write_timeout_ns` | `HostState` |
 | `HttpStreamFinish` | `align_rt_http_stream_finish` | `HostState` |
 | `HttpStreamFree` | `align_rt_http_stream_free` | `HostState` |
 | `HttpStreamReject` | `align_rt_http_stream_reject` | `HostState` |
 | `HttpStreamSend` | `align_rt_http_stream_send` | `HostState` |
-| `HttpStreamSendEvent` | `align_rt_http_stream_send_event`, `align_rt_unicode_nfc` | `HostState` |
+| `HttpStreamSendEvent` | `align_rt_http_stream_send_event` | `HostState` |
 | `HttpTimeout` | `align_rt_http_timeout` | `HostState` |
 | `HttpUpgradeDeadline` | `align_rt_http_upgrade_deadline` | `HostState` |
 | `HttpUpgradeFree` | `align_rt_http_upgrade_free` | `HostState` |
@@ -566,6 +568,7 @@ declaration golden owns the emitted declaration and the class token together.
 | `StrFinderFree` | `align_rt_str_finder_free` | `IndirectStorage` |
 | `StrFinderNew` | `align_rt_str_finder_new` | `AllocNew` |
 | `StrRfind` | `align_rt_str_rfind` | `DispatchCache` |
+| `StrParseI64` | `align_rt_str_parse_i64` | `IndirectStorage` |
 | `StrStartsWith` | `align_rt_str_starts_with` | `PureArgRead` |
 | `StrTrim` | `align_rt_str_trim` | `PureArgRead` |
 | `StrTrimEnd` | `align_rt_str_trim_end` | `PureArgRead` |
@@ -1540,7 +1543,7 @@ from the bodies. A merged body also carries no producer string attribute.
 | A134 | `i32 @SYM(i32, ptr)` | `align_rt_process_signals` |
 | A135 | `i32 @SYM(i32, i64, ptr)` | `align_rt_fs_memory_file` |
 | A138 | `i64 @SYM(ptr, ptr, i64, i64, i64)` | `align_rt_io_file_pread_into` |
-| A20 | `i32 @SYM(ptr, ptr, i64)` | `align_rt_io_writer_write`, `align_rt_cli_get_bool`, `align_rt_regex_is_match`, `align_rt_http_stream_send`, `align_rt_http_stream_send_event` |
+| A20 | `i32 @SYM(ptr, ptr, i64)` | `align_rt_io_writer_write`, `align_rt_cli_get_bool`, `align_rt_regex_is_match`, `align_rt_http_stream_send`, `align_rt_http_stream_send_event`, `align_rt_unicode_nfc` |
 | A21 | `i32 @SYM(ptr, ptr, i64, i64, ptr)` | `align_rt_http_get_many`, `align_rt_regex_find` |
 | A22 | `i32 @SYM(ptr, ptr, i64, ptr)` | `align_rt_cli_parse`, `align_rt_http_resp_header`, `align_rt_http_client_get`, `align_rt_regex_find_all`, `align_rt_regex_split`, `align_rt_regex_captures`, `align_rt_http_ctx_header`, `align_rt_http_read_stream_header` |
 | A23 | `i32 @SYM(ptr, ptr, i64, ptr, i64, ptr)` | `align_rt_http_client_post` |

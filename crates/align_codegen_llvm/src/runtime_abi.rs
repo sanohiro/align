@@ -4567,6 +4567,26 @@ mod tests {
             assert_eq!(runtime_abi_for_symbol(symbol), Some(id));
         }
         assert!(runtime_abi_for_symbol("align_rt_not_a_fixed_row").is_none());
+
+        // Identity rows name one symbol each; shared ABI shapes do not share identities.
+        let ledger = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../docs/impl/20-runtime-abi-ledger.md"
+        )).unwrap();
+        let table = ledger.split_once("| Registry row | Physical symbol | `EffectClass` |\n")
+            .unwrap().1;
+        let documented: Vec<_> = table.lines().skip(1)
+            .take_while(|line| line.starts_with('|')).collect();
+        let expected: HashSet<_> = rows.iter().map(|row| {
+            let id = match row.key {
+                RuntimeAbiId::Keyed(key) => format!("{key:?}"),
+                RuntimeAbiId::Unkeyed(key) => format!("Unkeyed::{key:?}"),
+            };
+            format!("| `{id}` | `{}` | `{:?}` |", row.symbol, runtime_effects(row.key).class)
+        }).collect();
+        assert_eq!(documented.len(), expected.len(), "runtime identity ledger cardinality");
+        assert_eq!(documented.into_iter().collect::<HashSet<_>>(),
+            expected.iter().map(String::as_str).collect::<HashSet<_>>(),
+            "runtime identity ledger must match every key, symbol and effect class");
     }
 
     #[test]
