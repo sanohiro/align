@@ -63,3 +63,35 @@ retained. Both sides use release compiler/runtime, release generated code, nativ
 CPU, disabled runtime LTO and codegen cache. Input I/O and validation checks are
 outside timing; every measured aggregate must equal the independent generator.
 This is a before/after Align cost observation, not the unavailable serde duel.
+
+The retained [measurement record](../../bench/json_array_grammar/README.md)
+binds the baseline `7c66d0d1` and implementation `53bfe56a` to their actual
+compiler/runtime hashes. All counts and aggregates agree. At one million rows,
+the median-of-process-medians changes from 145.142 to 207.808 ms for AoS full,
+139.978 to 200.577 ms for AoS projection, 143.146 to 196.265 ms for SoA full,
+and 140.079 to 191.698 ms for SoA projection. The complete grammar check costs
+about 37–43% on that local corpus. Correctness no longer depends on the selected
+schema, and ignored numbers still undergo lexical validation without conversion.
+Reducing this cost is future parser optimization under the same grammar owner;
+skipping required grammar is not an admissible fast path.
+
+## Author matrix-to-diff closure
+
+`json_record_array_count` and both indexed entrypoints close complete syntax,
+direct-object membership, exact counts and validation before decoded allocation.
+`write_field_indexed` closes complete numeric and optional-null consumption.
+The parameterized native matrix checks successful values and error output
+sentinels across AoS/SoA, including 4,096 levels of ignored nesting. Its allocation
+owner distinguishes syntax rejection before staging from valid-syntax schema
+failures that must retire positive partial-owner allocations. All four existing
+decoded-owner failure/speculation tests still pass; only two syntax-failure
+allocation expectations changed to zero.
+
+The source owner executes the matrix through whole and per-unit compilation with
+ordinary Result recovery. The existing native JSON set passes 36 tests (two
+explicit probes ignored), including numeric spans, SoA values, string escapes
+and duplicate-key speculation. The `align-self-review` pass found no new type,
+IR, descriptor or ABI domain; it checked shared indexed consumers, bounded
+input access, cleanup/publication, adjacent comments and exclusive child/scratch
+ownership. One fresh full-diff inspection and final local gates remain the
+publication checks.
