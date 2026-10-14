@@ -5089,26 +5089,31 @@ backend diagnostic runs in semantic-only `check`.
 
 ### Authoritative record
 
-Extend the existing L2e same-program fact to producer-validated direct imports.
-A mutable-retention summary is `Option<Vec<Vec<MutableRetentionRoot>>>`;
-`MutableRetentionRoot` is `Contained(u32)` or `Storage(u32)`. Outer positions are
-logical parameter ordinals in declaration order, including nonmutable parameters.
-Each inner sequence is strictly sorted by `(tag, ordinal)` with no duplicates;
-Contained has tag 0 and Storage tag 1. A root denotes exactly the existing
-`BorrowRoot::Param` or `BorrowRoot::ParamStorage` edge. Contained selects the
-argument's embedded provenance; Storage selects its caller-owned storage.
-The record transports the exact output of the existing returning-path analysis,
-including its destination-self convention; it is not an arbitrary overapproximation
-of ordinary retained provenance. For a `borrow mut` destination, a nonempty set
-containing only that destination's Contained/Storage roots selects the existing
-unchanged-destination transition. An empty set selects the borrow-free replacement
-transition. Other sets select the existing source-substitution transition. `out`
-never uses the unchanged sentinel. Adding or removing a self root can change the
-transition and is not authorized as a conservative normalization. Every exclusive
-call checks live resource dependents and keeps pre-call invalidation unless the
-plan-80 direct-view effect proves a change; the unchanged transition still
-invalidates old observations. The record neither guarantees that a write
-executes nor supplies a return-value borrow summary. Plan 80 adds a separate
+The authoritative mutable-output record is refined by
+[Plan199](199-indirect-mutable-outputs.md). It is
+`Option<Vec<MutableRetentionDestination>>`, where each destination has
+`may_mutate: bool` and `roots: Vec<MutableRetentionRoot>`.
+`MutableRetentionRoot` is `Contained(u32)` (tag0) or `Storage(u32)` (tag1).
+Rows follow logical parameter order; roots are strictly ordered by (tag, ordinal),
+unique and in range. Only BorrowMut rows may set the mutation flag; Out rows keep
+it false and use their independent content-update transition. Nonmutable rows
+have empty roots. None is unavailable; concrete local bodies and certified imports
+supply complete records, while generic templates carry None.
+
+Retained roots never prove no mutation. A validated false BorrowMut mutation flag
+suppresses whole-place replacement; true retains all possible source dependencies,
+including unchanged siblings. Different-argument roots use the existing completed
+value/storage snapshots. Exact Contained(self) selects frozen borrowed contents,
+excluding only owned-header lifetime introductions at their typed occurrences.
+Storage(self) still selects full frozen storage: the callee may have installed a
+new view into its own owned field. Ambiguous self-storage relations stay
+conservative; they do not acquire a projected-origin proof. Unknown records keep
+the all-input fallback. Plan199 owns occurrence resolution, mutation propagation
+through Out/captured aliases and the complete closure matrix.
+
+Every exclusive call still checks live resource dependents and invalidates old
+observations. The mutation flag does not confer access authority, guarantee an
+executed write or supply a return-value summary. Plan 80 adds a separate
 format-17 effect for an eligible direct Copy-view `borrow mut` destination:
 retention roots alone cannot distinguish a descriptor rebind, an original or
 transient-target element write, or a partial overwrite. A proved change can preserve the addressed allocation
@@ -5127,41 +5132,32 @@ transporting the current exact fact loses that distinction, separate backing or
 mutation authority in this record before implementation; do not compensate by
 inventing a root or silently treating unavailable analysis as unchanged.
 
-`None` means unavailable and selects the existing all-compatible-input fallback.
-`Some` has exactly the logical parameter count, even if every inner set is empty.
-Only `borrow mut` and `out` destinations may have nonempty sets. Sources must be
-in range. A source may be any parameter mode: by-value arguments can contain
-views, and their storage can still require accounting. No type-based removal or
-root insertion is authorized. A local, ended,
-observation, or temporary root is not serializable: producer checking must reject
-an actual escape, and unavailable analysis must never become known-empty.
+A local, ended, observation or temporary root is not serializable: producer
+checking must reject an actual escape, and unavailable analysis never becomes
+known-empty. The self-content resolver preserves ended and unknown dependencies.
 
 The checked HIR carries the record on imported declarations. Local records are
 computed from actual checked bodies by the existing least-fixed-point analysis;
 interface construction obtains those same results. Importers use only validated
 records, never dependency bodies. Missing external metadata keeps `None`.
 Generic interface templates carry `None`; instantiated bodies infer concrete
-facts through the existing local worklist. Function-value types and indirect
-calls retain their existing conservative handling. Extern C declarations acquire
+facts through the existing local worklist. A uniquely resolved noncapturing function value consumes the complete record;
+unavailable, empty, multiple, captured or malformed targets retain conservative
+handling. Extern C declarations acquire
 no new authority. No new runtime ABI, source syntax, type ownership, allocation,
 Drop, or lifetime rule is introduced.
 
-Interface format 10 adds this field immediately after `parallel_transfer_params`
-in every top-level function record. All existing fields retain their version-9
-order and encoding. Integers below are little-endian. The field encodes `None`
-as u8 0, or `Some` as u8 1 followed by outer u32 length, then each destination's
-u32 root count followed by `(u8 tag, u32 ordinal)` records. Other option/root tags,
-truncation, wrong outer arity, duplicate/unsorted/out-of-range roots, nonmutable
-destination roots, and `Some` on generic templates reject. Decode structural
-errors follow byte order; validate arity before destination entries and each
-entry's tag/range/order before its destination-mode restriction. Existing header
-version rejection precedes every record. Direct in-memory interface validation
-and imported checked-HIR validation enforce the same shape before use. Checked
-HIR replay re-infers local body facts and retains only validated imported facts.
-No old-version fallback is permitted.
+Interface format20 retains format19 field order and replaces each mutable-retention
+row with a canonical bool byte followed by its root sequence. The field remains
+after `parallel_transfer_params`: None is u8 0; Some is u8 1, outer u32 LE length,
+then parameter-ordered rows of u8 bool (0/1), u32 LE root count, and
+(u8 tag, u32 LE ordinal) roots. Plan199 specifies rejection precedence and literal
+goldens. Unknown versions reject before records; there is no compatibility path.
+Shared HIR validation enforces the same shape in codecs, in-memory interfaces and
+checked imports. Replay re-infers and compares both roots and flags locally.
 
 The canonical function bytes, hence `interface_hash`, include this field. A
-private helper edit that changes a public function's inferred retention roots
+private helper edit that changes a public function's inferred retention roots or mutation flag
 invalidates consumers; an edit that preserves that public fact retains the
 ordinary implementation-only cache behavior. Root ordinals are nominal logical
 parameter identities, not layout fingerprints. The existing nominal type graph,
@@ -5170,20 +5166,10 @@ unchanged. Host-side vectors own their memory; no runtime allocation is added
 and no performance promise is made. There are no new text/native boundaries,
 ambient options, error variants exposed to Align programs, or platform APIs.
 
-Independent field golden vectors (hex, before embedding in a function record):
-
-```text
-None:                         00
-Some([]):                     01 00000000
-Some([[], []]):               01 02000000 00000000 00000000
-Some([[Contained(1)], []]):    01 02000000 01000000 00 01000000 00000000
-Some([[Storage(1)], []]):      01 02000000 01000000 01 01000000 00000000
-```
-
-The two nonempty vectors require destination 0 to be mutable and two logical
-parameters. Owners construct semantic records and compare their bytes, then
-independently decode literal bytes and compare semantic records; a roundtrip
-alone is insufficient. Full-interface owners cover format 10 and hash changes.
+Independent semantic-to-byte and byte-to-semantic vectors are authoritative in
+Plan199. Codec owners cover None, no parameters, empty rows, both root kinds,
+both flag values, malformed records and every truncated prefix. Full-interface
+owners cover format20 and changes to public roots or mutation flags.
 
 ### Implementation closure matrix
 
@@ -5192,12 +5178,12 @@ alone is insufficient. Full-interface owners cover format 10 and hash changes.
 | Formation and malformed input | One canonical root validator for arity, ordered roots, modes, and generic absence; enforce at codec, in-memory import, and checked HIR ingress. Invalid/unavailable never implies empty. | Interface codec literal goldens and parameterized tag/order/range/mode/arity mutations; checked-HIR imported-record mutations. |
 | Construction, move-in/out, source nulling, Drop, replacement, return | Transport existing contained/storage roots into the one current mutable-call transfer; preserve all local inference and cleanup code. No new runtime or MIR field. | Existing mutable-retention, resource ownership and replacement-cleanup owners; positive independent-output build and execution. |
 | `if`, `match`, `else`, `?`, `map_err`, early exits and loop joins | Existing body inference remains authoritative for each returning path; imported callers consume its fixed point without path reinterpretation. | Existing mutable-retention control-flow owners plus direct-import twins of retained versus cloned input and transitive forwarding. |
-| Unchanged/replacement distinction | Preserve the exact self-root convention and exclusive invalidation; prove unchanged-only, fresh-only, and conditional unchanged/fresh paths retain all possible backing lifetimes. | Local/imported/replay variants of `borrow_mut_dynamic_array_heap_replacement_re_marks_storage`, conditional early return and branch joins, unchanged region-backed owner read, and pre-call view/live-dependent rejection. |
+| Unchanged/replacement distinction | Use the independent mutation flag and preserve exclusive invalidation; prove unchanged-only, fresh-only, and conditional unchanged/fresh paths retain all possible backing lifetimes. | Local/imported/replay variants of `borrow_mut_dynamic_array_heap_replacement_re_marks_storage`, conditional early return and branch joins, unchanged region-backed owner read, and pre-call view/live-dependent rejection. |
 | Lifetime and storage generations | Retained local views and caller storage still reject on escape or stale use. Known-empty removes only false dependencies; it does not skip eager operand aliasing or replacement invalidation. | Imported contained-view and storage-view negative twins, sibling-output positive, actual overlapping-borrow negative, unavailable/indirect fallback owners. |
 | Generics and recursion | Generic templates omit the fact; concrete instantiations and recursive public/private forwarding converge through existing monotone inference. No capture ordinal may escape as a public parameter. | Imported generic body and mutually recursive forwarding owners; generic-record malformed owner. |
 | Whole program, per unit, replay | Same typed root meaning on all paths; imported metadata is validated before either MoveCheck or EscapeCheck; no body rediscovery. | Request 43 independent-output and Request 49 cloned-local-string consumers checked whole/per-unit, built and executed; retained-view twins reject; checked HIR replay owner. |
-| Serialization and cache | Format 10, independently checked bytes, public fact hashed; producer-only implementation changes preserving the fact keep prior cache semantics. | Interface goldens, incompatible version rejection, public-retention-change and unchanged-root private-body hash owners, transitive interface owner. |
-| Runtime provenance and allocation parity | No new runtime symbol, storage transfer, cleanup flag or allocation. Existing all-compatible fallback remains for absent metadata and indirect calls. | Existing resource/ABI owners; no benchmark because no new resource claim. |
+| Serialization and cache | Format20, independently checked bytes, complete public fact hashed; producer-only implementation changes preserving the fact keep prior cache semantics. | Interface goldens, incompatible version rejection, public-retention-change and unchanged-root private-body hash owners, transitive interface owner. |
+| Runtime provenance and allocation parity | No new runtime symbol, storage transfer, cleanup flag or allocation. Existing all-compatible fallback remains for absent metadata and unresolved/multiple/captured indirect targets. | Existing resource/ABI owners; no benchmark because no new resource claim. |
 
 The implementation, codec, producer and both consumer analyses land in one
 capability PR: a serialized producer without a consumer cannot fix either

@@ -1721,7 +1721,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
-                mutable_retention: Some(vec![vec![]; 0]),
+                mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
                 mutable_view_effect: None,
                 locals: Vec::new(),
                 body: Block {
@@ -1785,7 +1785,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
-                mutable_retention: Some(vec![vec![]; 1]),
+                mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
@@ -1859,7 +1859,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
-                mutable_retention: Some(vec![vec![]; 1]),
+                mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
@@ -1939,7 +1939,7 @@ mod tests {
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
-                mutable_retention: Some(vec![vec![]; 1]),
+                mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
@@ -2389,7 +2389,7 @@ mod tests {
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
-                mutable_retention: Some(vec![vec![]; 1]),
+                mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
                     id: 0,
@@ -2594,6 +2594,7 @@ mod tests {
                         loop_value_facts: std::collections::HashMap::new(),
                         control_value_facts: std::collections::HashMap::new(),
                         walked_value_facts: std::collections::HashMap::new(),
+                        walked_self_contents: std::collections::HashMap::new(),
                         walked_storage_facts: std::collections::HashMap::new(),
                         walked_backing_facts: std::collections::HashMap::new(),
                         pending_call_completions: std::collections::HashMap::new(),
@@ -2607,7 +2608,7 @@ mod tests {
                         parallel_transfer_roots: crate::BorrowRoots::new(),
                         mutable_access_roots: crate::BorrowRoots::new(),
                         borrow_mut_retention: vec![
-                            crate::BorrowRoots::new();
+                            crate::BorrowMutRetentionDestination::default();
                             move_program.fns[0].params.len()
                         ],
                         view_effect_exits: None,

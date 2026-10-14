@@ -3019,8 +3019,9 @@ fn mutable_retention_private_body_changes_reach_public_interface_hashes() {
     let first = produce("dst = a");
     let same = produce("print(1); dst = a");
     let changed = produce("dst = b");
-    assert_eq!(first.fns[0].mutable_retention, Some(vec![vec![Contained(1)], vec![], vec![]]));
-    assert_eq!(changed.fns[0].mutable_retention, Some(vec![vec![Contained(2)], vec![], vec![]]));
+    assert_eq!(first.fns[0].mutable_retention.as_ref().unwrap()[0].roots, vec![Contained(1)]);
+    assert!(first.fns[0].mutable_retention.as_ref().unwrap()[0].may_mutate);
+    assert_eq!(changed.fns[0].mutable_retention.as_ref().unwrap()[0].roots, vec![Contained(2)]);
     // Effect also belongs to the interface; use a pure implementation edit for the stable case.
     let equivalent = produce("n := 1 + 2; dst = a");
     assert_eq!(first.interface_hash, equivalent.interface_hash);
@@ -3033,15 +3034,35 @@ fn mutable_retention_private_body_changes_reach_public_interface_hashes() {
 }
 
 #[test]
+fn mutable_retention_mutation_flag_changes_interface_identity_without_root_changes() {
+    let produce = |body: &str| one(format!(
+        "pub Row {{ number: i64, text: str }}\nfn inner(borrow mut row: Row) {{ {body} }}\npub fn forward(borrow mut row: Row) {{ inner(row) }}\nfn main() {{}}\n"
+    )).remove(0);
+    let unchanged = produce("");
+    let changed = produce("row.number = 7");
+    let left = &unchanged.fns[0].mutable_retention.as_ref().unwrap()[0];
+    let right = &changed.fns[0].mutable_retention.as_ref().unwrap()[0];
+    assert_eq!(left.roots, right.roots);
+    assert!(!left.may_mutate && right.may_mutate);
+    assert_ne!(unchanged.interface_hash, changed.interface_hash);
+    for summary in [unchanged, changed] {
+        assert_eq!(deserialize(&serialize(&summary)), Ok(summary.clone()));
+        assert_eq!(validate_for_import(&summary), Ok(()));
+    }
+}
+
+#[test]
 fn mutable_retention_in_memory_imports_reject_malformed_records() {
     use align_sema::hir::MutableRetentionRoot::{Contained, Storage};
+    let row = |may_mutate, roots| align_sema::hir::MutableRetentionDestination { may_mutate, roots };
     let base = one("pub fn set(borrow mut dst: str, value: str) { dst = value }\nfn main() -> i32 = 0\n").remove(0);
     for record in [
         Some(vec![]),
-        Some(vec![vec![Contained(2)], vec![]]),
-        Some(vec![vec![Contained(1), Contained(1)], vec![]]),
-        Some(vec![vec![Storage(1), Contained(0)], vec![]]),
-        Some(vec![vec![], vec![Contained(0)]]),
+        Some(vec![row(true, vec![Contained(2)]), row(false, vec![])]),
+        Some(vec![row(true, vec![Contained(1), Contained(1)]), row(false, vec![])]),
+        Some(vec![row(true, vec![Storage(1), Contained(0)]), row(false, vec![])]),
+        Some(vec![row(false, vec![]), row(false, vec![Contained(0)])]),
+        Some(vec![row(false, vec![]), row(true, vec![])]),
     ] {
         let mut bad = base.clone();
         bad.fns[0].mutable_retention = record;
@@ -3051,7 +3072,7 @@ fn mutable_retention_in_memory_imports_reject_malformed_records() {
     }
     let mut generic = one("pub fn identity<T>(value: T) -> T = value\nfn main() -> i32 = 0\n").remove(0);
     assert_eq!(generic.fns[0].mutable_retention, None);
-    generic.fns[0].mutable_retention = Some(vec![vec![]]);
+    generic.fns[0].mutable_retention = Some(vec![row(false, vec![])]);
     rehash(&mut generic);
     assert!(matches!(validate_for_import(&generic), Err(ImportCompatibilityError::InvalidMutableRetention(_))));
     assert!(matches!(deserialize(&serialize(&generic)), Err(DecodeError::InvalidSummary(_))));

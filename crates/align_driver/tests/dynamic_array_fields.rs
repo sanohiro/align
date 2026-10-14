@@ -456,7 +456,7 @@ fn main()->i32 {
                         .mutable_retention
                         .as_ref()
                         .and_then(|outputs| outputs.first())
-                        .is_some_and(|roots| roots
+                        .is_some_and(|destination| destination.roots
                             .contains(&align_sema::hir::MutableRetentionRoot::Contained(1)))
                 );
                 execute(stage, text_source, "text-authority")?;
@@ -488,32 +488,11 @@ fn main()->i32 {
                     );
                 }
             }
-            // Function-value exclusive calls have no precise mutable-output summary today.
-            // Keep the established conservative refusal paired with whole-field replacement.
+            // A uniquely resolved function value consumes the same authenticated output facts.
             for body in ["row.a[0]=value as i64", "row.a=[value as i64].to_array()"] {
                 std::fs::write(&model, MODEL.replace("row.a[0]=value as i64", body))?;
-                let source = "module main\nimport model\nfn main(){mut row:=model.make();write:=model.set;write(row,7);print(row.a[0])}";
-                let path = stage.join("main.align");
-                std::fs::write(&path, source)?;
-                for per_unit in [false, true] {
-                    let mut sources = SourceMap::new();
-                    let diags = if per_unit {
-                        align_driver::build_per_unit(
-                            &mut sources,
-                            path.to_str().ok_or("path")?,
-                            source,
-                        )
-                        .diags
-                    } else {
-                        align_driver::check(&mut sources, path.to_str().ok_or("path")?, source)
-                            .diags
-                    };
-                    let text = align_driver::format_diagnostics(&sources, &diags);
-                    assert!(
-                        diags.has_errors() && text.contains("borrow"),
-                        "indirect/{body}/{per_unit}: {text}"
-                    );
-                }
+                let source = "module main\nimport model\nfn main()->i32{mut row:=model.make();write:=model.set;write(row,7);if row.a[0]!=7{return 1};return 0}";
+                execute(stage, source, "indirect-field-authority")?;
             }
             std::fs::write(&model, MODEL)?;
             let entry = stage.join("main.align");
