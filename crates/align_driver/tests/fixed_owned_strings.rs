@@ -458,7 +458,7 @@ fn fixed_owned_strings_reject_invalid_transfers_and_consumers() {
             ("moved-element-source", "fn main() { text := \"a\".clone(); values := [text, \"b\".clone()]; print(text) }".into()),
             ("borrowed-owner", "fn bad(borrow values: [string; 2]) { take(values) }\nfn main() {}".into()),
             ("owned-index", "fn main() { values := [\"a\".clone(), \"b\".clone()]; text: string := values[0] }".into()),
-            ("nested-move", "fn main() { value := Keys { values: [\"a\".clone(), \"b\".clone()] }; taken := value.values }".into()),
+            ("nested-move", "Outer { inner:Keys }\nfn main() { value := Outer { inner:Keys { values: [\"a\".clone(), \"b\".clone()] } }; taken := value.inner.values }".into()),
             ("write-element", "fn main() { mut values := [\"a\".clone(), \"b\".clone()]; values[0] = \"c\".clone() }".into()),
             ("write-view", "fn bad(out values: slice<string>) { values[0] = \"c\".clone() }\nfn main() {}".into()),
             ("returned-index", "fn bad() -> str { values := [\"a\".clone(), \"b\".clone()]; return values[0] }\nfn main() {}".into()),

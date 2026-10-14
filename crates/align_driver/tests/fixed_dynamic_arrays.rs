@@ -382,7 +382,7 @@ fn fixed_dynamic_arrays_reject_invalid_transfers_and_views() {
             ("indexed-store", "fn main() { mut values := model.make_values(); values[0] = [3].to_array() }".into()),
             ("indexed-exclusive", "fn mutate(borrow mut value: array<i64>) {}\nfn main() { mut values := model.make_values(); mutate(values[0]) }".into()),
             ("borrowed-owner-move", "fn bad(borrow values: [array<i64>; 2]) { take(values) }\nfn main() {}".into()),
-            ("nested-field-move", "fn main() { batch := model.make(); values := batch.values }".into()),
+            ("nested-field-move", "Outer { inner:model.Batch }\nfn main() { batch := Outer {inner:model.make()}; values := batch.inner.values }".into()),
             ("returned-inner-view", "fn bad() -> slice<i64> { values := model.make_values(); return model.view(values[0]) }\nfn main() {}".into()),
             ("returned-outer-view", "fn bad() -> slice<array<i64>> { values := model.make_values(); return values[..] }\nfn main() {}".into()),
             ("retained-inner-view", "View { values: slice<i64> }\nfn retain(borrow value: array<i64>, borrow mut output: View) { output.values = value[..] }\nfn main() { values := model.make_values(); mut output := View { values: [] }; retain(values[0], output); take(values); print(output.values[0]) }".into()),

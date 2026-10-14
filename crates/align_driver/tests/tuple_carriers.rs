@@ -378,7 +378,7 @@ fn tuple_carrier_rejects_invalid_authority() {
             ),
             (
                 "nested_owned_field",
-                "Record {pair:(string,i64)}\nfn main() {value:=Record {pair:(\"owned\".clone(),1)};other:=value.pair}",
+                "Record {pair:(string,i64)}\nOuter {inner:Record}\nfn main() {value:=Outer {inner:Record {pair:(\"owned\".clone(),1)}};other:=value.inner.pair}",
                 "owned",
             ),
             (

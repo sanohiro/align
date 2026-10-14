@@ -98,6 +98,28 @@ sequenceDiagram
 
 These calls return an integer and Unit. A function that returns a view can leave the caller with a reference into `p`; that view remains subject to `p`'s lifetime and mutation rules.
 
+### Moving a complete owned field
+
+A bound record can transfer a complete direct owned field, including an array, nested record or
+tuple. The other fields remain usable:
+
+```align
+Items { values: array<i64>, marker: i64 }
+fn main() -> i32 {
+    owner := Items { values: [10, 20].to_array(), marker: 7 }
+    values := owner.values
+    print(values.sum())  // 30
+    print(owner.marker)  // 7
+    return 0
+}
+```
+
+This transfers ownership without cloning or allocating. The old field and the partially moved
+record cannot be used as a whole again; assigning the old field does not restore it. A borrowed
+record cannot give away its field. For a deeper move, first take the complete direct inner record
+into its own local. Existing views of dynamic backing follow its new owner, and contained borrowed
+values still depend on their original sources. Views of moved inline backing expire.
+
 ### Replacing owned fields and shortening arrays
 
 An owned field can be replaced on a mutable record or through `borrow mut`:

@@ -236,10 +236,9 @@ fn nested_path_owned_field_move_still_rejected() {
 }
 
 #[test]
-fn nested_move_struct_field_move_still_rejected() {
-    // Moving a whole nested Move-struct field out (`a := u.addr`) is still deferred (it needs the
-    // sub-struct nulled, not a single `{ptr,len}`).
-    assert!(check_errs(
+fn complete_nested_move_struct_field_is_accepted() {
+    // Plan192 clears the complete selected field to its exact aggregate zero.
+    assert!(!check_errs(
         "ownfield-move-substruct",
         concat!(
             "Addr { name: string }\n",

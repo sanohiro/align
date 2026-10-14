@@ -87,15 +87,16 @@ fn main() -> Result<(), Error> {
         checked.whole_diags,
         checked.per_unit_diags
     );
-    let rejected = source.replace("inspect(row.node.text)", "nested := row.node");
+    // The complete direct field now moves; later reads through the old parent still reject.
+    let moved = source.replace("inspect(row.node.text)", "nested := row.node");
     let checked = diff_check_multi(
-        "owned-json-nested-record-control",
-        &[("main.align", &rejected)],
+        "owned-json-moved-parent-control",
+        &[("main.align", &moved)],
         "main.align",
     );
     for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
         assert!(
-            diagnostics.contains("moving a nested struct field out of a struct"),
+            diagnostics.contains("use of partially moved value 'row'"),
             "{diagnostics}"
         );
     }

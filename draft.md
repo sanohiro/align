@@ -1133,6 +1133,17 @@ A one-owner aggregate may forward a heap/arena path-dependent runtime bit,
 but its owned fields or elements cannot be mutated until the mode is definite. Direct Move-struct
 and fixed-array bindings retain every completed field owner until initialization succeeds.
 
+A bound owning record permits moving any complete direct owning field whose existing type has a
+valid recursive Drop plan: `value := owner.field`. The selected value inherits the parent's
+path-local cleanup bit, and only that field is cleared to its exact typed zero. Other fields,
+including descendants of an unmoved sibling, remain readable. Reusing the moved field or moving
+the partially moved parent is an error; refilling a previously moved field is not supported.
+The transfer introduces no allocation or clone. Allocated backing keeps its generation and
+existing aliases follow its new release owner; inline backing is materialized at the destination
+and aliases of the consumed source expire. Contained views retain their original dependencies.
+Borrowed roots cannot be consumed. Deeper `owner.inner.field` and indexed Move-element extraction
+remain outside this direct-field rule. See Plan192.
+
 Tagged values use the same ownership rule recursively. `Option<T>`, `Result<T,E>`, and user sum
 variants may carry any finite, non-recursive type whose Drop plan is known. The enclosing value is
 Move when any possible live payload is Move. Drop tests the active tag and drops only that payload;

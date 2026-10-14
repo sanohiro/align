@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan192](docs/impl/192-owned-field-extraction.md) completes direct owning
+  record-field extraction for voice V002 and LLM R36: arrays, nested Move
+  records and tuples transfer through the existing ownership model, with exact
+  projected storage and cleanup. Deeper/indexed extraction and partial exclusive
+  borrowing remain separate. Consumer adoption remains external.
+
 - [Plan191](docs/impl/191-unicode-nfc.md) supplies explicit Unicode16 NFC through
   `pkg.unicode` for voice V004, with independent owned output, fallible allocation
   and official complete NFC conformance. Tokenizer adoption remains external.

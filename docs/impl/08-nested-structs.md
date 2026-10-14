@@ -110,6 +110,14 @@ double-free). Landed as built below. `crates/align_driver/tests/owned_structs.rs
   added the supported scalar/struct array-field shapes and recursive drop; see
   `core-design/json.md`.
 
+#### Complete direct owned-field extraction (Plan192)
+
+Any already-admitted direct owning field may move as a complete value, including owned arrays,
+nested Move records and tuples. The shared valid Drop-plan predicate drives semantic admission,
+MIR nulling and producer validation. Typed field zeroing preserves siblings; the extracted value
+receives the parent's runtime cleanup bit and exact projected storage release ownership. Deeper
+consuming paths remain excluded. The slice descriptions below record earlier boundaries.
+
 #### Follow-up (landed) — moving an owned `string` field out of a struct (partial move)
 A depth-1 owned `string` field can now be **moved** out (`n := u.name`, `f(u.name)` by value,
 `return u.name`): the buffer transfers to the new owner, the struct's slot field is nulled, and the
