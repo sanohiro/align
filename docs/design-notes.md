@@ -2144,6 +2144,17 @@ Nonblocking open precedes descriptor metadata so a FIFO cannot wait for a writer
 The filesystem operation supplies safe fd ownership; application command policy remains in Align.
 See [plan 58](impl/58-r84-r88-client-batch-plan.md).
 
+### JSON owned-record array decoding (R133)
+
+Root position adds no ownership distinction to an accepted V3 record graph.
+Plan188 admits the existing inferred `json.decode` operation for `array<R>`;
+each row owns its reachable strings/arrays independently of input and arena.
+The explicit Record/Array IR kind authenticates the result and output storage;
+the canonical element graph and native descriptor ABI remain unchanged.
+Full array grammar precedes decoded allocation, partial failures clean every
+owner, and indexed views retain the array lifetime. Mixed-view graphs and
+SoA/scanner admission remain separate capabilities.
+
 ### JSON owned-string array decoding (V005)
 
 A root array of owned strings already has a complete language representation and
@@ -2152,8 +2163,8 @@ therefore admits the root using the same string parser and RAII staging list as
 an owned record field. The root delays header publication until trailing-input
 validation succeeds. Ownership-directed materialization remains explicit in
 `array<string>` and `json.decode`; no input/arena view or implicit wrapper is
-introduced. Owned-record AoS roots use a separate decoder and require their own
-closure, as do input-borrowing `array<str>` roots.
+introduced. Plan188 closes the separate owned-record AoS decoder; input-borrowing
+`array<str>` roots remain outside this capability.
 
 ### JSON dynamic-array root composition (R87)
 

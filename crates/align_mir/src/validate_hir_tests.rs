@@ -12025,7 +12025,7 @@ fn owned_bounded(value: Owned, limit: i64) -> i32 {
 }
 fn main() -> i32 = 0
 "#;
-    let source = if array { source.replace("value: Owned", "value: array<Owned>") } else { source.to_owned() };
+    let source = if array { source.replace("value: Owned", "value: array<Owned>").replace("Result<Owned, Error>", "Result<array<Owned>, Error>") } else { source.to_owned() };
     let base = checked_source_program(&source);
     assert!(
         align_sema::checked_hir_body_facts_are_valid(&base),
@@ -12034,6 +12034,25 @@ fn main() -> i32 = 0
     assert!(body_core_metadata_is_valid(&base));
     assert!(!is_empty(&lower_program(&base)));
 
+    assert_owned_json_body_mutation(&base, "owned-decode-root-kind", |program| {
+        let expression = body_value_expression_mut(program, "owned_decode");
+        if let hir::ExprKind::JsonOwnedDecode { root_kind, .. } = &mut expression.kind {
+            *root_kind = match root_kind {
+                hir::JsonOwnedRoot::Record => hir::JsonOwnedRoot::Array,
+                hir::JsonOwnedRoot::Array => hir::JsonOwnedRoot::Record,
+            };
+        }
+    });
+    assert_owned_json_body_mutation(&base, "owned-decode-empty-graph", |program| {
+        let expression = body_value_expression_mut(program, "owned_decode");
+        if let hir::ExprKind::JsonOwnedDecode { plan, .. } = &mut expression.kind {
+            plan.records.clear();
+        }
+    });
+    assert_owned_json_body_mutation(&base, "owned-decode-wrong-error", |program| {
+        let expression = body_value_expression_mut(program, "owned_decode");
+        if let Ty::Result(ok, _) = expression.ty { expression.ty = Ty::Result(ok, Scalar::Bool); }
+    });
     assert_owned_json_body_mutation(&base, "owned-decode-unknown-struct", |program| {
         let expression = body_value_expression_mut(program, "owned_decode");
         let hir::ExprKind::JsonOwnedDecode { plan, .. } = &mut expression.kind else {
@@ -12054,7 +12073,7 @@ fn main() -> i32 = 0
     });
     assert_owned_json_body_mutation(&base, "owned-decode-borrowed-discriminator", |program| {
         let expression = body_value_expression_mut(program, "owned_decode");
-        let hir::ExprKind::JsonOwnedDecode { plan, input } = &mut expression.kind else {
+        let hir::ExprKind::JsonOwnedDecode { plan, input, .. } = &mut expression.kind else {
             panic!("owned decode fixture lost its discriminator")
         };
         expression.kind = hir::ExprKind::JsonDecode {

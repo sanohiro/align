@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan188](docs/impl/188-owned-json-record-array-root.md) admits JSON decoding
+  directly into owned record arrays for Request133. The existing V3 schema and
+  deep cleanup make every row independent of input/arena; checked root kinds and
+  owner-bounded element views preserve the ownership contract. Consumer adoption
+  remains external.
+
 - [Plan187](docs/impl/187-indexed-json-array-grammar.md) validates complete JSON
   record-array syntax for AoS/SoA and consumes selected numeric tokens exactly.
   Malformed syntax rejects before decoded allocation; valid-syntax schema

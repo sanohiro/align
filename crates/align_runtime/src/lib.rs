@@ -54312,3 +54312,6 @@ mod json_array_root_tests;
 
 #[cfg(test)]
 mod json_record_array_grammar_tests;
+
+#[cfg(all(test, feature = "alloc-count"))]
+mod json_owned_record_array_tests;

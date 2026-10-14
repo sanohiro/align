@@ -1177,6 +1177,21 @@ Request 9 introduced the dedicated owned route. Request 13 atomically replaced
 its flat V1 plan, template-part variants, and interface format; no V1 producer,
 consumer, or compatibility decoder remains.
 
+#### Request133 owned JSON root kind
+
+Plan188 adds explicit `Record`/`Array` root kind to `JsonOwnedDecode`. The canonical
+V3 graph still describes the element record. Checked HIR derives exactly
+`Result<Struct(root), Error>` or `Result<DynStructArray(root), Error>` from that
+kind, with Str input and the reconstructed graph; no result-type heuristic chooses
+the operation. MIR authenticates the same output-slot type and graph and supplies
+Owned provenance. Array construction creates fresh individual heap storage even
+inside an arena, seeds no input-content dependency, and binds indexed views to
+that array's storage generation. Replay preserves the kind; existing graph remapping
+and interface container types remain authoritative. The parameterized
+`owned_json_checked_hir_mutation_sweep_fails_closed_at_all_lowering_entrypoints`
+and `producer_json_owned_root_output` reject forged kind, graph, input, result and
+slot in both root modes. The older V2 table below is superseded by this rule and R63.
+
 #### Request 13 recursive owned JSON replacement (implemented)
 
 `docs/impl/25-recursive-owned-json-plan.md` retains the three `JsonOwned*`

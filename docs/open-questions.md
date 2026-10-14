@@ -297,6 +297,16 @@ work. The earlier XNU final-link-refusal assumption was disproved by native
 qualification. Self `access` remains supported on Linux/macOS; no alternate
 error/ownership model or weaker platform-dependent success guarantee is added.
 
+**Owned record-array decoding (R133).** `json.decode(input)` also infers
+`Result<array<R>, Error>` for the same closed V3 owned record graph used by
+record decoding and embedded arrays. Every row and its reachable strings/arrays
+are independently owned, including inside arenas; input may expire after the call.
+Empty arrays allocate nothing. Full JSON array syntax is validated before decoded
+allocation; schema failure frees completed rows and the partial row before returning
+`Error.Code(1)`. Element views remain bounded by the array owner. Mixed views, SoA
+and scanner schemas do not widen. Plan188 owns root admission and cleanup; the
+existing V3 element graph, native ABI and interface format remain unchanged.
+
 **Owned string-array decoding (V005).** The inferred target of `json.decode(input)`
 may be `array<string>`. A complete UTF-8 JSON array of strings produces an
 independent owned array, including inside an arena. Clean and escaped elements
@@ -305,7 +315,7 @@ UTF-8, escapes or trailing input return `Error.Code(1)` and free every completed
 payload before exposing a result. Empty arrays allocate nothing; other arrays
 own one header spine and each nonempty string payload. Index views retain the
 array owner's lifetime. This reuses the existing type, Result and deep Drop;
-bare `string`, `array<str>` and owned-record array decoding remain separate.
+bare `string` and `array<str>` decoding remain separate.
 Plan183 owns the exact ABI, validation/publication order and cleanup matrix.
 
 **Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same

@@ -858,7 +858,8 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             struct_id: *struct_id,
             input: boxed!(input),
         },
-        ExprKind::JsonOwnedDecode { plan, input } => ExprKind::JsonOwnedDecode {
+        ExprKind::JsonOwnedDecode { root_kind, plan, input } => ExprKind::JsonOwnedDecode {
+            root_kind: *root_kind,
             plan: plan.clone(),
             input: boxed!(input),
         },

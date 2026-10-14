@@ -57,3 +57,38 @@ V3/A06 descriptor coverage, rollback and output publication, explicit root-kind
 authentication and unchanged transport identity. Its implementation checkpoint
 requires individual native heap provenance inside arenas and complete collection
 backing-storage analysis; the construction/lifetime row names both explicitly.
+
+## Implementation and owner closure
+
+The author extracted the ledger's exact/every/before/reject/required obligations
+and checked them against the final diff. `check_json_decode` selects the existing
+graph once; `JsonOwnedRoot::ty` is shared by checked-HIR derivation, MIR construction
+and producer validation. Replay cloning preserves the kind. The existing
+`native_storage_is_individual` and empty `JsonDecoded` content facts apply to both
+roots; collection backing-storage now explicitly recognizes the array kind.
+LLVM selects the existing record/A06 writer through one shared descriptor helper.
+
+- `json_owned_record_array_lifecycle_and_replay` owns real Case values, recursive
+  records/options/arrays, a concrete generic schema and generic forwarding,
+  input replacement/named-arena expiry, direct/Result returns, control joins,
+  discard/replacement/early exits, exact canonical bytes and positive allocation/
+  free parity with zero retained bytes. It executes whole/per-unit and cold/hit
+  imported frontend replay. Abstract generic nominal applications nested inside
+  arrays retain their existing restriction; this capability does not change it.
+- `json_owned_record_array_rejects_invalid_source_and_view_escape` owns schema/
+  input/arity exclusions and indexed-view escape/replacement in both build modes.
+- `owned_json_checked_hir_mutation_sweep_fails_closed_at_all_lowering_entrypoints`
+  now parameterizes record/array decode and encoding; it owns root-kind, graph,
+  input, result/Error, layout and mixed-view forgeries.
+- `producer_json_owned_root_output` owns both MIR validators for record/array
+  roots, forged kind/graph/input and absent or mismatched output slots.
+- `json_owned_record_array_v3_value_and_cleanup_matrix` owns every V3 value class
+  and optional sibling, exact scalar/aggregate values and allocation shape,
+  ordered/speculative/reordered rows, empty/missing/null and late schema failure,
+  unchanged failed output, idempotent nulling and complete allocation/free parity.
+  Plan187's grammar matrix closes malformed syntax; existing `m5_owned_json`,
+  `m5` JSON and `json_string_array_root` owners close sibling routes.
+
+No production runtime/parser change, ABI change or performance promise is added.
+The graph/interface formats and existing owned array Drop implementation remain
+unchanged; the root-kind mutation owners make the added distinction fail closed.

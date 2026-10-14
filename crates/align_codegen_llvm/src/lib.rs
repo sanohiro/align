@@ -16637,8 +16637,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 out,
                 arena,
             } => self.gen_json_decode(*struct_id, input, *out, arena.as_ref())?,
-            Rvalue::JsonOwnedDecode { plan, input, out } => {
-                self.gen_json_owned_decode(plan, input, *out)?
+            Rvalue::JsonOwnedDecode { root_kind, plan, input, out } => {
+                self.gen_json_owned_decode(*root_kind, plan, input, *out)?
             }
             Rvalue::JsonDecodeArray { elem, input, out } => {
                 self.gen_json_decode_array(*elem, input, *out)?
@@ -16651,7 +16651,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 input,
                 out,
                 arena,
-            } => self.gen_json_decode_struct_array(*struct_id, input, *out, arena.as_ref())?,
+            } => self.gen_json_decode_struct_array(*struct_id, input, *out, arena.as_ref(), None)?,
             Rvalue::JsonDecodeSoa { struct_id, input, out, arena } => {
                 self.gen_json_decode_soa(*struct_id, input, *out, arena)?
             }
@@ -21724,12 +21724,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// Emit the field-descriptor table for decoding struct `struct_id`, wrapping [`emit_desc_table`]
     /// with the struct's ABI allocation size. The table is a private constant global (safe inside a loop).
     fn decode_field_table(&mut self, struct_id: u32) -> Result<DecodeTable<'c>, CodegenError> {
+        self.decode_field_table_for_plan(struct_id, None)
+    }
+
+    fn decode_field_table_for_plan(
+        &mut self,
+        struct_id: u32,
+        owned: Option<&hir::OwnedJsonGraphPlanV3>,
+    ) -> Result<DecodeTable<'c>, CodegenError> {
         let sty = self
             .struct_types
             .get(struct_id as usize)
             .copied()
             .ok_or_else(|| self.err(format!("unknown JSON decode struct id {struct_id}")))?;
-        let t = self.emit_desc_table(struct_id)?;
+        let t = if let Some(plan) = owned {
+            self.emit_owned_desc_graph(plan)?
+        } else {
+            self.emit_desc_table(struct_id)?
+        };
         Ok(DecodeTable {
             descs: t.descs,
             n_fields: t.n_fields,
@@ -21887,11 +21899,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     fn gen_json_owned_decode(
         &mut self,
+        root_kind: hir::JsonOwnedRoot,
         plan: &hir::OwnedJsonGraphPlanV3,
         input: &Operand,
         out: Slot,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
-        self.gen_json_decode_record(plan.root, input, out, None, Some(plan))
+        match root_kind {
+            hir::JsonOwnedRoot::Record => self.gen_json_decode_record(plan.root, input, out, None, Some(plan)),
+            hir::JsonOwnedRoot::Array => self.gen_json_decode_struct_array(plan.root, input, out, None, Some(plan)),
+        }
     }
 
     fn gen_json_decode_record(
@@ -21920,19 +21936,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let t = if let Some(plan) = owned {
-            let t = self.emit_owned_desc_graph(plan)?;
-            DecodeTable {
-                descs: t.descs,
-                n_fields: t.n_fields,
-                store_size: self.element_allocation_size(sty.into()),
-                phf_ptr: t.phf_ptr,
-                phf_len: t.phf_len,
-                phf_seed: t.phf_seed,
-            }
-        } else {
-            self.decode_field_table(struct_id)?
-        };
+        let t = self.decode_field_table_for_plan(struct_id, owned)?;
         let n = i64t.const_int(t.n_fields, false);
         let size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);
@@ -22084,14 +22088,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     /// `json.decode` into an owned `array<Struct>` (MMv2 slice 8d): zero the out `{ptr,len}` slot,
     /// then call the runtime AoS parser with the same field table as the single-struct path plus
-    /// the element stride. The returned buffer is owned (freed by `Drop`); clean `str` fields point
-    /// into the input and selected escaped strings use the caller arena. Returns the i32 status.
+    /// the element stride. The returned buffer is owned (freed by `Drop`). Existing `str` fields
+    /// borrow input/caller arena; a V3 owned plan materializes independent owners. Returns i32 status.
     fn gen_json_decode_struct_array(
         &mut self,
         struct_id: u32,
         input: &Operand,
         out: Slot,
         arena: Option<&Operand>,
+        owned: Option<&hir::OwnedJsonGraphPlanV3>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         let out_ptr = self.slots[&out];
         // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop frees null).
@@ -22102,7 +22107,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
 
         let i64t = self.ctx.i64_type();
-        let t = self.decode_field_table(struct_id)?;
+        let t = self.decode_field_table_for_plan(struct_id, owned)?;
         let n = i64t.const_int(t.n_fields, false);
         let elem_size = i64t.const_int(t.store_size, false);
         let phf_len = i64t.const_int(t.phf_len, false);

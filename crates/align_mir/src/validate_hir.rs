@@ -11345,7 +11345,7 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 self.derive_json_decode_struct(*struct_id, input, context, false)
             }
-            hir::ExprKind::JsonOwnedDecode { plan, input } => {
+            hir::ExprKind::JsonOwnedDecode { root_kind, plan, input } => {
                 let flow = self.expr_flow(input)?;
                 if flow.ty != Ty::Str || !self.owned_json_plan_ok(plan) {
                     return None;
@@ -11353,7 +11353,7 @@ impl<'a> BodyValidator<'a> {
                 let error = self.error_id()?;
                 let (falls, breaks) = strict_flow(&[flow]);
                 Some((
-                    Ty::Result(Scalar::Struct(plan.root), Scalar::Enum(error)),
+                    Ty::Result(align_sema::ty_to_scalar(root_kind.ty(plan.root))?, Scalar::Enum(error)),
                     falls,
                     breaks,
                 ))

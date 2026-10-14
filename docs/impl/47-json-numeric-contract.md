@@ -1,5 +1,10 @@
 # Standard JSON numbers and owned encoder results (R63)
 
+**R133 decode root composition:** [Plan188](188-owned-json-record-array-root.md)
+admits `array<R>` decoding with the same V3 owned element-record graph and
+independent deep ownership as record decoding. It supersedes direct-record-only
+decode root restrictions below without widening mixed-view, SoA or scanner schemas.
+
 Status: **Implemented; focused correctness owners and local performance acceptance
 complete. Ordinary delivery gates and external consumer adoption are separate**.
 Provider baseline: `d469adcb931848ba03d18dcff022d32d95c2fda9`.
