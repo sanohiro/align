@@ -35722,6 +35722,16 @@ impl<'a> MoveCheck<'a> {
         };
         let headers = self.local_headers(base);
         let roots = self.view_effect_source_roots(value);
+        self.record_view_backing_store(flows, headers, roots, whole_element);
+    }
+
+    fn record_view_backing_store(
+        &mut self,
+        flows: std::collections::BTreeSet<u32>,
+        headers: ProjectedHeaderFact,
+        roots: BorrowRoots,
+        whole_element: bool,
+    ) {
         for position in flows {
             let original = StorageGeneration::caller_storage(position, &[]);
             let mut may_original = false;
@@ -46072,6 +46082,22 @@ impl<'a> MoveCheck<'a> {
     /// Opaque handle interiors are deliberately absent: only operations that replace a visible
     /// source place or write a caller-visible collection backing end a place reservation.
     fn apply_builtin_mutation_action(&mut self, expression: &Expr) {
+        let byte_write = match &expression.kind {
+            // Every returning setter wrote a positive scalar width after one full range check.
+            // Fill/copy may return on empty bytes, so they cannot prove a mandatory element store.
+            ExprKind::BytesSet { bytes, .. } => Some((bytes.as_ref(), true)),
+            ExprKind::BytesFill { bytes, .. } => Some((bytes.as_ref(), false)),
+            ExprKind::BytesCopyFrom { dst, .. } => Some((dst.as_ref(), false)),
+            _ => None,
+        };
+        if let Some((destination, whole_element)) = byte_write {
+            self.record_view_backing_store(
+                self.view_flows_of_expr(destination),
+                self.completed_headers(destination),
+                BorrowRoots::new(), // Bytes contain scalar values, never borrowed owners.
+                whole_element,
+            );
+        }
         if let Some(action) = Self::source_visible_mutation_action(&expression.kind) {
             match action {
                 SourceVisibleMutationAction::Storage(value) | SourceVisibleMutationAction::Source(value)
@@ -85388,6 +85414,105 @@ fn main() {}
         let function = program.fns.iter().find(|function| function.name == "retain").unwrap();
         assert_eq!(function.mutable_retention,
             Some(vec![vec![hir::MutableRetentionRoot::Storage(1)], vec![]]));
+    }
+
+    #[test]
+    fn binary_byte_write_effects_preserve_guarantees_and_replay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut cases = vec![
+            ("dst.set_u8(0,1)".to_string(), true, true),
+            ("dst.set_i8(0,-1)".to_string(), true, true),
+        ];
+        for scalar in ["u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"] {
+            for endian in ["le", "be"] {
+                let value = if scalar.starts_with('f') { "1.0" } else { "1" };
+                cases.push((format!("dst.set_{scalar}_{endian}(0,{value})"), true, true));
+            }
+        }
+        for (body, may, must) in [
+            ("mut alias:=dst[0..8];alias.set_u8(0,1)", true, true),
+            ("dst.fill(1)", true, false),
+            ("dst.fill_u64_be(1)", true, false),
+            ("dst.copy_from(src)", true, false),
+            ("if flag {dst.set_u8(0,1)}", true, false),
+            (
+                "if flag {dst.set_u8(0,1)} else {dst.set_i8(0,-1)}",
+                true,
+                true,
+            ),
+            (
+                "match src.len() {0=>dst.set_u8(0,1),_=>dst.set_i8(0,-1)}",
+                true,
+                true,
+            ),
+            ("loop {dst.set_u8(0,1);break}", true, true),
+            ("loop {if flag {break};dst.set_u8(0,1);break}", true, false),
+            ("if flag {return};dst.set_u8(0,1)", true, false),
+            ("dst.set_u8({if flag {return};0},1)", true, false),
+            ("dst.set_u8(0,{if flag {return};1})", true, false),
+            ("dst.set_u8({return;0},1)", false, false),
+            ("dst.set_u8(0,{return;1})", false, false),
+            ("mut alias:=dst;alias=[];alias.set_u8(0,1)", false, false),
+            ("dst=[];dst.set_u8(0,1)", false, false),
+        ] {
+            cases.push((body.to_string(), may, must));
+        }
+        for (body, may, must) in cases {
+            let source = format!(
+                "fn write(borrow mut dst:slice<u8>,src:slice<u8>,flag:bool) {{{body}}}\nfn main() {{}}\n"
+            );
+            let (program, diagnostics) = check(&source);
+            assert!(
+                !diagnostics.has_errors(),
+                "{body}: {:?}",
+                diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+            assert!(checked_hir_body_facts_are_valid(&program), "replay {body}");
+            let index = program
+                .fns
+                .iter()
+                .position(|f| f.name == "write")
+                .ok_or("write fixture")?;
+            let effect = program
+                .fns
+                .get(index)
+                .and_then(|f| f.mutable_view_effect.as_ref())
+                .and_then(|s| s.first())
+                .and_then(Option::as_ref)
+                .ok_or("effect fixture")?;
+            assert_eq!(
+                (
+                    effect.may_write_original,
+                    effect.must_write_original_element
+                ),
+                (may, must),
+                "{body}"
+            );
+            assert!(
+                effect.write_roots.is_empty(),
+                "byte values cannot carry view roots: {body}"
+            );
+            for toggle_must in [false, true] {
+                let mut forged = program.clone();
+                let effect = forged
+                    .fns
+                    .get_mut(index)
+                    .and_then(|f| f.mutable_view_effect.as_mut())
+                    .and_then(|s| s.first_mut())
+                    .and_then(Option::as_mut)
+                    .ok_or("forged effect")?;
+                if toggle_must {
+                    effect.must_write_original_element = !must;
+                } else {
+                    effect.may_write_original = !may;
+                }
+                assert!(
+                    !checked_hir_body_facts_are_valid(&forged),
+                    "stale {body}/{toggle_must}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
