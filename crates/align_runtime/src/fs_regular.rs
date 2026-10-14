@@ -1,5 +1,5 @@
 //! Ordinary-path regular-file admission; the opened descriptor owns the kind proof.
-use super::{AL_INVALID, BeneathFd, Reader, io_error_to_status, safe_len};
+use super::{AL_INVALID, BeneathFd, Reader, RwFile, io_error_to_status, safe_len};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Step {
@@ -64,11 +64,24 @@ fn acquire(path: &std::ffi::CStr) -> Result<BeneathFd, i32> {
 /// Numerical preflight precedes every byte read and output write. Live ranges remain the caller's
 /// unsafe obligation. An invalid range/overlap leaves output untouched; later errors leave null.
 pub(super) unsafe fn open(path: *const u8, len: i64, out: *mut *mut Reader) -> i32 {
+    unsafe { open_with(path, len, out, |fd| Reader::unbuffered(fd.into_raw(), true)) }
+}
+
+pub(super) unsafe fn open_file(path: *const u8, len: i64, out: *mut *mut RwFile) -> i32 {
+    unsafe { open_with(path, len, out, |fd| RwFile { fd: fd.into_raw() }) }
+}
+
+unsafe fn open_with<T>(
+    path: *const u8,
+    len: i64,
+    out: *mut *mut T,
+    publish: impl FnOnce(BeneathFd) -> T,
+) -> i32 {
     let out_start = out.addr();
-    if out.is_null() || !out_start.is_multiple_of(core::mem::align_of::<*mut Reader>()) {
+    if out.is_null() || !out_start.is_multiple_of(core::mem::align_of::<*mut T>()) {
         return AL_INVALID;
     }
-    let Some(out_end) = out_start.checked_add(core::mem::size_of::<*mut Reader>()) else {
+    let Some(out_end) = out_start.checked_add(core::mem::size_of::<*mut T>()) else {
         return AL_INVALID;
     };
     let Ok(n) = safe_len(len) else {
@@ -104,9 +117,9 @@ pub(super) unsafe fn open(path: *const u8, len: i64, out: *mut *mut Reader) -> i
     };
     match acquire(&path) {
         Ok(fd) => {
-            let reader = Box::new(Reader::unbuffered(fd.into_raw(), true));
+            let owner = Box::new(publish(fd));
             unsafe {
-                *out = Box::into_raw(reader);
+                *out = Box::into_raw(owner);
             }
             0
         }
@@ -171,25 +184,56 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    struct Owner(*mut Reader);
-    impl Drop for Owner {
-        fn drop(&mut self) {
+    #[derive(Clone, Copy, Debug)]
+    enum Publisher {
+        Reader,
+        File,
+    }
+    impl Publisher {
+        unsafe fn open(self, path: *const u8, len: i64, out: *mut *mut ()) -> i32 {
             unsafe {
-                crate::align_rt_io_reader_free(self.0);
+                match self {
+                    Self::Reader => crate::align_rt_io_reader_open_regular(path, len, out.cast()),
+                    Self::File => crate::align_rt_io_file_open_ro_regular(path, len, out.cast()),
+                }
             }
         }
     }
-    fn open_path(path: &std::path::Path) -> (i32, Owner) {
+    struct Owner {
+        pointer: *mut (),
+        publisher: Publisher,
+    }
+    impl Owner {
+        fn fd(&self) -> i32 {
+            unsafe {
+                match self.publisher {
+                    Publisher::Reader => (*self.pointer.cast::<Reader>()).fd,
+                    Publisher::File => (*self.pointer.cast::<RwFile>()).fd,
+                }
+            }
+        }
+    }
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            unsafe {
+                match self.publisher {
+                    Publisher::Reader => crate::align_rt_io_reader_free(self.pointer.cast()),
+                    Publisher::File => crate::align_rt_io_file_free(self.pointer.cast()),
+                }
+            }
+        }
+    }
+    fn open_path(publisher: Publisher, path: &std::path::Path) -> (i32, Owner) {
         let bytes = path.as_os_str().as_bytes();
-        let mut out = core::ptr::null_mut();
+        let mut pointer = core::ptr::null_mut();
         let status = unsafe {
-            crate::align_rt_io_reader_open_regular(
+            publisher.open(
                 bytes.as_ptr(),
                 i64::try_from(bytes.len()).unwrap(),
-                &mut out,
+                &mut pointer,
             )
         };
-        (status, Owner(out))
+        (status, Owner { pointer, publisher })
     }
     fn assert_closed(fd: i32) {
         assert!(fd >= 0, "positive acquisition witness required");
@@ -202,44 +246,60 @@ mod tests {
 
     #[test]
     fn regular_reader_abi_preflight() {
-        let sentinel = core::ptr::without_provenance_mut::<Reader>(1);
-        for (path, len) in [
-            (core::ptr::null(), 1),
-            (b"x".as_ptr(), -1),
-            (b"x".as_ptr(), i64::MAX),
-            (core::ptr::without_provenance::<u8>(usize::MAX), 2),
-        ] {
-            let mut out = sentinel;
-            assert_eq!(unsafe { open(path, len, &mut out) }, AL_INVALID);
-            assert_eq!(out, sentinel);
-        }
-        assert_eq!(
-            unsafe { open(b"x".as_ptr(), 1, core::ptr::null_mut()) },
-            AL_INVALID
-        );
-        let mut storage = [usize::MAX; 2];
-        let bytes = storage.as_mut_ptr().cast::<u8>();
-        assert_eq!(unsafe { open(bytes, 8, bytes.cast()) }, AL_INVALID);
-        assert_eq!(storage, [usize::MAX; 2], "overlap must not clear the input");
-        assert_eq!(
-            unsafe { open(b"x".as_ptr(), 1, bytes.add(1).cast()) },
-            AL_INVALID
-        );
-        for bytes in [&b"a\0b"[..], &b"\xff"[..]] {
-            test_state::CALLS.with(|calls| calls.set(0));
-            let mut out = sentinel;
+        for publisher in [Publisher::Reader, Publisher::File] {
+            let sentinel = core::ptr::without_provenance_mut::<()>(1);
+            for (path, len) in [
+                (core::ptr::null(), 1),
+                (b"x".as_ptr(), -1),
+                (b"x".as_ptr(), i64::MAX),
+                (core::ptr::without_provenance::<u8>(usize::MAX), 2),
+            ] {
+                let mut out = sentinel;
+                assert_eq!(unsafe { publisher.open(path, len, &mut out) }, AL_INVALID);
+                assert_eq!(out, sentinel);
+            }
             assert_eq!(
-                unsafe {
-                    open(
-                        bytes.as_ptr(),
-                        i64::try_from(bytes.len()).unwrap(),
-                        &mut out,
-                    )
-                },
+                unsafe { publisher.open(b"x".as_ptr(), 1, core::ptr::null_mut()) },
                 AL_INVALID
             );
-            assert!(out.is_null());
-            assert_eq!(test_state::CALLS.with(|value| value.get()), 0);
+            let overflowing_output = core::ptr::without_provenance_mut::<*mut ()>(usize::MAX - 7);
+            assert_eq!(
+                unsafe { publisher.open(core::ptr::null(), -1, overflowing_output) },
+                AL_INVALID
+            );
+            let mut empty = sentinel;
+            assert_eq!(
+                unsafe { publisher.open(core::ptr::null(), 0, &mut empty) },
+                crate::AL_NOT_FOUND
+            );
+            assert!(empty.is_null());
+            let mut storage = [usize::MAX; 2];
+            let bytes = storage.as_mut_ptr().cast::<u8>();
+            assert_eq!(
+                unsafe { publisher.open(bytes, 8, bytes.cast()) },
+                AL_INVALID
+            );
+            assert_eq!(storage, [usize::MAX; 2], "overlap must not clear the input");
+            assert_eq!(
+                unsafe { publisher.open(b"x".as_ptr(), 1, bytes.add(1).cast()) },
+                AL_INVALID
+            );
+            for bytes in [&b"a\0b"[..], &b"\xff"[..]] {
+                test_state::CALLS.with(|calls| calls.set(0));
+                let mut out = sentinel;
+                assert_eq!(
+                    unsafe {
+                        publisher.open(
+                            bytes.as_ptr(),
+                            i64::try_from(bytes.len()).unwrap(),
+                            &mut out,
+                        )
+                    },
+                    AL_INVALID
+                );
+                assert!(out.is_null());
+                assert_eq!(test_state::CALLS.with(|value| value.get()), 0);
+            }
         }
     }
 
@@ -253,7 +313,12 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        for mode in ["matrix", "fifo"] {
+        for (publisher, mode) in [
+            ("reader", "matrix"),
+            ("reader", "fifo"),
+            ("file", "matrix"),
+            ("file", "fifo"),
+        ] {
             let mut child = Child(
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
@@ -263,6 +328,7 @@ mod tests {
                         "--test-threads=1",
                     ])
                     .env("ALIGN_REGULAR_READER_CHILD", mode)
+                    .env("ALIGN_REGULAR_PUBLISHER", publisher)
                     .stdout(std::process::Stdio::inherit())
                     .spawn()
                     .expect("spawn regular-reader owner"),
@@ -290,15 +356,20 @@ mod tests {
     #[ignore = "isolated subprocess of regular_reader_native_matrix"]
     fn regular_reader_native_child() {
         let mode = std::env::var("ALIGN_REGULAR_READER_CHILD").expect("explicit child mode");
+        let publisher = match std::env::var("ALIGN_REGULAR_PUBLISHER").as_deref() {
+            Ok("reader") => Publisher::Reader,
+            Ok("file") => Publisher::File,
+            _ => panic!("explicit publisher required"),
+        };
         let fixture = Fixture::new();
         let root = std::fs::canonicalize(&fixture.0).unwrap();
         let fifo = root.join("fifo");
         let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         if mode == "fifo" {
-            let (status, owner) = open_path(&fifo);
+            let (status, owner) = open_path(publisher, &fifo);
             assert_eq!(status, AL_INVALID);
-            assert!(owner.0.is_null());
+            assert!(owner.pointer.is_null());
             assert_closed(test_state::LAST_FD.with(|value| value.get()));
             return;
         }
@@ -319,9 +390,9 @@ mod tests {
             ("ancestor/data", 5),
             ("empty", 0),
         ] {
-            let (status, owner) = open_path(std::path::Path::new(path));
+            let (status, owner) = open_path(publisher, std::path::Path::new(path));
             assert_eq!(status, 0, "{path}");
-            let fd = unsafe { (*owner.0).fd };
+            let fd = owner.fd();
             assert_eq!(
                 unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
                 0
@@ -343,9 +414,9 @@ mod tests {
         }
         std::env::set_current_dir(cwd).unwrap();
         for path in [root.clone(), std::path::PathBuf::from("/dev/null")] {
-            let (status, owner) = open_path(&path);
+            let (status, owner) = open_path(publisher, &path);
             assert_eq!(status, AL_INVALID);
-            assert!(owner.0.is_null());
+            assert!(owner.pointer.is_null());
             assert_closed(test_state::LAST_FD.with(|value| value.get()));
         }
         for path in [
@@ -353,30 +424,30 @@ mod tests {
             root.join("dangling"),
             std::path::PathBuf::new(),
         ] {
-            let (status, owner) = open_path(&path);
+            let (status, owner) = open_path(publisher, &path);
             assert_eq!(
                 status,
                 io_error_to_status(&std::io::Error::from_raw_os_error(libc::ENOENT))
             );
-            assert!(owner.0.is_null());
+            assert!(owner.pointer.is_null());
         }
         for step in [Step::Open, Step::Stat, Step::GetFlags, Step::SetFlags] {
             test_state::LAST_FD.with(|fd| fd.set(-1));
             test_state::FAILURE.with(|failure| failure.set(Some((step, libc::EIO))));
-            let (status, owner) = open_path(&data);
+            let (status, owner) = open_path(publisher, &data);
             assert_eq!(
                 status,
                 io_error_to_status(&std::io::Error::from_raw_os_error(libc::EIO)),
                 "{step:?}"
             );
-            assert!(owner.0.is_null());
+            assert!(owner.pointer.is_null());
             if step != Step::Open {
                 assert_closed(test_state::LAST_FD.with(|value| value.get()));
             }
             test_state::FAILURE.with(|failure| failure.set(Some((step, libc::EINTR))));
-            let (status, owner) = open_path(&data);
+            let (status, owner) = open_path(publisher, &data);
             assert_eq!(status, 0, "retry {step:?}");
-            assert!(!owner.0.is_null());
+            assert!(!owner.pointer.is_null());
         }
         // Replace a pathname after open: kind and bytes must follow the retained descriptor.
         let selected = data.clone();
@@ -386,14 +457,38 @@ mod tests {
                 std::fs::rename(&replacement, &selected).unwrap();
             }))
         });
-        let (status, owner) = open_path(&data);
+        let (status, owner) = open_path(publisher, &data);
         assert_eq!(status, 0);
         let mut bytes = [0u8; 5];
         assert_eq!(
-            unsafe { libc::read((*owner.0).fd, bytes.as_mut_ptr().cast(), bytes.len()) },
+            unsafe { libc::read(owner.fd(), bytes.as_mut_ptr().cast(), bytes.len()) },
             5
         );
         assert_eq!(&bytes, b"hello");
+        if let Publisher::File = publisher {
+            // Cursor now sits at EOF. Positional operations must still use this admitted fd.
+            let file = owner.pointer.cast::<RwFile>();
+            let buffer = crate::align_rt_buffer_new(8, 1, 0);
+            unsafe {
+                assert_eq!(crate::align_rt_io_file_len(file), 5);
+                assert_eq!(crate::align_rt_io_file_pread_into(file, buffer, 0, 8, 2), 3);
+                assert_eq!((*buffer).data.as_slice(), b"llo");
+                assert_eq!(crate::align_rt_io_file_pread_into(file, buffer, 0, 8, 5), 0);
+                assert_eq!((*buffer).data.as_slice(), b"llo");
+                assert_eq!(crate::align_rt_io_file_pread(file, buffer, 0), 5);
+                assert_eq!((*buffer).data.as_slice(), b"hello");
+                assert_eq!(
+                    crate::align_rt_io_file_pwrite(file, b"x".as_ptr(), 1, 0),
+                    -i64::from(crate::AL_DENIED)
+                );
+                assert_eq!(
+                    crate::align_rt_io_file_pwrite(file, core::ptr::null(), 0, 0),
+                    -i64::from(crate::AL_DENIED)
+                );
+                assert_eq!(libc::lseek(owner.fd(), 0, libc::SEEK_CUR), 5);
+                crate::align_rt_buffer_free(buffer);
+            }
+        }
         drop(owner);
         // The inverse replacement must still refuse the opened FIFO, even though its path is now regular.
         let replacement = root.join("replacement");
@@ -404,9 +499,9 @@ mod tests {
                 std::fs::rename(&replacement, &selected).unwrap();
             }))
         });
-        let (status, owner) = open_path(&data);
+        let (status, owner) = open_path(publisher, &data);
         assert_eq!(status, AL_INVALID);
-        assert!(owner.0.is_null());
+        assert!(owner.pointer.is_null());
         assert_closed(test_state::LAST_FD.with(|value| value.get()));
     }
 }

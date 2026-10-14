@@ -11508,6 +11508,22 @@ pub unsafe extern "C" fn align_rt_io_file_open_ro(path: *const u8, path_len: i64
 }
 const _: unsafe extern "C" fn(*const u8, i64, *mut *mut RwFile) -> i32 = align_rt_io_file_open_ro;
 
+/// `fs.open_ro_regular(path)` — admit one regular descriptor and publish an owned File.
+/// Uses the reader's nonblocking open, descriptor kind check and blocking restoration.
+/// Numerical/overlap rejection leaves output untouched; later errors leave null.
+///
+/// # Safety
+/// Input bytes must be live readable storage and output a live aligned writable pointer slot,
+/// disjoint from the input. Success transfers a File for exactly-once free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_open_ro_regular(
+    path: *const u8, path_len: i64, out: *mut *mut RwFile,
+) -> i32 {
+    unsafe { fs_regular::open_file(path, path_len, out) }
+}
+const _: unsafe extern "C" fn(*const u8, i64, *mut *mut RwFile) -> i32 = align_rt_io_file_open_ro_regular;
+
+
 /// `fs.create_rw_exclusive(path)` — one read/write exclusive native create, mode 0644 subject
 /// to umask. An occupied final entry is never followed, opened, truncated, replaced or removed.
 /// Drop owns only descriptor closure; a partial file remains for explicit application cleanup.

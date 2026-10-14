@@ -2265,6 +2265,13 @@ make pwrite return Denied, including zero-byte writes; no compiler constructor
 history or duplicated stored capability determines permission. Negative offsets
 still abort first. Plan 84 owns the exact path, ownership and ABI contract.
 
+Media AM-R03 needs regular-file admission and bounded positional access on one
+descriptor. Checking through a reader and reopening a File leaves a pathname
+replacement gap. `fs.open_ro_regular` reuses the established nonblocking
+admission state machine and publishes the existing File; it adds no reader seek,
+new owner family, duplicated permission flag or hidden content copy. Plan 185
+owns the typed publisher and same-descriptor acceptance contract.
+
 ## Why synchronization is explicit on the existing owners
 
 Request 31 separates draining a writer's existing buffer from asking the OS to

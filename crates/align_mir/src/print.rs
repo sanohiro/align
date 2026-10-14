@@ -933,7 +933,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         ),
         Rvalue::FileCreateRw { path, out } => format!("fs_create_rw({}, -> _{out})", operand_str(path)),
         Rvalue::FileOpenRw { path, out } => format!("fs_open_rw({}, -> _{out})", operand_str(path)),
-        Rvalue::FileOpenRo { path, out } => format!("fs_open_ro({}, -> _{out})", operand_str(path)),
+        Rvalue::FileOpenRo { path, out, regular_only } => format!("{}({}, -> _{out})", if *regular_only { "fs_open_ro_regular" } else { "fs_open_ro" }, operand_str(path)),
         Rvalue::FileCreateRwExclusive { path, out } => format!("fs_create_rw_exclusive({}, -> _{out})", operand_str(path)),
         Rvalue::FilePread { file, buffer, offset } => format!("file_pread({}, {}, {})", operand_str(file), operand_str(buffer), operand_str(offset)),
         Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset } => format!("file_pread_into({}, {}, {}, {}, {})", operand_str(file), operand_str(buffer), operand_str(destination_offset), operand_str(length), operand_str(offset)),

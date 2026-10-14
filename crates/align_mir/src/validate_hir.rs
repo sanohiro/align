@@ -9292,7 +9292,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[reader, writer])
             }
-            hir::ExprKind::FileCreateRw { path } | hir::ExprKind::FileOpenRw { path } | hir::ExprKind::FileOpenRo { path } | hir::ExprKind::FileCreateRwExclusive { path } => {
+            hir::ExprKind::FileCreateRw { path } | hir::ExprKind::FileOpenRw { path } | hir::ExprKind::FileOpenRo { path, .. } | hir::ExprKind::FileCreateRwExclusive { path } => {
                 (path.ty == Ty::Str).then(|| result(Ty::File, &[path]))?
             }
             hir::ExprKind::FilePread { file, buffer, offset } => {

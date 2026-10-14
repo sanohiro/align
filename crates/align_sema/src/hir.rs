@@ -1648,7 +1648,8 @@ pub enum ExprKind {
     /// is `Result<file, Error>`. The returned `file` owns its fd (closed on `Drop`). Impure. (A4.)
     FileOpenRw { path: Box<Expr> },
     /// `fs.open_ro(path)` — O_RDONLY|O_CLOEXEC, existing path, same owned File and Drop. Impure.
-    FileOpenRo { path: Box<Expr> },
+    /// `regular_only` selects same-descriptor regular admission before File publication.
+    FileOpenRo { path: Box<Expr>, regular_only: bool },
     /// `fs.create_rw_exclusive(path)` — exclusive final entry, read/write owned File. Impure.
     FileCreateRwExclusive { path: Box<Expr> },
     /// `f.pread(b: mut buffer, off)` — one positionless read at file offset `off` into `b`

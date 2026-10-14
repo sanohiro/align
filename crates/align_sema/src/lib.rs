@@ -17162,7 +17162,7 @@ impl EffectScan<'_> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } | ExprKind::FileCreateRwExclusive { path } => {
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path, .. } | ExprKind::FileCreateRwExclusive { path } => {
                 walk!(path);
                 self.impure_direct = true;
             }
@@ -29476,7 +29476,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } | ExprKind::FileCreateRwExclusive { path } => self.walk(path, depth),
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path, .. } | ExprKind::FileCreateRwExclusive { path } => self.walk(path, depth),
             ExprKind::RenameNoReplace { source, destination } => {
                 self.walk(source, depth);
                 self.walk(destination, depth);
@@ -48951,7 +48951,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } | ExprKind::FileCreateRwExclusive { path } => move_expr!(self, path, moved, false, false),
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path, .. } | ExprKind::FileCreateRwExclusive { path } => move_expr!(self, path, moved, false, false),
             ExprKind::RenameNoReplace { source, destination } => {
                 move_expr!(self, source, moved, false, false);
                 move_expr!(self, destination, moved, false, false);
@@ -55548,7 +55548,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // File constructors: create_rw (O_RDWR|O_CREAT|O_TRUNC), open_rw (O_RDWR), open_ro (O_RDONLY).
             // -> Result<file, Error> — the offset-addressed block I/O handle (A4).
-            if module == "fs" && matches!(method, "create_rw" | "open_rw" | "open_ro" | "create_rw_exclusive") {
+            if module == "fs" && matches!(method, "create_rw" | "open_rw" | "open_ro" | "open_ro_regular" | "create_rw_exclusive") {
                 self.require_import("std.fs", &format!("fs.{method}"), span);
                 return self.check_fs_create_open_rw(method, args, span);
             }
@@ -64807,10 +64807,13 @@ impl<'a, 't> Checker<'a, 't> {
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         }
         let path = self.check_str_init(&args[0]);
+        if self.resolve(path.ty) != Ty::Str && !hir_expr_diverges(&path) {
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         let kind = match method {
             "create_rw" => ExprKind::FileCreateRw { path: Box::new(path) },
             "create_rw_exclusive" => ExprKind::FileCreateRwExclusive { path: Box::new(path) },
-            "open_ro" => ExprKind::FileOpenRo { path: Box::new(path) },
+            "open_ro" | "open_ro_regular" => ExprKind::FileOpenRo { path: Box::new(path), regular_only: method == "open_ro_regular" },
             _ => ExprKind::FileOpenRw { path: Box::new(path) },
         };
         Expr {
@@ -71604,7 +71607,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::FsExists { path } | ExprKind::FsRemove { path }
             | ExprKind::FsCreateDir { path } | ExprKind::FsIsDir { path } | ExprKind::FsRemoveEmptyDir { path } | ExprKind::FsReadDir { path }
             | ExprKind::FsReadFileView { path } | ExprKind::FsReadBytesView { path }
-            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path } | ExprKind::FileCreateRwExclusive { path } => self.finalize_expr(path),
+            | ExprKind::FileCreateRw { path } | ExprKind::FileOpenRw { path } | ExprKind::FileOpenRo { path, .. } | ExprKind::FileCreateRwExclusive { path } => self.finalize_expr(path),
             ExprKind::RenameNoReplace { source, destination } => {
                 self.finalize_expr(source);
                 self.finalize_expr(destination);

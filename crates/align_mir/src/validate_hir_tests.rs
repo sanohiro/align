@@ -19985,7 +19985,7 @@ fn checked_byte_views_hir_rejects_forged_type_equations_in_every_entrypoint() {
 
 #[test]
 fn file_constructors_hir_reject_forged_types_in_every_entrypoint() -> Result<(), &'static str> {
-    for constructor in ["create_rw", "open_rw", "open_ro", "create_rw_exclusive"] {
+    for constructor in ["create_rw", "open_rw", "open_ro", "open_ro_regular", "create_rw_exclusive"] {
         let base = checked_source_program(&format!("import std.fs\nfn f(text: str) -> Result<file, Error> {{ value := fs.{constructor}(text); return value }}"));
         assert!(!is_empty(&lower_program(&base)));
         for mutation in 0..5 {
@@ -19994,7 +19994,7 @@ fn file_constructors_hir_reject_forged_types_in_every_entrypoint() -> Result<(),
             let original = expression.ty;
             let path = match &mut expression.kind {
                 hir::ExprKind::FileCreateRw { path } | hir::ExprKind::FileOpenRw { path }
-                | hir::ExprKind::FileOpenRo { path } | hir::ExprKind::FileCreateRwExclusive { path } => path,
+                | hir::ExprKind::FileOpenRo { path, .. } | hir::ExprKind::FileCreateRwExclusive { path } => path,
                 _ => return Err("file constructor fixture"),
             };
             match mutation {
