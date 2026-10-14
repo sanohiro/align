@@ -22002,9 +22002,9 @@ impl<'a> EscapeCheck<'a> {
                 // generation must not retain the input fact: doing so turns a returned owner into
                 // a false frame/arena borrow even though `region_of` and `BorrowRootAnalyzer`
                 // correctly classify the same producer as independent.
-                ExprKind::JsonOwnedDecode { .. } => EscapeValueFact::default(),
+                ExprKind::JsonOwnedDecode { .. }
+                | ExprKind::JsonDecodeArray { .. } => EscapeValueFact::default(),
                 ExprKind::JsonDecode { input, .. }
-                | ExprKind::JsonDecodeArray { input, .. }
                 | ExprKind::JsonDecodeStructArray { input, .. }
                 | ExprKind::JsonDecodeUnion { input, .. } => self.completed_escape_value(input),
                 _ => EscapeValueFact::default(),
@@ -32136,6 +32136,7 @@ fn storage_header_descriptors_compatible(
 fn native_storage_is_individual(kind: &ExprKind) -> bool {
     matches!(kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
         | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
+        | ExprKind::JsonDecodeArray { .. }
         | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. })
 }
 
@@ -41628,13 +41629,13 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Template(_) => {
                 self.template_owner_root(e).into_iter().collect()
             }
-            // Either JSON encoder copies source bytes into a free-standing owned `string`; neither
+            // Owned JSON materialization copies source bytes into free-standing owners; neither
             // its Ok payload nor its Error payload borrows the input.
             ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
+            | ExprKind::JsonDecodeArray { .. }
             | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } => BorrowRoots::new(),
             ExprKind::JsonDecode { input, .. }
-            | ExprKind::JsonDecodeArray { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
             ExprKind::JsonDecodeSoa { input, struct_id } => {
                 let borrows_input = self.structs.get(*struct_id as usize).is_some_and(|s| {
@@ -63371,16 +63372,19 @@ impl<'a, 't> Checker<'a, 't> {
                 // The element must be runtime-parseable. Scalar `str` elements are not admitted on
                 // this arena-free top-level path because selected escapes need an arena; typed struct
                 // fields use the arena-bearing decoder below.
-                if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool) {
+                if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::String) {
                     self.diags.error(
-                        format!("'json.decode' into array<{}> is not supported yet (int/float/bool elements only)", ty_name(elem)),
+                        format!("'json.decode' into array<{}> is not supported yet (int/float/bool/string elements only)", ty_name(elem)),
                         span,
                     );
                     return err;
                 }
                 // `check_str_init` accepts a `str` or auto-borrows an owned `string` (the result
-                // is copied, so the input's region does not constrain it), and reports a mismatch.
+                // owns its bytes, so the input's region does not constrain it), and reports a mismatch.
                 let input = self.check_str_init(&args[0]);
+                if input.ty == Ty::Error {
+                    return err;
+                }
                 return Expr {
                     kind: ExprKind::JsonDecodeArray { elem, input: Box::new(input) },
                     ty: Ty::Result(Scalar::DynArray(prim), Scalar::Enum(self.error_enum_id)),

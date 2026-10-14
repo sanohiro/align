@@ -1354,8 +1354,8 @@ pub enum ExprKind {
         input: Box<Expr>,
     },
     /// `json.decode(input)` targeting an owned `array<T>` (MMv2 slice 8c) — parse a JSON array of
-    /// scalars into a freshly heap-allocated owned `array<T>` (the elements are *copied*, so the
-    /// result is `Static`/returnable, not region-tied to the input). `elem` is the (primitive)
+    /// int/float/bool/string values into an owned `array<T>`. String elements own their decoded
+    /// bytes; every result is `Static`/returnable, not region-tied to the input. `elem` is the
     /// element type; the expression `ty` is `Result<array<T>, Error>`.
     JsonDecodeArray { elem: crate::Ty, input: Box<Expr> },
     /// `json.decode(input)` targeting a bare scalar (JSON completeness T1b) — parse the WHOLE input as

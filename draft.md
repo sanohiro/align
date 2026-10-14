@@ -2193,6 +2193,17 @@ one explicit unescaped append. Contextual language-template parsing remains defe
 
 ## 14. JSON
 
+**Owned string-array decoding (V005).** The inferred target of `json.decode(input)`
+may be `array<string>`. A complete UTF-8 JSON array of strings produces an
+independent owned array, including inside an arena. Clean and escaped elements
+own their decoded bytes; escaped U+0000 is valid. Malformed elements, separators,
+UTF-8, escapes or trailing input return `Error.Code(1)` and free every completed
+payload before exposing a result. Empty arrays allocate nothing; other arrays
+own one header spine and each nonempty string payload. Index views retain the
+array owner's lifetime. This reuses the existing type, Result and deep Drop;
+bare `string`, `array<str>` and owned-record array decoding remain separate.
+Plan183 owns the exact ABI, validation/publication order and cleanup matrix.
+
 **Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same
 existing element grammar as its JSON record field: supported integers, floats,
 bool, str, string, and accepted AoS record schemas. Root bytes equal the embedded

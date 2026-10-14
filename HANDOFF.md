@@ -24,6 +24,9 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan183](docs/impl/183-json-string-array-root.md) adds the inferred JSON
+  `array<string>` root using independent string owners and complete prefix
+  cleanup. Voice V005 consumer adoption remains external.
 - [Plan182](docs/impl/182-copy-record-producer.md) certifies independent inline
   Copy data projected from borrowed records beside fresh owned return storage
   for Request134. Source authority, contained views and Move siblings retain
