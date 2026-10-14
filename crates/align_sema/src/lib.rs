@@ -33592,9 +33592,9 @@ struct BorrowStateData {
     view_flows: std::collections::HashMap<LocalId, std::collections::BTreeSet<u32>>,
     /// Path-sensitive effects; control joins union may facts and intersect must facts.
     view_effects: Vec<Option<ViewEffectFlow>>,
-    /// Path-sensitive origin places (root local and field path) tracked for locals initialized from
-    /// place projections or view-producing operations on places (e.g. `state.slot.bytes()`).
-    local_origin_places: std::collections::HashMap<LocalId, (LocalId, Vec<u32>)>,
+    /// Typed origin places for projected locals/views and authenticated borrowed match bindings.
+    /// Payload segments distinguish a field inside a sum from its enclosing record field.
+    local_origin_places: std::collections::HashMap<LocalId, (LocalId, StoragePath)>,
 }
 
 impl std::ops::Deref for BorrowState {
@@ -36813,13 +36813,14 @@ impl<'a> MoveCheck<'a> {
         };
         if let Some(root) = root {
             self.borrows.invalid.remove(&root);
-            let path = path.unwrap_or(&[]);
+            let path = path.unwrap_or(&[]).iter().copied()
+                .map(BorrowProjection::StructField).collect::<StoragePath>();
             self.borrows.local_origin_places.retain(|local, (origin_root, origin_path)| {
                 if *local == root {
                     return false;
                 }
                 if *origin_root == root
-                    && (path.is_empty() || origin_path.starts_with(path) || path.starts_with(origin_path))
+                    && (path.is_empty() || origin_path.starts_with(&path) || path.starts_with(origin_path))
                 {
                     return false;
                 }
@@ -36889,6 +36890,22 @@ impl<'a> MoveCheck<'a> {
             }
         }
         self.record_nested_view_call_effects(args, modes, view_summary);
+        // An exact no-rebind effect preserves this completed local view's descriptor.
+        // The action's alias/reservation checks above already exclude replacing its
+        // source owner through another argument. Keep only this local origin, not
+        // arbitrary observers or an unavailable/possibly rebinding call's origins.
+        let preserved_view_origins = args.iter().enumerate().filter_map(|(index, argument)| {
+            let ExprKind::Local(local) = &argument.kind else { return None; };
+            if modes.get(index) != Some(&ast::ParamMode::BorrowMut)
+                || !mutable_view_effect_eligible(argument.ty, self.storage_type_context())
+                || view_summary.and_then(Option::as_ref)
+                    .and_then(|effects| effects.get(index)).and_then(Option::as_ref)
+                    .is_none_or(|effect| effect.may_rebind)
+            {
+                return None;
+            }
+            self.borrows.local_origin_places.get(local).cloned().map(|origin| (*local, origin))
+        }).collect::<Vec<_>>();
         let value_argument_facts = args
             .iter()
             .map(|argument| self.completed_value_fact(argument))
@@ -37471,6 +37488,7 @@ impl<'a> MoveCheck<'a> {
                 }
             }
         }
+        self.borrows.local_origin_places.extend(preserved_view_origins);
         if self.completion_snapshot_needed(action) {
             let completion = self.mutable_call_result_completion(
                 action,
@@ -38112,7 +38130,7 @@ impl<'a> MoveCheck<'a> {
         self.storage_roots(argument)
     }
 
-    fn expr_origin_place(&self, expression: &Expr) -> Option<(LocalId, Vec<u32>)> {
+    fn expr_origin_place(&self, expression: &Expr) -> Option<(LocalId, StoragePath)> {
         if let Some(inner) = borrow_transparent_value(expression) {
             return self.expr_origin_place(inner);
         }
@@ -38127,15 +38145,15 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Field { root, path } => {
                 if let Some(&(base_root, ref base_path)) = self.borrows.local_origin_places.get(root) {
                     let mut p = base_path.clone();
-                    p.extend_from_slice(path);
+                    p.extend(path.iter().copied().map(BorrowProjection::StructField));
                     Some((base_root, p))
                 } else {
-                    Some((*root, path.clone()))
+                    Some((*root, path.iter().copied().map(BorrowProjection::StructField).collect()))
                 }
             }
             ExprKind::TupleIndex { recv, index } => {
                 let (root, mut path) = self.expr_origin_place(recv)?;
-                path.push(*index);
+                path.push(BorrowProjection::TupleElement(*index));
                 Some((root, path))
             }
             ExprKind::BufferBytes { buffer }
@@ -38165,7 +38183,7 @@ impl<'a> MoveCheck<'a> {
                 if let Some(local) = local {
                     if self.local_may_borrow(*local) {
                         let mut path = base_path.clone();
-                        path.push(index as u32);
+                        path.push(BorrowProjection::TupleElement(index as u32));
                         self.borrows.local_origin_places.insert(*local, (root, path));
                     } else {
                         self.borrows.local_origin_places.remove(local);
@@ -38175,19 +38193,9 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn type_at_path(&self, mut current: Ty, path: &[u32]) -> Option<Ty> {
-        for &field in path {
-            current = expand_tagged_ty(current, self.tagged_types);
-            match current {
-                Ty::Struct(id) => {
-                    current = self.structs.get(id as usize)?.fields.get(field as usize)?.ty;
-                }
-                Ty::Tuple(id) => {
-                    let elem_scalar = self.tuples.get(id as usize)?.elems.get(field as usize)?;
-                    current = scalar_to_ty(*elem_scalar);
-                }
-                _ => return None,
-            }
+    fn type_at_path(&self, mut current: Ty, path: &[BorrowProjection]) -> Option<Ty> {
+        for &projection in path {
+            current = self.projection_ty(current, projection)?;
         }
         Some(current)
     }
@@ -38195,8 +38203,8 @@ impl<'a> MoveCheck<'a> {
     fn is_disjoint_sibling_fields(
         &self,
         root: LocalId,
-        path_l: &[u32],
-        path_r: &[u32],
+        path_l: &[BorrowProjection],
+        path_r: &[BorrowProjection],
     ) -> bool {
         let root_ty = match self.f.locals.get(root as usize) {
             Some(record) => record.ty,
@@ -38215,6 +38223,14 @@ impl<'a> MoveCheck<'a> {
         };
         let field_l = path_l[k];
         let field_r = path_r[k];
+        // Sum alternatives can overlap physical storage. Only actual sibling fields
+        // (including tuple positions) retain the existing independent-owner proof.
+        if !matches!((field_l, field_r),
+            (BorrowProjection::StructField(_), BorrowProjection::StructField(_))
+                | (BorrowProjection::TupleElement(_), BorrowProjection::TupleElement(_)))
+        {
+            return false;
+        }
         let Some(ty_l) = self.type_at_path(parent_ty, &[field_l]) else {
             return false;
         };
@@ -43090,12 +43106,14 @@ impl<'a> MoveCheck<'a> {
         }
         self.borrows
             .invalidate_mutable_places(root, path, BorrowEnd::Consumed);
+        let path = path.iter().copied().map(BorrowProjection::StructField)
+            .collect::<StoragePath>();
         self.borrows.local_origin_places.retain(|local, (origin_root, origin_path)| {
             if *local == root {
                 return false;
             }
             if *origin_root == root
-                && (path.is_empty() || origin_path.starts_with(path) || path.starts_with(origin_path))
+                && (path.is_empty() || origin_path.starts_with(&path) || path.starts_with(origin_path))
             {
                 return false;
             }
@@ -48115,6 +48133,7 @@ impl<'a> MoveCheck<'a> {
         let scrutinee_headers = self.completed_headers(scrutinee);
         let scrutinee_storage_roots = self.completed_storage_fact(scrutinee).live_roots();
         let scrutinee_source = self.direct_storage_move_source(scrutinee);
+        let scrutinee_origin = self.expr_origin_place(scrutinee);
         let mut joined: Option<MoveControlEdge> = None;
         for arm in arms {
             let arm_moves_payload = self.arm_moves_payload(arm);
@@ -48168,6 +48187,16 @@ impl<'a> MoveCheck<'a> {
                     fact,
                     scrutinee_storage_roots.clone(),
                 );
+                if borrowed
+                    && let Some(projection) = projection
+                    && let Some((root, mut path)) = scrutinee_origin.clone()
+                {
+                    // This binding aliases the active payload in the original stable place.
+                    // Keep the typed path for sibling checks; lifetime and ownership facts
+                    // remain the ordinary shared-projection facts above.
+                    path.push(projection);
+                    self.borrows.local_origin_places.insert(*binding, (root, path));
+                }
                 clear_moved(&mut arm_moved, *binding);
             }
             self.begin_storage_advance_frame();

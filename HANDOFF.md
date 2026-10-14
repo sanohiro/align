@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan198](docs/impl/198-shared-match-field-origins.md) retains typed stable
+  field origins through shared sum-payload matches for R130. Existing checked
+  no-rebind effects preserve local view origins across repeated calls. Parent
+  ownership, payload read-only access and alias/lifetime refusals remain;
+  exclusive matched payloads and partial Move-field calls stay separate.
+
 - [Plan197](docs/impl/197-fixed-text-array-borrows.md) certifies local fixed
   str-array shared/exclusive borrows through complete Copy construction and
   separate text/header authority. Input text lifetimes and sole cleanup remain;
