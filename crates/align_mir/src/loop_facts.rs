@@ -284,7 +284,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::JsonDecodeSoa { .. } | Rvalue::CsvDecode { .. } | Rvalue::JsonDecodeUnion { .. } |
         Rvalue::JsonDoc { .. } | Rvalue::JsonDocKind { .. } | Rvalue::JsonDocGet { .. } |
         Rvalue::JsonDocAt { .. } | Rvalue::JsonDocAsStr { .. } | Rvalue::JsonDocAsScalar { .. } |
-        Rvalue::JsonDocLen { .. } | Rvalue::JsonDocKey { .. } | Rvalue::JsonDocElems { .. } |
+        Rvalue::JsonDocLen { .. } | Rvalue::JsonDocKey { .. } | Rvalue::JsonDocCollect { .. } |
         Rvalue::JsonScanNew { .. } | Rvalue::JsonScanNext { .. } | Rvalue::FsReadFile { .. } |
         Rvalue::FsCreatePrivateTempDir { .. } | Rvalue::ReaderOpen { .. } | Rvalue::ReaderOpenBeneath { .. } |
         Rvalue::ReaderOpenBeneathSingleLink { .. } | Rvalue::WriterCreate { .. } | Rvalue::WriterCreateExclusive { .. } |

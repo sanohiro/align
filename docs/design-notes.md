@@ -2386,3 +2386,14 @@ nonfinite defaults and malformed/overflowing values before publishing a result.
 without re-tokenizing argv. Last-value-wins stays uniform; callers own duplicate
 and application-range policy. [Plan181](impl/181-cli-float-occurrences.md) records
 the synchronous Copy observations and unchanged command/parsed ownership.
+
+
+### Linear object keys
+
+The tokenizer vocabulary in voice V001 makes repeated `key(i)` traversal
+quadratic. `keys()` complements the existing `elems()` materialization with
+one contiguous ordered `slice<str>`, preserving duplicates and index pairing.
+Explicit arena storage keeps allocation and lifetime visible; clean keys borrow
+input, while escaped bytes use the call's arena. A tape sibling walk skips each
+nested value once. No iterator protocol, map type or owned value tree is needed.
+[Plan186](impl/186-json-doc-keys.md) owns the native and compiler closure.

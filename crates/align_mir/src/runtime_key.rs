@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 467] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 468] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -345,6 +345,7 @@ runtime_keys! {
     JsonDocElems => "json_doc_elems",
     JsonDocGet => "json_doc_get",
     JsonDocKey => "json_doc_key",
+    JsonDocKeys => "json_doc_keys",
     JsonDocKind => "json_doc_kind",
     JsonDocLen => "json_doc_len",
     JsonDocParse => "json_doc_parse",
@@ -492,7 +493,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 467] = [(); RuntimeKey::ALL.len()];
+const _: [(); 468] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -501,7 +502,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 467);
+        assert_eq!(RuntimeKey::ALL.len(), 468);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

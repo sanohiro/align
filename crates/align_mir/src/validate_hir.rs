@@ -4687,7 +4687,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::JsonDocAsStr { .. }
             | hir::ExprKind::JsonDocLen { .. }
             | hir::ExprKind::JsonDocKey { .. }
-            | hir::ExprKind::JsonDocElems { .. } => true,
+            | hir::ExprKind::JsonDocCollect { .. } => true,
             hir::ExprKind::JsonDocAsScalar { scalar, .. } => self.json_doc_scalar_ok(*scalar),
             hir::ExprKind::ArrayGroupAgg {
                 base,
@@ -7190,7 +7190,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::JsonDocAsStr { doc }
             | hir::ExprKind::JsonDocAsScalar { doc, .. }
             | hir::ExprKind::JsonDocLen { doc }
-            | hir::ExprKind::JsonDocElems { doc } => push_expr!(doc, context.clone()),
+            | hir::ExprKind::JsonDocCollect { doc, .. } => push_expr!(doc, context.clone()),
             hir::ExprKind::JsonDocGet { doc, key } | hir::ExprKind::JsonDocAt { doc, index: key } | hir::ExprKind::JsonDocKey { doc, index: key } => {
                 push_expr!(key, context.clone());
                 push_expr!(doc, context.clone());
@@ -11493,13 +11493,13 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[doc_flow, index_flow]);
                 Some((Ty::Option(Scalar::Str), falls, breaks))
             }
-            hir::ExprKind::JsonDocElems { doc } => {
+            hir::ExprKind::JsonDocCollect { kind, doc } => {
                 let flow = self.expr_flow(doc)?;
                 if context.arena_depth == 0 || flow.ty != Ty::JsonDoc {
                     return None;
                 }
                 let (falls, breaks) = strict_flow(&[flow]);
-                Some((Ty::Slice(Scalar::JsonDoc), falls, breaks))
+                Some((Ty::Slice(kind.element()), falls, breaks))
             }
             hir::ExprKind::JsonScan { struct_id, input } => {
                 let flow = self.expr_flow(input)?;

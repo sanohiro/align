@@ -778,7 +778,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::JsonDocLen { doc } => format!("json_doc_len({})", operand_str(doc)),
         Rvalue::JsonDocKey { doc, index, out } => format!("json_doc_key({}, {}, -> _{out})", operand_str(doc), operand_str(index)),
-        Rvalue::JsonDocElems { doc, arena, out } => format!("json_doc_elems({}, arena={}, -> _{out})", operand_str(doc), operand_str(arena)),
+        Rvalue::JsonDocCollect { kind, doc, arena, out } => format!("json_doc_collect({kind:?}, {}, arena={}, -> _{out})", operand_str(doc), operand_str(arena)),
         Rvalue::JsonScanNew { input } => format!("json_scan_new({})", operand_str(input)),
         Rvalue::JsonScanNext { scanner, struct_id, cursor, row } => {
             format!("json_scan_next({}, struct#{struct_id}, cursor=_{cursor}, -> row _{row})", operand_str(scanner))

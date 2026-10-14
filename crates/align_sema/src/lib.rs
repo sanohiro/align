@@ -18109,7 +18109,7 @@ impl EffectScan<'_> {
             // `json.doc(...)` / `d.kind()` / `d.get(k)` / `d.at(i)` / `d.as_*()` are all Pure (parse /
             // navigate — no I/O); walk their sub-expressions for effects (J4).
             ExprKind::JsonDoc { input } => walk!(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => walk!(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocCollect { doc, .. } => walk!(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 walk!(doc);
                 walk!(key);
@@ -22009,8 +22009,8 @@ impl<'a> EscapeCheck<'a> {
                 | ExprKind::JsonDecodeUnion { input, .. } => self.completed_escape_value(input),
                 _ => EscapeValueFact::default(),
             },
-            StorageContentInitializer::JsonDocElements => match &expression.kind {
-                ExprKind::JsonDocElems { doc } => self.completed_escape_value(doc),
+            StorageContentInitializer::JsonDocCollection => match &expression.kind {
+                ExprKind::JsonDocCollect { doc, .. } => self.completed_escape_value(doc),
                 _ => EscapeValueFact::default(),
             },
             StorageContentInitializer::GroupAggregation => {
@@ -24788,7 +24788,7 @@ impl<'a> EscapeCheck<'a> {
             // `d.elems()` bump-allocates the handle buffer in the enclosing arena, and each element
             // handle views the same tape (the doc's region). So the slice is region-tied to BOTH — the
             // arena and the doc — i.e. the shorter of the two (like `json.decode → soa` / `to_array`).
-            ExprKind::JsonDocElems { doc } => push_fold(
+            ExprKind::JsonDocCollect { doc, .. } => push_fold(
                 &mut work,
                 self.allocation_region(expression),
                 vec![(doc, depth, None)],
@@ -25961,7 +25961,7 @@ impl<'a> EscapeCheck<'a> {
             // `elems()` yields an arena-allocated `slice<json.doc>` — its buffer is bump-allocated, not
             // a borrow of a function-local stack array, so it is not local-backed (escape is governed
             // by `region_of` = the arena). Like `to_array` / a `json.decode` view.
-            | ExprKind::JsonDocElems { .. }
+            | ExprKind::JsonDocCollect { .. }
             // A `json.scanner<Row>` handle is a `{ptr,len}` input view, not a local-backed slice (J5).
             | ExprKind::JsonScan { .. }
             | ExprKind::ArrayGroupAgg { .. }
@@ -29461,7 +29461,7 @@ impl<'a> EscapeCheck<'a> {
             // `json.doc(...)` and the doc accessors: walk their operands (J4).
             ExprKind::JsonDoc { input } => self.walk(input, depth),
             ExprKind::JsonScan { input, .. } => self.walk(input, depth),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.walk(doc, depth),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocCollect { doc, .. } => self.walk(doc, depth),
             ExprKind::JsonDocGet { doc, key } => {
                 self.walk(doc, depth);
                 self.walk(key, depth);
@@ -31956,7 +31956,7 @@ enum StorageContentInitializer {
     SoaColumns,
     CloneIn,
     JsonDecoded,
-    JsonDocElements,
+    JsonDocCollection,
     GroupAggregation,
     CarrierSource,
     BuilderElement,
@@ -32236,8 +32236,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::JsonDecodeUnion { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::JsonDecoded)
         }
-        ExprKind::JsonDocElems { .. } => {
-            StorageVariantPolicy::Fresh(StorageContentInitializer::JsonDocElements)
+        ExprKind::JsonDocCollect { .. } => {
+            StorageVariantPolicy::Fresh(StorageContentInitializer::JsonDocCollection)
         }
         ExprKind::ArrayGroupAgg { .. } | ExprKind::ArrayGroupAggMulti { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::GroupAggregation)
@@ -41695,7 +41695,7 @@ impl<'a> MoveCheck<'a> {
             // decode / soa views above (J4). `key` is a borrowed `str` argument, `index` a Copy int —
             // neither adds a root (`borrow_sources` short-circuits a non-borrowing `key`/`index`).
             ExprKind::JsonDoc { input } => self.storage_roots(input),
-            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } | ExprKind::JsonDocElems { doc } => {
+            ExprKind::JsonDocGet { doc, .. } | ExprKind::JsonDocAt { doc, .. } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocKey { doc, .. } | ExprKind::JsonDocCollect { doc, .. } => {
                 self.storage_roots(doc)
             }
             // A `json.scanner<Row>` is a view rooted in its JSON input, like `json.doc` (J5) — a use
@@ -48936,7 +48936,7 @@ impl<'a> MoveCheck<'a> {
             // `json.doc(...)` and the doc accessors read their operands — a `str` input / key (borrowed),
             // a Copy `json.doc` receiver, a Copy index — none consumed (J4).
             ExprKind::JsonDoc { input } => move_expr!(self, input, moved, false, false),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => move_expr!(self, doc, moved, false, false),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocCollect { doc, .. } => move_expr!(self, doc, moved, false, false),
             ExprKind::JsonDocGet { doc, key } => {
                 move_expr!(self, doc, moved, false, false);
                 move_expr!(self, key, moved, false, false);
@@ -56550,7 +56550,7 @@ impl<'a, 't> Checker<'a, 't> {
             // above), BEFORE the shared `get` (box) arm so the name stays free on other values.
             // (`d.as_str()` shares the `as_str` intercept above.) The receiver may be a temporary — a
             // `json.doc` is Copy, never dropped, so chaining `d.get("a").at(0).as_i64()` is fine.
-            "kind" | "get" | "at" | "key" | "elems" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
+            "kind" | "get" | "at" | "key" | "elems" | "keys" | "as_i64" | "as_f64" | "as_bool" if recv_ty == Ty::JsonDoc => {
                 self.check_json_doc_method(recv_expr, method, args, span)
             }
             "is_null" if recv_ty == Ty::Raw => {
@@ -63623,21 +63623,22 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 Expr { kind: ExprKind::JsonDocKind { doc: Box::new(recv_expr) }, ty: Ty::Enum(self.json_kind_enum_id), span }
             }
-            "elems" => {
+            "elems" | "keys" => {
                 if !args.is_empty() {
-                    self.diags.error(format!("'.elems()' takes no arguments, got {}", args.len()), span);
+                    self.diags.error(format!("'.{method}()' takes no arguments, got {}", args.len()), span);
                     return err;
                 }
                 // Materializes the handle buffer in the enclosing arena, like the direct-to-`soa`
                 // decode / `.to_array()` — so it needs an `arena {}`.
                 if self.arena_depth == 0 {
                     self.diags.error(
-                        "'.elems()' materializes a document level in an arena — call it inside an `arena {}` block".to_string(),
+                        format!("'.{method}()' materializes a document level in an arena — call it inside an `arena {{}}` block"),
                         span,
                     );
                     return err;
                 }
-                Expr { kind: ExprKind::JsonDocElems { doc: Box::new(recv_expr) }, ty: Ty::Slice(Scalar::JsonDoc), span }
+                let kind = if method == "keys" { hir::JsonDocCollection::Keys } else { hir::JsonDocCollection::Values };
+                Expr { kind: ExprKind::JsonDocCollect { kind, doc: Box::new(recv_expr) }, ty: Ty::Slice(kind.element()), span }
             }
             "get" => {
                 if args.len() != 1 {
@@ -71592,7 +71593,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::TemplateHtmlToString { output, .. } => self.finalize_expr(output),
             ExprKind::JsonDoc { input } => self.finalize_expr(input),
             ExprKind::JsonScan { input, .. } => self.finalize_expr(input),
-            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocElems { doc } => self.finalize_expr(doc),
+            ExprKind::JsonDocKind { doc } | ExprKind::JsonDocAsStr { doc } | ExprKind::JsonDocAsScalar { doc, .. } | ExprKind::JsonDocLen { doc } | ExprKind::JsonDocCollect { doc, .. } => self.finalize_expr(doc),
             ExprKind::JsonDocGet { doc, key } => {
                 self.finalize_expr(doc);
                 self.finalize_expr(key);
@@ -79871,13 +79872,25 @@ mod tests {
             ),
             (
                 Expr {
-                    kind: ExprKind::JsonDocElems {
+                    kind: ExprKind::JsonDocCollect {
+                        kind: hir::JsonDocCollection::Values,
                         doc: Box::new(leaf()),
                     },
                     ty: Ty::Slice(Scalar::JsonDoc),
                     span,
                 },
-                StorageContentInitializer::JsonDocElements,
+                StorageContentInitializer::JsonDocCollection,
+            ),
+            (
+                Expr {
+                    kind: ExprKind::JsonDocCollect {
+                        kind: hir::JsonDocCollection::Keys,
+                        doc: Box::new(leaf()),
+                    },
+                    ty: Ty::Slice(Scalar::Str),
+                    span,
+                },
+                StorageContentInitializer::JsonDocCollection,
             ),
             (
                 Expr {

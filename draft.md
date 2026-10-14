@@ -2384,15 +2384,27 @@ non-container yields a `Missing` doc, which propagates through further navigatio
 **once** — as `None` from a leaf accessor. The leaf accessors `as_str` / `as_i64` / `as_f64` /
 `as_bool` return `Option` (`None` when the value is not that kind); `d.kind()` returns the builtin
 `json.kind` sum type and distinguishes JSON `null` from absence (`Missing`). `as_str` is a zero-copy
-view into the input, except an escaped string, which is unescaped into the arena (the one allocating
-accessor). `d.len()` is the member / element count (0 on a non-container); `d.key(i) -> Option<str>` is
-the i-th object key in document order — so an object is read as ordered data (keys + `at(i)` values)
+view into the input, except an escaped string, which is unescaped into the parse arena. `d.len()` is the member / element count (0 on a non-container); `d.key(i) -> Option<str>` is
+the i-th object key in document order — so an object is read as ordered data (keys + `elems()[i]` values)
 without a `map` type. `d.elems()` materializes one level (each array element, or each object member
 value) as a `slice<json.doc>` — arena-backed, built once (so iterating with `elems()`+`[i]` is O(n),
 vs `at(i)`'s O(i) per call), indexable and `len`-able like any slice, and nameable as a
 `fn f(xs: slice<json.doc>)` parameter (a level walked by recursion). The types `json.doc` and
 `json.kind` are nameable, so a `fn f(d: json.doc)` helper factors doc code out. `json.doc` (and
 `elems()`) need an enclosing `arena {}`, like the direct-to-`soa` decode.
+
+`d.keys() -> slice<str>` materializes an object's decoded keys in document order,
+including every duplicate; `keys()[i]` pairs with `elems()[i]`. Non-objects,
+Missing and empty objects return an empty slice. The zero-argument call requires
+an explicit enclosing arena: one contiguous key-header array and each escaped
+key's exact decoded bytes are allocated there; clean keys borrow the input.
+The slice and its elements depend on both the doc's input/parse arena and this
+materialization arena. Work is O(member count + key bytes), with O(1) indexing;
+repeated calls materialize again. Escapes include Unicode surrogate pairs and
+embedded U+0000. No new error model is introduced: parsing remains fallible,
+while arena allocation exhaustion remains terminal. `key(i)` retains its O(i)
+prefix walk and parse-arena decoding. See [Plan186](docs/impl/186-json-doc-keys.md).
+
 
 ---
 

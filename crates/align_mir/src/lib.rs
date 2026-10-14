@@ -1797,10 +1797,10 @@ pub enum Rvalue {
         index: Operand,
         out: Slot,
     },
-    /// `d.elems()` on a `json.doc`: the runtime materializes the level's child handles into an
-    /// arena-allocated buffer and writes the `slice<json.doc>` `{ptr,len}` into the `out` slot. No
-    /// status (an empty container / non-container → an empty slice). `arena` is the enclosing arena.
-    JsonDocElems {
+    /// Arena materialization of one JSON level: Values writes Slice(JsonDoc), Keys
+    /// writes Slice(Str). Unit result, exact private output slot, shared content roots.
+    JsonDocCollect {
+        kind: hir::JsonDocCollection,
         doc: Operand,
         arena: Operand,
         out: Slot,
@@ -8971,17 +8971,18 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::JsonDocKey { doc, index } => lower_json_doc_key(b, doc, index, e.ty),
-            hir::ExprKind::JsonDocElems { doc } => {
+            hir::ExprKind::JsonDocCollect { kind, doc } => {
                 let arena = *b
                     .arenas
                     .last()
-                    .expect("json.doc.elems() outside an arena (sema-checked)");
-                let out = b.new_slot(e.ty); // slice<json.doc>
+                    .expect("json.doc collection outside an arena (sema-checked)");
+                let out = b.new_slot(e.ty); // exact collection element selected by kind
                 lower_required_binding!(b, d = lower_expr(b, doc), Operand::Const(Const::Unit));
                 let unit = b.fresh_value(Ty::Unit);
                 b.push(Stmt::Let(
                     unit,
-                    Rvalue::JsonDocElems {
+                    Rvalue::JsonDocCollect {
+                        kind: *kind,
                         doc: d,
                         arena: Operand::Value(arena),
                         out,

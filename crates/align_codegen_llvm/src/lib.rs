@@ -16692,8 +16692,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value().basic().expect("json_doc_len returns i64")
             }
             Rvalue::JsonDocKey { doc, index, out } => self.gen_json_doc_key(doc, index, *out)?,
-            Rvalue::JsonDocElems { doc, arena, out } => {
-                self.gen_json_doc_elems(doc, arena, *out)?;
+            Rvalue::JsonDocCollect { kind, doc, arena, out } => {
+                self.gen_json_doc_collect(*kind, doc, arena, *out)?;
                 return Ok(None);
             }
             // json.scan (J5). The scanner value IS the input `{ptr,len}` view — no allocation.
@@ -22019,15 +22019,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .expect("json_doc_key returns i32 present flag"))
     }
 
-    /// `d.elems()` (J4 slice 3): zero the out `{ptr,len}` slot, then call the void runtime materializer,
-    /// which bump-allocates the level's handle buffer in `arena` and writes the `slice<json.doc>` header.
-    fn gen_json_doc_elems(&mut self, doc: &Operand, arena: &Operand, out: Slot) -> Result<(), CodegenError> {
+    /// Lower the authenticated collection mode to its matching A71 materializer.
+    /// Both modes publish a slice header; MIR owns the exact element and arena contract.
+    fn gen_json_doc_collect(&mut self, kind: hir::JsonDocCollection, doc: &Operand, arena: &Operand, out: Slot) -> Result<(), CodegenError> {
         let out_ptr = self.slots[&out];
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
         let (tape, node) = self.split_doc(doc)?;
         let ah = self.operand(arena)?;
         self.builder
-            .build_call(self.runtime(RuntimeKey::JsonDocElems), &[tape.into(), node.into(), ah.into(), out_ptr.into()], "")
+            .build_call(self.runtime(match kind { hir::JsonDocCollection::Values => RuntimeKey::JsonDocElems, hir::JsonDocCollection::Keys => RuntimeKey::JsonDocKeys }), &[tape.into(), node.into(), ah.into(), out_ptr.into()], "")
             .map_err(|e| self.err(e))?;
         Ok(())
     }
@@ -32262,6 +32262,39 @@ fn main() -> i32 = 0
                 }
                 assert!(changed);
                 assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{ty}/{mutation}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn json_doc_collection_mir_exact_outputs_and_symbols() -> Result<(), &'static str> {
+        for method in ["elems", "keys"] {
+            let base = mir(&format!("import core.json\nfn f(d:json.doc, spare:slice<str>) -> i64 = arena {{ collection:=d.{method}(); collection.len() }}\nfn main()->i32 = 0\n"));
+            assert!(validate_resource_rvalues(&base).is_ok());
+            let index = xml_test_function(&base, "f");
+            let ir = emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "collection IR")?;
+            assert!(ir.contains(&format!("call void @align_rt_json_doc_{method}(")));
+            let (value, slot) = base.fns[index].blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
+                Stmt::Let(value, Rvalue::JsonDocCollect { out, .. }) => Some((*value, *out)), _ => None,
+            }).ok_or("collection native fixture")?;
+            for mutation in 0..8 {
+                let mut wrong = base.clone();
+                let spare = wrong.fns[index].params[1];
+                let (kind, doc, arena, out) = wrong.fns[index].blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
+                    Stmt::Let(_, Rvalue::JsonDocCollect { kind, doc, arena, out }) => Some((kind, doc, arena, out)), _ => None,
+                }).ok_or("collection mutable fixture")?;
+                match mutation {
+                    0 => *kind = match kind { hir::JsonDocCollection::Values => hir::JsonDocCollection::Keys, hir::JsonDocCollection::Keys => hir::JsonDocCollection::Values },
+                    1 => *doc = Operand::Const(Const::Bool(true)),
+                    2 => *arena = Operand::Const(Const::Bool(true)),
+                    3 => *out = u32::MAX,
+                    4 => *out = spare,
+                    5 => wrong.fns[index].slots[slot as usize] = Ty::Slice(Scalar::Bool),
+                    6 => wrong.fns[index].value_tys[value as usize] = Ty::Int(IntTy { bits: 32, signed: true }),
+                    _ => { wrong.fns[index].blocks[0].stmts.push(Stmt::Store(slot, Operand::Const(Const::Bool(true)))); }
+                }
+                assert_xml_producer_rejected(&wrong, "collection discriminator/exact inputs/private outputs");
             }
         }
         Ok(())

@@ -1,0 +1,23 @@
+import core.json
+import std.fs
+import std.time
+
+fn main(args: array<str>) -> Result<(), Error> {
+  if args.len() != 2 { return Err(Error.Invalid) }
+  text := fs.read_file(args[1])?
+  arena {
+    doc := json.doc(text)?
+    start := time.instant()
+    mut i: i64 := 0
+    mut bytes: i64 := 0
+    loop {
+      if i >= doc.len() { break }
+      key := doc.key(i) else { return Err(Error.Invalid) }
+      bytes = bytes + key.len()
+      i = i + 1
+    }
+    print(bytes)
+    print(time.instant() - start)
+  }
+  return Ok(())
+}

@@ -13,6 +13,22 @@ use align_span::Span;
 /// Identifier of a local variable (and its memory slot) within a function body.
 pub type LocalId = u32;
 
+/// One explicitly arena-materialized level of a JSON document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum JsonDocCollection {
+    Values,
+    Keys,
+}
+
+impl JsonDocCollection {
+    pub fn element(self) -> crate::Scalar {
+        match self {
+            Self::Values => crate::Scalar::JsonDoc,
+            Self::Keys => crate::Scalar::Str,
+        }
+    }
+}
+
 /// Physical ownership result carried by an Align call. Copy returns have no extra ABI value;
 /// recursively Move returns carry the path-selected cleanup bit beside the returned value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
@@ -1439,12 +1455,10 @@ pub enum ExprKind {
     /// `None` (not an object / out of range / Missing). The `str` is a view (into the input, or the
     /// arena for an escaped key), so region-bound to `doc`. The objects-as-ordered-data half of J4.
     JsonDocKey { doc: Box<Expr>, index: Box<Expr> },
-    /// `d.elems()` on a `json.doc` — materialize one document level (each Array element, or each Object
-    /// member value) as an arena-backed `slice<json.doc>`. The handle buffer is bump-allocated in the
-    /// enclosing arena, and the element handles view the same tape, so the slice is region-tied to
-    /// min(input, arena). A non-container / empty yields an empty slice. J4 slice 3 (a pipeline source
-    /// materialized once — `at(i)` re-walks per call, `elems()` is O(n) then O(1) indexing).
-    JsonDocElems { doc: Box<Expr> },
+    /// Explicit arena materialization: Values yields one-level `slice<json.doc>`, Keys
+    /// yields ordered Object `slice<str>`. Headers and decoded key bytes use the current
+    /// arena; contents retain the receiver's input/tape roots. Nonmatching kinds are empty.
+    JsonDocCollect { kind: JsonDocCollection, doc: Box<Expr> },
     /// `json.scan(input)` (core.json J5) — build a streaming typed-row scanner over the JSON `input`
     /// view. The expression `ty` is `json.scanner<Row>` (`struct_id` = the row struct, from the binding
     /// annotation). It borrows the input (region-tracked), never materializes an `array<Row>`, and is a

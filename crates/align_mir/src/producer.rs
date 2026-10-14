@@ -1669,6 +1669,11 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::JsonDocCollect { kind, doc, arena, out } => {
+            contract.outputs = vec![(*out, Ty::Slice(kind.element()))];
+            contract.operands = vec![(doc, Ty::JsonDoc, read), (arena, Ty::ArenaHandle, read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
         Rvalue::BufferTryNew { capacity, fill, alignment, pages, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::Buffer)];
@@ -1934,7 +1939,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::JsonDocAt { out, .. }
         | Rvalue::JsonDocAsStr { out, .. }
         | Rvalue::JsonDocKey { out, .. }
-        | Rvalue::JsonDocElems { out, .. }
+        | Rvalue::JsonDocCollect { out, .. }
         | Rvalue::BytesAsStr { out, .. }
         | Rvalue::FsReadFileView { out, .. }
         | Rvalue::FsReadBytesView { out, .. }
@@ -2037,7 +2042,7 @@ fn xml_out_producer_result_ty(rvalue: &Rvalue) -> Option<Ty> {
     Some(match rvalue {
         Rvalue::JsonDocGet { .. }
         | Rvalue::JsonDocAt { .. }
-        | Rvalue::JsonDocElems { .. }
+        | Rvalue::JsonDocCollect { .. }
         | Rvalue::RandSeed { .. } => Ty::Unit,
         _ => Ty::Int(IntTy {
             bits: 32,
@@ -2102,7 +2107,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
             vec![doc, index]
         }
         Rvalue::JsonDocAsStr { doc, .. } | Rvalue::JsonDocAsScalar { doc, .. } => vec![doc],
-        Rvalue::JsonDocElems { doc, arena, .. } => vec![doc, arena],
+        Rvalue::JsonDocCollect { doc, arena, .. } => vec![doc, arena],
         Rvalue::JsonScanNext { scanner, .. } => vec![scanner],
         Rvalue::ReaderOpenBeneath { root, relative, .. }
         | Rvalue::ReaderOpenBeneathSingleLink { root, relative, .. }
@@ -6615,7 +6620,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::JsonDocAsScalar { .. }
             | Rvalue::JsonDocLen { .. }
             | Rvalue::JsonDocKey { .. }
-            | Rvalue::JsonDocElems { .. }
+            | Rvalue::JsonDocCollect { .. }
             | Rvalue::JsonScanNew { .. }
             | Rvalue::JsonScanNext { .. }
             | Rvalue::ReaderOpen { .. }
