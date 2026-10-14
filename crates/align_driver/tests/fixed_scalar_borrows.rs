@@ -1109,3 +1109,334 @@ fn fixed_scalar_pooled_borrows_require_sealed_writers() {
         );
     }
 }
+
+#[test]
+fn fixed_text_borrow_producer_matrix() {
+    for length in [0, 1, 2, 37] {
+        let elements = vec!["text"; length].join(", ");
+        let constants = vec!["\"first\""; length].join(", ");
+        let mutation = if length == 0 {
+            ""
+        } else {
+            "values[0] = \"changed\""
+        };
+        let source = format!(
+            "fn inspect(borrow values: [str; {length}]) -> i64 = values.len()\n\
+             fn change(borrow mut values: [str; {length}]) {{ {mutation} }}\n\
+             fn exercise(text: str) {{\n\
+               pooled: [str; {length}] := [{constants}]\n\
+               print(inspect(pooled))\n\
+               mut values: [str; {length}] := [{elements}]\n\
+               change(values); change(values); print(inspect(values))\n\
+               copied := values; print(inspect(copied))\n\
+             }}\nfn main() {{ exercise(\"first\") }}\n"
+        );
+        let program = checked(&source);
+        certify(&program, true, &format!("text/{length}"));
+    }
+}
+
+#[test]
+fn fixed_text_borrows_execute_and_replay() {
+    owned_fixture::run("fixed_text_borrows_execute_and_replay", |stage| {
+        let model = r#"module text_arrays
+import core.json
+Text {value:str}
+pub fn inspect(borrow values:[str;2])->i64=values.len()
+pub fn first(borrow values:[str;2])->str=values[0]
+pub fn change(borrow mut values:[str;2]){values[0]="changed"}
+pub fn generic<T>(borrow mut values:[str;2], marker:T){change(values)}
+pub fn empty(borrow values:[str;0])->i64=values.len()
+fn guard(fail:bool)->Result<(),i64>{if fail{return Err(7)};return Ok(())}
+fn error(value:i64)->i64=value
+pub fn fallible(fail:bool)->Result<i64,i64>{
+ owner:="fallible".clone();text:str:=owner;mut values:=[text,"second"]
+ change(values);guard(fail).map_err(error)?;return Ok(inspect(values))
+}
+pub fn joined(flag:bool)->i64 {
+ first:=["first","second"];second:=["third","fourth"]
+ mut values:=if flag {first}else{second};change(values)
+ tag:=if flag {0}else{1};saved:=match tag{0=>values[0].len(),_=>values[1].len()}
+ values=first
+ return saved+values[0].len()
+}
+pub fn terminated()->i64{values:[str;2]:=["first",{return 9}];return inspect(values)}
+pub fn in_arena()->i64 {
+ arena {
+  owner:="arena".clone()
+  result:Result<Text,Error>:=json.decode("{\"value\":\"\\u0061rena\"}")
+  decoded:=result else {return 2}
+  mut values:=[decoded.value,"second"]
+  change(values)
+  if values[0]!="changed" || decoded.value!="arena" || owner!="arena" {return 1}
+ }
+ return 0
+}
+"#;
+        let main = r#"import text_arrays
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+fn exercise()->i64 {
+ owner:="owned".clone()
+ text:str:=owner
+ if unsafe{align_rt_requested_live_bytes()}<=0 {return 1}
+ before:=unsafe{align_rt_alloc_count()};freed:=unsafe{align_rt_free_count()}
+ mut values:=[text,"second"]
+ if text_arrays.inspect(values)!=2 || text_arrays.first(values)!="owned" {return 2}
+ copied:=values
+ text_arrays.generic(values,1)
+ text_arrays.change(values)
+ if values[0]!="changed" || copied[0]!="owned" || owner!="owned" {return 3}
+ empty:[str;0]:=[]
+ if text_arrays.empty(empty)!=0 {return 4}
+ mut i:=0
+ loop {if i==5 {break};text_arrays.change(values);i=i+1}
+ if unsafe{align_rt_alloc_count()}!=before || unsafe{align_rt_free_count()}!=freed {return 5}
+ return 0
+}
+fn main()->i32 {
+ unsafe{align_rt_requested_live_reset()}
+ baseline:=unsafe{align_rt_requested_live_bytes()}
+ if exercise()!=0 {return 1}
+ if unsafe{align_rt_requested_live_bytes()}!=baseline {return 11}
+ if (text_arrays.fallible(false) else {return 3})!=2 {return 4}
+ if unsafe{align_rt_requested_live_bytes()}!=baseline {return 12}
+ match text_arrays.fallible(true){Ok(_)=>{return 5},Err(code)=>{if code!=7{return 6}}}
+ if unsafe{align_rt_requested_live_bytes()}!=baseline {return 13}
+ if text_arrays.joined(true)!=12 || text_arrays.joined(false)!=11 || text_arrays.terminated()!=9 {return 7}
+ if text_arrays.in_arena()!=0 {return 8}
+ if unsafe{align_rt_requested_live_bytes()}!=baseline {return 2}
+ return 0
+}"#;
+        std::fs::write(stage.join("text_arrays.align"), model).unwrap();
+        let path = stage.join("main.align");
+        std::fs::write(&path, main).unwrap();
+        let entry = path.to_str().unwrap();
+        let mut sources = SourceMap::new();
+        let checked = check(&mut sources, entry, main);
+        assert!(
+            !checked.diags.has_errors(),
+            "{}",
+            align_driver::format_diagnostics(&sources, &checked.diags)
+        );
+        execute(stage, &[lower_to_mir(&checked.hir)], "text-whole");
+        let context = align_driver::CacheContext::at(stage.join("text-cache"));
+        let mut original_mir = Vec::new();
+        for round in 0..4 {
+            let body = if round == 2 {
+                model.replace("change(values)}", "change(values);change(values)}")
+            } else {
+                model.to_owned()
+            };
+            std::fs::write(stage.join("text_arrays.align"), body).unwrap();
+            let mut sources = SourceMap::new();
+            let mut built = align_driver::build_package(
+                &mut sources,
+                entry,
+                main,
+                &context,
+                align_driver::UnitReuse::Allowed,
+            );
+            assert!(
+                !built.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sources, &built.diags)
+            );
+            assert_eq!(built.units.len(), 2);
+            if round < 2 {
+                assert!(
+                    built
+                        .units
+                        .iter()
+                        .all(|unit| unit.frontend.as_ref().unwrap().hit == (round == 1))
+                );
+            }
+            let programs = (0..built.units.len())
+                .map(|i| built.materialize(i).unwrap().clone())
+                .collect::<Vec<_>>();
+            let snapshot = programs
+                .iter()
+                .map(align_mir::print::program_to_string)
+                .collect::<Vec<_>>();
+            if round == 0 {
+                original_mir = snapshot;
+            } else if round == 2 {
+                assert_ne!(snapshot, original_mir);
+            } else {
+                assert_eq!(snapshot, original_mir);
+            }
+            execute(stage, &programs, &format!("text-replay-{round}"));
+        }
+    });
+}
+
+#[test]
+fn fixed_text_borrows_reject_incomplete_or_forged_storage() {
+    use align_mir::{Const, Operand, Rvalue, Stmt};
+    use align_sema::{IntTy, Ty};
+    let integer = Ty::Int(IntTy {
+        bits: 64,
+        signed: true,
+    });
+    let original = checked(
+        "fn touch(borrow mut values:[str;2]) {values[0]=\"changed\"}\nfn exercise(text:str){mut values:=[text,\"other\"];touch(values)}\nfn main(){}\n",
+    );
+    certify(&original, true, "text initialized original");
+    for mutation in 0..9 {
+        let mut program = original.clone();
+        let function = program
+            .fns
+            .iter_mut()
+            .find(|f| f.name.as_str() == "exercise")
+            .unwrap();
+        let block = function
+            .blocks
+            .iter()
+            .position(|b| b.stmts.iter().any(|s| matches!(s, Stmt::StoreIndex(..))))
+            .unwrap();
+        let first = function.blocks[block]
+            .stmts
+            .iter()
+            .position(|s| matches!(s, Stmt::StoreIndex(..)))
+            .unwrap();
+        let Stmt::StoreIndex(constructor, _, ref input) = function.blocks[block].stmts[first]
+        else {
+            unreachable!()
+        };
+        let input = input.clone();
+        let (call, root) = function.blocks[block]
+            .stmts
+            .iter()
+            .enumerate()
+            .find_map(|(i, s)| {
+                let Stmt::Let(_, Rvalue::Call(_, args)) = s else {
+                    return None;
+                };
+                let Operand::BorrowedPlace(place) = &args[0] else {
+                    return None;
+                };
+                Some((i, place.slot))
+            })
+            .unwrap();
+        match mutation {
+            0 => {
+                function.blocks[block].stmts.remove(first);
+            }
+            1 | 2 => {
+                let Stmt::StoreIndex(_, index, value) = &mut function.blocks[block].stmts[first]
+                else {
+                    unreachable!()
+                };
+                if mutation == 1 {
+                    *index = Operand::Const(Const::Int(1, integer));
+                } else {
+                    *value = Operand::Const(Const::Bool(true));
+                }
+            }
+            3 => {
+                function.param_modes[0] = align_ast::ParamMode::Out;
+            }
+            4 => {
+                let store = function.blocks[block]
+                    .stmts
+                    .iter()
+                    .position(|s| matches!(s,Stmt::Store(slot,_) if *slot==root))
+                    .unwrap();
+                let statement = function.blocks[block].stmts.remove(store);
+                function.blocks[block].stmts.insert(call, statement);
+            }
+            5 => {
+                function.blocks[block]
+                    .stmts
+                    .retain(|s| !matches!(s,Stmt::Store(slot,_) if *slot==root));
+            }
+            6 | 7 => {
+                let index = if mutation == 6 {
+                    let id = u32::try_from(function.value_tys.len()).unwrap();
+                    function.value_tys.push(integer);
+                    function.blocks[block].stmts.insert(
+                        call + 1,
+                        Stmt::Let(id, Rvalue::Use(Operand::Const(Const::Int(2, integer)))),
+                    );
+                    Operand::Value(id)
+                } else {
+                    Operand::Const(Const::Int(-1, integer))
+                };
+                function.blocks[block].stmts.insert(
+                    call + if mutation == 6 { 2 } else { 1 },
+                    Stmt::StoreIndex(constructor, index, input),
+                );
+            }
+            8 => {
+                let Stmt::Let(_, Rvalue::Call(_, args)) = &mut function.blocks[block].stmts[call]
+                else {
+                    unreachable!()
+                };
+                let Operand::BorrowedPlace(place) = &mut args[0] else {
+                    unreachable!()
+                };
+                place.slot = u32::MAX;
+            }
+            _ => unreachable!(),
+        }
+        certify(&program, false, &format!("text mutation {mutation}"));
+        assert!(
+            align_driver::emit_llvm_ir(
+                &program,
+                BuildTarget::Baseline,
+                Profile::Dev,
+                false,
+                &[],
+                false
+            )
+            .is_err(),
+            "text mutation {mutation}"
+        );
+    }
+    for source in [
+        "fn main(){align(64) values:=[\"x\"]}",
+        "fn change(borrow mut a:[str;1]){a[0]=\"new\"}\nfn bad(borrow a:[str;1]){change(a)}\nfn main(){}",
+        "fn peek(borrow a:[str;1])->str=a[0]\nfn bad()->str{owner:=\"x\".clone();text:str:=owner;a:=[text];return peek(a)}\nfn main(){}",
+        "fn peer(borrow mut a:[str;1],borrow b:[str;1]){}\nfn main(){mut a:=[\"x\"];peer(a,a)}",
+    ] {
+        let mut sources = SourceMap::new();
+        let result = check(&mut sources, "text-lifetime-negative.align", source);
+        assert!(result.diags.has_errors(), "accepted {source}");
+    }
+}
+
+#[test]
+fn fixed_text_construction_in_loops() {
+    owned_fixture::run("fixed_text_construction_in_loops", |stage| {
+        for (length, literal) in [(4, false), (37, true)] {
+            let elements = vec![if literal { "\"abc\"" } else { "text" }; length].join(",");
+            let source = format!(
+                "fn inspect(borrow values:[str;{length}])->i64=values[0].len()\nfn run(text:str)->i64{{mut at:=0;mut total:=0;loop{{if at>={length}{{break}};values:=[{elements}];total=total+values[at].len()+inspect(values);at=at+1}};return total}}\nfn main()->i32{{if run(\"abc\")!={}{{return 1}};return 0}}",
+                length * 6
+            );
+            let program = checked(&source);
+            let versioned = program.loop_facts.iter().any(|f| {
+                f.function == "run"
+                    && f.loops
+                        .iter()
+                        .any(|d| matches!(d, align_mir::loop_facts::LoopDecision::Versioned { .. }))
+            });
+            assert!(
+                !versioned
+                    && program.loop_facts.iter().any(|f| f.function == "run"
+                        && f.loops.iter().any(|d| matches!(
+                            d,
+                            align_mir::loop_facts::LoopDecision::KeptChecks(
+                                align_mir::loop_facts::KeptReason::UnmodelledStatement
+                            )
+                        ))),
+                "{:?}",
+                program.loop_facts
+            );
+            certify(&program, true, "loop text construction");
+            execute(stage, &[program], &format!("text-loop-{length}"));
+        }
+    });
+}

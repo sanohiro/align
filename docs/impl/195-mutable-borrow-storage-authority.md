@@ -65,9 +65,9 @@ all-path initialization, typed cardinality and malformed writer obligations;
 this is not permission to reconstruct arbitrary array writes as construction.
 Borrowed element/fixed-element descriptors retain their existing stable-place,
 bounds and field authentication. They gain no new exclusive source admission.
-Named fixed str-array roots retain
-their existing refusal; this capability admits complete fixed str-array record
-fields. Native arena decoder outputs retain their existing producer authority;
+This capability admits complete fixed str-array record fields; Plan197
+subsequently closes named fixed str-array roots through Copy construction. Native
+arena decoder outputs retain their existing producer authority;
 only the typed allocation-pointer/header path gains arena buffer authority here.
 
 One call validator serves all four direct/indirect and cleanup/no-cleanup MIR

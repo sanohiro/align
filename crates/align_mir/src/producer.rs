@@ -1629,9 +1629,12 @@ pub(crate) fn xml_plain_fixed_array_element(element: Scalar) -> bool {
     )
 }
 
+pub(crate) fn xml_copy_fixed_array_element(element: Scalar) -> bool {
+    xml_plain_fixed_array_element(element) || element == Scalar::Str
+}
+
 fn xml_fixed_array_load_needs_construction_proof(element: Scalar) -> bool {
-    xml_plain_fixed_array_element(element)
-        || element == Scalar::Str
+    xml_copy_fixed_array_element(element)
         || align_sema::fixed_owned_header_scalar(scalar_to_ty(element)).is_some()
 }
 
@@ -7417,14 +7420,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
         if self.graph.slot_stores.roots.get(*array_slot as usize)
             .is_some_and(|stores| !stores.is_empty())
-            || (length > 0 && xml_plain_fixed_array_element(element)
+            || (length > 0 && xml_copy_fixed_array_element(element)
                 && self.graph.function.blocks.iter().flat_map(|block| &block.stmts).any(|statement|
                     matches!(statement, Stmt::StoreConstArray { slot, .. } if slot == array_slot)))
         {
-            // Whole values retain their projected input checks. Plain named roots also need
+            // Whole values retain their projected input checks. Copy named roots also need
             // a complete publication on every path before this load, including branch joins.
-            return !xml_plain_fixed_array_element(element)
-                || xml_plain_array_root_initialized_at(self.graph, *array_slot, expected, *value);
+            return !xml_copy_fixed_array_element(element)
+                || xml_copy_array_root_initialized_at(self.graph, *array_slot, expected, *value);
         }
         let mut load_site = None;
         for block in &self.graph.function.blocks {
@@ -7635,6 +7638,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     self.check_whole_read_operand(&mut equation, &operand, slot_ty);
                     self.add_read_operand(&mut equation, &operand, selected_ty, path.clone());
                 } else {
+                    // Selected text/owner leaves alone cannot prove that every inline
+                    // element was constructed before the complete value was published.
+                    if matches!(slot_ty, Ty::Array(element, _) if xml_fixed_array_load_needs_construction_proof(element))
+                        && !self.check_fixed_array_construction_operand(&mut equation, &operand, slot_ty)
+                    {
+                        equation.invalid = true;
+                        continue;
+                    }
                     self.check_whole_operand(&mut equation, &operand, slot_ty);
                     self.add_operand(&mut equation, &operand, selected_ty, path.clone());
                 }
@@ -7662,7 +7673,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     continue;
                 }
-                if matches!(stored_ty, Ty::Array(element, _) if xml_plain_fixed_array_element(element)) {
+                if matches!(stored_ty, Ty::Array(element, _) if xml_copy_fixed_array_element(element)) {
                     // An owned-sibling projection must not discard this array's typed inputs.
                     self.check_whole_operand(&mut equation, &operand, stored_ty);
                 }
@@ -8146,7 +8157,7 @@ fn xml_borrowed_access(
 
 /// Prove that every path to a local use has published one complete inline value.
 /// Anonymous literal construction retains its separate strict producer proof.
-fn xml_plain_array_root_initialized_at(
+fn xml_copy_array_root_initialized_at(
     graph: &ValidatedProducerGraph<'_>,
     slot: Slot,
     array: Ty,
@@ -8240,7 +8251,7 @@ fn xml_plain_array_root_initialized_at(
 }
 
 /// Keep readable element payload and exclusive storage authority independent.
-fn xml_plain_array_borrow_at_call(
+fn xml_copy_array_borrow_at_call(
     graph: &ValidatedProducerGraph<'_>,
     operand: &Operand,
     call: ValueId,
@@ -8252,12 +8263,12 @@ fn xml_plain_array_borrow_at_call(
         return None;
     };
     if !place.path.is_empty()
-        || !xml_plain_fixed_array_element(element)
+        || !xml_copy_fixed_array_element(element)
         || graph.function.params.contains(&place.slot)
     {
         return None;
     }
-    if !xml_plain_array_root_initialized_at(graph, place.slot, place.ty, call) {
+    if !xml_copy_array_root_initialized_at(graph, place.slot, place.ty, call) {
         return Some(XmlProducerState::Invalid);
     }
     let (selected, path) = if length == 0 {
@@ -8286,10 +8297,10 @@ fn xml_place_call_access_valid(
     if matches!(mode, align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out)
         && !exclusive.is_satisfied_by(storage) { return false; }
     if mode == align_ast::ParamMode::Out { return true; }
-    // Plan170's complete local publication proof is deliberately restricted to plain
-    // elements. Do not authorize an arbitrary named view-bearing array from one writer.
+    // Plans170/197 require complete local publication for Copy scalar/text arrays.
+    // Text readability is separate from authority to replace its inline headers.
     if prefix.is_empty() && matches!(physical, Ty::Array(..)) {
-        let initialized = xml_plain_array_borrow_at_call(graph, &operand, call)
+        let initialized = xml_copy_array_borrow_at_call(graph, &operand, call)
             .unwrap_or_else(|| xml_borrowed_access(graph, &operand));
         if !OperandRequirement::READ.is_satisfied_by(initialized) { return false; }
     }
@@ -8309,7 +8320,7 @@ fn xml_place_call_access_valid(
         } else { xml_slot_path_access(graph, place.slot, actual, path) }
     };
     if leaves.is_empty() {
-        let payload = xml_plain_array_borrow_at_call(graph, &operand, call)
+        let payload = xml_copy_array_borrow_at_call(graph, &operand, call)
             .unwrap_or_else(|| xml_borrowed_access(graph, &operand));
         if !OperandRequirement::READ.is_satisfied_by(payload) { return false; }
     } else if !leaves.iter().all(|(selected, path)| {
@@ -9425,7 +9436,7 @@ fn validate_resource_rvalues_component(
                                         && xml_place_call_access_valid(&access_graph, place,
                                             *expected, *mode, call, &leaves);
                                 }
-                                let payload = xml_plain_array_borrow_at_call(&access_graph, operand, call)
+                                let payload = xml_copy_array_borrow_at_call(&access_graph, operand, call)
                                     .unwrap_or_else(|| xml_borrowed_access(&access_graph, operand));
                                 let storage =
                                     xml_borrowed_storage_access(&access_graph, operand);

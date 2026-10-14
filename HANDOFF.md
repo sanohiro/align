@@ -24,11 +24,16 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan197](docs/impl/197-fixed-text-array-borrows.md) certifies local fixed
+  str-array shared/exclusive borrows through complete Copy construction and
+  separate text/header authority. Input text lifetimes and sole cleanup remain;
+  Move-element/record roots and native arena decoder proofs stay separate.
+
 - [Plan195](docs/impl/195-mutable-borrow-storage-authority.md) separates readable
   borrowed-call contents from complete recursive owner and buffer authority.
   Typed arena dynamic arrays and fixed str-array record fields now execute
-  through existing whole-place mutable calls. Named fixed str-array roots and
-  native arena-decoder outputs retain separate producer limits.
+  through existing whole-place mutable calls. Plan197 closes named fixed str-array
+  roots; native arena-decoder outputs retain separate producer limits.
 
 - [Plan194](docs/impl/194-dynamic-array-field-writes.md) admits indexed writes to
   owned scalar-array record fields for media AM-R01 and LLM R147/R46. Exact selected
