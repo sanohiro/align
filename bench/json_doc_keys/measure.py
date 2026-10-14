@@ -7,35 +7,26 @@ import os
 from pathlib import Path
 import platform
 import signal
+import shutil
 import statistics
-import subprocess
+import sys
 import tempfile
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import native_probe
 
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def run(command, stage, timeout=55):
-    # File-backed output bounds parent memory and preserves group ownership until
-    # all descendants have retired. TemporaryDirectory owns every artifact.
-    with (stage / "stdout").open("wb") as out, (stage / "stderr").open("wb") as err:
-        child = subprocess.Popen(command, cwd=stage, stdin=subprocess.DEVNULL,
-                                 stdout=out, stderr=err, start_new_session=True,
-                                 env={**os.environ, "ALIGNC_CACHE": "off", "TMPDIR": str(stage)})
-        try:
-            result = child.wait(timeout=timeout)
-        finally:
-            try:
-                os.killpg(child.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            child.wait(timeout=5)
-    stdout = (stage / "stdout").read_text()
-    stderr = (stage / "stderr").read_text()
-    if result:
-        raise RuntimeError(f"{command}: {result}\n{stdout}\n{stderr}")
-    return stdout, stderr
+def run(command, stage):
+    # The shared supervisor pins the leader PID until its whole group retires.
+    # File-backed stdout bounds parent memory; diagnostics inherit stderr.
+    with (stage / "stdout").open("wb") as out:
+        native_probe.run_phase("probe", command, stdout=out)
+    return (stage / "stdout").read_text()
 
 
 def main():
@@ -48,7 +39,10 @@ def main():
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("repeats must be positive")
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, native_probe.record_signal)
     compiler = args.compiler.resolve()
+    output = args.output.resolve()
     here = Path(__file__).resolve().parent
     runtime = compiler.with_name("libalign_runtime.a")
     result = {"compiler_source": args.source_id,
@@ -60,8 +54,12 @@ def main():
                       "parse excluded; timed region includes byte-count print; "
                       "keys validates every key byte and paired value after timing",
               "source_sha256": {}, "rows": []}
-    with tempfile.TemporaryDirectory(prefix="align-json-keys-") as directory:
-        stage = Path(directory)
+    stage = Path(tempfile.mkdtemp(prefix="align-json-keys-")).resolve()
+    previous = Path.cwd()
+    cleanup_safe = True
+    try:
+        os.chdir(stage)
+        os.environ.update(ALIGNC_CACHE="off", TMPDIR=str(stage))
         for mode in ["key", "keys"]:
             source = here / f"{mode}.align"
             result["source_sha256"][mode] = sha(source.read_bytes())
@@ -75,17 +73,26 @@ def main():
                 expected = sum(len(str(i)) for i in range(count))
                 samples = []
                 for _ in range(args.repeats):
-                    stdout, stderr = run([str(stage / mode), str(path)], stage)
+                    stdout = run([str(stage / mode), str(path)], stage)
                     lines = stdout.splitlines()
-                    if stderr or len(lines) != 2 or int(lines[0]) != expected:
-                        raise RuntimeError(f"invalid observation: {stdout!r} {stderr!r}")
+                    if len(lines) != 2 or int(lines[0]) != expected:
+                        raise RuntimeError(f"invalid observation: {stdout!r}")
                     samples.append(int(lines[1]))
                 result["rows"].append({"mode": mode, "members": count,
                                        "expected_key_bytes": expected,
                                        "input_sha256": sha(data), "ns": samples,
                                        "median_ns": statistics.median(samples)})
                 print(mode, count, result["rows"][-1]["median_ns"], flush=True)
-    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    except native_probe.CleanupError:
+        cleanup_safe = False
+        print(f"Preserving scratch after child cleanup failure: {stage}", file=sys.stderr)
+        raise
+    finally:
+        os.chdir(previous)
+        if cleanup_safe:
+            shutil.rmtree(stage)
+    native_probe.check_signal()
+    output.write_text(json.dumps(result, indent=2) + "\n")
 
 
 if __name__ == "__main__":

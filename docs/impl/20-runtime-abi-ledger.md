@@ -461,7 +461,7 @@ declaration golden owns the emitted declaration and the class token together.
 | `JsonDocAsI64` | `align_rt_json_doc_as_i64` | `IndirectStorage` |
 | `JsonDocAsStr` | `align_rt_json_doc_as_str` | `IndirectStorage` |
 | `JsonDocAt` | `align_rt_json_doc_at` | `IndirectStorage` |
-| `JsonDocElems` | `align_rt_json_doc_elems`, `align_rt_json_doc_keys` | `IndirectStorage` |
+| `JsonDocElems` | `align_rt_json_doc_elems` | `IndirectStorage` |
 | `JsonDocKeys` | `align_rt_json_doc_keys` | `IndirectStorage` |
 | `JsonDocGet` | `align_rt_json_doc_get` | `IndirectStorage` |
 | `JsonDocKey` | `align_rt_json_doc_key` | `IndirectStorage` |

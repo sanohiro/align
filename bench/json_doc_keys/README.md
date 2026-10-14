@@ -32,6 +32,11 @@ deadline and owned process-group cleanup. The 151,000-member quadratic control
 is deliberately omitted; the three smaller sizes already establish its scaling.
 No fixed speedup, cross-host timing or application startup claim follows.
 
+The shared native-probe supervisor retains each leader until group retirement,
+including HUP/INT/TERM interruption. Failed retirement preserves scratch for
+inspection. Run `python3 bench/json_doc_keys/test_measure.py` for actual-process
+interruption and exited-leader controls in both compilation and measurement.
+
 ## Local observation (2026-10-14)
 
 [All samples and identities](macos-samples.json) use the committed implementation
