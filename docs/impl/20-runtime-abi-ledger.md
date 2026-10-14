@@ -1441,6 +1441,17 @@ moves the prior 356 keyed / 374 base / 385 maximum-probe inventory to 358 / 376 
 prefix/root/randomness semantics, removal race boundary, and closure matrix are authoritative in
 `docs/impl/36-fs-private-temp-plan.md`.
 
+## JSON array element amendment (plan183)
+
+A05's `JsonDecodeArray` signature and export count are unchanged. Its exact
+`elem_tag` domain is int kind0/width1,2,4,8 with sign bit16 zero or one;
+bool `0x101`; floats `0x204`/`0x208`; and owned string `0x810`. Other bits/tags
+reject, including for empty arrays. String output is the existing owned
+`{ptr,len}` header array, with 16-byte `{ptr,len}` elements. The runtime
+validates tag, UTF-8, complete array and trailing input before publishing the
+spine; failure leaves the caller-zeroed output untouched and frees staged
+payloads. This adds no arena or input lifetime, descriptor or serialized field.
+
 ## Request 13 recursive owned JSON replacement (design accepted)
 
 Request 13 added no runtime key, symbol, LLVM function shape, C signature, or

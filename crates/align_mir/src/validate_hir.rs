@@ -4669,10 +4669,8 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::JsonOwnedDecode { plan, .. } => {
                 self.owned_json_plan_ok(plan)
             }
-            hir::ExprKind::JsonDecodeArray { elem, .. }
-            | hir::ExprKind::JsonDecodeScalar { scalar: elem, .. } => {
-                self.json_scalar_target_ok(*elem)
-            }
+            hir::ExprKind::JsonDecodeArray { elem, .. } => self.json_array_target_ok(*elem),
+            hir::ExprKind::JsonDecodeScalar { scalar, .. } => self.json_scalar_target_ok(*scalar),
             hir::ExprKind::JsonDecodeSoa { struct_id, .. } => {
                 self.json_soa_struct_ok(*struct_id)
             }
@@ -6324,6 +6322,10 @@ impl<'a> BodyValidator<'a> {
             }
         }
         index == parts.len()
+    }
+
+    fn json_array_target_ok(&self, ty: Ty) -> bool {
+        ty == Ty::String || self.json_scalar_target_ok(ty)
     }
 
     fn json_scalar_target_ok(&self, ty: Ty) -> bool {
@@ -12111,7 +12113,7 @@ impl<'a> BodyValidator<'a> {
         _: &BodyContext,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
         let flow = self.expr_flow(input)?;
-        if flow.ty != Ty::Str || !self.json_scalar_target_ok(elem) {
+        if flow.ty != Ty::Str || !self.json_array_target_ok(elem) {
             return None;
         }
         let payload = Ty::DynArray(align_sema::ty_to_scalar(elem)?);

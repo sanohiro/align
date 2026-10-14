@@ -1684,7 +1684,7 @@ pub enum Rvalue {
         input: Operand,
         out: Slot,
     },
-    /// `json.decode` into an owned `array<elem>` (MMv2 slice 8c): parse a JSON array of scalars
+    /// `json.decode` into an owned `array<elem>`: parse JSON int/float/bool/owned-string elements
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
     /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
     JsonDecodeArray {

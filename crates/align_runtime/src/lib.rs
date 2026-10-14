@@ -4685,17 +4685,16 @@ unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_wid
     Some(AlignStr { ptr: dst, len: count })
 }
 
-/// Decode a JSON array of strings into one owned header spine whose elements each own a distinct
-/// free-standing byte allocation. The staging list frees every completed element on any malformed
-/// current element or delimiter failure; ownership transfers only after the closing `]`.
-fn decode_owned_string_array_value(p: &mut JsonParser<'_>) -> Option<AlignStr> {
+/// Stage independently owned strings until the caller validates its complete container.
+/// The list frees every completed payload on a malformed element, delimiter or later root failure.
+fn parse_owned_string_array(p: &mut JsonParser<'_>) -> Option<OwnedStringList> {
     p.ws();
     p.expect(b'[')?;
     p.ws();
     let mut items = OwnedStringList::default();
     if p.peek() == Some(b']') {
         p.pos += 1;
-        return items.into_array().ok();
+        return Some(items);
     }
     loop {
         let value = p.owned_string_value()?;
@@ -4708,11 +4707,16 @@ fn decode_owned_string_array_value(p: &mut JsonParser<'_>) -> Option<AlignStr> {
             }
             Some(b']') => {
                 p.pos += 1;
-                return items.into_array().ok();
+                return Some(items);
             }
             _ => return None,
         }
     }
+}
+
+/// Record fields publish at their closing bracket; enclosing record cleanup owns later failures.
+fn decode_owned_string_array_value(p: &mut JsonParser<'_>) -> Option<AlignStr> {
+    parse_owned_string_array(p)?.into_array().ok()
 }
 
 /// # Safety
@@ -5857,20 +5861,17 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     0
 }
 
-/// Parse the JSON array in `input` into a freshly heap-allocated owned `array<T>`, writing the
-/// materialized `{ptr, len}` (len = element count) to `out` (MMv2 slice 8c). `elem_tag` is the
-/// element encoding `(signed << 16) | (kind << 8) | byte-width` (kind 0 = int, 1 = bool, 2 = float;
-/// this top-level ABI accepts numeric elements only). Typed struct-field descriptors additionally
-/// use kind 3 for `str`: clean elements borrow the input and selected escaped elements require the
-/// arena-bearing path. Numeric elements are copied into the new buffer, whose spine is owned and
-/// freed by generated `Drop`.
-/// Returns 0 on success, 1 on a parse error (leaving `out` as the caller-zeroed `{null,0}`). An
-/// empty array allocates nothing (null buffer).
+/// Decode one complete JSON array into an independent owned `{ptr,len}` (element count).
+/// Tags: int widths 1/2/4/8 with optional sign bit16, bool 0x101, floats 0x204/0x208,
+/// owned string 0x810. All other tags reject, including for an empty array.
+/// String payloads are staged by the same RAII parser as owned record fields; the spine is
+/// published only after trailing-input validation. Failure frees every staged payload once.
+/// Returns 0 on success, 1 on validation/parse/representability error. Empty arrays allocate
+/// nothing. Allocation failure retains the runtime's terminal policy.
 ///
 /// # Safety
-/// `input` must describe a valid byte range; `out` must point to a writable `{ptr,len}`. The
-/// top-level scalar-array entry point has no arena, so a selected escaped `str` element is an
-/// intentional error; the typed struct-field path supplies the caller arena.
+/// `input` must describe a valid byte range; `out` must point to a writable `AlignStr`.
+/// Failure leaves `out` untouched; generated callers initialize it to `{null,0}`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_json_decode_array(
     input: *const u8,
@@ -5878,12 +5879,23 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     elem_tag: i32,
     out: *mut AlignStr,
 ) -> i32 {
+    if !matches!(elem_tag, 1 | 2 | 4 | 8 | 0x10001 | 0x10002 | 0x10004 | 0x10008
+        | 0x101 | 0x204 | 0x208 | 0x810)
+    {
+        return 1;
+    }
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    // Validate UTF-8 for any `str` elements before publishing their input views. The arena-free
-    // top-level array entry point rejects selected escaped elements through `write_value`; the
-    // supported struct-field path supplies the caller arena for those materializations.
     if !validate_utf8(src) {
         return 1;
+    }
+    if elem_tag == 0x810 {
+        let mut parser = JsonParser::new(src);
+        let Some(items) = parse_owned_string_array(&mut parser) else { return 1; };
+        parser.ws();
+        if parser.pos != src.len() {
+            return 1;
+        }
+        return unsafe { items.publish(out) }.map_or(1, |()| 0);
     }
     let kind = (elem_tag >> 8) & 0xff;
     let width = (elem_tag & 0xff) as usize;
@@ -54086,3 +54098,6 @@ mod batch_byte_transform_tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "alloc-count"))]
+mod json_array_root_tests;
