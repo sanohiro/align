@@ -1408,6 +1408,120 @@ fn fixed_text_borrows_reject_incomplete_or_forged_storage() {
 }
 
 #[test]
+fn fixed_copy_array_forwarding_retains_complete_construction() {
+    use align_mir::{Const, Operand, Rvalue, Stmt};
+    use align_sema::Ty;
+    for (element, input, other) in [("str", "text", "\"other\""), ("i64", "number", "7")] {
+        for field in [false, true] {
+            let declaration = if field {
+                format!("Record {{ text: string, values: [{element}; 2] }}")
+            } else {
+                format!("fn touch(borrow mut values: [{element}; 2]) {{ values[0] = {other} }}")
+            };
+            let (result, body) = if field {
+                (
+                    "Record",
+                    format!(
+                        "return Record {{ text: \"owner\".clone(), values: [{input}, {other}] }}"
+                    ),
+                )
+            } else {
+                (
+                    "()",
+                    format!("mut values := [{input}, {other}]; touch(values)"),
+                )
+            };
+            let original = checked(&format!(
+                "{declaration}\nfn exercise(text: str, number: i64) -> {result} {{ {body} }}\nfn main() {{}}"
+            ));
+            for select in [false, true] {
+                for complete in [true, false] {
+                    let mut program = original.clone();
+                    let function = program
+                        .fns
+                        .iter_mut()
+                        .find(|f| f.name.as_str() == "exercise")
+                        .unwrap();
+                    let (block, first, constructor) = function
+                        .blocks
+                        .iter()
+                        .enumerate()
+                        .find_map(|(block, body)| {
+                            body.stmts.iter().enumerate().find_map(
+                                |(at, statement)| match statement {
+                                    Stmt::StoreIndex(slot, ..) => Some((block, at, *slot)),
+                                    _ => None,
+                                },
+                            )
+                        })
+                        .unwrap();
+                    if !complete {
+                        function.blocks[block].stmts.remove(first);
+                    }
+                    let load = function.blocks[block]
+                        .stmts
+                        .iter()
+                        .find_map(|statement| match statement {
+                            Stmt::Let(value, Rvalue::Load(slot)) if *slot == constructor => {
+                                Some(*value)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    let publication = function.blocks[block]
+                        .stmts
+                        .iter()
+                        .position(|statement| {
+                            matches!(statement, Stmt::Store(_, Operand::Value(value))
+                            | Stmt::StoreField(_, _, Operand::Value(value)) if *value == load)
+                        })
+                        .unwrap();
+                    let array_ty = function.value_tys[load as usize];
+                    assert!(matches!(array_ty, Ty::Array(_, 2)));
+                    let wrapper = u32::try_from(function.value_tys.len()).unwrap();
+                    function.value_tys.push(array_ty);
+                    let forwarded = Operand::Value(load);
+                    let definition = if select {
+                        Rvalue::Select {
+                            cond: Operand::Const(Const::Bool(true)),
+                            a: forwarded.clone(),
+                            b: forwarded,
+                        }
+                    } else {
+                        Rvalue::Use(forwarded)
+                    };
+                    let operand = match &mut function.blocks[block].stmts[publication] {
+                        Stmt::Store(_, operand) | Stmt::StoreField(_, _, operand) => operand,
+                        _ => unreachable!(),
+                    };
+                    *operand = Operand::Value(wrapper);
+                    function.blocks[block]
+                        .stmts
+                        .insert(publication, Stmt::Let(wrapper, definition));
+                    let label =
+                        format!("{element}/field={field}/select={select}/complete={complete}");
+                    certify(&program, complete, &label);
+                    if !complete {
+                        assert!(
+                            align_driver::emit_llvm_ir(
+                                &program,
+                                BuildTarget::Baseline,
+                                Profile::Dev,
+                                false,
+                                &[],
+                                false
+                            )
+                            .is_err(),
+                            "{label}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn fixed_text_construction_in_loops() {
     owned_fixture::run("fixed_text_construction_in_loops", |stage| {
         for (length, literal) in [(4, false), (37, true)] {

@@ -7401,12 +7401,17 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return false;
         }
         let Operand::Value(value) = operand else {
+            self.check_operand(equation, operand, expected);
             self.check_whole_operand(equation, operand, expected);
             return true;
         };
         let Some(Some(Rvalue::Load(array_slot))) =
             self.graph.value_definitions.get(*value as usize)
         else {
+            // Forwarding values must retain a path-empty construction query. Selecting
+            // only owned/text leaves lets Use/Select hide an incomplete inline Load.
+            // The worklist follows wrappers without recursive traversal or new authority.
+            self.check_operand(equation, operand, expected);
             self.check_whole_operand(equation, operand, expected);
             return true;
         };

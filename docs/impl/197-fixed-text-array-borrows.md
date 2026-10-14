@@ -21,7 +21,7 @@ their distinct construction/cleanup proofs and remain outside this repair.
 | Axis | Implementation and owner obligation |
 | --- | --- |
 | Formation and construction | Extend the existing plain-Copy literal normalization to str: materialize a complete anonymous array, then Store its Copy value into the named local. Numeric pooled constants retain their sealed constant-only path; str literals remain unpooled under the existing source rule. Exact type/cardinality, N=0/1/many, computed and borrowed text, natural inline layout, and a terminating element are covered by `fixed_scalar_borrows::fixed_text_borrow_producer_matrix`. Explicit binding alignment retains its numeric-only source rule. No new formation rule. |
-| Initialization and mutation | Authenticate a complete typed whole Store on every path before a root call or Load. Retain strict anonymous construction, all typed input producers and later named-root writers. Missing, late, duplicate, mistyped, non-dominating, dynamic or out-of-range anonymous writes reject. Pooled storage cannot mix with root/indexed/native writers. Reuse Plan170's malformed owner with str twins where its input class changes. |
+| Initialization and mutation | Authenticate a complete typed whole Store on every path before a root call or Load. Retain strict anonymous construction, all typed input producers and later named-root writers. SSA forwarding must keep an independent whole-value construction query beside selected payload queries. Missing, late, duplicate, mistyped, non-dominating, dynamic or out-of-range anonymous writes reject. Pooled storage cannot mix with root/indexed/native writers. Reuse Plan170's malformed owner with str twins where its input class changes. |
 | Authority and lifetime | Require readable text independently from writable/exclusive header storage. Cover shared/exclusive forwarding, local/static/owned/arena input, replacement, retained views, overlap and expired owners. Copies retain text origins; no copied-bits normalization may mint writable text or ownership. Out remains unreadable until initialized. Existing source lifetime rules remain authoritative. |
 | Control and optimization | Observe exact values through if/match/else/?/map_err, repeated loops, early exits, branch publication and whole Copy replacement. Computed text-header stores retain the existing unmodelled-statement optimization refusal. Both literal and computed text constructors keep that refusal; adjacent scalar owners retain actual fast/slow versioning and sealed pooled-constant coverage. No pooling, loop-admission or constructor-cloning rule changes. |
 | Move and cleanup boundary | Array headers remain Copy and own no text. Borrowing, copying and repeated reads allocate/free nothing. Owned input text and arenas retain their existing sole cleanup authority on normal/error exits. Move arrays, source nulling and recursive Drop are unchanged. |
@@ -55,6 +55,8 @@ Local literals use the existing complete temporary-value Store path; named roots
 require an all-path complete publication at calls and whole loads. Root and field
 publication authenticate anonymous fixed-array construction independently of
 selected payload queries, so a readable text sibling cannot hide a missing slot.
+Non-Load operands retain a path-empty READ query through the existing equation
+worklist, so SSA forwarding cannot erase that independent construction proof.
 The existing strict cardinality/type/dominance/writer scan is retained. Named
 storage and each text producer keep separate authority; no loop rule changed.
 
@@ -65,6 +67,10 @@ rejection; the existing numeric alignment owner remains positive.
 duplicate, mistyped, late and out-of-range/SSA extra construction, incomplete
 publication, Out text, forged slots, shared mutation, overlap and escaping views.
 It rejects at both full/partition producer boundaries and LLVM emission.
+`fixed_copy_array_forwarding_retains_complete_construction` pairs complete and
+incomplete str/scalar constructors through Use/Select forwarding into root/field
+publication. The producer controls distinguish whole-array construction from
+readable selected leaves; incomplete inputs also reject before emission.
 `fixed_text_borrows_execute_and_replay` runs imported generic helpers through
 whole/per-unit and cold/hit/body-edit/restored caches, observes independent Copy
 headers, covers if/match/else/?/map_err/termination and arena use, and checks
