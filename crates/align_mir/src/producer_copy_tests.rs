@@ -1,7 +1,7 @@
 //! Plan182: independent bits never confer source-storage or Move authority.
 use super::*;
 
-fn lower(source: &str) -> Program {
+fn lower(source: &str) -> Result<Program, Box<dyn std::error::Error>> {
     let mut diagnostics = align_diag::Diagnostics::new();
     let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
     let ast = align_parser::parse_file(tokens, &mut diagnostics);
@@ -11,18 +11,18 @@ fn lower(source: &str) -> Program {
         "{:?}",
         diagnostics.iter().collect::<Vec<_>>()
     );
-    crate::lower_program_checked(&hir, false, None).unwrap()
+    Ok(crate::lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?)
 }
 
 #[test]
-fn producer_plain_copy_type_graph() {
-    let mut program = lower("Plain { value:i64 }\nfn main() {}\n");
+fn producer_plain_copy_type_graph() -> Result<(), Box<dyn std::error::Error>> {
+    let mut program = lower("Plain { value:i64 }\nfn main() {}\n")?;
     let plain = program
         .structs
         .iter()
         .position(|s| s.name == "Plain")
-        .unwrap();
-    let id = u32::try_from(plain).unwrap();
+        .ok_or("Plain fixture type")?;
+    let id = u32::try_from(plain)?;
     let int = Scalar::Int(IntTy {
         bits: 64,
         signed: true,
@@ -116,7 +116,7 @@ fn producer_plain_copy_type_graph() {
         let mut record = program.structs[plain].clone();
         record.fields[0].ty = Ty::Struct(previous);
         record.fields.push(record.fields[0].clone());
-        previous = u32::try_from(program.structs.len()).unwrap();
+        previous = u32::try_from(program.structs.len())?;
         program.structs.push(record);
     }
     assert!(xml_plain_copy_type(&program, Ty::Struct(previous)));
@@ -125,23 +125,35 @@ fn producer_plain_copy_type_graph() {
 
     let mut carriers = lower(
         "Pair { a:i64,b:bool }\nChoice { One(Pair),None }\nfn pair() -> (i64,bool) = (1,true)\nfn main() {}\n",
-    );
+    )?;
     let pair = carriers
         .structs
         .iter()
         .position(|s| s.name == "Pair")
-        .unwrap();
+        .ok_or("Pair fixture type")?;
     let choice = carriers
         .enums
         .iter()
         .position(|e| e.name == "Choice")
-        .unwrap();
-    let choice = u32::try_from(choice).unwrap();
-    let tuple = u32::try_from(carriers.tuples.len() - 1).unwrap();
+        .ok_or("Choice fixture type")?;
+    let choice = u32::try_from(choice)?;
+    let tuple = u32::try_from(
+        carriers
+            .tuples
+            .len()
+            .checked_sub(1)
+            .ok_or("tuple fixture")?,
+    )?;
     carriers
         .tagged_types
         .push(hir::TaggedType::Result(int, Scalar::Enum(choice)));
-    let tagged = u32::try_from(carriers.tagged_types.len() - 1).unwrap();
+    let tagged = u32::try_from(
+        carriers
+            .tagged_types
+            .len()
+            .checked_sub(1)
+            .ok_or("tagged fixture")?,
+    )?;
     assert!(xml_plain_copy_type(&carriers, Ty::Tuple(tuple)));
     assert!(xml_plain_copy_type(&carriers, Ty::Tagged(tagged)));
     carriers.structs[pair].fields[1].ty = Ty::Str;
@@ -149,10 +161,11 @@ fn producer_plain_copy_type_graph() {
     assert!(!xml_plain_copy_type(&carriers, Ty::Tagged(tagged)));
     carriers.tuples[tuple as usize].elems[0] = Scalar::String;
     assert!(!xml_plain_copy_type(&carriers, Ty::Tuple(tuple)));
+    Ok(())
 }
 
 #[test]
-fn producer_copy_record_authority_matrix() {
+fn producer_copy_record_authority_matrix() -> Result<(), Box<dyn std::error::Error>> {
     for mode in ["", "borrow ", "borrow mut "] {
         for result in [false, true] {
             let ret = if result {
@@ -169,21 +182,21 @@ fn producer_copy_record_authority_matrix() {
             let source = format!(
                 "Capacity {{ a:i64,b:i64,c:i64,d:i64 }}\nPlan {{ capacity:Capacity }}\nOwned {{ values:array<i64>,capacity:Capacity }}\nfn construct({mode}plan:Plan)->{ret} {{capacity:=plan.capacity; values:=[1,2].to_array();return {expression}}}\n"
             );
-            let base = lower(&source);
-            validate_mir_producers(&base).unwrap();
+            let base = lower(&source)?;
+            validate_mir_producers(&base)?;
             let defined = base
                 .fns
                 .iter()
                 .map(|f| f.name.clone())
                 .collect::<BTreeSet<_>>();
-            validate_partition_resource_rvalues(&base, &defined).unwrap();
+            validate_partition_resource_rvalues(&base, &defined)?;
             for mutation in 0..4 {
                 let mut bad = base.clone();
                 let f = bad
                     .fns
                     .iter_mut()
                     .find(|f| f.name.as_str() == "construct")
-                    .unwrap();
+                    .ok_or("construct fixture function")?;
                 let (block, statement, value) = f
                     .blocks
                     .iter()
@@ -197,7 +210,7 @@ fn producer_copy_record_authority_matrix() {
                                 _ => None,
                             })
                     })
-                    .unwrap();
+                    .ok_or("field producer fixture")?;
                 match mutation {
                     0 => f.param_modes[0] = align_ast::ParamMode::Out,
                     1 => {
@@ -218,7 +231,7 @@ fn producer_copy_record_authority_matrix() {
                                 Stmt::Store(slot, Operand::Value(v)) if *v == value => Some(*slot),
                                 _ => None,
                             })
-                            .unwrap();
+                            .ok_or("field publication fixture")?;
                         f.blocks[block].stmts[statement] = Stmt::Let(value, Rvalue::Load(target));
                     }
                 }
@@ -235,8 +248,8 @@ fn producer_copy_record_authority_matrix() {
         let source = format!(
             "Capacity {{ n:i64 }}\nPlan {{ capacity:Capacity }}\nOwned {{ values:{owner},capacity:Capacity }}\nfn construct(borrow plan:Plan,values:{owner})->Owned {{capacity:=plan.capacity;return Owned {{values:values,capacity:capacity}}}}\n"
         );
-        let base = lower(&source);
-        validate_mir_producers(&base).unwrap();
+        let base = lower(&source)?;
+        validate_mir_producers(&base)?;
         for mode in [
             align_ast::ParamMode::Borrow,
             align_ast::ParamMode::BorrowMut,
@@ -247,9 +260,10 @@ fn producer_copy_record_authority_matrix() {
                 .fns
                 .iter_mut()
                 .find(|f| f.name.as_str() == "construct")
-                .unwrap();
+                .ok_or("construct fixture function")?;
             f.param_modes[1] = mode;
             assert!(validate_mir_producers(&bad).is_err(), "{owner}/{mode:?}");
         }
     }
+    Ok(())
 }
