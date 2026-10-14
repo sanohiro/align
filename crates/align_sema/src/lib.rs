@@ -79476,7 +79476,7 @@ mod tests {
         // OsMemory observes only Copy counts and retains no storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 355,
+            variants, 357,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
