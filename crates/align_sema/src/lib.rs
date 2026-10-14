@@ -42914,6 +42914,12 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn completed_value_transfers_storage(&self, value: &Expr) -> bool {
+        // A sibling allocation header cannot stand in for the selected value's legacy
+        // string/buffer/writer or fixed-element release obligation. Keep those views
+        // conservatively invalidated, just as a complete local move does.
+        if has_inline_owned_storage(value.ty, self.storage_type_context()) {
+            return false;
+        }
         let headers = self.completed_headers(value);
         storage_type_paths(value.ty, self.storage_type_context())
             .headers

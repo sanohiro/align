@@ -230,7 +230,18 @@ fn field_extraction_authority_matrix() {
                 false,
                 r#"R { values:array<i64> } fn bad(borrow maybe:Option<R>)->array<i64> = match maybe {Some(r)=>r.values,None=>[0].to_array()} fn main()->i32=0"#,
             ),
+            (
+                "mixed-dynamic-alias",
+                true,
+                r#"I {values:array<i64>,text:string} R {value:I} fn main()->i32 {owner:=R {value:I {values:[1].to_array(),text:"live".clone()}}; alias:slice<i64>:=owner.value.values; moved:=owner.value; if alias[0]!=1 || moved.text!="live" {return 1};return 0}"#,
+            ),
+            (
+                "tuple-dynamic-alias",
+                true,
+                r#"fn main()->i32 {owner:=([1].to_array(),"live".clone());alias:slice<i64>:=owner.0;moved:=owner.0;if alias[0]!=1 || moved[0]!=1 || owner.1!="live" {return 1};return 0}"#,
+            ),
         ];
+        legacy_mixed_field_authority(stage);
         for (name, accepted, source) in cases {
             let path = stage.join(format!("{name}.align"));
             std::fs::write(&path, source).unwrap();
@@ -254,6 +265,94 @@ fn field_extraction_authority_matrix() {
             }
         }
     });
+}
+
+// Allocated siblings never certify the release lifetime of an inline owner. Every source is
+// check-only: the rejected alternatives deliberately describe views of released storage.
+fn legacy_mixed_field_authority(stage: &Path) {
+    let mut failures = Vec::new();
+    for (family, inner, view) in [
+        (
+            "string",
+            "I {values:array<i64>, text:string}",
+            "owner.value.text",
+        ),
+        (
+            "buffer",
+            "I {values:array<i64>, data:buffer}",
+            "owner.value.data.bytes()",
+        ),
+        (
+            "nested",
+            "Text {name:string} I {values:array<i64>, text:Text}",
+            "owner.value.text.name",
+        ),
+        (
+            "fixed",
+            "I {values:array<i64>, texts:[string;1]}",
+            "owner.value.texts[0]",
+        ),
+        (
+            "fixed-record",
+            "Text {name:string} I {values:array<i64>, texts:[Text;1]}",
+            "owner.value.texts[0].name",
+        ),
+    ] {
+        for (action, transfer) in [
+            ("bind-replace", "mut taken:=owner.value; taken=replacement"),
+            ("direct-call", "consume(owner.value)"),
+            ("indirect-call", "callback:=consume; callback(owner.value)"),
+            ("constructor", "{wrapped:=Wrap {value:owner.value}; ()}"),
+        ] {
+            let view_type = if family == "buffer" {
+                "slice<u8>"
+            } else {
+                "str"
+            };
+            let source = format!(
+                "{inner}\nR {{value:I}}\nWrap {{value:I}}\nfn consume(value:I) {{}}\nfn probe(owner:R,replacement:I)->i64 {{view:{view_type}:={view};{transfer};return view.len()}}\nfn main()->i32=0\n"
+            );
+            let path = stage.join(format!("legacy-{family}-{action}.align"));
+            std::fs::write(&path, &source).unwrap();
+            let mut sources = SourceMap::new();
+            let checked = align_driver::check(&mut sources, path.to_str().unwrap(), &source);
+            let diagnostics = align_driver::format_diagnostics(&sources, &checked.diags);
+            if !checked.diags.has_errors()
+                || !diagnostics.contains("use of invalidated borrow 'view'")
+            {
+                failures.push(format!("{family}/{action}: {diagnostics}"));
+            }
+        }
+    }
+    for (name, source) in [
+        (
+            "tuple-field",
+            r#"R {value:(string,array<i64>)} fn consume(value:(string,array<i64>)) {} fn text(borrow value:(string,array<i64>))->str=value.0[0..value.0.len()] fn probe(owner:R)->i64 {view:=text(owner.value);consume(owner.value);return view.len()} fn main()->i32=0"#,
+        ),
+        (
+            "tuple-direct",
+            r#"fn probe()->i64 {owner:=("old".clone(),[1].to_array());view:str:=owner.0;mut taken:=owner.0;taken="new".clone();return view.len()} fn main()->i32=0"#,
+        ),
+        (
+            "tuple-deferred",
+            r#"fn consume(value:string) {} fn probe()->i64 {owner:=("old".clone(),[1].to_array());view:str:=owner.0;consume(owner.0);return view.len()} fn main()->i32=0"#,
+        ),
+    ] {
+        let mut sources = SourceMap::new();
+        let path = stage.join(format!("legacy-{name}.align"));
+        std::fs::write(&path, source).unwrap();
+        let checked = align_driver::check(&mut sources, path.to_str().unwrap(), source);
+        let diagnostics = align_driver::format_diagnostics(&sources, &checked.diags);
+        if !checked.diags.has_errors() || !diagnostics.contains("use of invalidated borrow 'view'")
+        {
+            failures.push(format!("{name}: {diagnostics}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "legacy mixed ownership: {}",
+        failures.join("\n")
+    );
 }
 
 const LIFECYCLE: &str = r#"
