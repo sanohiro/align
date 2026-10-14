@@ -174,11 +174,11 @@ worktree; their adoption is not a prerequisite for independent work.
 - Request126's borrowed-session loop refusal and Request28's indexed/view builder
   readers require their own provenance closure; the shipped binary-write effect
   producer does not resume K1.
-- Next capability: [Plan196](docs/impl/196-indexed-array-field-length.md) addresses
-  Request137's scalar length observation through indexed owned-array fields.
-  Its initial wider view proposal lacked an interprocedural access-authority
-  proof. Keep view-producing access separate from the useful nonescaping scalar
-  consumer; neither the parked K1 implementation nor general provenance is selected.
+- [Plan196](docs/impl/196-indexed-array-field-length.md) implements R137's scalar
+  `rows[index].ids.len()` observation across stable fixed/dynamic AoS and slice
+  bases. The parent remains owned, checked bounds precede the read, and the i64
+  result retains no borrow. Wider indexed Move-field views and their Plan61
+  authority prerequisite remain unselected; consumer adoption is external.
 - Function-value whole-record exclusive calls retain the existing conservative
   mutable-output fallback: even supported whole-field replacement can invalidate
   later destination use. Precise indirect mutable-output summaries are separate

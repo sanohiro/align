@@ -22,7 +22,7 @@ must not claim their authority or lifetime proof.
 | Ownership and lifetime | The containing collection remains the sole owner of the selected array. The operation reads its initialized length without allocation, element copies, transfer, nulling, replacement, independent cleanup or Drop. Source storage and contained roots stay live through the read. The i64 result retains no borrow and may outlive the collection; subsequent ordinary moves/replacement remain valid. Existing owner transfers retain their established generation rules. |
 | Evaluation and errors | Resolve the exact stable base, field path and array type; arity remains zero and index type is i64. Evaluate base and index once in written order. Reserve the complete parent generation before evaluating the index and preserve it until the header observation. Overlapping move/Drop/replacement/exclusive access during index evaluation rejects; unrelated mutation is permitted. After index fallthrough, check the outer signed bounds before loading the selected length, even when the selected field is empty. A terminating index performs no bounds/header/read. Existing hard bounds failure and diagnostics retain their ordering. |
 | Excluded uses | An ordinary alias, owning return/store/capture, indexed Move extraction, replacement, exclusive field/element borrow, range or slice conversion from this Move field remains subject to its existing rejection. Existing explicit shared-call arguments keep their prior grammar, including the fixed Move-field literal-index gate. A successful length read does not grant a new view or write permission. |
-| Compiler proof | Sema admits the immediate selected Move array only under Len. Checked HIR independently verifies that exact context, stable parent, path, physical leaf and index; permission cannot leak into nested children. MIR may load only the representation-compatible Slice-typed header and immediately observe SliceLen; no owner-typed indexed SSA is admitted. Producer validation restricts this new header producer to length observations, never storage, return, capture, argument or mutation. Existing exact path/type/index/construction/bounds validation remains. LLVM only lowers the authenticated read. |
+| Compiler proof | Sema admits the immediate selected Move array only under Len. Checked HIR independently verifies that exact context, stable parent, path, physical leaf and index; permission cannot leak into nested children. MIR reuses the exact bounds-guarded BorrowedElementPlace as the operand of SliceLen; no owner or view header SSA is formed. Only this ordinary array-field scalar read and existing shared calls accept that descriptor. Producer validation requires readable exact selected storage; all ordinary value/store/return/Drop contexts retain their descriptor refusal. Existing exact path/type/index/construction/bounds validation remains. LLVM only lowers the authenticated read. |
 | Identity and other boundaries | No HIR/MIR variant, serialized/interface field, runtime ABI, public parameter/return signature, persisted format, native text boundary, global state, ambient configuration or runtime helper changes. Existing compiler/source identity invalidates caches. All allocation and cleanup remain with existing constructors and owners. No performance promise or benchmark. Plans28/44/56/165 and the existing length operation are prerequisites. |
 
 ## Implementation closure matrix
@@ -33,7 +33,7 @@ must not claim their authority or lifetime proof.
 | Evaluation and control | `indexed_array_field_length::evaluation_and_control` covers once-only effects, negative/high indices, empty parent versus empty selected array, same-root invalidating indices and unrelated-root positives, if/match/else/?/map_err, branch/loop joins and early return/break/exit. A terminating index cannot produce a bounds action; a completed scalar survives subsequent parent retirement. |
 | Construction and lifecycle | `indexed_array_field_length::allocation_and_drop` uses existing heap/arena/JSON construction, complete owner moves/returns, replacement and ordinary/error exits. Native allocation/free/live-byte counters prove that observation neither allocates nor releases the field. Source nulling and recursive Drop remain on existing paths. |
 | Checked HIR | `indexed_array_field_length_hir_matrix` mutates the immediate consumer, physical leaf/result, source root/path/type, index and nested-child permission; ordinary Move reads and forged mutation still reject, including unused peers. Full and partition lowering replay the same proof. |
-| MIR and LLVM | `indexed_array_field_length_mir_matrix` authenticates array-to-Slice physical identity and limits the header SSA to SliceLen. Wrong element/layout/path/index/producer, owner-typed loads and forged return/store/call/Drop consumers reject before emission. Existing Copy/String field reads remain controls. |
+| MIR and LLVM | `indexed_array_field_length_mir_matrix` authenticates the exact array-field descriptor at SliceLen. Wrong element/layout/path/index/producer/guard, owner-typed loads and forged return/store/Drop consumers reject before emission. Existing shared-call descriptor admission remains unchanged. Existing Copy/String field reads remain controls. |
 | Imports and replay | `indexed_array_field_length::imports_and_cache` covers imported and concrete-generic scalar helpers in whole/per-unit execution and cold/hit/type-edit/restore caches. No view result or mutable retention is added. Existing borrowed_params, owned_structs_arrays and fixed_array_fields owners cover adjacent source and lowering rules. |
 
 This is one independently useful scalar consumer matching the real request.
@@ -41,9 +41,43 @@ Splitting its source/producer/validation chain would leave a dormant or unsafe
 intermediate. If complete proof exceeds roughly 1,000 handwritten lines, keep the
 coherent boundary rather than duplicating its integration obligations.
 
-Before implementation, independently review this revised boundary against the
-initial authority finding and complete the author obligation pass. Before code
-review, bind every applicable row to implementation and a passing regression
-owner. Normative prose changes together in draft.md, language-spec.md,
-design-notes.md, open-questions.md, Plan28 and the Len/ElemField checked-HIR rows.
-Record the delivered scalar scope separately from R137's pending wider views.
+The revised strategy was independently reviewed after the initial authority
+finding. The final representation reuses `SliceLen(BorrowedElementPlace)` rather
+than introducing even an internal slice-valued header. `checked_borrowed_element_place_ty`
+returns the outer physical element type for pointer stride; the scalar consumer
+separately requires the exact selected `element_ty` to be an ordinary array.
+
+## Implementation closure
+
+All named owners live in `crates/align_driver/tests/indexed_array_field_length.rs`.
+Sema's `check_index_field` admits only the immediate Len receiver. MoveCheck
+reserves the source before the index; both its eager worklist and transparent
+spine preserve that action boundary. Existing escape analysis walks the same
+children and gives the scalar result no borrowed payload. `evaluation_and_control`
+rejects move/replacement/exclusive access and slice rebinding during the index,
+while scalar survival after parent retirement and unrelated mutation pass.
+
+Checked HIR resets the length permission at every child boundary. MIR's
+`lower_borrowed_element_field` shares the existing reservation and signed bounds
+construction with shared calls. Producer validation replays exact base/path/type
+and readable storage, including unused scalar results; LLVM's existing guarded
+pointer validator authenticates the bounds and source-preservation interval.
+The HIR/MIR mutation matrices cover malformed context, selected type, path, index,
+slot, reservation, bounds, and ordinary value/return/store/free consumers.
+Existing shared-call and fixed-field owners retain their adjacent refusals.
+
+Native owners cover fixed/dynamic/slice bases, nested scalar/text/string/record
+array fields, borrowed match and exclusive parameters, empty selected arrays and
+empty outer fixed/dynamic arrays, termination, heap/arena/JSON construction,
+complete moves/replacement and cleanup. Requested-live instrumentation is enabled
+and positively witnessed; allocation/free counters remain unchanged across the
+repeated observations. Builder buffers use a separate allocator, so global
+alloc-call/free-call equality is not claimed. Imported generic helpers execute
+whole/per-unit and through cold/repeated/type-edit/restored cache builds.
+
+Existing constructors remain prerequisites: a heap record builder cannot contain
+`array<str>`, and a region record builder cannot acquire independently owned
+array fields. The owners use admitted fixed storage for arena/text-array cases.
+The existing whole-fixed-Move-record call producer restriction is separate from
+checking the admitted borrowed function body; this capability does not widen
+whole-place calls. No consumer code or compiler pin changes are required here.

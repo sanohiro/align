@@ -5879,11 +5879,39 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         equation.invalid = true;
                         return equation;
                     };
-                    self.check_operand(
-                        &mut equation,
-                        &input,
-                        input_ty,
-                    );
+                    if let Operand::BorrowedElementPlace(place) = &input {
+                        let mut selected_path = vec![XmlAccessPathSegment::Element];
+                        selected_path.extend(place.field_path.iter().copied()
+                            .map(XmlAccessPathSegment::StructField));
+                        if place.field_path.is_empty()
+                            || !align_sema::indexed_array_field_has_length(place.element_ty)
+                            || !matches!(place.base.ty, Ty::StructArray(..)
+                                | Ty::DynStructArray(_, Layout::Aos)
+                                | Ty::Slice(Scalar::Struct(_)))
+                            || xml_selected_ty(self.graph.program, place.base.ty, &selected_path)
+                                != Some(place.element_ty)
+                        {
+                            equation.invalid = true;
+                        } else {
+                            self.check_operand(&mut equation, &place.index, i64_ty);
+                            // Inline storage records individual elements. Heap/slice storage is
+                            // authenticated by its complete header; an empty inline array has no
+                            // element producer and its independent bounds guard prevents the read.
+                            let (expected, selected_path) = if matches!(place.base.ty,
+                                Ty::StructArray(_, count) if count != 0)
+                            {
+                                (place.element_ty, selected_path)
+                            } else {
+                                (place.base.ty, Vec::new())
+                            };
+                            let source = self.read_source(&mut equation,
+                                &Operand::BorrowedPlace(Box::new(place.base.clone())),
+                                expected, selected_path);
+                            Self::add_required_source(&mut equation, source, OperandRequirement::READ);
+                        }
+                    } else {
+                        self.check_operand(&mut equation, &input, input_ty);
+                    }
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
@@ -9515,6 +9543,11 @@ fn validate_resource_rvalues_component(
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
                     return Err(fail(function, &format!("native owner producer contract mismatch: {rvalue:?}")));
+                }
+                if matches!(rvalue, Rvalue::SliceLen(Operand::BorrowedElementPlace(_)))
+                    && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), i64_ty))
+                {
+                    return Err(fail(function, "indexed array-field length producer mismatch"));
                 }
                 let protected_call_boundary = |args: &[Operand]| {
                     xml_owned_leaf_paths(program, result)

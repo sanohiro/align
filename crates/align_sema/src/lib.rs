@@ -4672,6 +4672,18 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
     }
 }
 
+/// Ordinary owning array headers that support the scalar indexed-field length observation.
+pub fn indexed_array_field_has_length(ty: Ty) -> bool {
+    matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexedFieldUse {
+    Value,
+    SharedCall,
+    Length,
+}
+
 /// Whether an already-formed direct record field has a valid owning cleanup plan.
 /// Formation remains responsible for placement restrictions and native resource identities.
 pub fn owned_field_extraction_is_valid(
@@ -45438,7 +45450,11 @@ impl<'a> MoveCheck<'a> {
         // This node establishes a storage-generation reservation before its index child runs.
         // The generic worklist discovers children before evaluating them, so keep this one on the
         // recursive path where the reservation encloses the child's complete evaluation.
-        if matches!(expression.kind, ExprKind::BorrowedIndex { .. }) {
+        if matches!(expression.kind, ExprKind::BorrowedIndex { .. })
+            || matches!(&expression.kind, ExprKind::Len(inner)
+                if indexed_array_field_has_length(inner.ty)
+                    && matches!(inner.kind, ExprKind::ElemField { .. }))
+        {
             return false;
         }
         if pipeline_stages(&expression.kind).is_some() {
@@ -47243,6 +47259,9 @@ impl<'a> MoveCheck<'a> {
                     ExprKind::BuilderNew {
                         capacity: Some(child),
                     } => (child.as_ref(), false, false, false, Post::None),
+                    ExprKind::Len(child)
+                        if indexed_array_field_has_length(child.ty)
+                            && matches!(child.kind, ExprKind::ElemField { .. }) => break,
                     ExprKind::Unary { expr: child, .. }
                     | ExprKind::Cast(child)
                     | ExprKind::RawAlloc(child)
@@ -48641,9 +48660,34 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, new_len, moved, false, false);
             }
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
-            | ExprKind::Len(i) => {
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i) => {
                 move_expr!(self, i, moved, false, false)
+            }
+            ExprKind::Len(inner) => {
+                let selected_base = match &inner.kind {
+                    ExprKind::ElemField { recv, .. }
+                        if indexed_array_field_has_length(inner.ty) =>
+                            Self::mutable_actual_place(recv),
+                    _ => None,
+                };
+                if let Some(place) = selected_base {
+                    // The source is selected before the index, including its contained owners.
+                    // A scalar result carries no source dependency after this immediate read.
+                    let reservation = Self::expr_key(e);
+                    let mut roots = self.borrowed_element_roots(place.root);
+                    roots.extend(self.local_borrow_fact(place.root).live_roots());
+                    self.borrows.begin_value_source(reservation, roots);
+                    self.borrows.begin_value_headers(reservation, self.local_headers(place.root));
+                    self.borrows.begin_mutable_place_source(reservation, place);
+                    let falls = self.expr(inner, moved, false, false);
+                    if falls {
+                        self.validate_value_snapshot(reservation, reservation, e.span);
+                    }
+                    self.borrows.finish_value_source(reservation);
+                    if !falls { return false; }
+                } else {
+                    move_expr!(self, inner, moved, false, false);
+                }
             }
             ExprKind::CloneIn { value, region } => {
                 move_expr!(self, value, moved, false, false);
@@ -52706,7 +52750,7 @@ impl<'a, 't> Checker<'a, 't> {
         // not materialized.
         if let Some((arr, index, mut names)) = peel_index_field_chain(recv) {
             names.push(field);
-            return self.check_index_field(arr, index, &names, expected, span, false);
+            return self.check_index_field(arr, index, &names, expected, span, IndexedFieldUse::Value);
         }
         // Resolve the receiver to a struct **place** — a local, or a nested field path `l.a.b`.
         let (root, mut path, recv_ty) = match self.resolve_place(recv) {
@@ -54231,7 +54275,7 @@ impl<'a, 't> Checker<'a, 't> {
                     &fields,
                     expected,
                     argument.span,
-                    true,
+                    IndexedFieldUse::SharedCall,
                 );
                 self.constrain(checked.ty, expected, argument.span);
                 return checked;
@@ -64512,7 +64556,13 @@ impl<'a, 't> Checker<'a, 't> {
     /// `.len()` — the element count of a `str`, `slice<T>`, or fixed array, as an `i64`.
     fn check_len(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
-        let r = self.check_expr(recv, None);
+        let r = if let Some((base, index, fields)) = peel_index_field_chain(recv)
+            && !fields.is_empty()
+        {
+            self.check_index_field(base, index, &fields, None, recv.span, IndexedFieldUse::Length)
+        } else {
+            self.check_expr(recv, None)
+        };
         if r.ty == Ty::Builder || r.ty.is_array_builder() {
             if !args.is_empty() {
                 self.diags.error(format!("'.len()' takes no arguments, got {}", args.len()), span);
@@ -69958,7 +70008,7 @@ impl<'a, 't> Checker<'a, 't> {
         fields: &[&ast::Ident],
         expected: Option<Ty>,
         span: Span,
-        allow_indexed_move_borrow: bool,
+        use_kind: IndexedFieldUse,
     ) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
         let r = self.check_expr(arr, None);
@@ -70023,11 +70073,13 @@ impl<'a, 't> Checker<'a, 't> {
         if leaf_ty == Ty::String {
             leaf_ty = Ty::Str;
         }
-        // Fail closed for every other Move leaf unless this exact expression is the argument of
-        // an explicit shared borrow from a dynamic AoS/slice record array. That call boundary can
-        // retain a pointer to the selected field while the array root stays live and unchanged;
-        // by-value reads still cannot identify which runtime element surrendered its owner.
-        let indexed_move_borrow = allow_indexed_move_borrow
+        // Other Move leaves are places only at an explicit shared call or immediate array-field
+        // length observation. Both reserve the source through their action; ordinary by-value
+        // reads still cannot identify which runtime element surrendered its owner.
+        let length_observation = use_kind == IndexedFieldUse::Length
+            && indexed_array_field_has_length(leaf_ty)
+            && self.borrowed_element_base(&r).is_some();
+        let indexed_move_borrow = use_kind == IndexedFieldUse::SharedCall
             && (matches!(
                 r.ty,
                 Ty::Slice(Scalar::Struct(_)) | Ty::DynStructArray(_, Layout::Aos)
@@ -70036,6 +70088,7 @@ impl<'a, 't> Checker<'a, 't> {
         if drop_plan(leaf_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()
             && !(matches!(leaf_ty, Ty::Resource(_)) && matches!(r.ty, Ty::StructArray(..)))
             && !indexed_move_borrow
+            && !length_observation
         {
             self.diags.error(
                 format!(

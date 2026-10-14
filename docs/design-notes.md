@@ -77,11 +77,18 @@ slicing retains its terminal failure contract. Prefix/suffix comparison already
 needs no interior substring. This adds no second string-slicing or error model;
 [plan 66](impl/66-array-prefix-and-text-boundary-plan.md) owns the closure.
 
+[Plan196](impl/196-indexed-array-field-length.md) admits the scalar observation
+`rows[index].values.len()` without exposing the owned array field as a value or
+view. It reuses the existing reserved, bounds-checked element place and reads
+only its length. General view-return and mutable-retention authority remain on
+the separate Plan61 track; a scalar observation needs neither a second borrow
+model nor a new lifetime summary.
+
 The [R77–R83 composition batch](impl/56-r77-r83-composition-plan.md) separates
 initialized reads, ownership, storage generations and contained-view lifetimes.
 A shared source need not taint an independently owned result; a fresh outer
 container must still retain its contained views. The implementation also admits
-an indexed Move field only as an explicit shared call-place, keeping the field in
+an indexed Move field at an explicit shared call-place, keeping the field in
 caller-owned storage with no implicit copy or transfer. Dynamic slice/AoS views
 use checked runtime indices; source-formed fixed `StructArray` places require an
 integer-literal index. R82 composes the existing
