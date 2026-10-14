@@ -1,0 +1,112 @@
+{
+  "compiler_source": "96db7e9effe8621eb08e101c25821bae7d61c6fc",
+  "runtime_sha256": "3655bfc33d2a2a2aadb086ad32ec56075b9cbf424abcf8d902a07fdf0e136a92",
+  "compiler_sha256": "ca1008110beb41d870b0566ae569dc06ef7829a262fe1adccffc02386298df39",
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "mode": "release O2 generated code, baseline CPU, no runtime LTO, cache off; parse excluded; timed region includes byte-count print; keys validates every key byte and paired value after timing",
+  "source_sha256": {
+    "key": "3fd694eefe483ca5d463c1af11290e01e3068b249a7d23b5f65a810e80a76183",
+    "keys": "4d40422f2bb23cc2cf6aa82f42cad1560728c5d97941cd09ea4974c71f40eb3d"
+  },
+  "rows": [
+    {
+      "mode": "key",
+      "members": 4000,
+      "expected_key_bytes": 14890,
+      "input_sha256": "c60f7aab7f79562e8c1fa402dd77fb8eb7a68278c40376f68320ef289ce5f925",
+      "ns": [
+        68369375,
+        33978584,
+        29982750,
+        30269625,
+        29960000
+      ],
+      "median_ns": 30269625
+    },
+    {
+      "mode": "key",
+      "members": 8000,
+      "expected_key_bytes": 30890,
+      "input_sha256": "a9ef58a875e726c128ae24e4f707eb9ac5ce05d324ff0ed2ee940b5ffd926861",
+      "ns": [
+        120008791,
+        120572042,
+        120602292,
+        119966166,
+        120759709
+      ],
+      "median_ns": 120572042
+    },
+    {
+      "mode": "key",
+      "members": 16000,
+      "expected_key_bytes": 68890,
+      "input_sha256": "92612187cc503323d2952c70f9b0466acd09d659d35bdfd201bb99987939c021",
+      "ns": [
+        482523167,
+        483558667,
+        483974708,
+        486006708,
+        483984208
+      ],
+      "median_ns": 483974708
+    },
+    {
+      "mode": "keys",
+      "members": 4000,
+      "expected_key_bytes": 14890,
+      "input_sha256": "c60f7aab7f79562e8c1fa402dd77fb8eb7a68278c40376f68320ef289ce5f925",
+      "ns": [
+        425167,
+        258209,
+        283042,
+        202084,
+        135041
+      ],
+      "median_ns": 258209
+    },
+    {
+      "mode": "keys",
+      "members": 8000,
+      "expected_key_bytes": 30890,
+      "input_sha256": "a9ef58a875e726c128ae24e4f707eb9ac5ce05d324ff0ed2ee940b5ffd926861",
+      "ns": [
+        149958,
+        163333,
+        157083,
+        175166,
+        183042
+      ],
+      "median_ns": 163333
+    },
+    {
+      "mode": "keys",
+      "members": 16000,
+      "expected_key_bytes": 68890,
+      "input_sha256": "92612187cc503323d2952c70f9b0466acd09d659d35bdfd201bb99987939c021",
+      "ns": [
+        233875,
+        207833,
+        215958,
+        208666,
+        205375
+      ],
+      "median_ns": 208666
+    },
+    {
+      "mode": "keys",
+      "members": 151000,
+      "expected_key_bytes": 794890,
+      "input_sha256": "5f4105b3b3df2db0330d127b9548847156958d1d4c173fa5769f3218f29906e2",
+      "ns": [
+        1197125,
+        1203583,
+        1197083,
+        1229791,
+        1200875
+      ],
+      "median_ns": 1200875
+    }
+  ]
+}

@@ -31,3 +31,17 @@ under one exclusively acquired directory. Each subprocess has a 55-second work
 deadline and owned process-group cleanup. The 151,000-member quadratic control
 is deliberately omitted; the three smaller sizes already establish its scaling.
 No fixed speedup, cross-host timing or application startup claim follows.
+
+## Local observation (2026-10-14)
+
+[All samples and identities](macos-samples.json) use the committed implementation
+`96db7e9effe8621eb08e101c25821bae7d61c6fc`. Each reported time is the median of five
+fresh processes on this Mac. Fixed output overhead obscures fine scaling in the
+small keys() cases; no minimum speedup is asserted.
+
+| Members | Repeated key(i) | One keys() materialization |
+| --- | ---: | ---: |
+| 4,000 | 30.270 ms | 0.258 ms |
+| 8,000 | 120.572 ms | 0.163 ms |
+| 16,000 | 483.975 ms | 0.209 ms |
+| 151,000 | not measured | 1.201 ms |
