@@ -1061,6 +1061,77 @@ fn xml_numeric_vector_shape(ty: Ty) -> Option<(Scalar, u32)> {
     xml_numeric_scalar_ty(scalar_to_ty(element)).then_some((element, lanes))
 }
 
+fn xml_plain_copy_leaf(ty: Ty) -> bool {
+    matches!(ty, Ty::Unit | Ty::Bool | Ty::Char | Ty::Rng)
+        || xml_numeric_scalar_ty(ty)
+        || matches!(ty, Ty::Array(element, _) if
+            matches!(element, Scalar::Unit | Scalar::Bool | Scalar::Char)
+                || xml_numeric_scalar_ty(scalar_to_ty(element)))
+        || xml_numeric_vector_shape(ty).is_some()
+        || matches!(ty, Ty::Mask(element, lanes)
+            if xml_numeric_vector_shape(Ty::Vec(element, lanes)).is_some())
+}
+
+/// Inline data can be copied out of readable storage without retaining its authority.
+/// Copy alone is insufficient: views and callable environments must keep their provenance.
+fn xml_plain_copy_type(program: &Program, root: Ty) -> bool {
+    if xml_plain_copy_leaf(root) {
+        return true;
+    }
+    let mut pending = vec![(root, false)];
+    let mut active = HashSet::new();
+    let mut complete = HashSet::new();
+    while let Some((ty, exiting)) = pending.pop() {
+        if exiting {
+            active.remove(&ty);
+            complete.insert(ty);
+            continue;
+        }
+        if complete.contains(&ty) || xml_plain_copy_leaf(ty) {
+            continue;
+        }
+        if !active.insert(ty) {
+            return false;
+        }
+        pending.push((ty, true));
+        match ty {
+            Ty::Struct(id) => {
+                let Some(record) = program.structs.get(id as usize) else { return false };
+                pending.extend(record.fields.iter().map(|field| (field.ty, false)));
+            }
+            Ty::Tuple(id) => {
+                let Some(tuple) = program.tuples.get(id as usize) else { return false };
+                pending.extend(tuple.elems.iter().map(|element| (scalar_to_ty(*element), false)));
+            }
+            Ty::Enum(id) => {
+                let Some(sum) = program.enums.get(id as usize) else { return false };
+                pending.extend(sum.variants.iter().flat_map(|variant|
+                    variant.payload.iter().map(|payload| (scalar_to_ty(*payload), false))));
+            }
+            // Inspect even zero-length elements and inactive payloads. Neither erases a type's
+            // borrow, callable or Move authority, and neither supplies a producer seed.
+            Ty::Array(element, _) | Ty::Option(element) => {
+                pending.push((scalar_to_ty(element), false));
+            }
+            Ty::StructArray(id, _) => pending.push((Ty::Struct(id), false)),
+            Ty::Result(ok, error) => {
+                pending.push((scalar_to_ty(ok), false));
+                pending.push((scalar_to_ty(error), false));
+            }
+            Ty::Tagged(id) => match program.tagged_types.get(id as usize) {
+                Some(hir::TaggedType::Option(payload)) => pending.push((scalar_to_ty(*payload), false)),
+                Some(hir::TaggedType::Result(ok, error)) => {
+                    pending.push((scalar_to_ty(*ok), false));
+                    pending.push((scalar_to_ty(*error), false));
+                }
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn xml_option_payload(program: &Program, ty: Ty) -> Option<Ty> {
     match ty {
         Ty::Option(payload) => Some(scalar_to_ty(payload)),
@@ -7670,18 +7741,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
             let mut equation = match &node {
                 XmlAccessNode::Value(value, path) => {
                     let mut equation = self.value_equation(*value, path.clone());
-                    // Plain scalar and inline scalar-array SSA results copy bits out of
+                    // Closed inline Copy SSA results copy bits out of
                     // storage without inheriting its borrow authority. Retain every grounding,
                     // check and absence fact; never transform storage or view-bearing values.
                     equation.copied_bits = path.is_empty()
-                        && self.graph.function.value_tys.get(*value as usize).is_some_and(|ty| {
-                            matches!(ty, Ty::Unit | Ty::Bool | Ty::Char)
-                                || matches!(ty, Ty::Array(element, _) if xml_plain_fixed_array_element(*element))
-                                || xml_numeric_scalar_ty(*ty)
-                                || xml_numeric_vector_shape(*ty).is_some()
-                                || matches!(*ty, Ty::Mask(element, lanes @ (2 | 4 | 8 | 16))
-                                    if xml_numeric_vector_shape(Ty::Vec(element, lanes)).is_some())
-                        });
+                        && self.graph.function.value_tys.get(*value as usize)
+                            .is_some_and(|ty| xml_plain_copy_type(self.graph.program, *ty));
                     equation
                 },
                 XmlAccessNode::Slot(slot, path) => self.slot_equation(*slot, path.clone()),
@@ -11904,6 +11969,10 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "producer_copy_tests.rs"]
+mod copy_tests;
 
 #[cfg(test)]
 mod tests {
