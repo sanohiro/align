@@ -9716,7 +9716,7 @@ impl<'a> BodyValidator<'a> {
                     && function.params.len() == 1
                     && function.param_modes == [align_ast::ParamMode::ByValue]
                     && function.locals.get(usize::try_from(*function.params.first()?).ok()?)?.ty == Ty::Str
-                    && function.ret == self.native_result_ty(Ty::String)?)
+                    && self.body_ty_matches(function.ret, self.native_result_ty(Ty::String)?))
                     .then(|| result(Ty::String, &[input]))?
             }
             hir::ExprKind::TimeParse { input, .. } => {

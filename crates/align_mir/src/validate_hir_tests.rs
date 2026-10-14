@@ -12408,8 +12408,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // validation, source-shape, replay and ownership. OsMemory adds one nullary
         // Copy Result family with explicit checked-HIR validation and no retained storage.
         // BufferTryNew adds one explicit fallible owned-buffer construction family.
+        // UnicodeNfc adds the canonical owned-string normalization producer.
         variants,
-        357,
+        358,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -20472,6 +20473,14 @@ fn unicode_nfc_checked_hir() -> Result<(), Box<dyn std::error::Error>> {
     let base = align_sema::check_program(&modules, &mut diagnostics);
     assert!(!diagnostics.has_errors(), "check canonical Unicode modules");
     for per_unit in [false, true] { assert!(lower_program_checked(&base, per_unit, None).is_ok()); }
+    let mut equivalent = base.clone();
+    let function = equivalent.fns.iter_mut().find(|f| f.name == "pkg.unicode$nfc").ok_or("NFC function")?;
+    let Ty::Result(ok, error) = function.ret else { return Err("NFC result type".into()); };
+    function.ret = Ty::Tagged(u32::try_from(equivalent.tagged_types.len())?);
+    equivalent.tagged_types.push(hir::TaggedType::Result(ok, error));
+    for per_unit in [false, true] {
+        assert!(lower_program_checked(&equivalent, per_unit, None).is_ok(), "equivalent NFC return type/{per_unit}");
+    }
     for axis in ["input", "result", "origin", "parameter", "body", "cleanup", "identity", "duplicate"] {
         let mut bad = base.clone();
         let function = bad.fns.iter_mut().find(|f| f.name == "pkg.unicode$nfc").ok_or("NFC function")?;
