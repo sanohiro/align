@@ -4523,7 +4523,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_abi_registry_is_complete_and_unique() {
+    fn runtime_abi_registry_is_complete_and_unique() -> Result<(), Box<dyn std::error::Error>> {
         fn assert_ord<T: Ord>() {}
 
         assert_ord::<RuntimeAbiId>();
@@ -4571,9 +4571,9 @@ mod tests {
         // Identity rows name one symbol each; shared ABI shapes do not share identities.
         let ledger = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"), "/../../docs/impl/20-runtime-abi-ledger.md"
-        )).unwrap();
+        ))?;
         let table = ledger.split_once("| Registry row | Physical symbol | `EffectClass` |\n")
-            .unwrap().1;
+            .ok_or("missing runtime identity ledger header")?.1;
         let documented: Vec<_> = table.lines().skip(1)
             .take_while(|line| line.starts_with('|')).collect();
         let expected: HashSet<_> = rows.iter().map(|row| {
@@ -4587,6 +4587,7 @@ mod tests {
         assert_eq!(documented.into_iter().collect::<HashSet<_>>(),
             expected.iter().map(String::as_str).collect::<HashSet<_>>(),
             "runtime identity ledger must match every key, symbol and effect class");
+        Ok(())
     }
 
     #[test]
