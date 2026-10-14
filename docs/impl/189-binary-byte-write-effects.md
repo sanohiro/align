@@ -31,3 +31,31 @@ This implements the reviewed Plan80 record semantics and Plan65 W contract.
 Author-side matrix pass and one fresh preflight code review close the boundary;
 no separate new public/safety strategy review is required. R133 is merged in #1336; all three registers were reconciled before selection.
 Consumer-owned adoption remains pending.
+
+## Author closure
+
+`record_view_backing_store` retains the existing exact original-header proof
+shared with indexed assignment. `apply_builtin_mutation_action` records byte
+writes only at the completed eager action, using its captured receiver headers
+and header flows. All BytesSet variants establish a mandatory whole-byte write;
+BytesFill/BytesCopyFrom only contribute may-write. Byte values supply no borrowed
+content roots. Existing access validation, byte-validation invalidation, caller
+transfer, summary serialization and replay are unchanged. Other writer families
+retain their existing producer rules and conservative fallback; this boundary
+closes the binary byte-write family, not general interprocedural precision.
+
+`binary_byte_write_effects_preserve_guarantees_and_replay` owns all 18 setters,
+subview/copy/rebind origins, optional/empty-capable writers, if/match/loop/early
+return and eager divergence; stale may/must records fail independent replay.
+`binary_byte_write_loops_and_replay` checks independent endian byte oracles for
+zero/one/multiple iterations, zero-length nonexecuting loops, imported generic
+forwarding and error returns after guaranteed writes. It executes whole/per-unit
+and cold/hit frontend-cache replay. The companion negative source owner retains
+shared-destination, owner replacement/escape, validated-text invalidation and
+conditional/early-error/empty fill/copy fallback in both compilation modes.
+
+Existing `bytes_ops` owns all native range/refusal and write-order behavior;
+`return_provenance` mutable-copy-view and eager snapshot owners plus
+`imported_mutable_retention::mutable_copy_view_effect_transport` own unchanged
+caller/transport semantics. Plan80 wire goldens remain valid because the record
+format is unchanged. No runtime allocation or performance promise is introduced.

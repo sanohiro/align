@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan189](docs/impl/189-binary-byte-write-effects.md) records binary setter
+  guarantees in the existing mutable Copy-view effect model for Request146.
+  Repeated subview calls preserve caller backing; empty-capable fill/copy and
+  conditional writes retain conservative may effects. Consumer adoption remains
+  external.
+
 - [Plan188](docs/impl/188-owned-json-record-array-root.md) admits JSON decoding
   directly into owned record arrays for Request133. The existing V3 schema and
   deep cleanup make every row independent of input/arena; checked root kinds and
