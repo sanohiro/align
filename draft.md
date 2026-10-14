@@ -1860,7 +1860,7 @@ import std.fs
 
 fn main() {
   task_group {
-    a := spawn(fn { fs.exists("a.txt") })   // a deferred task; the `fn { }` makes the
+    a := spawn(fn { fs.exists("a.txt") })   // a separate task; the `fn { }` makes the
     b := spawn(fn { fs.exists("b.txt") })   // "runs as a separate task" visible
     wait()                                   // join all primitive-result tasks
     print(a.get())                           // extract a result after its group joined
@@ -1870,11 +1870,17 @@ fn main() {
 }
 ```
 
-`spawn` takes a **lambda** (the deferred work), not a bare call — the deferral is then visible
+`spawn` takes a **lambda** (the separate work), not a bare call — the task boundary is visible
 in the source (*Nothing hidden*), and it is the same lambda mechanism as `map`/`reduce`/`par_map`
 rather than a second, special-cased one (*One way*). It returns a `Task<R>` handle; `wait()?` is
 the single error boundary (it joins every task and propagates the lowest-spawn-index `Err`), and `a.get()`
 reads a task's result after the join.
+
+A fully initialized task becomes eligible for worker execution before `spawn` returns, including
+when it is the only task. The caller continues independently; finite worker availability does not
+promise immediate execution or bounded start latency. `wait` also participates in executing its
+own pending tasks so nested groups can complete without an idle worker. Arbitrary user-created
+cross-task blocking cycles have no progress guarantee.
 
 For a fallible group, `get()` requires control to have passed through a successful `wait()` that
 covers the current task generation. The Result may be handled immediately or first kept in a bare
@@ -1909,9 +1915,16 @@ handling that Result outside cannot authorize an enclosing Task. Proofs for stil
 groups remain. Owned task results remain a future extension.
 
 Unlike a `par_map` lambda (which must be Pure), a spawned task **may** be impure — that is the
-point: it performs I/O. Safety comes from capture being by value (a task shares no mutable state
-with another) rather than from purity. By-value capture still requires worker-sendability: a
-`region` capability is rejected before the spawned environment is published.
+point: it performs I/O. Captures are snapshots of Copy values. A copied view descriptor still
+shares backing, so a task may read that backing but cannot modify it or access it exclusively.
+The caller cannot modify, invalidate or release overlapping captured backing until the covering
+join completes. Protection belongs to the group even when its Task handle is discarded; an inner
+wait cannot end an outer group's protection. Completing a fallible wait ends this storage
+protection on both Ok and Err, independently of result-slot success authorization. Existing borrow
+invalidation rules still apply to owner moves. Fresh task-local storage remains writable, and
+copies containing no borrowed backing are independent. These rules include transitive helper and
+callback calls. By-value capture also requires worker-sendability: a `region` capability is
+rejected before the spawned environment is published.
 
 A spawned lambda *escapes* (it outlives the `spawn` call, running later on the task), so it is
 represented as a first-class closure with an environment holding its captured values — distinct

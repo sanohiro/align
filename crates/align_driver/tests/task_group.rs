@@ -1,6 +1,4 @@
-//! `task_group` structured concurrency (slice ④a — walking skeleton). `spawn(fn { … })` returns
-//! a `Task<R>`; `wait()` joins; `t.get()` reads the result. ④a runs tasks eagerly/sequentially
-//! (correct results; real threads arrive in ④b). `spawn`/`wait` are valid only inside the scope.
+//! Structured concurrency: spawn publishes worker work; wait joins and authorizes result reads.
 mod common;
 use common::*;
 
@@ -40,25 +38,12 @@ fn unit_returning_side_effect_task() {
 }
 
 #[test]
-fn tasks_run_deferred_at_wait() {
-    if !backend_available() {
-        return;
-    }
-    // ④b-1b: a spawned task runs at `wait()`, not at `spawn` — so the side effect prints after
-    // the statements between `spawn` and `wait` (matching the eventual "complete by wait" model).
-    let src = "fn main() -> Result<(), Error> {\n  task_group {\n    a := spawn(fn { print(1) })\n    print(2)\n    wait()\n    a.get()\n  }\n  return Ok(())\n}\n";
-    let out = build_and_run("tg-deferred", src);
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "2\n1\n");
-}
-
-#[test]
 fn scope_end_implicitly_joins_tasks() {
     if !backend_available() {
         return;
     }
     // Structured concurrency joins every task when the group scope ends, even without an explicit
-    // `wait()`. The captured view must remain live until the deferred task has observed it.
+    // `wait()`. The captured view must remain live until the task has observed it.
     let src = "fn main() -> Result<(), Error> {\n  owned := \"captured\".clone()\n  view: str := owned\n  task_group {\n    t := spawn(fn { print(view) })\n  }\n  return Ok(())\n}\n";
     let out = build_and_run("tg-implicit-join", src);
     assert_eq!(out.status.code(), Some(0));

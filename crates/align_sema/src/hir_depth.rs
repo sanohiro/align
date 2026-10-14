@@ -1711,6 +1711,7 @@ mod tests {
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_access: None,
                 mutable_retention: Some(vec![vec![]; 0]),
                 mutable_view_effect: None,
                 locals: Vec::new(),
@@ -1774,6 +1775,7 @@ mod tests {
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_access: None,
                 mutable_retention: Some(vec![vec![]; 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -1847,6 +1849,7 @@ mod tests {
                 return_region: hir::ReturnRegionSummary::None,
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_access: None,
                 mutable_retention: Some(vec![vec![]; 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -1926,6 +1929,7 @@ mod tests {
                     hir::ReturnCleanupAbi::None
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_access: None,
                 mutable_retention: Some(vec![vec![]; 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -2375,6 +2379,7 @@ mod tests {
                     hir::ReturnCleanupAbi::None
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
+                mutable_access: None,
                 mutable_retention: Some(vec![vec![]; 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -2558,6 +2563,8 @@ mod tests {
                         diags: &mut diagnostics,
                         named_return_borrow: &named_return_borrow,
                         named_parallel_transfer: &named_return_borrow,
+                        named_mutable_access: &crate::MutableAccessMap::new(),
+                        task_groups: std::collections::HashMap::new(),
                         named_param_modes: &named_param_modes,
                         named_borrow_mut_retention: &named_borrow_mut_retention,
                         named_view_effect: &named_view_effect,
@@ -2589,6 +2596,7 @@ mod tests {
                         arena_depth: 0,
                         return_roots: crate::BorrowRoots::new(),
                         parallel_transfer_roots: crate::BorrowRoots::new(),
+                        mutable_access_roots: crate::BorrowRoots::new(),
                         borrow_mut_retention: vec![
                             crate::BorrowRoots::new();
                             move_program.fns[0].params.len()

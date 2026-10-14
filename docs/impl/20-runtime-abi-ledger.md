@@ -2246,3 +2246,13 @@ i64::MAX return Invalid. No pathname lookup, heap allocation or owner transfer i
 introduced. [Plan 162](162-retained-directory-available-space.md) owns observation
 limits, platform scope and the regression matrix. The declaration golden and
 source-export inventory include this literal native export.
+
+## Structured task publication (plan180)
+
+TgBegin/TgAlloc/TgRegister/TgWait/TgEnd retain their existing C symbols and signatures.
+The opaque group owns caller-only arena metadata plus a shared generation. Registration
+publishes each fully initialized descriptor before returning; workers claim it once.
+TgWait participates in claiming and joins completion before returning the lowest-index
+error slot. TgEnd defensively joins before reclamation. Late helpers retain generation
+metadata only, and completion follows every descriptor/environment/slot access.
+[Plan180](180-structured-task-progress.md) owns the exact mutex and lifetime invariants.

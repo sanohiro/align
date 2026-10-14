@@ -1122,6 +1122,18 @@ boundary: it joins every task and propagates the **lowest-spawn-index** `Err`. I
 must be transitively worker-Send; a `region` capability reachable through a nested function-value
 environment is rejected before the spawned environment is published.
 
+Every initialized task is worker-eligible before `spawn` returns, including a singleton; finite
+pool availability does not guarantee immediate execution or bounded latency. The waiter also
+executes its own queued tasks, preserving nested progress without an idle worker. Arbitrary
+cross-task blocking cycles are outside this guarantee.
+
+Copy view captures share backing. Neither task nor caller may modify, exclusively access,
+invalidate or release overlapping backing until the covering join completes. This protection
+belongs to the group, survives discarded handles, and ends on either Ok or Err from that group's
+wait; result access separately requires success. An inner wait cannot clear outer protection.
+Existing borrow invalidation on owner moves remains. Task-local storage and copies containing no
+borrowed backing remain independently writable. Helper and callback invocations obey the same rule.
+
 `Task.get()` is valid only after a successful `wait()` on every reachable path for its task
 generation. In a fallible group, the Wait Result may be handled directly or through a bare local,
 copy/reassignment, block tail, `map_err`, or value-producing `if`/`match`/`else`/`loop`; only an

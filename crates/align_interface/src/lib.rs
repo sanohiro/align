@@ -204,6 +204,7 @@ pub struct IFnSig {
     pub effect: Effect,
     /// Canonical parameter roots whose contained views may be transferred to parallel workers.
     pub parallel_transfer_params: Vec<u32>,
+    pub mutable_access: align_sema::hir::MutableAccessSummary,
     pub mutable_retention: align_sema::hir::MutableRetentionSummary,
     pub mutable_view_effect: align_sema::hir::MutableViewEffectSummary,
     /// Whether the producer source has the exact top-level `unsafe {}` body shape required of a
@@ -589,6 +590,10 @@ pub fn build_summaries_with_effects(
             )
         }))
         .collect();
+    let mutable_access: HashMap<&str, _> = program.fns.iter()
+        .map(|function| (function.name.as_str(), function.mutable_access.clone()))
+        .chain(program.imported_fns.iter().map(|function| (function.name.as_str(), function.mutable_access.clone())))
+        .collect();
     let mutable_retention: HashMap<&str, _> = program.fns.iter()
         .map(|function| (function.name.as_str(), function.mutable_retention.clone()))
         .chain(program.imported_fns.iter().map(|function| (function.name.as_str(), function.mutable_retention.clone())))
@@ -844,6 +849,9 @@ pub fn build_summaries_with_effects(
                             },
                             effect,
                             parallel_transfer_params,
+                            mutable_access: if is_generic { None } else {
+                                mutable_access.get(canonical.as_str()).cloned().flatten()
+                            },
                             mutable_retention: if is_generic { None } else {
                                 mutable_retention.get(canonical.as_str()).cloned().flatten()
                             },
@@ -1334,6 +1342,7 @@ pub enum ImportCompatibilityError {
     ReturnSummaryGenerativeCapabilityGraph,
     ParallelTransferRootsNonCanonical,
     InvalidMutableRetention(&'static str),
+    InvalidMutableAccess(&'static str),
     InvalidMutableViewEffect(&'static str),
     ReturnCleanupMismatch,
     DropStateEffectMismatch,
@@ -1458,6 +1467,7 @@ impl std::fmt::Display for ImportCompatibilityError {
                 )
             }
             ImportCompatibilityError::InvalidMutableRetention(message) => write!(f, "{message}"),
+            ImportCompatibilityError::InvalidMutableAccess(message) => write!(f, "{message}"),
             ImportCompatibilityError::InvalidMutableViewEffect(message) => write!(f, "{message}"),
             ImportCompatibilityError::ParallelTransferRootsNonCanonical => {
                 write!(f, "interface parallel-transfer roots are not strictly increasing")
@@ -2955,6 +2965,10 @@ pub fn validate_for_import(
                 function.name.clone(),
             ));
         }
+        align_sema::hir::validate_mutable_access(
+            &function.mutable_access, function.params.len(),
+            matches!(function.body, IFnBody::GenericTemplate(_)),
+        ).map_err(ImportCompatibilityError::InvalidMutableAccess)?;
         align_sema::hir::validate_mutable_retention(
             &function.mutable_retention,
             &function
@@ -3349,6 +3363,7 @@ pub fn summary_return_provenance(
                     IFnBody::Absent | IFnBody::GenericTemplate(_) => None,
                 },
                 function.mutable_view_effect.clone(),
+                function.mutable_access.clone(),
             ),
         );
     }
@@ -3497,6 +3512,7 @@ mod builtin_spelling_tests {
                 producer_certification: ProducerCertification::ValidatedBody,
                 effect: Effect::Pure,
                 parallel_transfer_params: Vec::new(),
+                mutable_access: None,
                 mutable_retention: None,
                 mutable_view_effect: None,
                 resource_hook_body: false,

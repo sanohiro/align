@@ -1227,6 +1227,14 @@ Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-no
 
 ### First-class closures + `task_group` — SETTLED + IMPLEMENTED (fully-escaping fn values deferred)
 
+**Structured task progress:** a fully initialized task is worker-eligible before spawn returns,
+including singleton groups. Shared captured backing remains live and read-only until its covering
+join; protection belongs to the group and follows existing borrow invalidation rules, independent
+of the Task handle. A fallible join ends memory protection on either outcome while result access
+still requires success. The waiter participates in its own queued work; no bounded start latency
+or arbitrary cross-task blocking-cycle progress is promised. [Plan180](impl/180-structured-task-progress.md)
+owns the safety, interface and scheduler records. Exclusive/owned captures and owned results stay deferred.
+
 > **Current status:** first-class closures ①–③ and `task_group` ④a–④c are shipped, including real
 > threads, scoped capture environments, `spawn`/`wait()`/`get()`, and fallible `wait()?`. The plan
 > below is retained as the implementation record. The exact stored-Result/control-flow
@@ -1236,7 +1244,7 @@ Record: `draft.md` §8 (Function Arguments), `docs/language-spec.md`, `design-no
 > heap-owned environment and Drop model with a real consumer. A `Static`/noncapturing named function
 > value may already occupy a locally used struct field or array element; aggregate placement alone
 > is not a full escape.
-**Decision (2026-06-23): escape decides a lambda's representation; `spawn` takes a lambda; `task_group` is a structured scope.** The ideal form, chosen on merit (not legacy): a lambda that **escapes** (stored in a variable, returned, or handed to `spawn`) gets a **closure environment** holding its captured values; a non-escaping lambda (every pipeline stage/reducer) stays inlined with captures-as-parameters (zero allocation, SIMD/GPU-friendly). The compiler's **escape analysis** picks the representation — the same syntax, two representations — so first-class function values and `task_group` exist without eroding the offload-ready pipeline path. The environment is **owned by the enclosing region** (the `task_group {}` / `arena {}` scope) and freed with it — a region allocation, not a hidden `malloc`, so the visible scope is the boundary (consistent with *Nothing hidden*). (The model for a closure that escapes *every* region is part of this deferred design; the `task_group` consumer is scope-bounded.) `task_group` (`draft.md` §11) is a **structured** scope like `arena {}`: `spawn(fn { … })` takes a lambda (the deferral is then visible — *Nothing hidden* — and it is the one lambda mechanism, not a bare-call special form), returns a `Task<R>` handle; `wait()?` is the single error boundary (joins all, propagates the lowest-index `Err`); `a.get()` reads a result after the join. A spawned task **may be impure** (it does I/O — unlike a Pure `par_map`); safety comes from by-value capture (no shared mutable state). Rejected alternative: a bare-call special form `spawn(fs.read_file(p))` — it hides the deferral (against *Nothing hidden*) and is a second deferral mechanism (against *One way*); it was only attractive as a way to dodge the closure-environment work, which escape analysis handles cleanly. **Build order:** first-class closures (escape-driven) as the foundation, then `task_group` as a consumer. Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
+**Decision (2026-06-23): escape decides a lambda's representation; `spawn` takes a lambda; `task_group` is a structured scope.** The ideal form, chosen on merit (not legacy): a lambda that **escapes** (stored in a variable, returned, or handed to `spawn`) gets a **closure environment** holding its captured values; a non-escaping lambda (every pipeline stage/reducer) stays inlined with captures-as-parameters (zero allocation, SIMD/GPU-friendly). The compiler's **escape analysis** picks the representation — the same syntax, two representations — so first-class function values and `task_group` exist without eroding the offload-ready pipeline path. The environment is **owned by the enclosing region** (the `task_group {}` / `arena {}` scope) and freed with it — a region allocation, not a hidden `malloc`, so the visible scope is the boundary (consistent with *Nothing hidden*). (The model for a closure that escapes *every* region is part of this deferred design; the `task_group` consumer is scope-bounded.) `task_group` (`draft.md` §11) is a **structured** scope like `arena {}`: `spawn(fn { … })` takes a lambda (the deferral is then visible — *Nothing hidden* — and it is the one lambda mechanism, not a bare-call special form), returns a `Task<R>` handle; `wait()?` is the single error boundary (joins all, propagates the lowest-index `Err`); `a.get()` reads a result after the join. A spawned task **may be impure** (it does I/O — unlike a Pure `par_map`); safety combines by-value snapshots with shared-backing protection until join. Rejected alternative: a bare-call special form `spawn(fs.read_file(p))` — it hides the deferral (against *Nothing hidden*) and is a second deferral mechanism (against *One way*); it was only attractive as a way to dodge the closure-environment work, which escape analysis handles cleanly. **Build order:** first-class closures (escape-driven) as the foundation, then `task_group` as a consumer. Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
 By-value capture still requires worker-sendability: the same general non-Send rule recursively
 rejects a `region` capability in any reachable callable environment before either a spawned
 environment or a `par_map` range is published.
@@ -3460,13 +3468,11 @@ the same convention as the external audit: **CONFIRMED** = read against the code
 - **Status: fixed.** **`task_group` spawned one OS thread per task** (`align_runtime/src/lib.rs`,
   `align_rt_tg_wait`, via `thread::scope` + a `spawn` per task) instead of reusing the **persistent**
   `ParPool` that `par_map` already built for exactly this cost. `tg_wait` now routes tasks through
-  `ParPool` with a **caller-participating work-claiming** loop: the tasks live in a shared claim-once
-  list (`TgTasks`, `Send + Sync` by construction — each contiguous batch is claimed exactly once via
-  an atomic cursor, each `env`/`slot`/`err_slot` is a private disjoint region allocation) with a
-  low-lock completion latch (`TgCompletion`: one Release decrement per batch, lowest error index by
-  atomic minimum, lowest panic by mutex, and a guarded final wake). `wait()` dispatches
-  `min(workers, n-1)` runners onto the pool **and runs the same claim loop on the calling thread**,
-  then blocks until every task is done (so the join still precedes the region free at `tg_end`). The
+  `ParPool` with a **caller-participating work-claiming** loop. Plan180 now publishes
+  initialized descriptors at `spawn`, including singleton groups. One generation mutex owns
+  enqueue, helper reservation/retirement, claim-once batches, completion, and lowest-index
+  error/panic selection. `wait()` drains its own generation and joins every registered task;
+  queued helpers remaining after completion retain metadata only, never the task arena. The
   panic-collecting behaviour is preserved (a worker panic is re-raised on the caller — defensive: a
   real Align task is `extern "C"` and *aborts* on panic rather than unwinding). **Nesting/deadlock
   analysis (the crux):** a spawned closure is lifted to an ordinary fn, so its body may open its own
@@ -4343,16 +4349,12 @@ every valid finding addressed. Disposition:
      **DONE (2026-07-13):** `align_rt_par_map` now checks `count <= PAR_MIN_CHUNK` and runs the
      whole map on the caller *before* calling `par_pool()`, so a tiny map never touches the global
      pool (the pre-existing `nchunks <= 1` fallback stays, reached only when a degenerate worker
-     count still collapses a bigger-than-threshold `count` to one chunk). `align_rt_tg_wait` gets
-     the same treatment: `par_pool()` is now called only when `n > 1` (`workers.min(n - 1)` is
-     always 0 for `n == 1`, so a single-task group never needed the pool either — confirmed by
-     reading the code, not just the report). Regression-pinned by a same-process correctness sweep
-     across the threshold boundary (`par_map_correct_across_threshold_boundary`) plus a
-     process-isolated integration test (`tests/par_map_cold_start.rs`) that checks a new test-only
-     introspection hook (`align_rt_test_par_pool_initialized`, not part of the FFI surface) stays
-     `false` through both the tiny `par_map` and the single-task `task_group`, then confirms on a
-     multi-worker host that a workload above the threshold flips it to `true`; a one-worker host
-     intentionally remains caller-only (so the assertions above are not vacuous).
+     count still collapses a bigger-than-threshold `count` to one chunk). The original
+     singleton `task_group` shortcut was superseded by Plan180: even one task now initializes
+     the pool and becomes worker-eligible at registration so it can overlap caller work.
+     `par_map_correct_across_threshold_boundary` and the process-isolated
+     `tests/par_map_cold_start.rs` retain the tiny-map cold-start check; the latter then checks
+     the large-map host policy and singleton task worker initialization separately.
   6. **zero-size arena alloc** can take a fresh 64 KiB zeroed chunk (`CHUNK = 64*1024`,
      `align_runtime` ~7095). Adopt: size-0 fast path returning a canonical dangling pointer,
      allocation-counter test. Distinct from the REJECTED arena pool+re-zero — do not conflate.

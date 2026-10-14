@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 17;
+pub const FORMAT_VERSION: u32 = 18;
 
 const MAX_TYPE_DEPTH: u32 = 128;
 
@@ -181,6 +181,42 @@ fn write_producer_certification(w: &mut Writer, value: crate::ProducerCertificat
         crate::ProducerCertification::RevalidateGenericBody => 0,
         crate::ProducerCertification::ValidatedBody => 1,
     });
+}
+
+fn write_mutable_access(w: &mut Writer, summary: &align_sema::hir::MutableAccessSummary) {
+    use align_sema::hir::MutableAccessRoot;
+    match summary {
+        None => w.u8(0),
+        Some(roots) => {
+            w.u8(1);
+            w.seq(roots, |w, root| {
+                let (tag, index) = match root {
+                    MutableAccessRoot::Contained(index) => (0, *index),
+                    MutableAccessRoot::Storage(index) => (1, *index),
+                };
+                w.u8(tag);
+                w.u32(index);
+            });
+        }
+    }
+}
+
+fn read_mutable_access(
+    r: &mut Reader<'_>, parameter_count: usize, generic: bool,
+) -> Result<align_sema::hir::MutableAccessSummary, DecodeError> {
+    use align_sema::hir::MutableAccessRoot;
+    let summary = match r.u8()? {
+        0 => None,
+        1 => Some(r.seq(|r| match r.u8()? {
+            0 => Ok(MutableAccessRoot::Contained(r.u32()?)),
+            1 => Ok(MutableAccessRoot::Storage(r.u32()?)),
+            tag => Err(DecodeError::BadTag { what: "mutable-access root", tag }),
+        })?),
+        tag => return Err(DecodeError::BadTag { what: "mutable-access option", tag }),
+    };
+    align_sema::hir::validate_mutable_access(&summary, parameter_count, generic)
+        .map_err(DecodeError::InvalidSummary)?;
+    Ok(summary)
 }
 
 fn write_mutable_retention(w: &mut Writer, summary: &align_sema::hir::MutableRetentionSummary) {
@@ -376,6 +412,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_producer_certification(w, f.producer_certification);
     write_effect(w, f.effect);
     w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
+    write_mutable_access(w, &f.mutable_access);
     write_mutable_retention(w, &f.mutable_retention);
     write_mutable_view_effect(w, &f.mutable_view_effect);
     w.bool(f.resource_hook_body);
@@ -822,6 +859,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let effect = read_effect(r)?;
     let parallel_transfer_params = r.seq(|r| r.u32())?;
     validate_transfer_roots(&parallel_transfer_params, params.len())?;
+    let mutable_access = read_mutable_access(r, params.len(), !type_params.is_empty())?;
     let mutable_retention = read_mutable_retention(r, &params, !type_params.is_empty())?;
     let mutable_view_effect = read_mutable_view_effect(r, params.len(), !type_params.is_empty())?;
     let resource_hook_body = r.bool()?;
@@ -851,6 +889,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         producer_certification,
         effect,
         parallel_transfer_params,
+        mutable_access,
         mutable_retention,
         mutable_view_effect,
         resource_hook_body,
@@ -1205,6 +1244,74 @@ mod tests {
     }
 
     #[test]
+    fn mutable_access_has_independent_bytes_and_malformed_controls() {
+        use align_sema::hir::MutableAccessRoot::{Contained, Storage};
+        let vectors = [
+            (None, vec![0]),
+            (Some(vec![]), vec![1, 0, 0, 0, 0]),
+            (Some(vec![Contained(2), Storage(0)]), vec![1, 2, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0]),
+        ];
+        for (record, bytes) in vectors {
+            let mut writer = Writer::new();
+            write_mutable_access(&mut writer, &record);
+            assert_eq!(writer.buf, bytes);
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(read_mutable_access(&mut reader, 3, false), Ok(record));
+            assert!(reader.finish().is_ok());
+            for end in 0..bytes.len() {
+                assert!(read_mutable_access(&mut Reader::new(&bytes[..end]), 3, false).is_err());
+            }
+        }
+        for bytes in [
+            vec![2],
+            vec![1, 1, 0, 0, 0, 2, 0, 0, 0, 0],
+            vec![1, 1, 0, 0, 0, 0, 3, 0, 0, 0],
+            vec![1, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+            vec![1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            assert!(read_mutable_access(&mut Reader::new(&bytes), 3, false).is_err(), "{bytes:?}");
+        }
+        assert!(read_mutable_access(&mut Reader::new(&[1, 0, 0, 0, 0]), 0, true).is_err());
+        assert_eq!(read_mutable_access(&mut Reader::new(&[0]), 0, true), Ok(None));
+    }
+
+    #[test]
+    fn function_record_pins_mutable_access_field_placement() {
+        let function = IFnSig {
+            name: "x".to_owned(), type_params: vec![], params: vec![],
+            ret: IType::Tuple(vec![]),
+            return_borrow: ReturnBorrowSummary::None,
+            return_region: ReturnRegionSummary::None,
+            return_cleanup: align_sema::hir::ReturnCleanupAbi::None,
+            drop_state_effects: vec![],
+            producer_certification: crate::ProducerCertification::ValidatedBody,
+            effect: Effect::Pure, parallel_transfer_params: vec![],
+            mutable_access: Some(vec![]), mutable_retention: None, mutable_view_effect: None,
+            resource_hook_body: false, body: IFnBody::Absent,
+        };
+        // Transcribed independently from the format-18 function table, including both neighbors.
+        let bytes = [
+            1, 0, 0, 0, b'x', // name
+            0, 0, 0, 0, // type parameters
+            0, 0, 0, 0, // parameters
+            1, 0, 0, 0, 0, // empty tuple result
+            0, 0, 0, // return borrow, region and cleanup
+            0, 0, 0, 0, // drop effects
+            1, 0, // validated producer, pure
+            0, 0, 0, 0, // parallel transfer
+            1, 0, 0, 0, 0, // present empty mutable access
+            0, 0, // unavailable retention and view effects
+            0, 0, // resource hook and absent body
+        ];
+        let mut writer = Writer::new();
+        write_fn(&mut writer, &function);
+        assert_eq!(writer.buf, bytes);
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(read_fn(&mut reader), Ok(function));
+        assert!(reader.finish().is_ok());
+    }
+
+    #[test]
     fn mutable_view_effect_has_independent_byte_goldens_and_rejects_malformed_records() {
         use align_sema::hir::{MutableRetentionRoot::Contained, MutableViewEffect};
         let effect = |flags: u8, rebind_roots| MutableViewEffect {
@@ -1367,6 +1474,7 @@ mod tests {
                 producer_certification: ProducerCertification::ValidatedBody,
                 effect: Effect::Impure,
                 parallel_transfer_params: Vec::new(),
+                mutable_access: None,
                 mutable_retention: Some(vec![Vec::new()]),
                 mutable_view_effect: Some(vec![Some(MutableViewEffect::default())]),
                 resource_hook_body: false,
