@@ -2358,3 +2358,13 @@ the normal place/exclusion rules; no receiver copy-back convention is needed.
 The semantic layout must match the existing LLVM `[4 x i64]` representation.
 [Plan175](impl/175-rng-record-composition.md) owns the closure and specialized
 placement exclusions.
+
+### CLI finite values and explicit occurrence counts
+
+Media's scale and adapter admission compose through the existing CLI builder.
+`flag_f64` shares JSON's number grammar and binary64 conversion; parse rejects
+nonfinite defaults and malformed/overflowing values before publishing a result.
+`occurrences` preserves the distinction between absence and explicit empty values
+without re-tokenizing argv. Last-value-wins stays uniform; callers own duplicate
+and application-range policy. [Plan181](impl/181-cli-float-occurrences.md) records
+the synchronous Copy observations and unchanged command/parsed ownership.

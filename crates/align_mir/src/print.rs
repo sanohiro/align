@@ -1187,6 +1187,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::CliParse { cmd, args, out } => format!("cli_parse({}, {}, -> _{out})", operand_str(cmd), operand_str(args)),
         Rvalue::CliGetBool { parsed, name } => format!("cli_get_bool({}, {})", operand_str(parsed), operand_str(name)),
         Rvalue::CliGetI64 { parsed, name } => format!("cli_get_i64({}, {})", operand_str(parsed), operand_str(name)),
+        Rvalue::CliGetF64 { parsed, name } => format!("cli_get_f64({}, {})", operand_str(parsed), operand_str(name)),
+        Rvalue::CliOccurrences { parsed, name } => format!("cli_occurrences({}, {})", operand_str(parsed), operand_str(name)),
         Rvalue::CliGetStr { parsed, name } => format!("cli_get_str({}, {})", operand_str(parsed), operand_str(name)),
         Rvalue::CliUsage { cmd } => format!("cli_usage({})", operand_str(cmd)),
         Rvalue::HttpRequest { method, url } => format!(

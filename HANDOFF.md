@@ -4,7 +4,11 @@
 
 The owner requests continuous planned feature and improvement work: finish each
 capability through PR and merge, then continue until asked to stop. The current
-instruction was reaffirmed on 2026-10-13. It supersedes earlier one-batch stops.
+instruction was reaffirmed on 2026-10-14. It supersedes earlier one-batch stops.
+Reconcile all three external request registers first, validate each request
+against real consumer evidence and Align's design, and reassess deferred
+requests after the current delivery. Implement coherent capabilities; retain a
+reasoned deferral when the required design conflicts with Align's invariants.
 
 Prioritize existing std/library usability, useful bounded transport/library
 composition, then measured execution/storage/startup improvements. Complex
@@ -20,6 +24,13 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan181](docs/impl/181-cli-float-occurrences.md) supplies finite `std.cli`
+  float flags and explicit occurrence counts for media AM-R04/05. All CLI
+  receivers remain live through later eager operands; scalar observations
+  release their call reservation, while `get_str` retains its owner dependency.
+  Consumer adoption remains external.
+- [Plan180](docs/impl/180-structured-task-progress.md) supplies caller-assisted
+  structured-task progress for media AM-R08; consumer adoption remains external.
 - [Plan179](docs/impl/179-form-output-prefix.md) maps admitted same-width
   prefixes in expanded form output, preserving space-to-plus conversion and the
   scalar remainder. Native byte/extent/allocation and source owners qualify the
@@ -75,17 +86,18 @@ That archive preserves the prior narrative; it is not a source of current status
 ## Deferred work and capability boundaries
 
 Full K1 and adoption of the parked
-[plan61 implementation](docs/impl/61-interprocedural-view-access-plan.md) remain
-explicitly deferred by the owner. The separately parked general aggregate-
-provenance experiment is also deferred. The narrower HIR reuse candidate lacks
+[plan61 implementation](docs/impl/61-interprocedural-view-access-plan.md) and the
+separately parked general aggregate-provenance experiment remain unselected.
+The narrower HIR reuse candidate lacks
 an established finite abstraction for recursive selected view origins;
 whole-parameter lifetime roots lose independent field authority. Known
 interprocedural write-authority and temporal-validation gaps remain.
 
-Do not resume either approach without a new explicit user request. Older
-implementation/continuation instructions do not reactivate them. Keep parked
-source and evidence archived outside the active worktree; their adoption is not
-a prerequisite for independent work.
+The owner's 2026-10-14 instruction authorizes fresh assessment of deferred
+requests after the current delivery. It does not select either archived
+implementation: qualify each real-use requirement and its safety strategy
+independently. Keep parked source and evidence archived outside the active
+worktree; their adoption is not a prerequisite for independent work.
 
 - Request126's borrowed-session loop refusal and Request28's indexed/view builder
   readers require their own provenance closure. Request146's repeated mutable

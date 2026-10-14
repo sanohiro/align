@@ -23,10 +23,13 @@ c := cli.command(name: str)                    // builder; returns a cli command
 c.flag_bool(name: str)                          // register a bool flag (default false)
 c.flag_str(name: str, default: str)             // str flag with a default
 c.flag_i64(name: str, default: i64)             // i64 flag with a default
+c.flag_f64(name: str, default: f64)             // register an f64 flag with a default
 c.parse(args: array<str>) -> Result<parsed, Error>
 p.get_bool(name: str) -> bool                   // total after a successful parse
 p.get_str(name: str) -> str
 p.get_i64(name: str) -> i64
+p.get_f64(name: str) -> f64
+p.occurrences(name: str) -> i64                 // explicit uses; zero for an omitted flag
 c.usage() -> string
 ```
 
@@ -41,7 +44,7 @@ The load-bearing decision:
   `read_dir`'s `array<string>` (#339): each owned `string` inside is freed. (Terminology: `str` is
   a borrowed read-only view; `string` is the heap-owned Move type — the values these tables own are
   `string`s.)
-- **`parse` borrows `c`, it does NOT consume it.** `c.parse(args)` takes `c` by mutable borrow (it
+- **`parse` borrows `c`, it does NOT consume it.** `c.parse(args)` takes `c` by shared borrow (it
   reads the flag table; it does not move the command). So `c.usage()` stays callable *after* parse
   — including on the `Err` path, which is exactly when you want to print help. (If parse consumed
   `c`, a parse failure would leave you unable to render usage — the reason this is called out.)
@@ -50,7 +53,7 @@ The load-bearing decision:
   `Result<parsed, Error>`, so `parsed` DOES appear as a Result Ok payload — allow `parsed` in the
   Ok position exactly like reader/writer were allowed in Option/Result payload positions;
   buffer's `Scalar::Buffer` precedent from #346 is the template.)
-- `p.get_*` return values: `bool`/`i64` are Copy; `get_str` returns a `str` **view into the
+- `p.get_*` return values: `bool`/`i64`/`f64` and occurrence counts are Copy; `get_str` returns a `str` **view into the
   parsed structure** — region-bound to `p` (the parsed value), like `json.decode` field views are
   bound to the decoded arena/value. So `region_of(CliGetStr) = region_of(p)`; escaping the str
   past `p`'s drop is rejected; `.clone()` copies out. (Do NOT return Static — that is the #297
@@ -64,19 +67,45 @@ for correctness of effect inference.
 
 ## Error policy
 
-- `c.parse(args)` input errors — unknown flag, missing value for a str/i64 flag, malformed i64
+- `c.parse(args)` input errors — unknown flag, missing value for a str/i64/f64 flag, malformed i64/f64
   literal, wrong kind — return `Error.Invalid` (the fixed mapping, no errno syscall path; build
   the Error directly like encoding's decode).
-- `p.get_bool/get_str/get_i64` for a name that was never registered, or against the wrong flag
+- `p.get_bool/get_str/get_i64/get_f64` for a name that was never registered, or against the wrong flag
   type — **runtime abort** (the settled decision from #345 review: Align has no comptime, so a
   `get_*` call cannot be statically checked against the flag set a builder registered at
   runtime; abort like OOB-index/div-by-zero, "programmer error aborts, never silently
   misbehaves"). This is NOT a compile-time error and NOT a Result.
 
+**Finite floats and occurrences.** `flag_f64` takes an exact `f64` default.
+Before reading argv or allocating parsed entries, `parse` rejects any registered
+nonfinite default with `Error.Invalid`, including a duplicate registration or an
+overridden default. Float argv values must be complete ASCII JSON numbers:
+`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`. Whitespace, leading plus/zeros,
+hex, NaN, infinity, embedded NUL and trailing bytes reject. Conversion rounds to
+binary64 with nearest/ties-to-even independently of host rounding mode; overflow
+rejects, while subnormals, underflow to signed zero and negative zero are valid.
+Application-specific ranges remain explicit caller checks.
+
+`occurrences` accepts every registered flag kind. It counts explicit options,
+including repeated bools and empty string values, across both value spellings;
+defaults count zero. Separate value tokens are consumed verbatim, even if they
+look like flags. Values still use the last occurrence; repeated registrations
+still select the first registered kind/default for that name. Each parse starts
+new counts. Checked count overflow returns `Error.Invalid`. Unknown names abort
+like an unknown getter; `get_f64` also aborts on the wrong kind. Both operations
+borrow their bound parsed local and name only during the call, allocate nothing,
+and return independent Copy scalars. They do not extend string-view lifetimes.
+Parsing still owns its copied strings, releases partial entries on failure and
+keeps the command reusable. Usage adds registration-order f64 defaults, including
+nonfinite defaults before parse rejects them, using existing display rendering.
+
+The exact compiler/runtime closure and tests are in
+[plan181](../181-cli-float-occurrences.md).
+
 ## New machinery required
 
 Two new Move `Ty` (CliCommand, CliParsed) + their runtime structs + Drop; the builder methods
-(flag_bool/str/i64), parse, and the three total getters + usage as sema builtins behind
+(flag_bool/str/i64/f64), parse, and the four total getters and occurrence observation + usage as sema builtins behind
 `import std.cli` with the `name_in_scope` shadowing guard (the #340 helper); a new `region_of`
 arm for `CliGetStr` (view into parsed). No new effect, no new syscall.
 
@@ -86,10 +115,10 @@ Single slice, but ordered:
 
 1. The two Move types + runtime structs + Drop (deep-free owned strings) + Gate-1 sweep across
    all passes (the reader/writer + `read_dir` `array<string>` template).
-2. Builder: `command` + `flag_bool`/`str`/`i64` (store name, kind, default into the command's
+2. Builder: `command` + `flag_bool`/`str`/`i64`/`f64` (store name, kind, default into the command's
    table).
 3. `parse`: tokenize argv (`--name`, `--name=value`, `--name value`, `-` conventions per draft —
-   keep v1 minimal: `--name` for bool, `--name value` and `--name=value` for str/i64), validate
+   keep v1 minimal: `--name` for bool, `--name value` and `--name=value` for str/i64/f64), validate
    against the table → `Error.Invalid` on any input error, else build parsed.
 4. Getters (total, abort on unregistered/wrong-type) + `usage` (render from the table).
 
@@ -118,11 +147,11 @@ Single slice, but ordered:
 ## Test checklist
 
 - bool present/absent (default false)
-- str/i64 with default and overridden
+- str/i64/f64 with default and overridden
 - `--name=value` and `--name value` forms
 - unknown flag → `Error.Invalid`
 - missing value → `Error.Invalid`
-- malformed i64 → `Error.Invalid`
+- malformed i64/f64 or nonfinite float → `Error.Invalid`
 - `get_*` unregistered name → abort
 - `get_*` wrong type → abort
 - `get_str` view escaping `p` → compile error

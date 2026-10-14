@@ -750,7 +750,7 @@ pub enum Ty {
     CliCommand,
     /// A `cli parsed` (`std.cli`) — the outcome of `c.parse(args)`, the `Ok` payload of its
     /// `Result<parsed, Error>`. An owned **Move** handle owning the resolved name→value map (with
-    /// owned `string` values), `Drop`-freed. `p.get_bool/i64/str(name)` read a flag total-ly (abort
+    /// owned `string` values), `Drop`-freed. `p.get_bool/i64/f64/str(name)` and occurrence counts read a flag total-ly (abort
     /// on unregistered / wrong-kind); `get_str` returns a `str` **view** into this handle's storage
     /// (region-bound to `p`). Opaque pointer.
     CliParsed,
@@ -17419,7 +17419,7 @@ impl EffectScan<'_> {
                 walk!(cmd);
                 walk!(args);
             }
-            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetF64 { parsed, name } | ExprKind::CliOccurrences { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
                 walk!(parsed);
                 walk!(name);
             }
@@ -25608,6 +25608,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CliParse { .. }
             | ExprKind::CliGetBool { .. }
             | ExprKind::CliGetI64 { .. }
+            | ExprKind::CliGetF64 { .. }
+            | ExprKind::CliOccurrences { .. }
             | ExprKind::CliUsage { .. }
             | ExprKind::HttpRequest { .. }
             | ExprKind::HttpHeader { .. }
@@ -26091,6 +26093,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CliParse { .. }
             | ExprKind::CliGetBool { .. }
             | ExprKind::CliGetI64 { .. }
+            | ExprKind::CliGetF64 { .. }
+            | ExprKind::CliOccurrences { .. }
             | ExprKind::CliGetStr { .. }
             | ExprKind::CliUsage { .. }
             | ExprKind::HttpRequest { .. }
@@ -29656,7 +29660,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(cmd, depth);
                 self.walk(args, depth);
             }
-            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetF64 { parsed, name } | ExprKind::CliOccurrences { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
                 self.walk(parsed, depth);
                 self.walk(name, depth);
             }
@@ -32442,6 +32446,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CliParse { .. }
         | ExprKind::CliGetBool { .. }
         | ExprKind::CliGetI64 { .. }
+        | ExprKind::CliGetF64 { .. }
+        | ExprKind::CliOccurrences { .. }
         | ExprKind::CliGetStr { .. }
         | ExprKind::CliUsage { .. }
         | ExprKind::HttpRequest { .. }
@@ -35161,7 +35167,8 @@ impl<'a> MoveCheck<'a> {
                 arguments.insert(Self::expr_key(receiver));
                 places.insert(Self::expr_key(receiver));
             }
-            if let Some(receiver) = Self::http_timeout_action_receiver(&expression.kind) {
+            if let Some(receiver) = Self::http_timeout_action_receiver(&expression.kind)
+                .or_else(|| Self::cli_action_receiver(&expression.kind)) {
                 arguments.insert(Self::expr_key(receiver));
                 places.insert(Self::expr_key(receiver));
             }
@@ -40054,6 +40061,18 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    /// CLI handles are loaded before eager names/defaults/argv. Keep that exact owner live
+    /// through the action; scalar observations release the reservation at completion.
+    fn cli_action_receiver(kind: &ExprKind) -> Option<&Expr> {
+        match kind {
+            ExprKind::CliFlag { cmd, .. } | ExprKind::CliParse { cmd, .. } => Some(cmd),
+            ExprKind::CliGetBool { parsed, .. } | ExprKind::CliGetI64 { parsed, .. }
+            | ExprKind::CliGetF64 { parsed, .. } | ExprKind::CliGetStr { parsed, .. }
+            | ExprKind::CliOccurrences { parsed, .. } => Some(parsed),
+            _ => None,
+        }
+    }
+
     fn reader_action_receiver(expression: &Expr) -> Option<&Expr> {
         match &expression.kind {
             ExprKind::XmlNext { reader } | ExprKind::XmlName { reader }
@@ -40095,6 +40114,7 @@ impl<'a> MoveCheck<'a> {
             _ => Self::array_builder_action_receiver(&expression.kind)
                 .or_else(|| Self::buffer_growth_receiver(&expression.kind))
                 .or_else(|| Self::http_timeout_action_receiver(&expression.kind))
+                .or_else(|| Self::cli_action_receiver(&expression.kind))
                 .or_else(|| Self::reader_action_receiver(expression)),
         };
         if let Some(reader) = receiver {
@@ -41926,7 +41946,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
             | ExprKind::RandNext { .. } | ExprKind::RandRange { .. } | ExprKind::RandShuffle { .. }
             | ExprKind::CliCommand { .. } | ExprKind::CliFlag { .. } | ExprKind::CliParse { .. }
-            | ExprKind::CliGetBool { .. } | ExprKind::CliGetI64 { .. } | ExprKind::CliUsage { .. }
+            | ExprKind::CliGetBool { .. } | ExprKind::CliGetI64 { .. } | ExprKind::CliGetF64 { .. } | ExprKind::CliOccurrences { .. } | ExprKind::CliUsage { .. }
             | ExprKind::HttpRequest { .. } | ExprKind::HttpHeader { .. } | ExprKind::HttpBody { .. }
             | ExprKind::HttpRequestTimeout { .. } | ExprKind::HttpClientTimeout { .. }
             | ExprKind::HttpRequestMaxResponseBodyBytes { .. }
@@ -49136,7 +49156,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, cmd, moved, false, false);
                 move_expr!(self, args, moved, false, false);
             }
-            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetF64 { parsed, name } | ExprKind::CliOccurrences { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
                 move_expr!(self, parsed, moved, false, false);
                 move_expr!(self, name, moved, false, false);
             }
@@ -56586,12 +56606,12 @@ impl<'a, 't> Checker<'a, 't> {
             // flag, `c.parse(args)` yields `Result<parsed, Error>`, `c.usage()` renders help.
             // Type-guarded (like `trim`/`contains`/`map_err`): a same-named method on any other type
             // falls through to the `_` arm's normal "unknown method" resolution, never intercepted.
-            "flag_bool" | "flag_str" | "flag_i64" | "parse" | "usage" if recv_ty == Ty::CliCommand => {
+            "flag_bool" | "flag_str" | "flag_i64" | "flag_f64" | "parse" | "usage" if recv_ty == Ty::CliCommand => {
                 self.check_cli_command_method(recv_expr, method, args, span)
             }
-            // `std.cli` parsed getters on a `cli parsed`: `p.get_bool/i64/str(name)`. Total after a
+            // `std.cli` parsed getters on a `cli parsed`: `p.get_bool/i64/f64/str(name)` and occurrence counts. Total after a
             // successful parse; unregistered / wrong-kind aborts at runtime. Type-guarded, same as above.
-            "get_bool" | "get_i64" | "get_str" if recv_ty == Ty::CliParsed => {
+            "get_bool" | "get_i64" | "get_str" | "get_f64" | "occurrences" if recv_ty == Ty::CliParsed => {
                 self.check_cli_parsed_method(recv_expr, method, args, span)
             }
             // `std.regex` searches borrow a bound compiled handle. `find_at`'s start is a UTF-8
@@ -66670,13 +66690,14 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         match method {
-            "flag_bool" | "flag_str" | "flag_i64" => {
+            "flag_bool" | "flag_str" | "flag_i64" | "flag_f64" => {
                 let kind = match method {
                     "flag_bool" => hir::CliFlagKind::Bool,
                     "flag_str" => hir::CliFlagKind::Str,
+                    "flag_f64" => hir::CliFlagKind::F64,
                     _ => hir::CliFlagKind::I64,
                 };
-                // `flag_bool(name)` takes one arg; `flag_str`/`flag_i64` take `(name, default)`.
+                // `flag_bool(name)` takes one arg; `flag_str`/`flag_i64`/`flag_f64` take `(name, default)`.
                 let want = if matches!(kind, hir::CliFlagKind::Bool) { 1 } else { 2 };
                 if args.len() != want {
                     self.diags.error(
@@ -66696,6 +66717,14 @@ impl<'a, 't> Checker<'a, 't> {
                         if d.ty == Ty::Error {
                             return err;
                         }
+                        Some(Box::new(d))
+                    }
+                    hir::CliFlagKind::F64 => {
+                        let d = self.check_expr(&args[1], None);
+                        if d.ty == Ty::Error { return err; }
+                        let expected = Ty::Float(FloatTy { bits: 64 });
+                        self.unify(d.ty, expected, args[1].span);
+                        if self.resolve(d.ty) != expected { return err; }
                         Some(Box::new(d))
                     }
                     hir::CliFlagKind::I64 => {
@@ -66744,7 +66773,7 @@ impl<'a, 't> Checker<'a, 't> {
                 Expr { kind: ExprKind::CliUsage { cmd: Box::new(recv_expr) }, ty: Ty::String, span }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on a cli command (try flag_bool / flag_str / flag_i64 / parse / usage)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on a cli command (try flag_bool / flag_str / flag_i64 / flag_f64 / parse / usage)"), span);
                 err
             }
         }
@@ -66778,9 +66807,11 @@ impl<'a, 't> Checker<'a, 't> {
         match method {
             "get_bool" => Expr { kind: ExprKind::CliGetBool { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: Ty::Bool, span },
             "get_i64" => Expr { kind: ExprKind::CliGetI64 { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: i64_ty, span },
+            "get_f64" => Expr { kind: ExprKind::CliGetF64 { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: Ty::Float(FloatTy { bits: 64 }), span },
+            "occurrences" => Expr { kind: ExprKind::CliOccurrences { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: i64_ty, span },
             "get_str" => Expr { kind: ExprKind::CliGetStr { parsed: Box::new(recv_expr), name: Box::new(name) }, ty: Ty::Str, span },
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on a cli parsed (try get_bool / get_i64 / get_str)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on a cli parsed (try get_bool / get_i64 / get_f64 / get_str / occurrences)"), span);
                 err
             }
         }
@@ -71734,7 +71765,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(cmd);
                 self.finalize_expr(args);
             }
-            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
+            ExprKind::CliGetBool { parsed, name } | ExprKind::CliGetI64 { parsed, name } | ExprKind::CliGetF64 { parsed, name } | ExprKind::CliOccurrences { parsed, name } | ExprKind::CliGetStr { parsed, name } => {
                 self.finalize_expr(parsed);
                 self.finalize_expr(name);
             }
@@ -79445,7 +79476,7 @@ mod tests {
         // OsMemory observes only Copy counts and retains no storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 355,
+            variants, 357,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

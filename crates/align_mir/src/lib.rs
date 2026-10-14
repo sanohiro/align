@@ -2639,6 +2639,16 @@ pub enum Rvalue {
         parsed: Operand,
         name: Operand,
     },
+    /// Independent binary64 value from a parsed CLI owner.
+    CliGetF64 {
+        parsed: Operand,
+        name: Operand,
+    },
+    /// Explicit occurrences of a registered flag, returned as i64.
+    CliOccurrences {
+        parsed: Operand,
+        name: Operand,
+    },
     /// `p.get_str(name)` — the parsed `str` **view** (`{ptr,len}`) for flag `name`, borrowing the
     /// parsed handle's storage (region-bound to `parsed`). Aborts on unregistered / wrong-kind. Pure.
     CliGetStr {
@@ -9899,6 +9909,40 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(
                     v,
                     Rvalue::CliGetI64 {
+                        parsed: pop,
+                        name: nm,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::CliGetF64 { parsed, name } => {
+                lower_required_binding!(
+                    b,
+                    pop = lower_expr(b, parsed),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, nm = lower_expr(b, name), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::CliGetF64 {
+                        parsed: pop,
+                        name: nm,
+                    },
+                ));
+                Operand::Value(v)
+            }
+            hir::ExprKind::CliOccurrences { parsed, name } => {
+                lower_required_binding!(
+                    b,
+                    pop = lower_expr(b, parsed),
+                    Operand::Const(Const::Unit)
+                );
+                lower_required_binding!(b, nm = lower_expr(b, name), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                b.push(Stmt::Let(
+                    v,
+                    Rvalue::CliOccurrences {
                         parsed: pop,
                         name: nm,
                     },
