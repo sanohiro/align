@@ -84,12 +84,12 @@ count is a public performance promise; no benchmark is required.
 | Axis | Implementation authority | Exact discriminating owner |
 | --- | --- | --- |
 | Type formation / malformed source | Canonical package AST and private descriptor checker; `str` input, builtin `Result<string, Error>` output. No new type variant. | `align_driver --test pkg_unicode`: `unicode_package_admission` parameterizes bad arity/type, forged package/helper/import/extern and altered signature/body. |
-| HIR formation / all pass consumers | Dedicated `UnicodeNfc { input }`, exact Str child and Result type; borrowed child visit; fresh owned result, no retained input; Pure with explicit fresh heap ownership; ordinary heap allocation remains allowed in Pure closures. Existing new-variant tripwires require complete pass coverage. | `align_mir --lib unicode_nfc`: `unicode_nfc_checked_hir` mutates child/result/checked facts; existing variant-sweep owners, Pure heap-transform closure positive and existing non-Send region-capability negative source. |
-| MIR / ABI / malformed private records | Dedicated status-producing `UnicodeNfc { input, out }`; exact Str operand, String out slot and i32 result even when unused or in partition peer; call only after input completion. Typed runtime key, effects and private symbol registry. | `align_codegen_llvm --lib unicode_nfc`: `unicode_nfc_mir_validation` mutates input/out/result/slot and unused/peer placement. Runtime declaration golden, native export/signature audit. |
+| HIR formation / all pass consumers | Dedicated `UnicodeNfc { input }`, exact Str child and Result type; borrowed child visit; fresh owned result, no retained input; Pure with explicit fresh heap ownership; ordinary heap allocation remains allowed in Pure closures. Existing new-variant tripwires require complete pass coverage. | `align_mir --lib unicode_nfc`: `unicode_nfc_checked_hir` mutates child/result/checked facts; `unicode_values_and_transport` Pure heap-transform closure positive and `unicode_package_admission` non-Send region-capability negative, plus existing variant-sweep owners. |
+| MIR / ABI / malformed private records | Dedicated status-producing `UnicodeNfc { input, out }`; exact Str operand, String out slot and i32 result even when unused or in partition peer; call only after input completion. Typed runtime key, effects and private symbol registry. | `align_codegen_llvm --lib unicode_nfc`: `unicode_nfc_mir_validation` mutates input/out/result/slot and unused/peer placement. `align_codegen_llvm --lib runtime_abi` declaration/type/effect owners and `bash scripts/test-runtime-abi-exports.sh` native export/signature audit. |
 | Construction / moves / Drop / replacement | Existing Result/string transfer and source nulling, unique scratch/output RAII, no input mutation for admitted disjoint spans. Ordinary allocator provenance and arena independence. | `align_runtime --lib unicode_nfc` with `alloc-count`: `unicode_nfc_allocation_lifecycle` exact acquisition/free/failpoint counts and source input sentinels; `pkg_unicode::unicode_values_and_transport` and `unicode_lifecycle` source witnesses. |
 | Native metadata / errors / bounds | Ordered phases above, no forged references before admission; checked scalar/layout/byte counts. | `unicode_nfc_native_admission` parameterizes null, negative, overflow, alignment, overlap, malformed UTF-8 and multi-invalid/failpoint precedence. Direct pure extent-helper limits test representability without huge allocation. |
 | Unicode semantics / data | Offline generator from official UnicodeData and full exclusions in DerivedNormalizationProps; flattened canonical decomposition, CCC and composition pair tables. | `unicode_nfc_conformance`: all 19,965 official NormalizationTest rows, all five NFC columns (99,825 comparisons); all Unicode scalars absent from Part1 normalize identically, satisfying header clause 2. Expected data comes from the independent official NormalizationTest, not implementation tables. `unicode_nfc_data_identity` pins table structure; `scripts/generate-unicode.py --check` pins source hashes and exact generation. |
-| Control / authority | if/match/else/?/map_err, loop joins, early/implicit return, eager child divergence use existing Result cleanup; string views retain their actual output owner. | `pkg_unicode::unicode_values_and_transport` and `unicode_lifecycle` cover success/error cleanup, result replacement, bound/temporary/arena source and returned independent string; `unicode_package_admission` rejects escaped result view and consumed owner reuse. Existing Result control owners are reused. |
+| Control / authority | if/match/else/?/map_err, loop joins, early/implicit return, eager child divergence use existing Result cleanup; string views retain their actual output owner. | `pkg_unicode::unicode_values_and_transport` and `unicode_lifecycle` cover success/error cleanup, result replacement, bound/temporary/arena source and returned independent string; `unicode_package_admission` rejects escaped result view and consumed owner reuse. The existing driver `else_result` target is reused for unchanged Result control. |
 | Generics / interfaces / calls / caches | Canonical ordinary wrappers retain standard signatures through direct/imported/generic/indirect calls, whole-program/per-unit and warm/cold caches. No raw table id persists. | `unicode_values_and_transport` runs both modes with imported generic/helper and function values, and cold/hit builds. One runtime-LTO executable uses the same native symbol/table ownership. |
 | Resource bounds / concurrency | No retained/global native state or locale; per-call scratch/output owners. Conformance can invoke internal helper without leaking processglobal failpoints; allocation probes use existing isolated child harness. | Native owner input >8192 and long nonstarter/equal-CCC/Hangul/NUL/unassigned cases; isolated allocation owner and bounded driver harness. |
 
@@ -103,3 +103,22 @@ inputs. Deliver one useful capability PR; consumer adoption remains pending.
 Independent preimplementation strategy review completed with no findings. The
 author corrected the parallel owner to preserve ordinary Pure heap allocation
 before review completion. No production implementation preceded this review.
+
+## Implementation closure
+
+The native owner passes every official NFC column and the full scalar complement,
+including long nonstarter runs, canonical blocking, exclusions, Hangul and NUL.
+Both allocation phases use the shared fallible owned allocator, exact acquired/free
+counts and zero requested live bytes. Source owners cover direct/indirect/generic,
+whole/per-unit, cold/hit and runtime-LTO execution, arena-independent output,
+replacement, early error/return, Pure heap closures and retained region rejection.
+The documentation example owner checks both language mirrors.
+
+Malformed HIR authenticates canonical origin, signature, exact parameter body,
+result and cleanup facts. MIR authenticates borrowed Str input, owned String output
+and i32 status even when the result is unused or no function is selected for a
+partition. The runtime-key extern matcher rejects even the exact source prototype
+at native ABI admission; source parsing/type checking alone is not that gate.
+The registry retains its existing curated read-parameter policy: only input gains
+readonly, both pointers are noncapturing and overall memory effects stay unstated.
+No new mutable-parameter attribute rule or native effect class is introduced.

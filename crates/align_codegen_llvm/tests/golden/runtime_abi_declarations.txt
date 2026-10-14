@@ -455,6 +455,7 @@ key|UdpBind|udp_bind|HostState|declare i32 @align_rt_udp_bind(ptr, i64, i64, ptr
 key|UdpRecvFrom|udp_recv_from|HostState|declare i64 @align_rt_udp_recv_from(ptr, ptr) #2
 key|UdpSendTo|udp_send_to|HostState|declare i64 @align_rt_udp_send_to(ptr, ptr, i64, ptr, i64, i64) #2
 key|UdpSocketFree|udp_socket_free|HostState|declare void @align_rt_udp_socket_free(ptr) #2
+key|UnicodeNfc|unicode_nfc|IndirectStorage|declare i32 @align_rt_unicode_nfc(ptr captures(none), ptr readonly captures(none), i64) #2
 key|Utf8BoundaryFail|utf8_boundary_fail|FailNoReturn|declare void @align_rt_utf8_boundary_fail(i64, i64) #1
 key|Utf8DecodeLossy|utf8_decode_lossy|ArgRead|declare { ptr, i64 } @align_rt_utf8_decode_lossy(ptr readonly captures(none), i64) #3
 key|Utf8Valid|utf8_valid|DispatchCache|declare i32 @align_rt_utf8_valid(ptr readonly captures(none), i64) #8

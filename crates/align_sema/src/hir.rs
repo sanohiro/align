@@ -2001,9 +2001,10 @@ pub enum ExprKind {
     /// I/O); `data` is borrowed, never consumed (like `hash64` / `print`). Html requires `Str`;
     /// owned source strings are normalized through `StrBorrow` before this node.
     EncodingEncode { kind: EncodingKind, data: Box<Expr> },
-    /// `encoding.base64_decode`/`base64url_decode`/`hex_decode(s)` — decode a `str` into an owned
-    /// `buffer` (`bytes` carries no UTF-8 invariant, so a decoded blob is not a `str`); invalid
-    /// input yields `Error.Invalid`. The `ty` is `Result<buffer, Error>`. Pure; `input` is borrowed.
+    /// Explicit Unicode NFC: borrowed Str to fresh Result<string, Error>, Pure and fallible.
+    UnicodeNfc { input: Box<Expr> },
+    /// `encoding.base64_decode`/`base64url_decode`/`hex_decode(s)` — borrowed text to owned buffer.
+    /// Invalid input yields Error.Invalid. Pure; the result is Result<buffer, Error>.
     EncodingDecode { kind: EncodingKind, input: Box<Expr> },
     /// `encoding.utf8_valid(b)` — whether the bytes `b` (`slice<u8>`) are valid UTF-8 (the `ty` is
     /// [`crate::Ty::Bool`]). A thin wrapper over the shared UTF-8 validator, for checking `bytes`

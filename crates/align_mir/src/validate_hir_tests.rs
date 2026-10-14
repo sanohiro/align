@@ -20452,3 +20452,49 @@ fn tuple_carrier_checked_hir_validation() -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+#[test]
+fn unicode_nfc_checked_hir() -> Result<(), Box<dyn std::error::Error>> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/unicode/pkg");
+    let package = std::fs::read_to_string(root.join("unicode.align"))?;
+    let descriptor = std::fs::read_to_string(root.join("unicode/internal/descriptor.align"))?;
+    let mut diagnostics = Diagnostics::new();
+    let files: Vec<_> = [&package, &descriptor, "module main\nimport pkg.unicode\nfn main(){value:=pkg.unicode.nfc(\"é\")}\n"]
+        .iter().zip(0u32..).map(|(source, id)| {
+            let tokens = tokenize(id, source, &mut diagnostics);
+            parse_file(tokens, &mut diagnostics)
+        }).collect();
+    assert!(!diagnostics.has_errors(), "parse canonical Unicode modules");
+    let modules: Vec<_> = ["pkg.unicode", "pkg.unicode.internal.descriptor", "main"].iter()
+        .zip(&files).map(|(name, file)| align_sema::Module {
+            path: (*name).to_owned(), file, is_entry: *name == "main", interface_only: false,
+        }).collect();
+    let base = align_sema::check_program(&modules, &mut diagnostics);
+    assert!(!diagnostics.has_errors(), "check canonical Unicode modules");
+    for per_unit in [false, true] { assert!(lower_program_checked(&base, per_unit, None).is_ok()); }
+    for axis in ["input", "result", "origin", "parameter", "body", "cleanup", "identity", "duplicate"] {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "pkg.unicode$nfc").ok_or("NFC function")?;
+        match axis {
+            "origin" => function.origin = hir::FnOrigin::Lifted { capture_count: 0 },
+            "identity" => function.name = "forged".to_owned(),
+            "parameter" => function.param_modes[0] = align_ast::ParamMode::BorrowMut,
+            "cleanup" => function.return_cleanup = hir::ReturnCleanupAbi::None,
+            "duplicate" => function.body.stmts.push(hir::Stmt::Expr((**function.body.value.as_ref().ok_or("body")?).clone())),
+            _ => {
+                let expression = function.body.value.as_mut().ok_or("NFC body")?;
+                let hir::ExprKind::UnicodeNfc { input } = &mut expression.kind else { return Err("NFC operation".into()); };
+                match axis {
+                    "input" => input.ty = Ty::Bool,
+                    "result" => expression.ty = Ty::String,
+                    "body" => input.kind = hir::ExprKind::Str("forged".to_owned()),
+                    _ => return Err("mutation axis".into()),
+                }
+            }
+        }
+        for per_unit in [false, true] {
+            assert!(lower_program_checked(&bad, per_unit, None).is_err(), "{axis}/{per_unit}");
+        }
+    }
+    Ok(())
+}

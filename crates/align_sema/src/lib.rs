@@ -18,6 +18,7 @@ pub mod fs_tree;
 pub mod process_live;
 pub use hir::*;
 mod hir_depth;
+mod unicode_package;
 mod replay_clone;
 mod task_wait;
 mod known_bits;
@@ -9042,6 +9043,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
 ) -> CheckedProgram {
     validate_pkg_frame_modules(modules, diags);
     validate_pkg_csv_modules(modules, diags);
+    unicode_package::validate(modules, diags);
     validate_pkg_template_modules(modules, diags);
     // Pass 0a: assign a canonical id to every type (so field/sig types can refer to them regardless
     // of order). Types are **per-module namespaced** like functions: a non-entry module's type `T`
@@ -17414,6 +17416,7 @@ impl EffectScan<'_> {
             // Encoding and named time transforms are pure computations; recurse into the input.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => walk!(data),
             ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => walk!(input),
             // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
             // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
@@ -25666,7 +25669,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EncodingEncode { .. }
             | ExprKind::TimeFormat { .. }
             | ExprKind::TimeParse { .. }
-            | ExprKind::EncodingDecode { .. }
+            | ExprKind::UnicodeNfc { .. } | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
             | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. }
@@ -26151,7 +26154,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EncodingEncode { .. }
             | ExprKind::TimeFormat { .. }
             | ExprKind::TimeParse { .. }
-            | ExprKind::EncodingDecode { .. }
+            | ExprKind::UnicodeNfc { .. } | ExprKind::EncodingDecode { .. }
             | ExprKind::Utf8Valid { .. }
             | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. }
@@ -29669,6 +29672,7 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.walk(data, depth),
             ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.compress` — the owned `buffer` result borrows nothing from `data`; just recurse
             // into the operands so any escape inside them is still checked.
@@ -32503,7 +32507,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::EncodingEncode { .. }
         | ExprKind::TimeFormat { .. }
         | ExprKind::TimeParse { .. }
-        | ExprKind::EncodingDecode { .. }
+        | ExprKind::UnicodeNfc { .. } | ExprKind::EncodingDecode { .. }
         | ExprKind::Utf8Valid { .. }
         | ExprKind::Compress { .. }
         | ExprKind::Decompress { .. }
@@ -42033,7 +42037,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CommandEnv { .. } | ExprKind::CommandEnvClear { .. } | ExprKind::CommandRun { .. }
             | ExprKind::CommandRunBytes { .. }
             | ExprKind::EncodingEncode { .. }
-            | ExprKind::TimeFormat { .. } | ExprKind::TimeParse { .. } | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
+            | ExprKind::TimeFormat { .. } | ExprKind::TimeParse { .. } | ExprKind::UnicodeNfc { .. } | ExprKind::EncodingDecode { .. } | ExprKind::Utf8Valid { .. } | ExprKind::Compress { .. }
             | ExprKind::Decompress { .. } | ExprKind::RandSeed | ExprKind::RandSeedWith { .. }
             | ExprKind::RandNext { .. } | ExprKind::RandRange { .. } | ExprKind::RandShuffle { .. }
             | ExprKind::CliCommand { .. } | ExprKind::CliFlag { .. } | ExprKind::CliParse { .. }
@@ -49192,6 +49196,7 @@ impl<'a> MoveCheck<'a> {
             // `std.encoding` borrows its byte-view / `str` arg (never consumed) — like `hash64`.
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => move_expr!(self, data, moved, false, false),
             ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => move_expr!(self, input, moved, false, false),
             // `std.compress` borrows its byte-view `data` (never consumed) — like `encoding.*`.
             ExprKind::Compress { data, level, .. } => {
@@ -55949,6 +55954,9 @@ impl<'a, 't> Checker<'a, 't> {
         if !leftmost_is_local && let Some(modpath) = flatten_module_path(recv) {
             if modpath == "pkg.db.internal.descriptor" {
                 return self.check_static_descriptor_op(method, args, expected, span);
+            }
+            if modpath == "pkg.unicode.internal.descriptor" && method == "nfc" {
+                return self.check_unicode_nfc(args, span);
             }
             if modpath == "pkg.csv.internal.descriptor" && method == "decode" {
                 return self.check_csv_decode_op(args, expected, span);
@@ -71842,6 +71850,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::EncodingEncode { data, .. } | ExprKind::Utf8Valid { data } => self.finalize_expr(data),
             ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
+            | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
             ExprKind::Compress { data, level, .. } => {
                 self.finalize_expr(data);

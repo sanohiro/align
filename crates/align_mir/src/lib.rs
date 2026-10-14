@@ -2377,6 +2377,8 @@ pub enum Rvalue {
     },
     /// Pure named formatting into an owned String slot; i32 errno status.
     TimeFormat { kind: hir::TimeFormatKind, ns: Operand, out: Slot },
+    /// Private NFC status producer; out receives an independent owned String.
+    UnicodeNfc { input: Operand, out: Slot },
     /// Pure call-borrowed parsing into an i64 slot; i32 errno status.
     TimeParse { kind: hir::TimeFormatKind, input: Operand, out: Slot },
     /// `encoding.base64_encode`/`base64url_encode`/`hex_encode(data)` — encode the byte view `data`
@@ -9523,6 +9525,15 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 let out = b.new_slot(Ty::String);
                 let code = b.fresh_value(status_ty());
                 b.push(Stmt::Let(code, Rvalue::TimeFormat { kind: *kind, ns: input, out }));
+                let value = b.fresh_value(Ty::String);
+                b.push(Stmt::Let(value, Rvalue::Load(out)));
+                lower_status_value_result(b, code, Operand::Value(value), e.ty)
+            }
+            hir::ExprKind::UnicodeNfc { input } => {
+                lower_required_binding!(b, text = lower_expr(b, input), Operand::Const(Const::Unit));
+                let out = b.new_slot(Ty::String);
+                let code = b.fresh_value(status_ty());
+                b.push(Stmt::Let(code, Rvalue::UnicodeNfc { input: text, out }));
                 let value = b.fresh_value(Ty::String);
                 b.push(Stmt::Let(value, Rvalue::Load(out)));
                 lower_status_value_result(b, code, Operand::Value(value), e.ty)

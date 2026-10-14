@@ -2408,3 +2408,15 @@ Explicit arena storage keeps allocation and lifetime visible; clean keys borrow
 input, while escaped bytes use the call's arena. A tape sibling walk skips each
 nested value once. No iterator protocol, map type or owned value tree is needed.
 [Plan186](impl/186-json-doc-keys.md) owns the native and compiler closure.
+
+### Explicit normalization for tokenizers
+
+Voice V004 provides a concrete normalization consumer: decomposed Japanese, Latin
+and Hangul inputs change token IDs without NFC. `pkg.unicode` isolates Unicode
+16.0.0 canonical normalization behind `nfc(str) -> Result<string, Error>` and a
+static `version()` query. Fresh owned output and fallible scratch/output storage
+preserve visible allocation and the one error model. Byte equality/order and
+locale behavior are unchanged. Official complete NFC conformance, pinned data
+and the existing sealed package/native bridge qualify this library capability;
+no new language extension or ambient Unicode dependency is needed.
+[Plan191](impl/191-unicode-nfc.md) owns its safety and compiler closure.

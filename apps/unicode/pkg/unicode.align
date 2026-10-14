@@ -1,0 +1,7 @@
+module pkg.unicode
+
+import pkg.unicode.internal.descriptor
+
+pub fn version() -> str = "16.0.0"
+
+pub fn nfc(input: str) -> Result<string, Error> = pkg.unicode.internal.descriptor.nfc(input)
