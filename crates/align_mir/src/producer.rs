@@ -10363,7 +10363,16 @@ fn validate_tagged_program_inner(
                 )));
             }
             work.push(TypeGraphWork::ExitTuple(id));
-            for &element in self.program.tuples[id as usize].elems.iter().rev() {
+            let tuple = self.program.tuples.get(id as usize).ok_or_else(||
+                Self::invalid(format!("tuple type id {id} is missing")))?;
+            // Checked HIR owns the narrower source element grammar. Private MIR also
+            // uses flat handle leaves to exercise storage/nulling independently. Inline
+            // aggregates cannot be completed before the tuple layout and stay forbidden.
+            if tuple.elems.len() < 2 || tuple.elems.iter().any(|element| matches!(element,
+                Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Tagged(_))) {
+                return Err(Self::invalid(format!("tuple type id {id} has unsupported elements or arity")));
+            }
+            for &element in tuple.elems.iter().rev() {
                 work.push(TypeGraphWork::InlineScalar(element));
             }
             Ok(())
@@ -10402,6 +10411,7 @@ fn validate_tagged_program_inner(
                     self.require_struct(id)
                 }
                 Scalar::Enum(id) => self.require_enum(id),
+                Scalar::Tuple(id) => self.require_tuple(id),
                 Scalar::Tagged(id) => self.require_tagged(id),
                 Scalar::Resource(id) | Scalar::ResourceRef(id) => self.require_resource(id),
                 Scalar::Param(id) => Err(Self::invalid(format!(
@@ -10499,6 +10509,12 @@ fn validate_tagged_program_inner(
                         Ty::Tuple(id) => self.enter_tuple(id, &mut work)?,
                         Ty::Tagged(id) => self.enter_tagged(id, &mut work)?,
                         Ty::Resource(id) | Ty::ResourceRef(id) => self.require_resource(id)?,
+                        Ty::Box(Scalar::Tuple(_)) | Ty::Slice(Scalar::Tuple(_))
+                        | Ty::DynArray(Scalar::Tuple(_)) | Ty::Array(Scalar::Tuple(_), _)
+                        | Ty::Vec(Scalar::Tuple(_), _) | Ty::Mask(Scalar::Tuple(_), _)
+                        | Ty::Task(Scalar::Tuple(_)) | Ty::ArrayBuilder(Scalar::Tuple(_)) => {
+                            return Err(Self::invalid("a tuple is not a collection, box, or task element".into()));
+                        }
                         Ty::Option(payload)
                         | Ty::Array(payload, _)
                         | Ty::Vec(payload, _)
@@ -10614,6 +10630,7 @@ fn validate_tagged_program_inner(
                         | Ty::Unit => {}
                     },
                     TypeGraphWork::InlineScalar(scalar) => match scalar {
+                        Scalar::Tuple(id) => self.enter_tuple(id, &mut work)?,
                         Scalar::Struct(id) => self.enter_struct(id, &mut work)?,
                         Scalar::Enum(id) => self.enter_enum(id, &mut work)?,
                         Scalar::Tagged(id) => self.enter_tagged(id, &mut work)?,
@@ -10973,6 +10990,12 @@ fn validate_tagged_program_inner(
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
+                if !aggregate_constructor_matches(program, f, *value, rvalue) {
+                    return Err(ProducerError::Lowering(format!(
+                        "function `{}` value {value} has mismatched aggregate constructor operands",
+                        f.name
+                    )));
+                }
                 match rvalue {
                     Rvalue::FnAddr { target, signature } => {
                         let Some((param_types, ret, modes, borrow, region, cleanup)) =
@@ -11329,6 +11352,45 @@ fn validate_tagged_program_inner(
         ));
     }
     Ok(())
+}
+
+// Type correlation is required even for an unused constructor: provenance's demand-driven
+// walk need not visit it, and union storage can hide a wrong operand type from LLVM's verifier.
+// Whole programs and partitions (including peer bodies) share this pre-emission check.
+fn aggregate_constructor_matches(
+    program: &Program,
+    function: &Function,
+    value: ValueId,
+    rvalue: &Rvalue,
+) -> bool {
+    let result = function.value_tys.get(value as usize).copied();
+    let operand_matches = |operand: &Operand, expected: Ty| {
+        preflight_operand_ty(function, operand)
+            .is_some_and(|actual| xml_value_flow_matches(program, actual, expected))
+    };
+    let payload_matches = |operands: &[Operand], expected: &[Scalar]| {
+        operands.len() == expected.len()
+            && operands.iter().zip(expected)
+                .all(|(operand, expected)| operand_matches(operand, scalar_to_ty(*expected)))
+    };
+    match rvalue {
+        Rvalue::OptionSome(operand) => result
+            .and_then(|ty| xml_option_payload(program, ty))
+            .is_some_and(|payload| operand_matches(operand, payload)),
+        Rvalue::OptionNone => result
+            .and_then(|ty| xml_option_payload(program, ty)).is_some(),
+        Rvalue::ResultOk(operand) | Rvalue::ResultErr(operand) => result
+            .and_then(|ty| xml_result_payload(program, ty, matches!(rvalue, Rvalue::ResultOk(_))))
+            .is_some_and(|payload| operand_matches(operand, payload)),
+        Rvalue::MakeTuple { tuple_id, elems } => result == Some(Ty::Tuple(*tuple_id))
+            && program.tuples.get(*tuple_id as usize)
+                .is_some_and(|tuple| payload_matches(elems, &tuple.elems)),
+        Rvalue::MakeEnum { enum_id, variant, payload } => result == Some(Ty::Enum(*enum_id))
+            && program.enums.get(*enum_id as usize)
+                .and_then(|definition| definition.variants.get(*variant as usize))
+                .is_some_and(|variant| payload_matches(payload, &variant.payload)),
+        _ => true,
+    }
 }
 
 pub fn callable_hex(name: &ProgramCall) -> String {
@@ -11722,6 +11784,7 @@ pub fn validate_fixed_element_nulling(program: &Program) -> Result<(), ProducerE
 pub(crate) fn struct_field_nulling_type_is_valid(
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
@@ -11729,7 +11792,7 @@ pub(crate) fn struct_field_nulling_type_is_valid(
         || matches!(ty, Ty::Resource(_))
         || align_sema::is_move_handle(ty)
         || (matches!(ty, Ty::Enum(_) | Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-            && align_sema::drop_plan(ty, structs, enums, tagged_types).needs_drop())
+            && align_sema::drop_plan(ty, structs, tuples, enums, tagged_types).needs_drop())
 }
 
 /// Authenticate partial source nulling before publication or LLVM construction.
@@ -11759,7 +11822,7 @@ pub fn validate_partial_field_nulling(program: &Program) -> Result<(), ProducerE
                     };
                     program.structs.get(id as usize)
                         .and_then(|record| record.fields.get(*field as usize))
-                        .is_some_and(|field| struct_field_nulling_type_is_valid(field.ty, &program.structs, &program.enums, &program.tagged_types))
+                        .is_some_and(|field| struct_field_nulling_type_is_valid(field.ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types))
                 }
                 _ => continue,
             };

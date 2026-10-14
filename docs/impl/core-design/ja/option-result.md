@@ -16,8 +16,8 @@
 Some(x) / None                     // Option constructors — bare, not qualified
 Ok(x)   / Err(e)                   // Result constructors — bare
 v else fallback     -> T           // Option(Some/None) にも Result(Ok/Err) にも効くフォールバック付き
-                                   //   アンラップ。Result では Ok の値を返し、(Copy の)エラーを捨てる
-expr?                              // Try: unwrap Ok/Some, else early-return Err/None to the caller
+                                   //   アンラップ。Result では Ok の値を返し、エラーを捨て、必要な Drop を行う
+expr?                              // Try: unwrap Ok, else early-return Err to the caller
 r.map_err(f)        -> Result<T,F> // Result-only; f: fn(E) -> F; Ok passes through untouched
 match v { Some(x) => …, None => … }        // exhaustive, payload binds positionally
 match r { Ok(v) => …, Err(e) => … }
@@ -45,6 +45,14 @@ handle family や native operation は追加しない。
 historical checkpoint境界は厳密だった。L1aがまず所有権付きstruct field leafとして
 `Option<string>` だけを許可し、L1bがMove struct/sumをOption/Result/user sumのpayloadとして
 許可してtagged control flowを完成させた。
+
+フラットなタプルも同じ carrier grammar に従う。`Option<(T,U)>`、
+`Result<(T,U),E>`、`Result<T,(E,F)>`、ユーザー定義 sum のタプル payload は、
+要素に基づく Copy/Move 判定と活性 payload の Drop を共有する。所有する値の
+`match`、`else`、`?`、`map_err` は所有要素を一度だけ移し、捨てるエラーは Drop する。
+record の直接・tagged タプル field と Align のタプル callback も同じ配置と寿命に従う。
+[Plan190](../../190-tuple-carrier-composition.md) はタプル要素の許可範囲、
+collection/box/global/FFI の制限、共有 borrow からの Move タプル projection の禁止を維持する。
 
 ## Effects
 

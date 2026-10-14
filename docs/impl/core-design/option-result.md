@@ -19,8 +19,8 @@ plus exactly three conveniences (`else`, `?`, `map_err`).
 Some(x) / None                     // Option constructors — bare, not qualified
 Ok(x)   / Err(e)                   // Result constructors — bare
 v else fallback     -> T           // unwrap-with-fallback on Option (Some/None) OR Result (Ok/Err);
-                                   //   on Result it yields Ok's value, discarding the (Copy) error
-expr?                              // Try: unwrap Ok/Some, else early-return Err/None to the caller
+                                   //   on Result it yields Ok's value, discarding and dropping the error
+expr?                              // Try: unwrap Ok, else early-return Err to the caller
 r.map_err(f)        -> Result<T,F> // Result-only; f: fn(E) -> F; Ok passes through untouched
 match v { Some(x) => …, None => … }        // exhaustive, payload binds positionally
 match r { Ok(v) => …, Err(e) => … }
@@ -57,6 +57,14 @@ operation is added.
 The historical checkpoint boundary was exact: L1a first admitted only `Option<string>` as an owned
 struct-field leaf, then L1b admitted Move structs/sums as Option/Result/user-sum payloads and
 completed their tagged control flow.
+
+Flat tuples use the same carrier grammar: `Option<(T,U)>`, `Result<(T,U),E>`,
+`Result<T,(E,F)>`, and ordinary user-sum tuple payloads share contextual Copy/Move
+classification and active-payload Drop. Owning `match`, `else`, `?`, and `map_err`
+transfer every owned element once; discarded errors are dropped. Direct/tagged
+tuple record fields and Align tuple callbacks use the same layout and lifetimes.
+[Plan190](../190-tuple-carrier-composition.md) keeps the tuple element whitelist,
+collection/box/global/FFI restrictions, and shared Move-tuple projection exclusion.
 
 ## Effects
 

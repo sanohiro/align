@@ -47,7 +47,7 @@ tuples; owning extraction and Copy payloads remain the existing modes.
 | Control paths | if/match/else/?/map_err, branch and loop joins, early return, partial eager construction and malformed input. Test both active tags and all materially different cleanup outcomes; reuse existing owner suites for unchanged carrier control. |
 | Views / borrowing | Region, return-borrow, MoveCheck/EscapeCheck, origin projections, retention, byte invalidation and checked replay traverse Scalar::Tuple via the existing tuple Ty path. Reject expired input/arena/resource owner, overlapping mutable authority, and unsupported shared Move tuple projection. |
 | Generic / interface / whole/per-unit | Existing structural Tuple interface, monomorph substitution, canonical type graph and call ABI have the same exact ordered members. Imported generic/helper and cache cold/hit owners compare values and lifetime rejection; no raw internal id enters a persisted identity. |
-| Runtime / allocation / ABI | No new runtime path. Direct/indirect Align calls and map_err callbacks use identical tuple parameter/return types and cleanup flags. LLVM tuple shells must exist before any enclosing record/tagged body refers to them; natural size/alignment and payload lowering use the same type. Counted resource fixtures distinguish leaks/double frees and unchanged source allocation provenance. |
+| Runtime / allocation / ABI | No new runtime path. Direct/indirect Align calls and map_err callbacks use identical tuple parameter/return types and cleanup flags. Flat LLVM tuple types must be complete before any enclosing record/tagged body refers to them; natural size/alignment and payload lowering use the same type. Counted resource fixtures distinguish leaks/double frees and unchanged source allocation provenance. |
 
 A single capability may exceed 1,000 hand-written changed lines because the new
 payload discriminator reaches contextual type tables, Drop and backend layout.
@@ -73,9 +73,9 @@ there is no performance or allocation-count improvement claim.
   ids/graphs; `tuple_carrier_provenance_replay` owns carrier/member origin and
   cleanup facts plus stale checked-record rejection. These close formation,
   ownership, representation and replay rows together.
-- `align_mir --lib tuple_carrier`: `tuple_carrier_validation_and_identity`
-  owns valid source twins followed by single-axis malformed tuple/payload/table
-  mutations in checked-HIR and MIR paths, canonical type graph remapping, exact
+- `align_mir --lib tuple_carrier`: `tuple_carrier_checked_hir_validation` owns valid source twins followed by
+  single-axis malformed tuple/payload/table mutations in checked HIR.
+  `tuple_carrier_validation_and_identity` owns canonical type graph remapping, exact
   tag-62 bytes, round-trip and malformed byte/reference rejection.
 - `align_codegen_llvm --lib tuple_carrier`: `tuple_carrier_layout_validation`
   checks independent semantic/LLVM size-alignment and pre-emission rejection of
@@ -98,3 +98,27 @@ also made the existing canonical codec's new tuple scalar tag/ordinal explicit;
 the interface tuple format itself is unchanged. No production implementation
 preceded resolution. This plan and the new codec record will be checked against
 the implementation in the one preflight full-diff review.
+
+## Author-side closure notes
+
+Tuple positional projection now preserves the same caller-owned place root as a
+named field when computing borrowed-storage caps. By-value tuple parameters,
+local owners, and call/temporary results retain the frame cap. Direct and indirect
+borrowed tuple callbacks have a positive execution twin and local/by-value escape
+negatives. This reuses the existing owner-generation and return-root strategy;
+it does not admit shared Move sum projection or exclusive partial-Move borrowing.
+
+The native lifecycle owner pins exact explicit resource-allocation counts as well
+as equal free counts and zero remaining requested bytes. It includes both active
+variants, partial construction, replacement, generic transfer and both map_err
+directions. Option propagation retains explicit `else { return None }`; `?`
+remains the existing Result-only operator.
+
+Checked HIR enforces the unchanged source tuple-element grammar. Private MIR
+retains flat handle leaves used by the existing parameterized storage/nulling
+owners; it rejects missing references and inline aggregate members before layout.
+This internal test domain does not admit new source tuple elements. Constructor
+correlation is checked for tuple, user-sum, Some/None and Ok/Err producers even
+when unused or in a partition peer body. The demand-driven provenance walk alone
+cannot cover an unused constructor; `tuple_carrier_constructor_preflight` owns
+wrong/missing result types, operand types and arity across that family.

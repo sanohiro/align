@@ -17,9 +17,11 @@ fn align_up(n: u64, align: u64) -> u64 {
 /// of restarting the same suffix traversal for every declaring struct.
 pub struct TypeLayoutCache<'a> {
     structs: &'a [StructDef],
+    tuples: &'a [hir::TupleDef],
     enums: &'a [hir::EnumDef],
     tagged_types: &'a [hir::TaggedType],
     struct_cache: HashMap<u32, (u64, u64)>,
+    tuple_cache: HashMap<u32, (u64, u64)>,
     enum_cache: HashMap<u32, (u64, u64)>,
     tagged_cache: HashMap<u32, (u64, u64)>,
 }
@@ -27,14 +29,17 @@ pub struct TypeLayoutCache<'a> {
 impl<'a> TypeLayoutCache<'a> {
     pub fn new(
         structs: &'a [StructDef],
+        tuples: &'a [hir::TupleDef],
         enums: &'a [hir::EnumDef],
         tagged_types: &'a [hir::TaggedType],
     ) -> Self {
         Self {
             structs,
+            tuples,
             enums,
             tagged_types,
             struct_cache: HashMap::new(),
+            tuple_cache: HashMap::new(),
             enum_cache: HashMap::new(),
             tagged_cache: HashMap::new(),
         }
@@ -53,6 +58,10 @@ impl<'a> TypeLayoutCache<'a> {
                 c_repr: bool,
                 over_align: Option<u32>,
             },
+            ExitTuple {
+                id: u32,
+                elements: usize,
+            },
             ExitEnum {
                 id: u32,
                 variants: Vec<usize>,
@@ -66,6 +75,7 @@ impl<'a> TypeLayoutCache<'a> {
         let mut work = vec![Work::Enter(ty)];
         let mut built = Vec::new();
         let mut active_structs = HashSet::new();
+        let mut active_tuples = HashSet::new();
         let mut active_enums = HashSet::new();
         let mut active_tagged = HashSet::new();
 
@@ -112,6 +122,30 @@ impl<'a> TypeLayoutCache<'a> {
                                 Ty::Tagged(id),
                                 self.tagged_types,
                             )));
+                        }
+                    }
+                    Ty::Tuple(id) => {
+                        if let Some(&layout) = self.tuple_cache.get(&id) {
+                            built.push(layout);
+                        } else if !active_tuples.insert(id) {
+                            built.push((0, 1));
+                        } else if let Some(definition) = self.tuples.get(id as usize) {
+                            work.push(Work::ExitTuple {
+                                id,
+                                elements: definition.elems.len(),
+                            });
+                            work.extend(
+                                definition
+                                    .elems
+                                    .iter()
+                                    .rev()
+                                    .copied()
+                                    .map(scalar_to_ty)
+                                    .map(Work::Enter),
+                            );
+                        } else {
+                            active_tuples.remove(&id);
+                            built.push((0, 1));
                         }
                     }
                     Ty::Struct(id) => {
@@ -204,6 +238,14 @@ impl<'a> TypeLayoutCache<'a> {
                     self.struct_cache.insert(id, layout);
                     built.push(layout);
                 }
+                Work::ExitTuple { id, elements } => {
+                    let start = built.len().saturating_sub(elements);
+                    let fields = built.drain(start..).collect::<Vec<_>>();
+                    let layout = aggregate_layout(&fields);
+                    active_tuples.remove(&id);
+                    self.tuple_cache.insert(id, layout);
+                    built.push(layout);
+                }
                 Work::ExitEnum { id, variants } => {
                     let payloads = variants.iter().sum();
                     let start = built.len().saturating_sub(payloads);
@@ -285,10 +327,11 @@ fn tagged_union_layout(tag: (u64, u64), payload: (u64, u64)) -> (u64, u64) {
 pub fn ty_abi_layout(
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> (u64, u64) {
-    TypeLayoutCache::new(structs, enums, tagged_types).layout(ty)
+    TypeLayoutCache::new(structs, tuples, enums, tagged_types).layout(ty)
 }
 
 #[cfg(test)]
@@ -297,7 +340,11 @@ mod tests {
     use crate::{IntTy, Scalar};
 
     fn variant(name: &str, payload: Vec<Scalar>, field_base: u32) -> hir::EnumVariant {
-        hir::EnumVariant { name: name.into(), payload, field_base }
+        hir::EnumVariant {
+            name: name.into(),
+            payload,
+            field_base,
+        }
     }
 
     #[test]
@@ -326,7 +373,7 @@ mod tests {
                 source_name: "Choice".into(),
                 variants: vec![variant("Value", vec![Scalar::Struct(1)], 1)],
             }];
-            let mut layouts = TypeLayoutCache::new(&structs, &enums, &[]);
+            let mut layouts = TypeLayoutCache::new(&structs, &[], &enums, &[]);
             assert_eq!(
                 layouts.layout(Ty::Array(i64, length)),
                 (8 * u64::from(length), 8)
@@ -355,15 +402,21 @@ mod tests {
             record("Large", Ty::Array(i64, u32::MAX)),
             record("Overflow", Ty::StructArray(0, u32::MAX)),
         ];
-        let mut layouts = TypeLayoutCache::new(&huge, &[], &[]);
+        let mut layouts = TypeLayoutCache::new(&huge, &[], &[], &[]);
         assert_eq!(layouts.layout(Ty::Struct(1)), (u64::MAX, 8));
         assert_eq!(layouts.layout(Ty::Option(Scalar::Struct(1))), (u64::MAX, 8));
     }
 
     #[test]
     fn tagged_layout_uses_only_the_largest_variant_payload() {
-        let i8 = Scalar::Int(IntTy { bits: 8, signed: false });
-        let i64 = Scalar::Int(IntTy { bits: 64, signed: true });
+        let i8 = Scalar::Int(IntTy {
+            bits: 8,
+            signed: false,
+        });
+        let i64 = Scalar::Int(IntTy {
+            bits: 64,
+            signed: true,
+        });
         let enums = [hir::EnumDef {
             name: "Mixed".into(),
             source_name: "Mixed".into(),
@@ -373,7 +426,7 @@ mod tests {
                 variant("Empty", vec![Scalar::Unit], 4),
             ],
         }];
-        let mut layouts = TypeLayoutCache::new(&[], &enums, &[]);
+        let mut layouts = TypeLayoutCache::new(&[], &[], &enums, &[]);
         assert_eq!(layouts.layout(Ty::Enum(0)), (24, 8));
         assert_eq!(layouts.layout(Ty::Option(Scalar::Unit)), (1, 1));
         assert_eq!(layouts.layout(Ty::Result(i64, i8)), (16, 8));
@@ -393,7 +446,7 @@ mod tests {
             source_name: "OnlyEmpty".into(),
             variants: vec![variant("Value", vec![Scalar::Struct(0)], 1)],
         }];
-        let mut layouts = TypeLayoutCache::new(&structs, &enums, &[]);
+        let mut layouts = TypeLayoutCache::new(&structs, &[], &enums, &[]);
         assert_eq!(layouts.layout(Ty::Enum(0)), (4, 4));
         assert_eq!(layouts.layout(Ty::Option(Scalar::Struct(0))), (1, 1));
     }

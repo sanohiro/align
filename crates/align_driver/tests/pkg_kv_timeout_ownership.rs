@@ -524,7 +524,7 @@ impl<'a> Formation<'a> {
     fn drop_plan(&self, ty: Ty) -> DropPlan {
         drop_plan(
             ty,
-            &self.program.structs,
+            &self.program.structs, &self.program.tuples,
             &self.program.enums,
             &self.program.tagged_types,
         )

@@ -870,6 +870,13 @@ first := t.0              // positional access: `t.0`, `t.1`, ...
 derived from its elements (Move if any element is Move; a tuple of views is region-tied to
 their sources) — the same rule as a struct, no new ownership concept.
 
+Existing flat tuples also compose with `Option`, either `Result` payload, user sum
+payloads, ordinary record fields, and Align function-value parameters/returns.
+They retain element order, inferred source lifetimes, and exactly-once recursive
+Drop without an implicit allocation or clone. This does not widen tuple elements,
+collection elements, boxes, globals, or the native ABI. A shared borrowed Move
+tuple payload remains outside the borrowed-sum projection grammar.
+
 ### Generics
 
 A function may take **type parameters** in `<...>` — `fn f<T>(...)`. Each distinct use is compiled

@@ -151,6 +151,8 @@ pub enum Scalar {
     /// A struct payload (the struct's id). Lets `Option`/`Result` carry a whole struct
     /// (e.g. `Result<User, Error>` from `json.decode`). No recursion — just the id.
     Struct(u32),
+    /// An existing anonymous product, resolved through the program tuple table.
+    Tuple(u32),
     /// An owned `string` payload (MMv2 slice 8a). Unlike the other scalars this is a **Move**
     /// type with a heap buffer, so an `Option<string>` / `Result<string, E>` that holds it owns
     /// that buffer: it is dropped (freed) when the aggregate local is dropped, and moved out on
@@ -459,7 +461,7 @@ pub fn str_clone_body_ty(ty: Ty) -> bool {
 /// support; every other `ty_to_scalar` scalar materializes. Move admission is a separate rule and
 /// stays with the caller (`reject_move_pipeline_call_arg`), which needs the diagnostic span.
 pub fn scan_accumulator_scalar(acc: Ty) -> Option<Scalar> {
-    if matches!(acc, Ty::Struct(_)) {
+    if matches!(acc, Ty::Struct(_) | Ty::Tuple(_)) {
         return None;
     }
     ty_to_scalar(acc)
@@ -1030,6 +1032,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::Char
         | Scalar::Unit
         | Scalar::Struct { .. }
+        | Scalar::Tuple { .. }
         | Scalar::String
         | Scalar::DynArray { .. }
         | Scalar::DynStructArray { .. }
@@ -1099,6 +1102,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::Char => Some(Scalar::Char),
         Ty::Unit => Some(Scalar::Unit),
         Ty::Struct(id) => Some(Scalar::Struct(id)),
+        Ty::Tuple(id) => Some(Scalar::Tuple(id)),
         Ty::Resource(id) => Some(Scalar::Resource(id)),
         Ty::ResourceRef(id) => Some(Scalar::ResourceRef(id)),
         Ty::String => Some(Scalar::String),
@@ -1253,6 +1257,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::Char => Ty::Char,
         Scalar::Unit => Ty::Unit,
         Scalar::Struct(id) => Ty::Struct(id),
+        Scalar::Tuple(id) => Ty::Tuple(id),
         Scalar::Resource(id) => Ty::Resource(id),
         Scalar::ResourceRef(id) => Ty::ResourceRef(id),
         Scalar::String => Ty::String,
@@ -1332,6 +1337,7 @@ pub fn array_builder_elem(ty: Ty) -> Option<ArrayBuilderElem> {
         Ty::StructArray(id, length) => Some(ArrayBuilderElem::Aggregate(
             AggregateArrayElem::FixedStructArray(id, length),
         )),
+        Ty::Tuple(_) => None,
         other => ty_to_scalar(other).map(ArrayBuilderElem::Scalar),
     }
 }
@@ -1875,28 +1881,31 @@ fn intern_tagged_type(tagged_types: &mut Vec<hir::TaggedType>, tagged: hir::Tagg
 fn par_map_kernel_value(
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
     matches!(
         ty,
         Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str
-    ) || matches!(ty, Ty::Struct(id) if structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs, enums, tagged_types)))
+    ) || matches!(ty, Ty::Struct(id) if structs.get(id as usize).is_some_and(|_| !struct_is_move(id, structs, tuples, enums, tagged_types)))
 }
 
 fn par_map_kernel_input_value(
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    par_map_kernel_value(ty, structs, enums, tagged_types) || matches!(ty, Ty::Slice(_))
+    par_map_kernel_value(ty, structs, tuples, enums, tagged_types) || matches!(ty, Ty::Slice(_))
 }
 
 pub fn par_map_staged_parallelizable(
     source: Ty,
     stages: &[hir::Stage],
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
@@ -1906,21 +1915,21 @@ pub fn par_map_staged_parallelizable(
         Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
         _ => return false,
     };
-    if !par_map_kernel_input_value(elem, structs, enums, tagged_types) || stages.is_empty() {
+    if !par_map_kernel_input_value(elem, structs, tuples, enums, tagged_types) || stages.is_empty() {
         return false;
     }
     for stage in stages {
         match stage.kind {
             hir::StageKind::Map { .. } => {
-                if !par_map_kernel_input_value(elem, structs, enums, tagged_types)
-                    || !par_map_kernel_value(stage.out_ty, structs, enums, tagged_types)
+                if !par_map_kernel_input_value(elem, structs, tuples, enums, tagged_types)
+                    || !par_map_kernel_value(stage.out_ty, structs, tuples, enums, tagged_types)
                 {
                     return false;
                 }
                 elem = stage.out_ty;
             }
             hir::StageKind::Where { .. } => {
-                if !par_map_kernel_input_value(elem, structs, enums, tagged_types)
+                if !par_map_kernel_input_value(elem, structs, tuples, enums, tagged_types)
                     || stage.out_ty != elem
                 {
                     return false;
@@ -1965,6 +1974,7 @@ pub fn par_map_parallelizable(
     source: Ty,
     stages: &[hir::Stage],
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
@@ -1974,10 +1984,10 @@ pub fn par_map_parallelizable(
         Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
         _ => return false,
     };
-    if !par_map_kernel_input_value(source_value, structs, enums, tagged_types) {
+    if !par_map_kernel_input_value(source_value, structs, tuples, enums, tagged_types) {
         return false;
     }
-    stages.is_empty() || par_map_staged_parallelizable(source, stages, structs, enums, tagged_types)
+    stages.is_empty() || par_map_staged_parallelizable(source, stages, structs, tuples, enums, tagged_types)
 }
 
 /// Whether the owned array produced by the range-kernel `par_map` path contains only values that
@@ -2368,6 +2378,11 @@ pub enum DropPlan {
         fields: Vec<(u32, DropPlanRef)>,
         needs_drop: bool,
     },
+    Tuple {
+        id: u32,
+        elements: Vec<DropPlanRef>,
+        needs_drop: bool,
+    },
     Option(DropPlanRef),
     Result {
         ok: DropPlanRef,
@@ -2396,6 +2411,11 @@ impl DropPlan {
                     take(field);
                 }
             }
+            DropPlan::Tuple { elements, .. } => {
+                for element in elements {
+                    take(element);
+                }
+            }
             DropPlan::FixedArray { element: payload, .. }
             | DropPlan::Option(payload) => take(payload),
             DropPlan::Result { ok, err } => {
@@ -2420,6 +2440,7 @@ impl DropPlan {
                 DropPlan::None => {}
                 DropPlan::Leaf(_) | DropPlan::Invalid => return true,
                 DropPlan::Struct { needs_drop, .. }
+                | DropPlan::Tuple { needs_drop, .. }
                 | DropPlan::Enum { needs_drop, .. } => {
                     if *needs_drop {
                         return true;
@@ -2452,6 +2473,9 @@ impl DropPlan {
                 DropPlan::Struct { fields, .. } => {
                     work.extend(fields.iter().rev().map(|(_, plan)| plan.as_ref()));
                 }
+                DropPlan::Tuple { elements, .. } => {
+                    work.extend(elements.iter().rev().map(|plan| plan.as_ref()));
+                }
                 DropPlan::FixedArray { element: payload, .. }
                 | DropPlan::Option(payload) => work.push(payload),
                 DropPlan::Result { ok, err } => {
@@ -2479,6 +2503,7 @@ impl DropPlan {
 pub fn drop_plan(
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> DropPlan {
@@ -2492,6 +2517,7 @@ pub fn drop_plan(
         Enter(Ty),
         ExitTagged(u32),
         ExitStruct { id: u32, fields: usize },
+        ExitTuple { id: u32, elements: usize },
         ExitFixedArray(u32),
         ExitOption,
         ExitResult,
@@ -2506,6 +2532,8 @@ pub fn drop_plan(
         plan: DropPlanRef::new(DropPlan::Invalid),
         needs_drop: true,
     };
+    let mut tuple_cache = HashMap::<u32, Built>::new();
+    let mut tuple_active = HashSet::new();
     let mut struct_cache = HashMap::<u32, Built>::new();
     let mut enum_cache = HashMap::<u32, Built>::new();
     let mut tagged_cache = HashMap::<u32, Built>::new();
@@ -2536,6 +2564,29 @@ pub fn drop_plan(
                 };
                 work.push(Work::ExitTagged(id));
                 work.push(Work::Enter(expanded));
+            }
+            Work::Enter(Ty::Tuple(id)) => {
+                if let Some(plan) = tuple_cache.get(&id) {
+                    built.push(plan.clone());
+                    continue;
+                }
+                if !tuple_active.insert(id) {
+                    built.push(invalid());
+                    continue;
+                }
+                let Some(definition) = tuples.get(id as usize) else {
+                    tuple_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                };
+                if definition.elems.len() < 2 {
+                    tuple_active.remove(&id);
+                    built.push(invalid());
+                    continue;
+                }
+                work.push(Work::ExitTuple { id, elements: definition.elems.len() });
+                work.extend(definition.elems.iter().rev().copied()
+                    .map(scalar_to_ty).map(Work::Enter));
             }
             Work::Enter(Ty::Struct(id)) => {
                 if let Some(plan) = struct_cache.get(&id) {
@@ -2694,6 +2745,24 @@ pub fn drop_plan(
                 struct_cache.insert(id, plan.clone());
                 built.push(plan);
             }
+            Work::ExitTuple { id, elements } => {
+                let Some(start) = built.len().checked_sub(elements) else {
+                    return DropPlan::Invalid;
+                };
+                let children = built.drain(start..).collect::<Vec<_>>();
+                let needs_drop = children.iter().any(|child| child.needs_drop);
+                let plan = Built {
+                    plan: DropPlanRef::new(DropPlan::Tuple {
+                        id,
+                        elements: children.into_iter().map(|child| child.plan).collect(),
+                        needs_drop,
+                    }),
+                    needs_drop,
+                };
+                tuple_active.remove(&id);
+                tuple_cache.insert(id, plan.clone());
+                built.push(plan);
+            }
             Work::ExitFixedArray(length) => {
                 let Some(element) = built.pop() else {
                     return DropPlan::Invalid;
@@ -2759,15 +2828,23 @@ pub fn drop_plan(
     built.pop().unwrap_or_else(none).plan.as_ref().clone()
 }
 
-/// Whether `ty` is a tuple with at least one owned (Move) element — i.e. a Move tuple. Needs the
-/// tuple table to read the element scalars. (Such tuples are restricted to temporaries in this
-/// cut — returned or destructured — so they never occupy a drop slot; see `check`/`check_fn`.)
-fn ty_tuple_is_move(ty: Ty, tuples: &[hir::TupleDef]) -> bool {
-    // Reached from the public Move authorities, so a malformed id must answer, never panic.
-    matches!(ty, Ty::Tuple(id)
-        if tuples
-            .get(id as usize)
-            .is_some_and(|tuple| tuple.elems.iter().any(|scalar| scalar.is_move())))
+fn tuple_element_is_supported(scalar: Scalar) -> bool {
+    matches!(
+        scalar,
+        Scalar::Int(_)
+            | Scalar::Float(_)
+            | Scalar::Bool
+            | Scalar::Char
+            | Scalar::Str
+            | Scalar::String
+            | Scalar::DynArray(_)
+            | Scalar::DynStructArray(_)
+            | Scalar::Resource(_)
+            | Scalar::ResourceRef(_)
+            | Scalar::HttpClient
+            | Scalar::HttpRequest
+            | Scalar::HttpResponse
+    )
 }
 
 /// Whether `ty` **is**, or transitively contains through a `Result` / `Option` / tuple / struct, a
@@ -3620,6 +3697,10 @@ fn ty_contains_http_receive_stream(
                 work.push(Ty::Struct(id));
                 false
             }
+            Scalar::Tuple(id) => {
+                work.push(Ty::Tuple(id));
+                false
+            }
             Scalar::Enum(id) => {
                 work.push(Ty::Enum(id));
                 false
@@ -3858,6 +3939,7 @@ pub fn http_stream_carrier_class(
             | Scalar::Char
             | Scalar::Unit
             | Scalar::Struct(_)
+            | Scalar::Tuple(_)
             | Scalar::String
             | Scalar::DynArray(_)
             | Scalar::DynStructArray(_)
@@ -4297,16 +4379,7 @@ pub fn ty_capture_is_move(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    let is_move = |scalar: Scalar| scalar_is_move(scalar, structs, enums, tagged_types);
-    // A tuple of Move aggregates owns them exactly as a fixed array does; `ty_tuple_is_move`
-    // only sees scalar-level Move-ness, so capture asks the recursive question here.
-    if let Ty::Tuple(id) = ty
-        && tuples
-            .get(id as usize)
-            .is_some_and(|tuple| tuple.elems.iter().copied().any(is_move))
-    {
-        return true;
-    }
+    let is_move = |scalar: Scalar| scalar_is_move(scalar, structs, tuples, enums, tagged_types);
     ty_is_move(ty, structs, tuples, enums, tagged_types)
         || matches!(ty, Ty::Array(s, _) if is_move(s))
 }
@@ -4315,20 +4388,20 @@ pub fn ty_capture_is_move(
 /// asked by every collection element, tuple element, and capture rule.
 ///
 /// The single owner of that question. `Scalar::is_move` alone answers only the type-directed part;
-/// a nominal payload (struct / sum type / nested `Option`/`Result`) needs the recursive Drop plan,
+/// an aggregate payload (struct / tuple / sum / nested `Option`/`Result`) needs the recursive Drop plan,
 /// and a consumer that re-derived just one of the two arms is how a checked program reached the MIR
 /// boundary and lowered to nothing.
 pub fn scalar_is_move(
     scalar: Scalar,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
     scalar.is_move()
-        || matches!(scalar, Scalar::Struct(id) if struct_is_move(id, structs, enums, tagged_types))
-        || matches!(scalar, Scalar::Enum(id) if enum_is_move(id, structs, enums, tagged_types))
-        || matches!(scalar, Scalar::Tagged(id)
-            if drop_plan(Ty::Tagged(id), structs, enums, tagged_types).needs_drop())
+        || matches!(scalar,
+        Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Tagged(_)
+        if drop_plan(scalar_to_ty(scalar), structs, tuples, enums, tagged_types).needs_drop())
 }
 
 /// Whether a collection element can be loaded as an ordinary value without
@@ -4384,10 +4457,11 @@ pub fn indexed_element_store_ok(elem: Ty) -> bool {
 pub fn struct_is_move(
     id: u32,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    drop_plan(Ty::Struct(id), structs, enums, tagged_types).needs_drop()
+    drop_plan(Ty::Struct(id), structs, tuples, enums, tagged_types).needs_drop()
 }
 
 /// Whether a JSON scanner row is safe to reuse as one per-step slot. The complete recursive
@@ -4397,10 +4471,11 @@ pub fn struct_is_move(
 pub fn json_scan_row_is_copy(
     id: u32,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    let plan = drop_plan(Ty::Struct(id), structs, enums, tagged_types);
+    let plan = drop_plan(Ty::Struct(id), structs, tuples, enums, tagged_types);
     plan.is_valid() && !plan.needs_drop()
 }
 
@@ -4413,10 +4488,11 @@ pub fn json_scan_row_is_copy(
 pub fn enum_is_move(
     id: u32,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    drop_plan(Ty::Enum(id), structs, enums, tagged_types).needs_drop()
+    drop_plan(Ty::Enum(id), structs, tuples, enums, tagged_types).needs_drop()
 }
 
 /// Byte threshold for the **huge struct copy** lint (`draft.md` §16): a struct passed/returned **by
@@ -4455,11 +4531,12 @@ fn warn_intermediate_array_sum(diags: &mut Diagnostics, span: Span) {
 fn struct_size_align(
     id: u32,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
     _visiting: &mut Vec<u32>,
 ) -> (u64, u64) {
-    ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
+    ty_abi_layout(Ty::Struct(id), structs, tuples, enums, tagged_types)
 }
 
 /// The `(size, align)` of struct `id` as codegen lays it out (descending-alignment field order for a
@@ -4470,10 +4547,11 @@ fn struct_size_align(
 pub fn struct_abi_layout(
     id: u32,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> (u64, u64) {
-    ty_abi_layout(Ty::Struct(id), structs, enums, tagged_types)
+    ty_abi_layout(Ty::Struct(id), structs, tuples, enums, tagged_types)
 }
 
 /// The scalar types with a direct C representation, also admitted as concrete `layout(C)`
@@ -4507,8 +4585,7 @@ pub fn ty_is_move(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    drop_plan(ty, structs, enums, tagged_types).needs_drop()
-        || ty_tuple_is_move(ty, tuples)
+    drop_plan(ty, structs, tuples, enums, tagged_types).needs_drop()
 }
 
 /// The pipeline stages of a stage-bearing pipeline node (else `None`). Lets the flow analyses
@@ -4596,15 +4673,16 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
 fn is_owned_droppable(
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
     // `Task<R>` (④b) is a box in the task_group region — bulk-freed with the region, never an
     // individually-dropped owned value (like `box<T>`).
     (!matches!(ty, Ty::Box(_) | Ty::Task(_))
-        && drop_plan(ty, structs, enums, tagged_types).needs_drop())
+        && drop_plan(ty, structs, tuples, enums, tagged_types).needs_drop())
         // A fixed array of a Move struct — dropped element-by-element (Slice 4a).
-        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, enums, tagged_types))
+        || matches!(ty, Ty::StructArray(id, _) if struct_is_move(id, structs, tuples, enums, tagged_types))
 }
 
 /// Canonical source-impossible local name for an owned `_` in tuple destructuring.
@@ -4619,10 +4697,11 @@ pub fn tuple_drop_local_name(ordinal: usize) -> String {
 pub fn tuple_discard_needs_hidden_local(
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    is_owned_droppable(ty, structs, enums, tagged_types)
+    is_owned_droppable(ty, structs, tuples, enums, tagged_types)
 }
 
 /// Whether a checked value needs the MIR individual-vs-arena ownership bit. This is the shared
@@ -4635,7 +4714,7 @@ pub fn needs_drop_flag(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    is_owned_droppable(ty, structs, enums, tagged_types) || ty_tuple_is_move(ty, tuples)
+    is_owned_droppable(ty, structs, tuples, enums, tagged_types)
 }
 
 /// Plan 74's target-independent admission check for one concrete interface body. The returned names
@@ -9662,7 +9741,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             // checked structurally here; its acyclicity and alignment are validated in pass 0b-2,
             // once all struct fields are populated. The field-specific array restrictions are
             // applied below after the complete struct table exists.
-            if !(is_field_ok(ty, &tagged_types) || s.c_repr && ty == Ty::Raw) {
+            if !(is_field_ok(ty, &tuples, &tagged_types) || s.c_repr && ty == Ty::Raw) {
                 diags.error(
                     format!("struct field type is not supported here, got {}", ty_name(ty)),
                     f.span,
@@ -9781,6 +9860,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     }
                     // A `str` view payload (J1): makes the enum region-tracked (see `tracks_region` /
                     // `region_of` / `ty_may_borrow`), never Move (a `str` borrows, owns nothing).
+                    Ty::Tuple(id) => payload.push(Scalar::Tuple(id)),
                     Ty::Str => payload.push(Scalar::Str),
                     // An owned string is a finite Move leaf. The enclosing sum's tag-switched Drop
                     // frees it only when this variant is active.
@@ -11157,7 +11237,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     Scalar::DynStructArray(id) => *id,
                     _ => continue,
                 };
-                if !struct_is_move(struct_id, &structs, &enums, &tagged_types) {
+                if !struct_is_move(struct_id, &structs, &tuples, &enums, &tagged_types) {
                     continue;
                 }
                 let source_span = *span.get_or_insert_with(|| {
@@ -12242,8 +12322,7 @@ fn run_body_analysis_passes(
             .filter(|l| {
                 !borrowed_params.contains(&l.id)
                     && !borrowed_projection_locals.contains(&l.id)
-                    && (is_owned_droppable(l.ty, structs, enums, tagged_types)
-                        || ty_tuple_is_move(l.ty, tuples))
+                    && (is_owned_droppable(l.ty, structs, tuples, enums, tagged_types))
             })
             .map(|l| l.id)
             .collect();
@@ -17789,7 +17868,7 @@ impl EffectScan<'_> {
                 // AoS projection, field-filter, and recognised invariant string-filter stages add
                 // no callable effect; filtered forms use stable compaction. SoA and aggregate
                 // layouts remain sequential, while `chunks` is a borrowed-slice source shape.
-                if par_map_staged_parallelizable(source.ty, stages, self.structs, self.enums, self.tagged_types) {
+                if par_map_staged_parallelizable(source.ty, stages, self.structs, self.tuples, self.enums, self.tagged_types) {
                     for stage in stages {
                         if let StageKind::Map { func, .. } | StageKind::Where { func, .. } = &stage.kind {
                             self.parmaps.push((func.clone(), e.span));
@@ -20362,6 +20441,12 @@ impl<'a> EscapeCheck<'a> {
     }
 
     fn borrowed_param_place(&self, expression: &Expr) -> bool {
+        // Positional projection preserves the place's caller-owned storage just as a
+        // named field does. A call/temporary remains a distinct, frame-owned value.
+        let mut expression = expression;
+        while let ExprKind::TupleIndex { recv, .. } = &expression.kind {
+            expression = recv;
+        }
         let root = match &expression.kind {
             ExprKind::Local(local) => *local,
             ExprKind::Field { root, .. } => *root,
@@ -20416,8 +20501,7 @@ impl<'a> EscapeCheck<'a> {
             return None;
         }
         (matches!(mode, ast::ParamMode::Borrow | ast::ParamMode::BorrowMut)
-            && (is_owned_droppable(argument.ty, self.structs, self.enums, self.tagged_types)
-                || ty_tuple_is_move(argument.ty, self.tuples)))
+            && (is_owned_droppable(argument.ty, self.structs, self.tuples, self.enums, self.tagged_types)))
         .then(|| self.borrowed_storage_cap(argument))
     }
 
@@ -20502,8 +20586,7 @@ impl<'a> EscapeCheck<'a> {
                     .region
                     .insert(param, Region::Caller(position as u32));
             }
-            if is_owned_droppable(local.ty, self.structs, self.enums, self.tagged_types)
-                || ty_tuple_is_move(local.ty, self.tuples)
+            if is_owned_droppable(local.ty, self.structs, self.tuples, self.enums, self.tagged_types)
             {
                 // A by-value Move parameter has crossed the call boundary and is free-standing.
                 // A borrowed builder keeps the constructor modes admitted by its element type:
@@ -20519,7 +20602,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                     (true, Ty::ArrayBuilder(Scalar::Struct(id)))
                         if heap_tree_record_type_ok(id, self.structs, self.tagged_types)
-                            && struct_is_move(id, self.structs, self.enums, self.tagged_types) =>
+                            && struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types) =>
                     {
                         (true, true)
                     }
@@ -22832,7 +22915,7 @@ impl<'a> EscapeCheck<'a> {
                     builder.ty.array_builder_element(),
                     Some(ArrayBuilderElem::Scalar(Scalar::Struct(id)))
                         if heap_tree_record_type_ok(id, self.structs, self.tagged_types)
-                            && struct_is_move(id, self.structs, self.enums, self.tagged_types)
+                            && struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types)
                 );
                 if move_heap_record
                     && (!self.drop_is_individual(value, depth)
@@ -23585,7 +23668,7 @@ impl<'a> EscapeCheck<'a> {
                 if par_map_parallelizable(
                     source.ty,
                     stages,
-                    self.structs,
+                    self.structs, self.tuples,
                     self.enums,
                     self.tagged_types,
                 ) && par_map_result_is_plain_primitive(expression.ty)
@@ -23807,7 +23890,7 @@ impl<'a> EscapeCheck<'a> {
                             if par_map_parallelizable(
                                 source.ty,
                                 stages,
-                                self.structs,
+                                self.structs, self.tuples,
                                 self.enums,
                                 self.tagged_types,
                             ) && par_map_result_is_plain_primitive(expression.ty) =>
@@ -24701,7 +24784,7 @@ impl<'a> EscapeCheck<'a> {
             // checked `par_map` result is primitive), so it is freely returnable and individually
             // dropped. Unsupported shapes use the arena-aware sequential collector below.
             ExprKind::ArrayParMap { source, stages, .. }
-                if par_map_parallelizable(source.ty, stages, self.structs, self.enums, self.tagged_types)
+                if par_map_parallelizable(source.ty, stages, self.structs, self.tuples, self.enums, self.tagged_types)
                     && par_map_result_is_plain_primitive(expression.ty) => {
                 values.push(Region::Static);
             }
@@ -24873,7 +24956,7 @@ impl<'a> EscapeCheck<'a> {
                     Ty::StructArray(sid, _)
                         if struct_is_move(
                             sid,
-                            self.structs,
+                            self.structs, self.tuples,
                             self.enums,
                             self.tagged_types,
                         )
@@ -28487,8 +28570,7 @@ impl<'a> EscapeCheck<'a> {
                 } else {
                     self.state.callable_capture_region.insert(*local, callable);
                 }
-                if is_owned_droppable(init.ty, self.structs, self.enums, self.tagged_types)
-                    || ty_tuple_is_move(init.ty, self.tuples)
+                if is_owned_droppable(init.ty, self.structs, self.tuples, self.enums, self.tagged_types)
                 {
                     let individual = self.drop_is_individual(init, depth);
                     let may_individual = self.drop_may_be_individual(init, depth);
@@ -28505,7 +28587,7 @@ impl<'a> EscapeCheck<'a> {
                     // region — it can't be *returned* (freed when the function returns), but it stays
                     // valid for the rest of the frame. `region_of` would infer `Static` from the
                     // individually heap-owned strings; cap it at `Frame` so the return check fires.
-                    if matches!(init.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.enums, self.tagged_types))
+                    if matches!(init.ty, Ty::StructArray(sid, _) if struct_is_move(sid, self.structs, self.tuples, self.enums, self.tagged_types))
                     {
                         r = r.shorter(Region::Frame);
                     }
@@ -28707,8 +28789,7 @@ impl<'a> EscapeCheck<'a> {
                 }
                 // Record allocation provenance separately from escape Region: region-free Move
                 // resources and owned call results are individual, while arena allocations are not.
-                if is_owned_droppable(value.ty, self.structs, self.enums, self.tagged_types)
-                    || ty_tuple_is_move(value.ty, self.tuples)
+                if is_owned_droppable(value.ty, self.structs, self.tuples, self.enums, self.tagged_types)
                 {
                     let individual = self.drop_is_individual(value, depth);
                     let may_individual = self.drop_may_be_individual(value, depth);
@@ -28903,8 +28984,7 @@ impl<'a> EscapeCheck<'a> {
                 let may_individual = self.drop_may_be_individual(init, depth);
                 for local in locals.iter().flatten() {
                     if self.f.locals.get(*local as usize).is_some_and(|l| {
-                        is_owned_droppable(l.ty, self.structs, self.enums, self.tagged_types)
-                            || ty_tuple_is_move(l.ty, self.tuples)
+                        is_owned_droppable(l.ty, self.structs, self.tuples, self.enums, self.tagged_types)
                     }) {
                         self.drop_individual.insert(*local, individual);
                         self.state.individual.insert(*local, individual);
@@ -29048,8 +29128,7 @@ impl<'a> EscapeCheck<'a> {
                 continue;
             }
             if self.f.locals.get(*binding as usize).is_some_and(|local| {
-                is_owned_droppable(local.ty, self.structs, self.enums, self.tagged_types)
-                    || ty_tuple_is_move(local.ty, self.tuples)
+                is_owned_droppable(local.ty, self.structs, self.tuples, self.enums, self.tagged_types)
             }) {
                 self.drop_individual.insert(*binding, individual);
                 self.state.individual.insert(*binding, individual);
@@ -35831,7 +35910,7 @@ impl<'a> MoveCheck<'a> {
             Some(ty) if self.is_move_ty(ty) => true,
             Some(Ty::Array(Scalar::String, _)) => true,
             Some(Ty::StructArray(sid, _)) => {
-                struct_is_move(sid, self.structs, self.enums, self.tagged_types)
+                struct_is_move(sid, self.structs, self.tuples, self.enums, self.tagged_types)
             }
             _ => false,
         }
@@ -44189,7 +44268,7 @@ impl<'a> MoveCheck<'a> {
                             Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_)
                         ) && drop_plan(
                             expression.ty,
-                            self.structs,
+                            self.structs, self.tuples,
                             self.enums,
                             self.tagged_types,
                         )
@@ -44201,7 +44280,7 @@ impl<'a> MoveCheck<'a> {
                             Ty::Enum(id)
                                 if enum_is_move(
                                     id,
-                                    self.structs,
+                                    self.structs, self.tuples,
                                     self.enums,
                                     self.tagged_types,
                                 )
@@ -46931,7 +47010,7 @@ impl<'a> MoveCheck<'a> {
                     ExprKind::TaskGet(child) => {
                         let consumes = is_owned_droppable(
                             current.ty,
-                            self.structs,
+                            self.structs, self.tuples,
                             self.enums,
                             self.tagged_types,
                         );
@@ -48017,11 +48096,11 @@ impl<'a> MoveCheck<'a> {
                     } else if consuming
                         && (e.ty == Ty::String
                             || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                                && drop_plan(e.ty, self.structs, self.enums, self.tagged_types)
+                                && drop_plan(e.ty, self.structs, self.tuples, self.enums, self.tagged_types)
                                     .needs_drop())
                             || is_move_handle(e.ty)
                             || matches!(e.ty, Ty::Resource(_))
-                            || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.enums, self.tagged_types)))
+                            || matches!(e.ty, Ty::Enum(id) if enum_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types)))
                     {
                         if self.borrowed_projection_owners.contains_key(base) {
                             self.diags.error(
@@ -48859,7 +48938,7 @@ impl<'a> MoveCheck<'a> {
             // consumes the task (a second `get()` would double-free the buffer).
             ExprKind::TaskGet(inner) => {
                 let consuming =
-                    is_owned_droppable(e.ty, self.structs, self.enums, self.tagged_types);
+                    is_owned_droppable(e.ty, self.structs, self.tuples, self.enums, self.tagged_types);
                 move_expr!(self, inner, moved, consuming, consuming);
             }
             ExprKind::Wait => {
@@ -50441,9 +50520,10 @@ impl<'a, 't> Checker<'a, 't> {
             // The struct name for the message — `.get()` (not direct indexing) so a stray id can
             // never panic; `sz > 0` already implies the struct exists (a missing one sizes to 0).
             let enums = &self.enums;
+            let tuples = &self.tuples;
             let tagged_types = &self.tagged_types;
             let huge = |structs: &[StructDef], id: u32, visiting: &mut Vec<u32>| {
-                let (sz, _) = struct_size_align(id, structs, enums, tagged_types, visiting);
+                let (sz, _) = struct_size_align(id, structs, tuples, enums, tagged_types, visiting);
                 (sz > HUGE_STRUCT_BYTES)
                     .then(|| structs.get(id as usize).map(|d| (sz, d.name.clone())))
                     .flatten()
@@ -50795,7 +50875,7 @@ impl<'a, 't> Checker<'a, 't> {
                                 // Copy / `str` element needs no cleanup, so `_` binds nothing.
                                 None if tuple_discard_needs_hidden_local(
                                     ety,
-                                    self.structs,
+                                    self.structs, self.tuples,
                                     self.enums,
                                     self.tagged_types,
                                 ) =>
@@ -51447,7 +51527,7 @@ impl<'a, 't> Checker<'a, 't> {
                 // only — a **Move** struct (Slice 4b: the lowering drops the old element's owned
                 // fields, then moves the new value in). Still deferred: a soa of *owned* columns
                 // (per-column drop), and a str-view struct into a *fixed* array.
-                let is_move = struct_is_move(sid, self.structs, self.enums, self.tagged_types);
+                let is_move = struct_is_move(sid, self.structs, self.tuples, self.enums, self.tagged_types);
                 if !(pod || str_view() || (!soa && is_move)) {
                     // In the error block: either `soa` is true (an owned-column soa — neither the POD
                     // nor the str field set matched), or `soa` is false with a non-POD, non-Move
@@ -51568,7 +51648,7 @@ impl<'a, 't> Checker<'a, 't> {
                 if !soa
                     && !is_dyn
                     && leaf_ty != Ty::String
-                    && drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop()
+                    && drop_plan(leaf_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()
                 {
                     self.diags.error(
                         format!(
@@ -52190,10 +52270,7 @@ impl<'a, 't> Checker<'a, 't> {
             let concrete = self.finalize(ce.ty);
             self.constrain(ce.ty, Some(concrete), ce.span);
             match ty_to_scalar(self.resolve(ce.ty)) {
-                Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
-                | Scalar::Resource(_) | Scalar::ResourceRef(_)
-                | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse)) => scalars.push(s),
+                Some(s) if tuple_element_is_supported(s) => scalars.push(s),
                 _ => {
                     if ce.ty != Ty::Error {
                         self.diags.error(
@@ -55272,6 +55349,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// caller, which mislabelled an array literal's element as a payload.
     fn payload_scalar(&mut self, ty: Ty, what: &str, allow_tagged: bool, span: Span) -> Scalar {
         let f = self.finalize(ty);
+        if !allow_tagged && matches!(f, Ty::Tuple(_)) {
+            self.diags.error(format!("{what} cannot be a tuple"), span);
+            return Scalar::Int(IntTy { bits: 64, signed: true });
+        }
         let scalar = ty_to_scalar(f).or_else(|| match (allow_tagged, f) {
             (true, Ty::Option(payload)) => Some(Scalar::Tagged(intern_tagged_type(
                 self.tagged_types,
@@ -59575,7 +59656,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.enums,
             self.tagged_types,
         ) && !matches!(elem_ty, Ty::Struct(id)
-            if struct_is_move(id, self.structs, self.enums, self.tagged_types))
+            if struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types))
         {
             self.diags.error(
                 "a resource or resource_ref cannot be an element of a fixed array".to_string(),
@@ -59619,7 +59700,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Inline owned headers and in-place Move records have complete transfer/cleanup and
         // shared reads. Other Move scalars remain closed even when they fit a Scalar.
         if fixed_owned_header_scalar(elem_ty).is_none() && !matches!(elem_ty, Ty::Struct(_))
-            && drop_plan(elem_ty, self.structs, self.enums, self.tagged_types).needs_drop()
+            && drop_plan(elem_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()
         {
             self.diags.error(
                 format!(
@@ -59642,7 +59723,7 @@ impl<'a, 't> Checker<'a, 't> {
             return true;
         }
         if let Ty::Enum(id) = elem_ty
-            && enum_is_move(id, self.structs, self.enums, self.tagged_types)
+            && enum_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types)
         {
             self.diags.error(
                 format!(
@@ -59820,7 +59901,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let resolved_elem = self.resolve(elem_ty);
         if let Ty::Struct(id) = resolved_elem {
-            if struct_is_move(id, self.structs, self.enums, self.tagged_types) {
+            if struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types) {
                 self.diags.error(
                     format!(
                         "`{}` cannot be copied into a fixed array from a value expression — construct each Move element in place",
@@ -59844,10 +59925,14 @@ impl<'a, 't> Checker<'a, 't> {
                 span,
             };
         }
+        let errors_before = self.diags.error_count();
         let scalar = match resolved_elem {
             Ty::Fn(fid) => Scalar::Fn(fid),
             other => self.payload_scalar(other, "array element", false, span),
         };
+        if self.diags.error_count() != errors_before {
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         Expr {
             kind: ExprKind::ArrayLit {
                 elems: checked,
@@ -61208,7 +61293,7 @@ impl<'a, 't> Checker<'a, 't> {
                 );
                 return err;
             }
-            Ty::Struct(id) if !struct_is_move(id, self.structs, self.enums, self.tagged_types) => {
+            Ty::Struct(id) if !struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types) => {
                 Ty::DynStructArray(id, Layout::Aos)
             }
             Ty::Struct(id) => {
@@ -61219,7 +61304,7 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
             _ => {
-                let Some(scalar) = ty_to_scalar(elem) else {
+                let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_))) else {
                     self.diags.error(
                         format!("'to_array' needs a scalar or Copy struct element, got {}", ty_name(elem)),
                         span,
@@ -61316,7 +61401,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        let Some(scalar) = ty_to_scalar(elem) else {
+        let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_))) else {
             self.diags.error(
                 format!("'map_into' needs a scalar element, got {} (project a field first)", ty_name(elem)),
                 span,
@@ -61684,7 +61769,7 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = piped else {
             return err;
         };
-        if ty_to_scalar(elem).is_none() {
+        if matches!(elem, Ty::Tuple(_)) || ty_to_scalar(elem).is_none() {
             self.diags.error(
                 format!("'{name}' needs a scalar element, got {} (project a field first)", ty_name(elem)),
                 span,
@@ -62616,7 +62701,7 @@ impl<'a, 't> Checker<'a, 't> {
         let moves_value = match elem {
             ArrayBuilderElem::Scalar(Scalar::String) => true,
             ArrayBuilderElem::Scalar(Scalar::Struct(id)) => {
-                struct_is_move(id, self.structs, self.enums, self.tagged_types)
+                struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_types)
             }
             _ => false,
         };
@@ -62785,7 +62870,11 @@ impl<'a, 't> Checker<'a, 't> {
         // annotation path is guarded in `resolve_type`, but inference here must reject the same
         // set or codegen's `scalar_bytes` hits `unreachable!`): a Move scalar (`string`/`array`),
         // a `Struct` (codegen can't size a struct box), or a `str` view (not boxable).
+        let errors_before = self.diags.error_count();
         let scalar = self.payload_scalar(arg.ty, "`heap.new` payload", false, args[0].span);
+        if arg.ty == Ty::Error || self.diags.error_count() != errors_before {
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
         let reject = match scalar {
             _ if scalar.is_move() => Some(format!("an owned `{}` cannot be boxed", scalar_name(scalar))),
             Scalar::Struct(_) => Some("struct boxes are not supported".to_string()),
@@ -63618,7 +63707,7 @@ impl<'a, 't> Checker<'a, 't> {
         if !self.json_struct_fields_ok(sid, span, JsonDir::Decode) {
             return err;
         }
-        if !json_scan_row_is_copy(sid, self.structs, self.enums, self.tagged_types) {
+        if !json_scan_row_is_copy(sid, self.structs, self.tuples, self.enums, self.tagged_types) {
             let Some(row_type_spelling) = self.json_scan_source_spelling.as_deref() else {
                 self.diags.error(
                     "cannot determine the scan row type spelling; annotate the binding with `json.scanner<Row>`".to_string(),
@@ -69793,7 +69882,7 @@ impl<'a, 't> Checker<'a, 't> {
                 Ty::Slice(Scalar::Struct(_)) | Ty::DynStructArray(_, Layout::Aos)
             ) || (matches!(r.ty, Ty::StructArray(..))
                 && matches!(index.kind, ast::ExprKind::Int(_))));
-        if drop_plan(leaf_ty, self.structs, self.enums, self.tagged_types).needs_drop()
+        if drop_plan(leaf_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()
             && !(matches!(leaf_ty, Ty::Resource(_)) && matches!(r.ty, Ty::StructArray(..)))
             && !indexed_move_borrow
         {
@@ -70357,7 +70446,7 @@ impl<'a, 't> Checker<'a, 't> {
         // double-free. Reject the nested-place case cleanly (defer, like a nested `string`-field move);
         // a bare local and a depth-1 field both null correctly and stay allowed. A binding-less match
         // (`Or`/`_` patterns only) moves nothing, so it is fine at any depth.
-        if matches!(resolved_scrutinee_ty, Ty::Enum(eid) if enum_is_move(eid, self.structs, self.enums, self.tagged_types))
+        if matches!(resolved_scrutinee_ty, Ty::Enum(eid) if enum_is_move(eid, self.structs, self.tuples, self.enums, self.tagged_types))
             && matches!(&s.kind, ExprKind::Field { path, .. } if path.len() > 1)
             && arms.iter().any(|a| matches!(&a.pattern, ast::MatchPattern::Variant { bindings, .. } if !bindings.is_empty()))
             && borrowed_place.is_none()
@@ -74694,6 +74783,10 @@ fn scalar_arg(
         diags.error(format!("{what} cannot be a generic type parameter yet, got {}", ty_name(ty)), span);
         return None;
     }
+    if matches!(ty, Ty::Tuple(_)) && !allow_param {
+        diags.error(format!("{what} cannot be a tuple"), span);
+        return None;
+    }
     // `run_bytes` has one public carrier: the Ok slot of `Result<run_bytes, E>`. The Result
     // resolver installs that exact leaf explicitly; every generic payload path (Option, enum,
     // nested tagged payload, collection, or box) must reject it rather than broadening ownership.
@@ -74825,6 +74918,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
     }
     if matches!(
         ty,
+        Ty::Tuple(_) |
         Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::CliCommand
@@ -75343,10 +75437,7 @@ fn resolve_type(
                     return Ty::Error;
                 }
                 match ty_to_scalar(ety) {
-                    Some(s @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char
-                    | Scalar::Str | Scalar::String | Scalar::DynArray(_) | Scalar::DynStructArray(_)
-                    | Scalar::Resource(_) | Scalar::ResourceRef(_)
-                | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse)) => scalars.push(s),
+                    Some(s) if tuple_element_is_supported(s) => scalars.push(s),
                     _ => {
                         diags.error(
                             format!("tuple elements must be a scalar, str, owned string, owned array, resource, or resource reference for now, got {}", ty_name(ety)),
@@ -76465,17 +76556,17 @@ fn http_headers_placement_error(what: &str) -> String {
 
 /// Whether a resolved type has a field representation. Detailed restrictions for inline layout
 /// and recursive ownership are applied after all definitions exist.
-fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
+fn is_field_ok(ty: Ty, tuples: &[hir::TupleDef], tagged_types: &[hir::TaggedType]) -> bool {
     // A dependent receive stream may only be stored in its builtin Option/Result carrier grammar.
     // User fields are a distinct storage edge and are therefore forbidden even when the immediate
     // field type is one of those tags. The complete graph classifier runs where all nominal tables
     // are available; this direct leaf guard closes concrete and generic field formation here.
-    if http_stream_carrier_class(ty, &[], &[], &[], tagged_types)
+    if http_stream_carrier_class(ty, &[], tuples, &[], tagged_types)
         != HttpStreamCarrierClass::None
     {
         return false;
     }
-    if http_upgrade_carrier_class(ty, &[], &[], &[], tagged_types)
+    if http_upgrade_carrier_class(ty, &[], tuples, &[], tagged_types)
         != HttpUpgradeCarrierClass::None
     {
         return false;
@@ -76550,6 +76641,11 @@ fn is_field_ok(ty: Ty, tagged_types: &[hir::TaggedType]) -> bool {
             Ty::Array(..) | Ty::StructArray(..) => {}
         // The payload is a `Scalar`; converting it back to `Ty` lets the same field-shape walker
         // admit producer-valid nested forms such as `Option<array<T>>`.
+        Ty::Tuple(id) => {
+            let Some(tuple) = tuples.get(id as usize) else { return false };
+            if tuple.elems.len() < 2 || !tuple.elems.iter().copied().all(tuple_element_is_supported) { return false; }
+            work.extend(tuple.elems.iter().copied().map(scalar_to_ty));
+        }
         Ty::Option(s) => work.push(scalar_to_ty(s)),
         Ty::Result(ok, err) => {
             work.push(scalar_to_ty(err));
@@ -76840,12 +76936,15 @@ pub fn union_shape_class(s: Scalar) -> Option<u8> {
 fn enum_payload_ok(
     s: Scalar,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
     match s {
         Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
         Scalar::Struct(id) => structs.get(id as usize).is_some(),
+        Scalar::Tuple(id) => tuples.get(id as usize).is_some_and(|tuple| tuple.elems.len() >= 2
+            && tuple.elems.iter().copied().all(tuple_element_is_supported)),
         Scalar::Enum(id) => enums.get(id as usize).is_some(),
         // Opaque handles admitted by concrete Pass 0c must remain legal after generic
         // substitution too. Their active sum arm owns exactly one null-safe Drop leaf.
@@ -76873,11 +76972,12 @@ fn enum_payload_ok(
         Scalar::DynArray(_) => true,
         Scalar::DynStructArray(id) => structs
             .get(id as usize)
-            .is_some_and(|_| !struct_is_move(id, structs, enums, tagged_types)),
+            .is_some_and(|_| !struct_is_move(id, structs, tuples, enums, tagged_types)),
         Scalar::Tagged(id) => {
             fn concrete(
                 scalar: Scalar,
                 structs: &[StructDef],
+                tuples: &[hir::TupleDef],
                 enums: &[hir::EnumDef],
                 tagged_types: &[hir::TaggedType],
                 active: &mut std::collections::HashSet<u32>,
@@ -76888,6 +76988,8 @@ fn enum_payload_ok(
                     Scalar::Struct(id)
                     | Scalar::DynStructArray(id)
                     | Scalar::Soa(id) => structs.get(id as usize).is_some(),
+                    Scalar::Tuple(id) => tuples.get(id as usize).is_some_and(|tuple|
+                        tuple.elems.len() >= 2 && tuple.elems.iter().copied().all(tuple_element_is_supported)),
                     Scalar::Enum(id) => enums.get(id as usize).is_some(),
                     Scalar::Tagged(id) => {
                         if !active.insert(id) {
@@ -76898,16 +77000,18 @@ fn enum_payload_ok(
                                 concrete(
                                     *payload,
                                     structs,
+                                    tuples,
                                     enums,
                                     tagged_types,
                                     active,
                                 )
                             }
                             Some(hir::TaggedType::Result(ok, err)) => {
-                                concrete(*ok, structs, enums, tagged_types, active)
+                                concrete(*ok, structs, tuples, enums, tagged_types, active)
                                     && concrete(
                                         *err,
                                         structs,
+                                        tuples,
                                         enums,
                                         tagged_types,
                                         active,
@@ -76925,6 +77029,7 @@ fn enum_payload_ok(
             concrete(
                 Scalar::Tagged(id),
                 structs,
+                tuples,
                 enums,
                 tagged_types,
                 &mut std::collections::HashSet::new(),
@@ -76990,7 +77095,7 @@ fn instantiate_struct(
             cx.enums,
             cx.tagged_types,
         );
-        if !is_field_ok(fty, cx.tagged_types) {
+        if !is_field_ok(fty, cx.tuples, cx.tagged_types) {
             diags.error(
                 format!("field '{}' of '{name}' resolves to {}, which is not a valid struct field type yet", f.name, ty_name(fty)),
                 span,
@@ -77128,7 +77233,7 @@ fn instantiate_enum(
             // slot while an early monomorph is cached. Validate those graph-dependent shapes once
             // all type and function-driven monomorphization is complete.
             if !matches!(p, Scalar::Param(_) | Scalar::Struct(_) | Scalar::DynStructArray(_))
-                && !enum_payload_ok(p, cx.structs, cx.enums, cx.tagged_types)
+                && !enum_payload_ok(p, cx.structs, cx.tuples, cx.enums, cx.tagged_types)
             {
                 diags.error(
                     format!("variant '{}' of '{name}' resolves to {}, which is not a valid sum-type payload yet", v.name, scalar_name(p)),
@@ -77209,6 +77314,129 @@ fn parse_mask_name(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tuple_carrier_layout_and_drop_plans() {
+        let integer = |bits| {
+            Scalar::Int(IntTy {
+                bits,
+                signed: false,
+            })
+        };
+        let tuples = vec![
+            hir::TupleDef {
+                elems: vec![integer(8), integer(64), integer(16)],
+            },
+            hir::TupleDef {
+                elems: vec![
+                    Scalar::String,
+                    Scalar::DynArray(PrimScalar::Int(IntTy {
+                        bits: 64,
+                        signed: true,
+                    })),
+                ],
+            },
+        ];
+        let structs = vec![StructDef {
+            name: "Record".into(),
+            source_name: "Record".into(),
+            fields: vec![
+                FieldDef {
+                    name: "flag".into(),
+                    ty: Ty::Bool,
+                },
+                FieldDef {
+                    name: "pair".into(),
+                    ty: Ty::Tuple(1),
+                },
+            ],
+            align: None,
+            c_repr: false,
+        }];
+        let enums = vec![hir::EnumDef {
+            name: "Choice".into(),
+            source_name: "Choice".into(),
+            variants: vec![hir::EnumVariant {
+                name: "Pair".into(),
+                payload: vec![Scalar::Tuple(1)],
+                field_base: 1,
+            }],
+        }];
+        let tagged = vec![hir::TaggedType::Option(Scalar::Tuple(1))];
+        let mut layouts = TypeLayoutCache::new(&structs, &tuples, &enums, &tagged);
+        for (ty, size, moves) in [
+            (Ty::Tuple(0), 24, false),
+            (Ty::Option(Scalar::Tuple(0)), 32, false),
+            (Ty::Result(Scalar::Bool, Scalar::Tuple(0)), 32, false),
+            (Ty::Tuple(1), 32, true),
+            (Ty::Tagged(0), 40, true),
+            (Ty::Struct(0), 40, true),
+            (Ty::Enum(0), 40, true),
+        ] {
+            assert_eq!(layouts.layout(ty), (size, 8), "{ty:?}");
+            let plan = drop_plan(ty, &structs, &tuples, &enums, &tagged);
+            assert!(plan.is_valid(), "{ty:?}: {plan:?}");
+            assert_eq!(plan.needs_drop(), moves, "{ty:?}");
+        }
+        for id in 0..2 {
+            assert_eq!(ty_to_scalar(Ty::Tuple(id)), Some(Scalar::Tuple(id)));
+            assert_eq!(scalar_to_ty(Scalar::Tuple(id)), Ty::Tuple(id));
+        }
+        assert!(
+            !drop_plan(
+                Ty::Option(Scalar::Tuple(2)),
+                &structs,
+                &tuples,
+                &enums,
+                &tagged
+            )
+            .is_valid()
+        );
+        let cycle = [hir::TupleDef {
+            elems: vec![Scalar::Bool, Scalar::Tuple(0)],
+        }];
+        assert!(!drop_plan(Ty::Tuple(0), &[], &cycle, &[], &[]).is_valid());
+    }
+
+    #[test]
+    fn tuple_carrier_provenance_replay() {
+        let (program, diagnostics) = check(
+            r#"
+fn borrowed(borrow source:string)->Result<(str,i64),i64> = Ok((source[0..source.len()],source.len()))
+fn fresh(borrow ignored:string)->Option<(string,i64)> = Some(("fresh".clone(),1))
+fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
+"#,
+        );
+        assert!(
+            !diagnostics.has_errors(),
+            "{:?}",
+            diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        assert!(checked_hir_body_facts_are_valid(&program));
+        let borrowed = program
+            .fns
+            .iter()
+            .position(|f| f.name == "borrowed")
+            .unwrap();
+        assert_eq!(
+            program.fns[borrowed].return_borrow,
+            hir::ReturnBorrowSummary::Roots {
+                params: vec![0],
+                captures: vec![]
+            }
+        );
+        let fresh = program.fns.iter().find(|f| f.name == "fresh").unwrap();
+        assert_eq!(fresh.return_borrow, hir::ReturnBorrowSummary::None);
+        let mut forged = program.clone();
+        forged.fns[borrowed].return_borrow = hir::ReturnBorrowSummary::None;
+        assert!(!checked_hir_body_facts_are_valid(&forged));
+        let mut forged = program.clone();
+        let main = forged.fns.iter_mut().find(|f| f.name == "main").unwrap();
+        let other = main.locals.iter().find(|l| l.name == "other").unwrap().id;
+        assert!(main.drop_locals.contains(&other));
+        main.drop_locals.retain(|id| *id != other);
+        assert!(!checked_hir_body_facts_are_valid(&forged));
+    }
+
     use align_lexer::tokenize;
     use align_parser::parse_file;
 
@@ -91622,16 +91850,16 @@ fn exit_branch(flag: bool) -> i64 {
                         Ty::Result(Scalar::Bool, Scalar::Struct(2)),
                         Ty::Enum(0), Ty::Tagged(0),
                     ] {
-                        let plan = drop_plan(ty, &structs, &enums, &tagged);
+                        let plan = drop_plan(ty, &structs, &[], &enums, &tagged);
                         assert!(plan.is_valid(), "{ty:?}/{leaf:?}");
                         assert_eq!(plan.needs_drop(), leaf != Ty::Bool, "{ty:?}/{leaf:?}");
                         assert_eq!(ty_is_move(ty, &structs, &[], &enums, &tagged), leaf != Ty::Bool);
                     }
-                    assert_eq!(json_scan_row_is_copy(2, &structs, &enums, &tagged), leaf == Ty::Bool);
+                    assert_eq!(json_scan_row_is_copy(2, &structs, &[], &enums, &tagged), leaf == Ty::Bool);
                 }
                 for malformed in [Ty::StructArray(99, length), Ty::StructArray(1, length)] {
                     let invalid = vec![record("Cycle", malformed), record("Back", Ty::Struct(0))];
-                    let plan = drop_plan(Ty::Struct(0), &invalid, &[], &[]);
+                    let plan = drop_plan(Ty::Struct(0), &invalid, &[], &[], &[]);
                     assert!(plan.needs_drop(), "malformed array must fail closed");
                     assert!(!plan.is_valid(), "{malformed:?}");
                 }
@@ -91663,7 +91891,7 @@ fn exit_branch(flag: bool) -> i64 {
                 c_repr: false,
             },
         ];
-        let plan = drop_plan(Ty::Struct(1), &structs, &[], &[]);
+        let plan = drop_plan(Ty::Struct(1), &structs, &[], &[], &[]);
         assert!(plan.needs_drop());
         let DropPlan::Struct { fields, .. } = plan else {
             panic!("outer plan must be a struct");
@@ -91693,9 +91921,9 @@ fn exit_branch(flag: bool) -> i64 {
             align: None,
             c_repr: false,
         }];
-        assert!(drop_plan(Ty::Struct(0), &cyclic, &[], &[]).needs_drop());
+        assert!(drop_plan(Ty::Struct(0), &cyclic, &[], &[], &[]).needs_drop());
         assert_eq!(
-            drop_plan(Ty::Struct(99), &cyclic, &[], &[]),
+            drop_plan(Ty::Struct(99), &cyclic, &[], &[], &[]),
             DropPlan::Invalid
         );
 
@@ -91710,7 +91938,7 @@ fn exit_branch(flag: bool) -> i64 {
             c_repr: false,
         }];
         assert!(
-            drop_plan(Ty::Struct(0), &missing_nested, &[], &[]).needs_drop(),
+            drop_plan(Ty::Struct(0), &missing_nested, &[], &[], &[]).needs_drop(),
             "a missing nested struct ID must fail closed without panicking"
         );
         let missing_enum_payload = vec![hir::EnumDef {
@@ -91723,7 +91951,7 @@ fn exit_branch(flag: bool) -> i64 {
             }],
         }];
         assert!(
-            drop_plan(Ty::Enum(0), &[], &missing_enum_payload, &[]).needs_drop(),
+            drop_plan(Ty::Enum(0), &[], &[], &missing_enum_payload, &[]).needs_drop(),
             "a missing enum payload struct ID must fail closed without panicking"
         );
     }
@@ -91809,7 +92037,7 @@ fn exit_branch(flag: bool) -> i64 {
                 c_repr: false,
             });
         }
-        let plan = drop_plan(Ty::Struct(39), &structs, &[], &[]);
+        let plan = drop_plan(Ty::Struct(39), &structs, &[], &[], &[]);
         assert!(
             !plan.needs_drop(),
             "Copy repeated subgraphs must use the cached nominal classification"
@@ -91859,8 +92087,7 @@ fn exit_branch(flag: bool) -> i64 {
                 }
                 let plan = drop_plan(
                     Ty::Struct((DEPTH - 1) as u32),
-                    &structs,
-                    &[],
+                    &structs, &[], &[],
                     &[],
                 );
                 assert!(
@@ -92183,12 +92410,12 @@ fn exit_branch(flag: bool) -> i64 {
 
         assert!(ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
         assert!(ty_may_borrow(Ty::Struct(0), &structs, &[], &[], &[]));
-        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (16, 8));
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[], &[]), (16, 8));
 
         structs[DEPTH - 1].fields[0].ty = Ty::String;
         assert!(!ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
         assert!(!ty_may_borrow(Ty::Struct(0), &structs, &[], &[], &[]));
-        assert!(struct_is_move(0, &structs, &[], &[]));
+        assert!(struct_is_move(0, &structs, &[], &[], &[]));
 
         structs[DEPTH - 1].fields[0].ty = Ty::Str;
         let paths = borrow_leaf_paths_for_type(Ty::Struct(0), &structs, &[], &[], &[]);
@@ -92213,10 +92440,10 @@ fn exit_branch(flag: bool) -> i64 {
                 Scalar::Tagged((id + 1) as u32)
             }))
             .collect::<Vec<_>>();
-        assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &tagged).1, 8);
+        assert_eq!(ty_abi_layout(Ty::Tagged(0), &[], &[], &[], &tagged).1, 8);
         let tagged_mangle = ty_mangle(Ty::Tagged(0), &tagged, &[], &[], &[], &[], &[]);
         assert!(tagged_mangle.len() > DEPTH * 2);
-        assert!(is_field_ok(Ty::Tagged(0), &tagged));
+        assert!(is_field_ok(Ty::Tagged(0), &[], &tagged));
         let mut tagged_struct = tagged.clone();
         tagged_struct[DEPTH - 1] =
             hir::TaggedType::Option(Scalar::Struct(42));
@@ -92307,11 +92534,11 @@ fn exit_branch(flag: bool) -> i64 {
         );
 
         structs[DEPTH - 1].fields[0].ty = Ty::Struct(0);
-        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[], &[]), (0, 1));
         assert!(!ty_mentions_slice(Ty::Struct(0), &structs, &[], &[]));
 
         structs[DEPTH - 1].fields[0].ty = Ty::Struct(DEPTH as u32 + 7);
-        assert_eq!(struct_abi_layout(0, &structs, &[], &[]), (0, 1));
+        assert_eq!(struct_abi_layout(0, &structs, &[], &[], &[]), (0, 1));
 
         std::thread::Builder::new()
             .name("deep-json-descriptor-owner".to_string())

@@ -16837,6 +16837,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::Char
         | Scalar::Unit
         | Scalar::Struct { .. }
+        | Scalar::Tuple { .. }
         | Scalar::String
         | Scalar::DynArray { .. }
         | Scalar::DynStructArray { .. }
@@ -16908,6 +16909,8 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         Scalar::Unit,
         Scalar::Struct(0),
         Scalar::Struct(1),
+        Scalar::Tuple(0),
+        Scalar::Tuple(1),
         Scalar::String,
         Scalar::DynArray(PrimScalar::Int(IntTy {
             bits: 64,
@@ -17064,7 +17067,7 @@ fn delegated_ownership_and_shape_gates_agree_with_sema() {
     let is_move = |scalar: Scalar| {
         align_sema::scalar_is_move(
             scalar,
-            &program.structs,
+            &program.structs, &program.tuples,
             &program.enums,
             &program.tagged_types,
         )
@@ -20399,6 +20402,51 @@ fn rng_record_fields_preserve_placement_boundaries() -> Result<(), &'static str>
             assert!(
                 is_empty(&lowered),
                 "mutation {mutation} published partial MIR"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn tuple_carrier_checked_hir_validation() -> Result<(), &'static str> {
+    let base = checked_source_program(
+        "Record {pair:(i64,bool)}\nChoice {Pair((i64,bool)),Empty}\nfn make()->Result<(i64,bool),i64> = Ok((3,true))\nfn main() {value:=make()}\n",
+    );
+    for per_unit in [false, true] {
+        assert!(lower_program_checked(&base, per_unit, None).is_ok());
+    }
+    for axis in [
+        "missing",
+        "arity",
+        "nested",
+        "forbidden",
+        "width",
+        "box",
+        "collection",
+        "constructor",
+    ] {
+        let mut bad = base.clone();
+        match axis {
+            "missing" => bad.tuples.clear(),
+            "arity" => bad.tuples[0].elems.truncate(1),
+            "nested" => bad.tuples[0].elems[0] = Scalar::Tuple(0),
+            "forbidden" => bad.tuples[0].elems[0] = Scalar::Reader,
+            "width" => bad.tuples[0].elems[0] = scalar_int(7),
+            "box" => bad.structs[0].fields[0].ty = Ty::Box(Scalar::Tuple(0)),
+            "collection" => bad.structs[0].fields[0].ty = Ty::Array(Scalar::Tuple(0), 2),
+            "constructor" => {
+                let function = bad.fns.iter_mut().find(|f| f.name == "make").ok_or("make function")?;
+                let value = function.body.value.as_mut().ok_or("make return")?;
+                let hir::ExprKind::ResultOk(payload) = &mut value.kind else { return Err("Ok fixture") };
+                payload.ty = Ty::Bool;
+            }
+            _ => return Err("unknown mutation axis"),
+        }
+        for per_unit in [false, true] {
+            assert!(
+                lower_program_checked(&bad, per_unit, None).is_err(),
+                "{axis}/{per_unit}"
             );
         }
     }
