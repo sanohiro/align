@@ -754,7 +754,7 @@ pub enum Stmt {
         offset: Operand,
         value: Operand,
     },
-    /// Run all deferred tasks of a `task_group` and clear the list (`wait()`). Operand = the
+    /// Join all pending tasks of a `task_group` (`wait()`). Operand = the
     /// task-group handle. ④b-1 runs them sequentially; ④b-2 joins threads.
     TgWait(Operand),
     /// End a `task_group`, freeing its region (the operand is the task-group handle).
@@ -1107,7 +1107,7 @@ pub enum Rvalue {
     ArenaBegin,
     /// Open a `task_group`; the value is its handle (a `*TaskGroup`).
     TgBegin,
-    /// Register a deferred task (`spawn`): snapshot the closure's captures into a fresh env in the
+    /// Publish a task (`spawn`): snapshot the closure's captures into a fresh env in the
     /// task-group region, allocate the result slot there, and register the task. Yields the slot
     /// pointer (the `Task<R>` handle). `tg` = the task-group handle, `closure` = the `{fn, env}`
     /// value, `capture_tys` give the env layout (empty = non-capturing), `r` = the result scalar.
@@ -10489,8 +10489,8 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 inherit_borrow_owners(b, value, [&owner]);
                 Operand::Value(value)
             }
-            // ④b: `task_group` opens a region owning each task's env + result slot, plus a deferred
-            // task list. `spawn`/`wait` use the handle; the region is freed at scope end.
+            // `task_group` opens a region owning each task's env + result slot and tracks pending
+            // work. `spawn`/`wait` use the handle; the region is freed at scope end.
             hir::ExprKind::TaskGroup(blk) => {
                 let handle = b.fresh_value(Ty::ArenaHandle);
                 b.push(Stmt::Let(handle, Rvalue::TgBegin));
@@ -10508,8 +10508,8 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     tail.unwrap_or(Operand::Const(Const::Unit))
                 }
             }
-            // ④b-1b (deferred): `spawn(closure)` snapshots the closure's captures into a fresh env in
-            // the task-group region and registers the task; it runs at `wait`. The `Task<R>` handle is
+            // `spawn(closure)` snapshots the closure's captures into a fresh env in
+            // the task-group region and publishes it for worker execution. The `Task<R>` handle is
             // the task's result slot. The closure's captures give the env layout.
             hir::ExprKind::Spawn { closure, fallible } => {
                 let Ty::Task(s) = e.ty else {
@@ -10548,7 +10548,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
                 Operand::Value(v)
             }
-            // `wait()` — run all deferred tasks of the enclosing task_group.
+            // `wait()` — join pending tasks of the enclosing task_group.
             hir::ExprKind::Wait => {
                 let tg = Operand::Value(*b.task_groups.last().expect("wait outside a task_group"));
                 // A fallible group's `wait()` yields `Result<(), Error>` (built from the runtime's

@@ -2354,3 +2354,15 @@ MIR producer validation authenticates i32 status and exclusive i64 scratch
 before LLVM. [Plan 101](101-os-memory-observation-plan.md) owns native queries,
 cleanup, source transport, cache parity and the implementation closure matrix.
 No Ty/Scalar or serialized leaf tag is added.
+
+## Structured task access and retention (plan180)
+
+`Fn::mutable_access` and `ImportedFn::mutable_access` are mandatory analysis surfaces:
+`Option<Vec<MutableAccessRoot>>`, with distinct `Contained(u32)` and `Storage(u32)`
+logical parameter roots, including lifted captures. `None` is unavailable; `Some([])`
+is proven empty. Producer inference, imported certification, concrete-inline comparison,
+replay reset/equality and interface format 18 cover the record. Canonical kind/index order,
+range checks and generic unavailability are shared validation. [Plan180](180-structured-task-progress.md)
+owns the exact bytes and closure matrix. Task captures additionally retain completed
+borrow/storage facts through control joins, generation renaming and pruning until their
+covering join. Discarded handles do not weaken protection.

@@ -2555,7 +2555,7 @@ fn par_pool() -> (&'static ParPool, usize) {
 /// Test-only introspection: has the global `par_map`/`task_group` worker pool been spun up yet in
 /// this process? Deliberately **not** part of the runtime's FFI surface (no `extern "C"`/
 /// `no_mangle`, so it is never callable from Align-generated code) — it exists only so regression
-/// tests can pin that a tiny `par_map`/single-task `task_group` never pays the pool's cold-start
+/// tests can pin that a tiny `par_map` never pays the pool's cold-start
 /// cost (Codex audit item 5). Checking `PAR_POOL.get()` rather than calling [`par_pool`] is the
 /// point: the latter would force creation, defeating the check.
 #[doc(hidden)]
@@ -17327,41 +17327,147 @@ pub unsafe extern "C" fn align_rt_arena_end(arena: *mut Arena) {
     drop(arena);
 }
 
-// `task_group` runtime (slice ④b). A `TaskGroup` owns a region (arena) holding each spawned
-// task's environment + result slot, plus the deferred task list. `wait` uses caller-participating
-// runners over the process worker pool; each runner claims contiguous task batches and publishes
-// completion through one shared latch.
+// Structured tasks publish initialized descriptors at spawn. Only the caller touches the group
+// arena; workers own a generation Arc and claim descriptors under its mutex. The join precedes
+// reclamation even when helper jobs remain queued in the finite process pool.
 struct TgTask {
-    /// `tramp(thunk, env, slot, err_slot) -> i32` — runs the spawned closure. On `Ok` it writes the
-    /// result into `slot` and returns `0`; on `Err` it writes the full `Error` value into `err_slot`
-    /// and returns `1` (surfaced by `wait()?`). A non-fallible task always returns `0`.
+    /// `tramp(thunk, env, slot, err_slot)` returns zero on success, nonzero on error.
     tramp: extern "C" fn(*const u8, *mut u8, *mut u8, *mut u8) -> i32,
-    /// The closure's function pointer (env-ABI `fn(env) -> R`), passed through to the trampoline.
     thunk: *const u8,
-    /// The task's environment (capture snapshot) — a fresh region allocation per `spawn`.
     env: *mut u8,
-    /// The task's result slot (a region allocation sized for `R`).
     slot: *mut u8,
-    /// The task's error slot (a region allocation sized for `Error`), or null for a non-fallible
-    /// task. `wait()?` reads the lowest-spawn-index errored task's `err_slot`.
     err_slot: *mut u8,
+}
+
+// The producer fully initializes each private environment/result/error allocation before enqueue.
+// One runner owns each descriptor; shared captured backing is protected by compiler analysis.
+// Allocations remain valid through completion, which is published after their final access.
+unsafe impl Send for TgTask {}
+
+#[derive(Default)]
+struct TgGenerationState {
+    pending: std::collections::VecDeque<(usize, TgTask)>,
+    registered: usize,
+    completed: usize,
+    helpers: usize,
+    /// Error pointers are stored as addresses so no late helper owns a dereferenceable region
+    /// reference. The join alone converts the selected address back to a pointer.
+    error: Option<(usize, usize)>,
+    panic: Option<(usize, ParPanic)>,
+}
+
+#[derive(Default)]
+struct TgGeneration {
+    state: std::sync::Mutex<TgGenerationState>,
+    complete: std::sync::Condvar,
+}
+
+const TG_OVERSUBSCRIPTION: usize = 4;
+
+fn tg_claim_batch_size(task_count: usize, workers: usize) -> usize {
+    if task_count <= workers {
+        return 1;
+    }
+    let claim_slots = workers.max(1).saturating_mul(TG_OVERSUBSCRIPTION);
+    task_count.div_ceil(claim_slots).max(1)
+}
+
+impl TgGeneration {
+    /// Enqueue and reserve a helper atomically with empty-queue helper retirement. A helper that
+    /// retired before this enqueue is replaced; one that has not retired must see the new work.
+    fn register(&self, task: TgTask, workers: usize) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let index = state.registered;
+        state.registered = state.registered.checked_add(1).unwrap_or_else(|| panic_abort("task count exhausted"));
+        state.pending.push_back((index, task));
+        if state.helpers < workers {
+            state.helpers += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn run(&self, helper: bool, workers: usize) {
+        loop {
+            let batch = {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if state.pending.is_empty() {
+                    if helper {
+                        state.helpers -= 1;
+                    }
+                    return;
+                }
+                let count = tg_claim_batch_size(state.pending.len(), workers);
+                state.pending.drain(..count).collect::<Vec<_>>()
+            };
+            let count = batch.len();
+            let mut error = None;
+            let mut panic = None;
+            for (index, task) in batch {
+                let err_address = task.err_slot.expose_provenance();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    (task.tramp)(task.thunk, task.env, task.slot, task.err_slot)
+                }));
+                match result {
+                    Ok(0) => {}
+                    Ok(_) if error.is_none() => error = Some((index, err_address)),
+                    Ok(_) => {}
+                    Err(payload) if panic.is_none() => panic = Some((index, payload)),
+                    Err(_) => {}
+                }
+            }
+            // No descriptor or pointed-to allocation is touched after publishing completion.
+            // Mutex unlock/acquire gives the waiter visibility of result and error slot writes.
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(error) = error
+                && state.error.as_ref().is_none_or(|old| error.0 < old.0)
+            { state.error = Some(error); }
+            if let Some(panic) = panic
+                && state.panic.as_ref().is_none_or(|old| panic.0 < old.0)
+            { state.panic = Some(panic); }
+            state.completed += count;
+            if state.completed == state.registered {
+                self.complete.notify_one();
+            }
+        }
+    }
+
+    fn join(&self, workers: usize) -> *mut u8 {
+        // A nested waiter always helps its own group, even if all process workers are occupied.
+        self.run(false, workers);
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        while state.completed != state.registered {
+            state = self.complete.wait(state).unwrap_or_else(|p| p.into_inner());
+        }
+        let panic = state.panic.take();
+        let error = state.error.map_or(core::ptr::null_mut(), |(_, address)| std::ptr::with_exposed_provenance_mut(address));
+        drop(state);
+        if let Some((_, payload)) = panic {
+            std::panic::resume_unwind(payload);
+        }
+        error
+    }
 }
 
 pub struct TaskGroup {
     arena: Arena,
-    tasks: Vec<TgTask>,
+    generation: Option<std::sync::Arc<TgGeneration>>,
 }
 
 /// Open a `task_group`. Freed by [`align_rt_tg_end`].
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_tg_begin() -> *mut TaskGroup {
-    Box::into_raw(Box::new(TaskGroup { arena: Arena { chunks: Vec::new(), off: 0, maps: Vec::new() }, tasks: Vec::new() }))
+    Box::into_raw(Box::new(TaskGroup {
+        arena: Arena { chunks: Vec::new(), off: 0, maps: Vec::new() },
+        generation: None,
+    }))
 }
 
-/// Bump-allocate `size` bytes (with `align`) from the task group's region (envs + result slots).
+/// Allocate private task environment/result/error storage. Only the caller touches arena metadata.
 ///
 /// # Safety
-/// `tg` must be a non-null, valid pointer returned by [`align_rt_tg_begin`] and not yet ended.
+/// `tg` must be a valid live group, exclusively accessed by its caller.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align: i64) -> *mut u8 {
     if tg.is_null() {
@@ -17369,18 +17475,17 @@ pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align:
     }
     let Ok(size_u) = safe_len(size) else { return core::ptr::null_mut() };
     let Ok(align_u) = safe_len(align) else { return core::ptr::null_mut() };
-    // Capture/result/error records have evolving aggregate/drop layouts; keep them conservative
-    // until MIR initialization facts prove every semantically visited byte is written first.
     unsafe { &mut *tg }.arena.alloc_zeroed(size_u, align_u)
 }
 
-/// Register a deferred task (its trampoline + closure pointer + env + result slot).
+/// Publish one fully initialized task for execution before returning to the caller.
 ///
 /// # Safety
-/// `tg` must be a non-null, valid pointer returned by [`align_rt_tg_begin`] and not yet ended.
-/// `thunk`/`env`/`slot`/`err_slot` (`err_slot` may be null for a non-fallible task) must be valid
-/// for `tramp` to read/write as documented on [`TgTask`], and must stay valid until the group's
-/// `wait()` (they are read only during the task's run, before `tg_end` frees the region).
+/// `tg` must be a valid live group, exclusively accessed by its caller. Each descriptor's
+/// environment/result/error storage must be private, correctly initialized/aligned for `tramp`,
+/// and valid through the next join. Shared capture backing must remain live and unmodified until
+/// that join. `tramp`/`thunk` must obey the compiler's task ABI; only an infallible task may omit
+/// `err_slot`. A task must not unwind through its C ABI.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_register(
     tg: *mut TaskGroup,
@@ -17390,247 +17495,40 @@ pub unsafe extern "C" fn align_rt_tg_register(
     slot: *mut u8,
     err_slot: *mut u8,
 ) {
-    unsafe { &mut *tg }.tasks.push(TgTask { tramp, thunk, env, slot, err_slot });
-}
-
-/// A task's data, made `Send` so it can move into a worker thread. Safe by construction (slice
-/// ④b): each task's `env`/`slot` are a fresh, private region allocation — no task shares them, the
-/// `env` is only read (its capture snapshot) and the `slot` only written, and the region outlives
-/// the join (`wait` happens before `tg_end`). `get()` reads a slot only after the join (④c).
-struct TgRun {
-    tramp: extern "C" fn(*const u8, *mut u8, *mut u8, *mut u8) -> i32,
-    thunk: *const u8,
-    env: *mut u8,
-    slot: *mut u8,
-    err_slot: *mut u8,
-}
-unsafe impl Send for TgRun {}
-
-/// A `task_group`'s registered tasks, shared across the runners of one `wait()`. Each index is
-/// **claimed exactly once** (an atomic fetch-add hands each contiguous batch to a single runner),
-/// and every task's `env`/`slot`/`err_slot` is a fresh, private, disjoint region allocation that no other
-/// task touches (`env` read-only, `slot`/`err_slot` write-only) — so concurrent immutable reads of
-/// the list plus disjoint per-task writes are race-free. That is why this is `Send + Sync` despite
-/// holding raw pointers.
-struct TgTasks(Vec<TgTask>);
-unsafe impl Send for TgTasks {}
-unsafe impl Sync for TgTasks {}
-
-const TG_OVERSUBSCRIPTION: usize = 4;
-const TG_NO_ERROR: usize = usize::MAX;
-
-/// Choose a contiguous claim size that bounds scheduler traffic while keeping small groups at
-/// one task per claim. Four-way oversubscription is the conservative end of the documented
-/// 4..8 probe range; the body-cost and false-sharing measurements remain separate work.
-fn tg_claim_batch_size(task_count: usize, workers: usize) -> usize {
-    if task_count <= workers {
-        return 1;
-    }
-    let claim_slots = workers.max(1).saturating_mul(TG_OVERSUBSCRIPTION);
-    task_count.div_ceil(claim_slots).max(1)
-}
-
-/// Low-lock completion state shared by every runner of one `wait()`. Normal task completion
-/// accumulates within a claimed batch and touches one atomic decrement per batch; a mutex is
-/// reserved for the real panic payload and for the condvar's lost-wakeup guard. "First" error/panic
-/// selection is by **lowest task index** (deterministic, unlike thread-completion order), so a
-/// re-run gives the same result.
-struct TgCompletion {
-    /// Tasks that have completed (ran to a return or panicked). The caller waits for this to reach
-    /// zero before returning, so no task is still live when `tg_end` frees the region.
-    remaining: std::sync::atomic::AtomicUsize,
-    /// Lowest errored task index, or `TG_NO_ERROR` when no task returned an error. The task's
-    /// `err_slot` is read only after `remaining` supplies the join Acquire edge.
-    err_index: std::sync::atomic::AtomicUsize,
-    /// First panic (lowest index) — re-raised on the caller so a worker panic is never swallowed.
-    panic: std::sync::Mutex<Option<(usize, ParPanic)>>,
-    /// Protects the final-transition notification against a waiter checking the count just before
-    /// it parks on `complete`.
-    wait_lock: std::sync::Mutex<()>,
-    complete: std::sync::Condvar,
-}
-
-impl TgCompletion {
-    fn record_error(&self, index: usize) {
-        use std::sync::atomic::Ordering;
-        self.err_index.fetch_min(index, Ordering::Relaxed);
-    }
-
-    fn record_panic(&self, index: usize, payload: ParPanic) {
-        let mut panic = self.panic.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if panic.as_ref().is_none_or(|(first, _)| index < *first) {
-            *panic = Some((index, payload));
-        }
-    }
-
-    fn batch_finished(&self, batch_len: usize) {
-        use std::sync::atomic::Ordering;
-        debug_assert!(batch_len > 0, "task-group empty completion batch");
-        let previous = self.remaining.fetch_sub(batch_len, Ordering::Release);
-        debug_assert!(previous >= batch_len, "task-group completion underflow");
-        if previous == batch_len {
-            // The waiter holds this mutex while checking `remaining` and entering `wait`, so the
-            // final notification cannot fall between the check and the park.
-            let _wait_guard = self
-                .wait_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.complete.notify_one();
-        }
-    }
-
-    fn wait(&self) {
-        use std::sync::atomic::Ordering;
-        let mut wait_guard = self
-            .wait_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while self.remaining.load(Ordering::Acquire) != 0 {
-            wait_guard = self
-                .complete
-                .wait(wait_guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
-    }
-
-    fn take_panic(&self) -> Option<(usize, ParPanic)> {
-        self.panic.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take()
+    let tg = unsafe { &mut *tg };
+    let generation = tg.generation.get_or_insert_with(Default::default);
+    let (pool, workers) = par_pool();
+    if generation.register(TgTask { tramp, thunk, env, slot, err_slot }, workers) {
+        let generation = generation.clone();
+        pool.submit_many(std::iter::once(Box::new(move || generation.run(true, workers)) as ParJob));
     }
 }
 
-/// Run every registered task and join them all before returning, reusing the process-lifetime
-/// [`ParPool`] (like `align_rt_par_map`) instead of spawning one OS thread per task.
-///
-/// **Work-claiming, caller-participating design.** The tasks live in a shared claim-once list with
-/// an atomic cursor. A *runner* loops: claim the next contiguous batch, run each task (under
-/// `catch_unwind`), publish one completion decrement per batch, and repeat until the list is drained.
-/// `wait()` dispatches up to `min(workers, n-1)` runners onto the pool **and runs the same claim
-/// loop on the calling thread itself**, then blocks until every task has finished.
-///
-/// **Nesting / deadlock analysis (the crux).** A spawned closure is lifted to an ordinary function,
-/// so its body may open its own `task_group` — i.e. a pool worker can re-enter `tg_wait`. With a
-/// *finite* pool, a naive "submit all, then wait" scheme deadlocks: nested waits on busy workers
-/// would wait for jobs that no free worker can pick up. The caller-participates claim loop removes
-/// that hazard: **the calling thread of every `wait()` drains its own group to completion by
-/// itself if no pool worker is free.** So each nesting level always makes forward progress on its
-/// own thread — even with zero idle workers, an N-deep nest just runs sequentially, one level per
-/// blocked thread. No `wait()` can ever wait on the pool for its *own* group's tasks. (This is why
-/// the tasks are shared and claimed atomically rather than moved into per-task jobs.) Runner jobs
-/// that a worker only picks up *after* the group has drained find the cursor past the end and exit
-/// without touching any task — they never dereference the freed region.
-///
-/// A worker panic is caught, recorded, and re-raised on the caller (never swallowed — that would
-/// falsely report success and then read an unwritten slot). Normal completion does not lock a
-/// shared mutex; the final transition wakes the caller after an Acquire join. All tasks are
-/// guaranteed finished before this returns, so the region stays valid until `tg_end` (the join
-/// precedes the free).
+/// Join all tasks since the preceding wait. Return the lowest registered error slot, or null.
+/// The caller participates in claiming work, so nested groups do not need a free pool worker.
+/// Late queued helpers retain only generation metadata and cannot touch the group arena.
 ///
 /// # Safety
-/// `tg` must be a non-null, valid pointer returned by [`align_rt_tg_begin`] and not yet ended.
-/// Every task registered via [`align_rt_tg_register`] must still have its `env`/`slot`/`err_slot`
-/// valid for the duration of this call (per its own safety contract).
+/// `tg` must be a valid live group, exclusively accessed by its caller. Registered allocations
+/// and capture backing must remain valid until this call finishes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
     let tg = unsafe { &mut *tg };
-    let tasks = std::mem::take(&mut tg.tasks);
-    let n = tasks.len();
-    if n == 0 {
-        return std::ptr::null_mut();
-    }
-
-    let tasks = Arc::new(TgTasks(tasks));
-    let cursor = Arc::new(AtomicUsize::new(0));
-    let (pool, workers) = if n > 1 {
-        let (pool, workers) = par_pool();
-        (Some(pool), workers)
-    } else {
-        (None, 1)
-    };
-    let batch_size = tg_claim_batch_size(n, workers);
-    let completion = Arc::new(TgCompletion {
-        remaining: AtomicUsize::new(n),
-        err_index: AtomicUsize::new(TG_NO_ERROR),
-        panic: std::sync::Mutex::new(None),
-        wait_lock: std::sync::Mutex::new(()),
-        complete: std::sync::Condvar::new(),
-    });
-
-    // One runner: claim contiguous batches until the list is drained, running each claimed task
-    // and recording its outcome. Cloned per pool worker and also run on the caller. (Closures
-    // capturing only `Clone` values — here three `Arc`s — are themselves `Clone` in edition 2021.)
-    let run_all = {
-        let tasks = tasks.clone();
-        let cursor = cursor.clone();
-        let completion = completion.clone();
-        move || loop {
-            let start = cursor.fetch_add(batch_size, Ordering::Relaxed);
-            if start >= n {
-                break;
-            }
-            let end = start.saturating_add(batch_size).min(n);
-            for i in start..end {
-                let t = &tasks.0[i];
-                // Copy the raw fields into a `Send` unit so `catch_unwind`'s closure captures them
-                // as a whole (edition-2021 disjoint capture would otherwise grab the non-`Send`
-                // raw fields).
-                let run = TgRun { tramp: t.tramp, thunk: t.thunk, env: t.env, slot: t.slot, err_slot: t.err_slot };
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    let run = run;
-                    (run.tramp)(run.thunk, run.env, run.slot, run.err_slot)
-                }));
-                match res {
-                    Ok(errored) => {
-                        if errored != 0 {
-                            completion.record_error(i);
-                        }
-                    }
-                    Err(p) => {
-                        completion.record_panic(i, p);
-                    }
-                }
-            }
-            completion.batch_finished(end - start);
-        }
-    };
-
-    // A single task never needs a helper (`workers.min(n - 1)` is always 0 when `n == 1`), so skip
-    // `par_pool()` entirely rather than paying its cold-start cost just to submit zero jobs
-    // (Codex audit item 5, the `task_group` analog of the tiny-`par_map` fix above).
-    if let Some(pool) = pool {
-        // Dispatch helper runners onto the pool (bounded by the pool size and by `n-1` — the caller
-        // is itself a runner), then run the claim loop on the caller. See the deadlock analysis
-        // above: even if every submitted helper is starved by busy workers, the caller drains the
-        // group.
-        pool.submit_many((0..workers.min(n - 1)).map(|_| Box::new(run_all.clone()) as ParJob));
-    }
-    run_all();
-
-    // Block until every task has finished. The caller may have run them all itself (no worker was
-    // free), or workers hold some — either way the region must not be freed until all are done.
-    completion.wait();
-    if let Some((_, p)) = completion.take_panic() {
-        std::panic::resume_unwind(p);
-    }
-    let err_index = completion.err_index.load(Ordering::Relaxed);
-    if err_index == TG_NO_ERROR {
-        std::ptr::null_mut()
-    } else {
-        tasks.0[err_index].err_slot
+    match tg.generation.take() {
+        Some(generation) => generation.join(par_pool().1),
+        None => core::ptr::null_mut(),
     }
 }
 
-/// Release the task group's region and the handle.
+/// Join remaining work and release the task group's arena and handle.
 ///
 /// # Safety
-/// `tg` must be null or a pointer returned by [`align_rt_tg_begin`] and not yet ended, and every
-/// task must have already been joined (via [`align_rt_tg_wait`]) so none is still live. This call
-/// consumes `tg` (frees the `TaskGroup` object), so `tg` must not be used again afterward.
+/// `tg` must be null or a live group exclusively accessed by its caller. All registered capture
+/// backing must remain valid through this call. Consumes the handle; it must not be used again.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
     if !tg.is_null() {
+        unsafe { align_rt_tg_wait(tg) };
         drop(unsafe { Box::from_raw(tg) });
     }
 }
@@ -37483,6 +37381,74 @@ mod tests {
         assert_eq!(super::tg_claim_batch_size(17, 4), 2);
         assert_eq!(super::tg_claim_batch_size(1_000, 4), 63);
         assert_eq!(super::tg_claim_batch_size(17, 0), 5);
+    }
+
+    #[test]
+    fn tg_single_task_progresses_before_wait_and_generations_reset() {
+        extern "C" fn signal(_thunk: *const u8, env: *mut u8, _slot: *mut u8, _err: *mut u8) -> i32 {
+            let sender = unsafe { &*env.cast::<std::sync::mpsc::Sender<()>>() };
+            let _ = sender.send(());
+            0
+        }
+        let tg = align_rt_tg_begin();
+        for _ in 0..8 {
+            let (sender, receiver) = std::sync::mpsc::channel::<()>();
+            unsafe {
+                align_rt_tg_register(tg, signal, std::ptr::null(),
+                    (&raw const sender).cast_mut().cast(), std::ptr::null_mut(), std::ptr::null_mut());
+            }
+            // Timeout bounds a broken scheduler; receipt, not elapsed time, proves worker progress.
+            let started = receiver.recv_timeout(std::time::Duration::from_secs(10));
+            let error = unsafe { align_rt_tg_wait(tg) };
+            assert!(error.is_null());
+            assert!(started.is_ok(), "one registered task must run before wait");
+            assert!(unsafe { align_rt_tg_wait(tg) }.is_null(), "empty generation");
+        }
+        unsafe { align_rt_tg_end(tg) };
+    }
+
+    #[test]
+    fn tg_helper_retirement_and_late_helpers_preserve_claims() {
+        // Exercise both sides of the enqueue/retire transition without scheduler timing. A
+        // reserved helper has not yet run when the caller drains and joins its generation.
+        let generation = TgGeneration::default();
+        let mut input = 21_i64;
+        let mut output = 0_i64;
+        let task = || TgTask {
+            tramp: double_tramp,
+            thunk: std::ptr::null(),
+            env: (&raw mut input).cast(),
+            slot: (&raw mut output).cast(),
+            err_slot: std::ptr::null_mut(),
+        };
+        let mut task = task;
+        assert!(generation.register(task(), 1));
+        assert!(!generation.register(task(), 1));
+        assert!(generation.join(1).is_null());
+        // The late helper sees no descriptor; no region access or extra completion is allowed.
+        generation.run(true, 1);
+        assert_eq!(generation.state.lock().unwrap().helpers, 0);
+        assert!(generation.register(task(), 1), "enqueue after retirement reserves a replacement");
+        generation.run(true, 1);
+        assert!(generation.join(1).is_null());
+        let state = generation.state.lock().unwrap();
+        assert_eq!(state.registered, 3);
+        assert_eq!(state.completed, 3);
+        assert_eq!(state.helpers, 0);
+        assert_eq!(output, 42);
+    }
+
+    #[test]
+    fn tg_end_joins_pending_work() {
+        let mut input = 7_i64;
+        let mut output = 0_i64;
+        let tg = align_rt_tg_begin();
+        unsafe {
+            align_rt_tg_register(tg, double_tramp, std::ptr::null(),
+                (&raw mut input).cast(), (&raw mut output).cast(), std::ptr::null_mut());
+            align_rt_tg_end(tg);
+        }
+        assert_eq!(output, 14);
     }
 
     #[test]

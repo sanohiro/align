@@ -7951,6 +7951,7 @@ pub type ExternalReturnProvenance = std::collections::HashMap<
         Vec<hir::DropStateEffect>,
         Option<Vec<String>>,
         hir::MutableViewEffectSummary,
+        hir::MutableAccessSummary,
     ),
 >;
 
@@ -10417,7 +10418,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
     // Synthesized interface source cannot spell compiler-owned provenance facts. Restore those
     // facts after signature collection. The driver supplies the complete transitive fact map, so
     // entries outside the modules visible to this check are intentionally ignored.
-    for (name, (return_borrow, return_region, return_cleanup, _, _, _, _, _, _)) in
+    for (name, (return_borrow, return_region, return_cleanup, _, _, _, _, _, _, _)) in
         external_return_provenance
     {
         if let Some(sig) = sigs.get_mut(name) {
@@ -10781,7 +10782,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             let concrete_inline = !is_generic
                 && external_return_provenance
                     .get(&mangled)
-                    .is_some_and(|(_, _, _, _, _, _, _, externs, _)| externs.is_some());
+                    .is_some_and(|(_, _, _, _, _, _, _, externs, _, _)| externs.is_some());
             if !is_generic
                 && !concrete_inline
                 && matches!(f.vis, ast::Vis::Pub)
@@ -10804,14 +10805,14 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         external_return_provenance.contains_key(&mangled);
                     let producer_certified = external_return_provenance
                         .get(&mangled)
-                        .is_some_and(|(_, _, _, _, certified, _, _, _, _)| *certified);
+                        .is_some_and(|(_, _, _, _, certified, _, _, _, _, _)| *certified);
                     let effect = external_effects
                         .get(&mangled)
                         .copied()
                         .unwrap_or(FnEffect::Impure);
                     let parallel_transfer_params = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, roots, _, _, _, _, _)| roots.clone())
+                        .map(|(_, _, _, roots, _, _, _, _, _, _)| roots.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10834,13 +10835,20 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         });
                     let mutable_retention = external_return_provenance
                         .get(&mangled)
-                        .and_then(|(_, _, _, _, _, summary, _, _, _)| summary.clone());
+                        .and_then(|(_, _, _, _, _, summary, _, _, _, _)| summary.clone());
+                let mutable_access = external_return_provenance.get(&mangled).and_then(|facts| facts.9.clone());
+                if mutable_access.is_some() && !producer_certified {
+                    diags.error("mutable-access summary requires producer certification".to_string(), f.span);
+                }
+                if let Err(message) = hir::validate_mutable_access(&mutable_access, sig.params.len(), false) {
+                    diags.error(message.to_string(), f.span);
+                }
                 let mutable_view_effect = external_return_provenance
                     .get(&mangled)
-                    .and_then(|(_, _, _, _, _, _, _, _, summary)| summary.clone());
+                    .and_then(|(_, _, _, _, _, _, _, _, summary, _)| summary.clone());
                     let drop_state_effects = external_return_provenance
                         .get(&mangled)
-                        .map(|(_, _, _, _, _, _, effects, _, _)| effects.clone())
+                        .map(|(_, _, _, _, _, _, effects, _, _, _)| effects.clone())
                         .unwrap_or_else(|| {
                             sig.params
                                 .iter()
@@ -10907,6 +10915,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         producer_certified,
                         effect,
                         parallel_transfer_params,
+                        mutable_access,
                         mutable_retention,
                     mutable_view_effect,
                 });
@@ -11244,7 +11253,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         let expected = external_return_provenance.get(&function.name);
         let exact_facts = expected.is_some_and(
             |(borrow, region, cleanup, transfer, certified, retention, effects, externs,
-                view_effect,
+                view_effect, access,
             )| {
                 *certified
                     && borrow == &function.return_borrow
@@ -11257,6 +11266,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                         }
                     && retention == &function.mutable_retention
                     && view_effect == &function.mutable_view_effect
+                    && access == &function.mutable_access
                     && effects
                         .iter()
                         .all(|effect| *effect == hir::DropStateEffect::NotApplicable)
@@ -12071,6 +12081,13 @@ fn run_body_analysis_passes(
             (function.name.clone(), summary)
         }))
         .collect::<std::collections::HashMap<_, _>>();
+    let named_mutable_access = program.fns.iter()
+        .map(|function| (function.name.clone(), function.mutable_access.clone()))
+        .chain(program.imported_fns.iter().map(|function| (
+            function.name.clone(),
+            if function.producer_certified { function.mutable_access.clone() } else { None },
+        )))
+        .collect::<MutableAccessMap>();
     let named_view_effect = program
         .fns
         .iter()
@@ -12121,6 +12138,8 @@ fn run_body_analysis_passes(
             diags,
             named_return_borrow: &named_return_borrow,
             named_parallel_transfer: &named_parallel_transfer,
+            named_mutable_access: &named_mutable_access,
+            task_groups: std::collections::HashMap::new(),
             named_param_modes: &named_param_modes,
             named_borrow_mut_retention: borrow_mut_retention,
             named_view_effect: &named_view_effect,
@@ -12154,6 +12173,7 @@ fn run_body_analysis_passes(
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
+            mutable_access_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); f.params.len()],
             view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
@@ -13168,6 +13188,12 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
         tagged_types: &program.tagged_types,
     };
     for function in &program.imported_fns {
+        if function.mutable_access.is_some() && !function.producer_certified {
+            return false;
+        }
+        if hir::validate_mutable_access(&function.mutable_access, function.params.len(), false).is_err() {
+            return false;
+        }
         if function.mutable_view_effect.is_some() && !function.producer_certified {
             return false;
         }
@@ -13198,7 +13224,9 @@ fn checked_hir_body_facts_are_valid_impl(program: &hir::Program) -> bool {
                         .is_some_and(|local| mutable_view_effect_eligible(local.ty, view_context))
             })
             .collect::<Vec<_>>();
-        if function.mutable_view_effect.is_none()
+        if function.mutable_access.is_none()
+            || hir::validate_mutable_access(&function.mutable_access, function.params.len(), false).is_err()
+            || function.mutable_view_effect.is_none()
             || hir::validate_mutable_view_effect(&function.mutable_view_effect, &eligible, false)
                 .is_err()
         {
@@ -13243,6 +13271,7 @@ fn reset_body_analysis_facts(program: &mut Program) {
         function.return_borrow = hir::ReturnBorrowSummary::None;
         function.return_region = hir::ReturnRegionSummary::None;
         function.parallel_transfer = hir::ReturnBorrowSummary::None;
+        function.mutable_access = None;
         function.mutable_retention = None;
         function.mutable_view_effect = None;
         function.drop_locals.clear();
@@ -13318,6 +13347,7 @@ fn body_analysis_facts_equal(expected: &hir::Program, actual: &Program) -> bool 
             || expected.return_cleanup != actual.return_cleanup
             || expected.mutable_retention != actual.mutable_retention
             || expected.mutable_view_effect != actual.mutable_view_effect
+            || expected.mutable_access != actual.mutable_access
             || expected.parallel_transfer != actual.parallel_transfer
             || expected.drop_locals != actual.drop_locals
             || expected.drop_individual_locals != actual.drop_individual_locals
@@ -14041,6 +14071,13 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
         enums: &program.enums,
         tagged_types: &program.tagged_types,
     };
+    let mut named_mutable_access = program.fns.iter()
+        .map(|function| (function.name.clone(), Some(Vec::new())))
+        .chain(program.imported_fns.iter().map(|function| (
+            function.name.clone(),
+            if function.producer_certified { function.mutable_access.clone() } else { None },
+        )))
+        .collect::<MutableAccessMap>();
     let mut named_view_effect = program
         .fns
         .iter()
@@ -14087,6 +14124,8 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             diags: &mut sink,
             named_return_borrow: &named,
                 named_parallel_transfer: &named_parallel,
+            named_mutable_access: &named_mutable_access,
+            task_groups: std::collections::HashMap::new(),
             named_param_modes: &named_param_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
                 named_view_effect: &named_view_effect,
@@ -14120,6 +14159,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
                 parallel_transfer_roots: BorrowRoots::new(),
+            mutable_access_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
                 view_effect_exits: None,
                 non_fallthrough: std::collections::HashSet::new(),
@@ -14161,17 +14201,24 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                 hir::ReturnBorrowSummary::None
             };
             let parallel_summary = summary_from_roots(&result.parallel_transfer_roots, explicit_params);
+            let access_summary = Some(result.mutable_access_roots.iter().filter_map(|root| match root {
+                BorrowRoot::Param(index) => Some(hir::MutableAccessRoot::Contained(*index)),
+                BorrowRoot::ParamStorage(index) => Some(hir::MutableAccessRoot::Storage(*index)),
+                _ => None,
+            }).collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>());
+            let access_changed = named_mutable_access.get(&function.name) != Some(&access_summary);
             let return_changed = named.get(&function.name) != Some(&summary);
             let parallel_changed = named_parallel.get(&function.name) != Some(&parallel_summary);
             let retention_changed = named_borrow_mut_retention.get(&function.name)
                 != Some(&result.borrow_mut_retention);
             let view_changed =
                 named_view_effect.get(&function.name) != Some(&result.mutable_view_effect);
-            if !return_changed && !retention_changed && !parallel_changed && !view_changed {
+            if !return_changed && !retention_changed && !parallel_changed && !view_changed && !access_changed {
                 continue;
             }
             named.insert(function.name.clone(), summary);
-            indirect_parallel_changed |= parallel_changed;
+            indirect_parallel_changed |= parallel_changed || access_changed;
+            named_mutable_access.insert(function.name.clone(), access_summary);
             named_parallel.insert(function.name.clone(), parallel_summary);
             named_borrow_mut_retention
                 .insert(function.name.clone(), result.borrow_mut_retention);
@@ -14184,7 +14231,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                     }
                 }
             }
-            if view_changed {
+            if view_changed || access_changed {
                 for &caller in &indirect_view_callers {
                     if !queued[caller] {
                         queued[caller] = true;
@@ -14230,6 +14277,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                 }).collect::<Option<Vec<_>>>().map(|mut roots| { roots.sort(); roots })
             }).collect::<Option<Vec<_>>>());
         function.mutable_view_effect = named_view_effect.get(&function.name).cloned().flatten();
+        function.mutable_access = named_mutable_access.get(&function.name).cloned().flatten();
         function.return_region = borrow_to_region_summary(&summary);
         function.return_borrow = summary;
         function.parallel_transfer = named_parallel
@@ -30279,6 +30327,8 @@ struct MoveCheck<'a> {
     named_return_borrow: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
     /// Same-program/imported roots whose contained views the callee may transfer to a worker.
     named_parallel_transfer: &'a std::collections::HashMap<String, hir::ReturnBorrowSummary>,
+    named_mutable_access: &'a MutableAccessMap,
+    task_groups: std::collections::HashMap<usize, usize>,
     /// Checked parameter modes for direct callees. Borrowed arguments are read from caller
     /// storage and therefore neither transfer ownership nor contribute their value facts as if
     /// they were by-value copies.
@@ -30386,6 +30436,7 @@ struct MoveCheck<'a> {
     return_roots: BorrowRoots,
     /// Symbolic parameter roots observed at worker-transfer sinks, including transitive callees.
     parallel_transfer_roots: BorrowRoots,
+    mutable_access_roots: BorrowRoots,
     /// Union of the exact parameter roots stored in every `borrow mut`/`out` destination at each
     /// returning function edge. Entries are indexed by this function's parameter positions.
     borrow_mut_retention: BorrowMutRetentionSummary,
@@ -30488,6 +30539,8 @@ type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
 type BorrowMutRetentionSummary = Vec<BorrowRoots>;
 type BorrowMutRetentionMap =
     std::collections::HashMap<String, BorrowMutRetentionSummary>;
+type MutableAccessMap = std::collections::HashMap<String, hir::MutableAccessSummary>;
+
 type MutableViewEffectMap = std::collections::HashMap<String, hir::MutableViewEffectSummary>;
 
 fn mutable_view_effect_eligible(ty: Ty, context: StorageTypeContext<'_>) -> bool {
@@ -30682,6 +30735,7 @@ struct MoveCheckResult {
     return_roots: BorrowRoots,
     borrow_mut_retention: BorrowMutRetentionSummary,
     parallel_transfer_roots: BorrowRoots,
+    mutable_access_roots: BorrowRoots,
     mutable_view_effect: hir::MutableViewEffectSummary,
 }
 
@@ -30824,6 +30878,8 @@ enum BorrowProjection {
     ArrayElement(u32),
     ClosureTarget(u32),
     ClosureCapture(u32),
+    /// The frame-owned environment itself, separate from values stored in its captures.
+    ClosureEnvironment,
     EnumPayload { variant: u32, index: u32 },
     OptionSome,
     ResultOk,
@@ -33310,11 +33366,32 @@ impl ViewEffectFlow {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PendingTaskCapture {
+    group: usize,
+    value: MoveValueFact,
+    span: Span,
+}
+
+/// Diagnostics are observations, not flow facts: restoring a branch or completing a later wait
+/// cannot erase an earlier conflict. Loop probes restore the collector alongside Diagnostics.
+#[derive(Clone, Default)]
+struct TaskCaptureState {
+    pending: std::collections::BTreeMap<usize, PendingTaskCapture>,
+    conflicts: std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<usize, Span>>>,
+}
+
+impl PartialEq for TaskCaptureState {
+    fn eq(&self, other: &Self) -> bool { self.pending == other.pending }
+}
+impl Eq for TaskCaptureState {}
+
 /// Heap-owned so adding another flow fact cannot silently consume the checked-HIR native-stack
 /// depth budget. Cloning this state already clones its map allocations; the one enclosing box
 /// keeps every recursive control walker frame at a stable pointer-sized footprint.
 #[derive(Clone, Default, PartialEq, Eq)]
 struct BorrowStateData {
+    tasks: TaskCaptureState,
     sources: std::collections::HashMap<LocalId, BorrowRoots>,
     facts: std::collections::HashMap<LocalId, BorrowFact>,
     /// Projected writable headers and read-only carrier dependencies owned by each value. Stable
@@ -33556,6 +33633,9 @@ impl BorrowState {
     }
 
     fn rename_header_state(&mut self, renames: &StorageGenerationRenames) {
+        for task in self.tasks.pending.values_mut() {
+            task.value.headers.rename_generations(renames);
+        }
         for headers in self.headers.values_mut() {
             headers.rename_generations(renames);
         }
@@ -33568,6 +33648,9 @@ impl BorrowState {
     }
 
     fn rename_root_state(&mut self, renames: &StorageGenerationRenames) {
+        for task in self.tasks.pending.values_mut() {
+            task.value.non_storage.rename_generations(renames);
+        }
         for roots in self.sources.values_mut() {
             rename_borrow_roots(roots, renames);
         }
@@ -33641,6 +33724,7 @@ impl BorrowState {
         for headers in self.headers.values().chain(self.value_headers.values()).chain(self.pipeline_headers.values()) {
             add_headers(&mut header_reachable, headers);
         }
+        for task in self.tasks.pending.values() { add_headers(&mut header_reachable, &task.value.headers); }
         add_headers(&mut header_reachable, &extra.headers);
         loop {
             let before = header_reachable.len();
@@ -33662,6 +33746,10 @@ impl BorrowState {
         }
         for fact in self.facts.values() {
             add_roots(&mut reachable, &fact.flatten());
+        }
+        for task in self.tasks.pending.values() {
+            add_headers(&mut reachable, &task.value.headers);
+            add_roots(&mut reachable, &task.value.non_storage.flatten());
         }
         add_roots(&mut reachable, &extra.non_storage.flatten());
         for headers in self
@@ -33899,6 +33987,11 @@ impl BorrowState {
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
         {
+            for (&key, task) in &self.tasks.pending {
+                if self.reachable_header_generations(&task.value.headers).contains(&generation) {
+                    self.tasks.conflicts.borrow_mut().insert(key, task.span);
+                }
+            }
             let Some(entry) = self.storage.directory.entries.get_mut(&generation) else {
                 continue;
             };
@@ -34184,6 +34277,13 @@ impl BorrowState {
         how: BorrowEnd,
         ended: impl std::ops::Fn(&BorrowRoot) -> bool,
     ) {
+        for (&key, task) in &self.tasks.pending {
+            let mut roots = task.value.non_storage.live_roots();
+            roots.extend(self.header_release_roots(&task.value.headers));
+            if roots.iter().any(&ended) {
+                self.tasks.conflicts.borrow_mut().insert(key, task.span);
+            }
+        }
         // View headers can carry fallback roots without an entry in the legacy source maps.
         // Keep generation/observation invalidation in the storage directory: resolving those here
         // would invalidate an XML reader's own header when it advances to its next observation.
@@ -34435,6 +34535,11 @@ impl BorrowState {
     /// that result is installed into a local.
     fn join_prepruned(a: &Self, b: &Self) -> Self {
         let mut out = a.clone();
+        for (&key, task) in &b.tasks.pending {
+            out.tasks.pending.entry(key)
+                .and_modify(|current| current.value = current.value.join(&task.value))
+                .or_insert_with(|| task.clone());
+        }
         for (local, flows) in &b.view_flows {
             out.view_flows.entry(*local).or_default().extend(flows);
         }
@@ -35258,6 +35363,23 @@ impl<'a> MoveCheck<'a> {
 
     fn check(mut self) -> MoveCheckResult {
         self.prepare_mutable_call_snapshots();
+        let mut groups = Vec::new();
+        for event in hir_depth::body_events(&self.f.body) {
+            match event {
+                hir_depth::BodyEvent::ExprEnter(expression) => match expression.kind {
+                    ExprKind::TaskGroup(_) => groups.push(Self::expr_key(expression)),
+                    ExprKind::Spawn { .. } | ExprKind::Wait => {
+                        if let Some(group) = groups.last() {
+                            self.task_groups.insert(Self::expr_key(expression), *group);
+                        }
+                    }
+                    _ => {}
+                },
+                hir_depth::BodyEvent::ExprExit { expression, .. }
+                    if matches!(expression.kind, ExprKind::TaskGroup(_)) => { groups.pop(); }
+                _ => {}
+            }
+        }
         self.borrows.view_effects = self
             .f
             .params
@@ -35351,10 +35473,14 @@ impl<'a> MoveCheck<'a> {
                 .map(|state| state.as_ref().map(|_| ViewEffectFlow::default()))
                 .collect()
         });
+        for span in self.borrows.tasks.conflicts.borrow().values() {
+            self.diags.error("spawned task capture is modified or invalidated before its covering wait".to_string(), *span);
+        }
         MoveCheckResult {
             return_roots: self.return_roots,
             borrow_mut_retention: self.borrow_mut_retention,
             parallel_transfer_roots: self.parallel_transfer_roots,
+            mutable_access_roots: self.mutable_access_roots,
             mutable_view_effect: Self::public_view_effect(&exit_effects),
         }
     }
@@ -39510,6 +39636,9 @@ impl<'a> MoveCheck<'a> {
             }
             let origin = StorageOrigin::producer(expression, &result.path);
             let generation = StorageGeneration::current(origin);
+            if result.header_kind == Some(StorageHeaderKind::InlineFixed) {
+                self.record_mutable_access_roots([BorrowRoot::Observation(generation.clone())].into());
+            }
             let staging = MoveReleasePlace::Staging {
                 action: Self::expr_key(expression),
                 operand: ordinal as u32,
@@ -40167,14 +40296,48 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
                 StageKind::Where { .. } | StageKind::WhereStrContains { .. } => {}
-                StageKind::Map { .. } => {
-                    // The callback's lifetime union is not an exact writability summary.
-                    fact = BorrowFact::from_direct(fact.without_readonly_origin().flatten());
+                StageKind::Map { func, captures } => {
+                    fact = self.pipeline_callback_return_fact(func, captures, &[fact], stage.out_ty);
                 }
             }
             element_ty = stage.out_ty;
         }
         (element_ty, fact)
+    }
+
+    fn pipeline_callback_return_fact(
+        &self, target: &str, captures: &[Expr], arguments: &[BorrowFact], result_ty: Ty,
+    ) -> BorrowFact {
+        if !ty_may_borrow(result_ty, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return BorrowFact::default();
+        }
+        let captured = captures.iter().map(|capture| self.completed_value_fact(capture)).collect::<Vec<_>>();
+        let fallback = || arguments.iter().chain(&captured).fold(BorrowFact::default(), |fact, input| fact.join(input));
+        let fact = match self.named_return_borrow.get(target) {
+            Some(hir::ReturnBorrowSummary::None) => BorrowFact::default(),
+            Some(hir::ReturnBorrowSummary::Roots { params, captures })
+                if params.iter().all(|index| (*index as usize) < arguments.len())
+                    && captures.iter().all(|index| (*index as usize) < captured.len()) => {
+                params.iter().map(|index| &arguments[*index as usize])
+                    .chain(captures.iter().map(|index| &captured[*index as usize]))
+                    .fold(BorrowFact::default(), |fact, input| fact.join(input))
+            }
+            _ => fallback(),
+        };
+        // A callback's root selection describes retained backing, not the returned field layout
+        // or writability. Flattening keeps all selected roots through later field projections.
+        BorrowFact::from_direct(fact.without_readonly_origin().flatten())
+    }
+
+    fn pipeline_accumulator_fact(
+        &self, target: &str, captures: &[Expr], init: &Expr, element: &BorrowFact,
+    ) -> BorrowFact {
+        let initial = self.completed_value_fact(init);
+        // A later invocation can receive backing introduced by an earlier callback result.
+        // Root selection is a union: initial + one application already closes that recurrence.
+        initial.join(&self.pipeline_callback_return_fact(
+            target, captures, &[initial.clone(), element.clone()], init.ty,
+        ))
     }
 
     fn try_error_roots(&self, result: &Expr) -> BorrowRoots {
@@ -40331,6 +40494,256 @@ impl<'a> MoveCheck<'a> {
         fact.without_readonly_origin()
     }
 
+    fn closure_environment_root(expression: &Expr) -> BorrowRoot {
+        // A frame closure site reuses one physical environment on loop re-entry. This identity
+        // therefore does not advance to a fresh generation: writing it conflicts with any task
+        // still holding its old function-value pointer, even when all its captures are scalar.
+        BorrowRoot::Observation(StorageGeneration::current(StorageOrigin::producer(
+            expression, &[BorrowProjection::ClosureEnvironment],
+        )))
+    }
+
+    fn access_storage_fact(&self, expression: &Expr) -> BorrowFact {
+        let headers = self.completed_headers(expression);
+        if !headers.leaves.is_empty() && headers.leaves.values().all(|leaf| leaf.known) {
+            BorrowFact::from_direct(self.borrows.header_release_roots(&headers))
+        } else {
+            self.completed_storage_fact(expression)
+        }
+    }
+
+    fn task_roots_overlap(&self, left: &BorrowRoot, right: &BorrowRoot) -> bool {
+        let external = |root: &BorrowRoot| matches!(root,
+            BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_)
+            | BorrowRoot::StorageLocal(StorageGeneration::ParameterValue { .. } | StorageGeneration::CallerStorage { .. }, ..));
+        if external(left) && external(right) { return true; }
+        let same_storage = |a: &StorageGeneration, b: &StorageGeneration| {
+            if a == b { return true; }
+            match (a, b) {
+                (StorageGeneration::Current(a_origin) | StorageGeneration::Prior(a_origin),
+                 StorageGeneration::Current(b_origin) | StorageGeneration::Prior(b_origin)) => {
+                    a_origin == b_origin && (matches!(a_origin, StorageOrigin::InlinePlace { .. })
+                        || [a, b].iter().any(|generation| self.borrows.storage.directory.entries.get(generation)
+                            .and_then(|entry| entry.descriptor).is_some_and(|descriptor| descriptor.kind == StorageHeaderKind::InlineFixed)))
+                }
+                _ => false,
+            }
+        };
+        match (left, right) {
+            (BorrowRoot::ReadOnly, _) | (_, BorrowRoot::ReadOnly) => false,
+            (BorrowRoot::StorageLocal(a, owner_a, path_a), BorrowRoot::StorageLocal(b, owner_b, path_b)) => {
+                let heap_owned = |generation| self.borrows.storage.directory.entries.get(generation)
+                    .and_then(|entry| entry.descriptor).is_some_and(|descriptor| descriptor.kind.owns_storage());
+                same_storage(a, b) || (owner_a == owner_b && !(heap_owned(a) && heap_owned(b))
+                    && (path_a.starts_with(path_b.as_ref()) || path_b.starts_with(path_a.as_ref())))
+            }
+            (BorrowRoot::Local(a), BorrowRoot::StorageLocal(_, b, _))
+            | (BorrowRoot::StorageLocal(_, a, _), BorrowRoot::Local(b)) => a == b,
+            (BorrowRoot::Observation(a), BorrowRoot::StorageLocal(b, ..))
+            | (BorrowRoot::StorageLocal(a, ..), BorrowRoot::Observation(b))
+            | (BorrowRoot::Observation(a), BorrowRoot::Observation(b)) => same_storage(a, b),
+            _ => left == right,
+        }
+    }
+
+    fn record_mutable_access_roots(&mut self, roots: BorrowRoots) {
+        let roots = self.borrows.expand_byte_validation_roots(roots);
+        self.mutable_access_roots.extend(self.borrows.summary_roots(roots.clone()).into_iter().map(|root| match root {
+            BorrowRoot::StorageLocal(StorageGeneration::ParameterValue { parameter, .. }, ..) => BorrowRoot::ParamStorage(parameter),
+            other => other,
+        }));
+        for (&key, task) in &self.borrows.tasks.pending {
+            let mut protected = task.value.non_storage.live_roots();
+            protected.extend(self.borrows.header_release_roots(&task.value.headers));
+            protected.extend(task.value.headers.leaves.values().flat_map(|leaf| leaf.generations.iter())
+                .map(|reference| BorrowRoot::Observation(reference.generation.clone())));
+            let protected = self.borrows.expand_byte_validation_roots(protected);
+            if roots.iter().any(|access| protected.iter().any(|root| self.task_roots_overlap(access, root))) {
+                self.borrows.tasks.conflicts.borrow_mut().insert(key, task.span);
+            }
+        }
+    }
+
+    fn record_storage_access(&mut self, expression: &Expr) {
+        self.record_mutable_access_roots(self.access_storage_fact(expression).live_roots());
+    }
+
+    fn direct_mutable_access(&self, target: &str, arguments: &[Expr]) -> BorrowRoots {
+        if matches!(target, "print" | "hash64" | "hash128") { return BorrowRoots::new(); }
+        let mut roots = BorrowRoots::new();
+        let summary = self.named_mutable_access.get(target).and_then(Option::as_ref);
+        for (index, argument) in arguments.iter().enumerate() {
+            let contained = summary.is_none_or(|summary| summary.contains(&hir::MutableAccessRoot::Contained(index as u32)));
+            let storage = summary.is_none_or(|summary| summary.contains(&hir::MutableAccessRoot::Storage(index as u32)))
+                || self.named_param_modes.get(target).and_then(|modes| modes.get(index))
+                    .is_some_and(|mode| matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out));
+            if contained { roots.extend(self.completed_value_fact(argument).live_roots()); }
+            if storage { roots.extend(self.access_storage_fact(argument).live_roots()); }
+        }
+        roots
+    }
+
+    fn indirect_mutable_access_from_facts(
+        &self, callee: &Expr, arguments: &[(BorrowFact, BorrowFact)],
+    ) -> BorrowRoots {
+        let environment = self.completed_value_fact(callee);
+        let environment_headers = self.completed_headers(callee);
+        let unresolved = || {
+            let mut roots = environment.live_roots();
+            roots.extend(self.borrows.header_release_roots(&environment_headers));
+            for (value, storage) in arguments {
+                roots.extend(value.live_roots());
+                roots.extend(storage.live_roots());
+            }
+            roots
+        };
+        let Ty::Fn(id) = callee.ty else { return unresolved(); };
+        let Some(targets) = self.callable_targets.get(id as usize).filter(|targets| !targets.is_empty()) else {
+            return unresolved();
+        };
+        let mut roots = BorrowRoots::new();
+        for target in targets.keys() {
+            let name = self.callable_target_ids.iter().find_map(|(name, id)| (id == target).then_some(name));
+            let Some(summary) = name.and_then(|name| self.named_mutable_access.get(name)).and_then(Option::as_ref) else {
+                roots.extend(unresolved());
+                continue;
+            };
+            for root in summary {
+                let (index, storage) = match root {
+                    hir::MutableAccessRoot::Contained(index) => (*index as usize, false),
+                    hir::MutableAccessRoot::Storage(index) => (*index as usize, true),
+                };
+                if let Some((value, backing)) = arguments.get(index) {
+                    roots.extend(if storage { backing } else { value }.live_roots());
+                } else if let Ok(capture) = u32::try_from(index.saturating_sub(arguments.len())) {
+                    let path = [BorrowProjection::ClosureTarget(*target), BorrowProjection::ClosureCapture(capture)];
+                    let headers = environment_headers.project_path(&path);
+                    if storage && !headers.leaves.is_empty() && headers.leaves.values().all(|leaf| leaf.known) {
+                        roots.extend(self.borrows.header_release_roots(&headers));
+                    } else {
+                        roots.extend(environment.project_exact(path[0]).project_exact(path[1]).live_roots());
+                    }
+                }
+            }
+        }
+        // An explicit exclusive borrow is an access even when the inferred body never writes.
+        if let Some(signature) = self.fn_types.get(id as usize) {
+            for ((mode, _), (_, storage)) in signature.params.iter().zip(arguments) {
+                if matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
+                    roots.extend(storage.live_roots());
+                }
+            }
+        }
+        roots
+    }
+
+    fn indirect_mutable_access(&self, callee: &Expr, arguments: &[Expr]) -> BorrowRoots {
+        let facts = arguments.iter().map(|argument| (
+            self.completed_value_fact(argument), self.access_storage_fact(argument),
+        )).collect::<Vec<_>>();
+        self.indirect_mutable_access_from_facts(callee, &facts)
+    }
+
+    fn record_pipeline_access(&mut self, expression: &Expr) {
+        let (source, stages) = match &expression.kind {
+            ExprKind::ArraySum { source, stages, .. } | ExprKind::ArrayCount { source, stages, .. }
+            | ExprKind::ArrayAnyAll { source, stages, .. } | ExprKind::ArrayMinMax { source, stages, .. }
+            | ExprKind::ArrayReduce { source, stages, .. } | ExprKind::ArrayScan { source, stages, .. }
+            | ExprKind::ArraySort { source, stages, .. } | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArrayToArray { source, stages, .. } | ExprKind::ArrayMapInto { source, stages, .. }
+            | ExprKind::ArrayPartition { source, stages, .. } | ExprKind::ArrayParMap { source, stages, .. } => (source, stages),
+            _ => return,
+        };
+        let mut callbacks = stages.iter().enumerate().filter_map(|(index, stage)| match &stage.kind {
+            StageKind::Map { func, captures } | StageKind::Where { func, captures } => Some((func, captures, index)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        match &expression.kind {
+            ExprKind::ArrayAnyAll { func, captures, .. } | ExprKind::ArrayReduce { func, captures, .. }
+            | ExprKind::ArrayScan { func, captures, .. } | ExprKind::ArrayPartition { func, captures, .. }
+            | ExprKind::ArrayParMap { func, captures, .. } | ExprKind::ArraySortBy { key_func: func, captures, .. } => callbacks.push((func, captures, stages.len())),
+            _ => {}
+        }
+        // Each callback observes the element before its own stage. A later map can erase
+        // provenance, so projecting the final pipeline element for earlier callbacks is unsound.
+        for (target, captures, prefix) in callbacks {
+            let (_, element) = self.pipeline_element_fact(source, &stages[..prefix]);
+            if let Some(dependencies) = self.summary_dependencies.as_deref_mut() { dependencies.insert(target.clone()); }
+            let explicit = self.named_param_modes.get(target).map_or(1, |modes| modes.len().saturating_sub(captures.len()));
+            let mut facts = vec![(element.clone(), element.clone()); explicit];
+            if prefix == stages.len()
+                && let ExprKind::ArrayReduce { init, .. } | ExprKind::ArrayScan { init, .. } = &expression.kind
+                && let Some(accumulator) = facts.first_mut()
+            {
+                let fact = self.pipeline_accumulator_fact(target, captures, init, &element);
+                *accumulator = (fact.clone(), fact);
+            }
+            facts.extend(captures.iter().map(|capture| (self.completed_value_fact(capture), self.access_storage_fact(capture))));
+            let summary = self.named_mutable_access.get(target).and_then(Option::as_ref);
+            let mut roots = BorrowRoots::new();
+            for (index, (value, storage)) in facts.iter().enumerate() {
+                if summary.is_none_or(|summary| summary.contains(&hir::MutableAccessRoot::Contained(index as u32))) {
+                    roots.extend(value.live_roots());
+                }
+                if summary.is_none_or(|summary| summary.contains(&hir::MutableAccessRoot::Storage(index as u32)))
+                    || self.named_param_modes.get(target).and_then(|modes| modes.get(index))
+                        .is_some_and(|mode| matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out)) {
+                    roots.extend(storage.live_roots());
+                }
+            }
+            self.record_mutable_access_roots(roots);
+        }
+    }
+
+    fn register_task_capture(&mut self, expression: &Expr, closure: &Expr) {
+        let writes = self.indirect_mutable_access(closure, &[]);
+        if !writes.is_empty() {
+            self.diags.error("a spawned task cannot modify or exclusively borrow captured backing".to_string(), expression.span);
+        }
+        let key = Self::expr_key(expression);
+        let Some(&group) = self.task_groups.get(&key) else { return; };
+        let mut value = MoveValueFact::default();
+        if let ExprKind::Closure { captures, .. } = &closure.kind {
+            for capture in captures {
+                // Inline scalar arrays and ordinary scalar/record copies own their snapshot.
+                // Only values containing borrowed backing retain external storage protection.
+                if ty_may_borrow(capture.ty, self.structs, self.tuples, self.enums, self.tagged_types) {
+                    let mut headers = self.completed_headers(capture);
+                    let mut fact = self.completed_value_fact(capture);
+                    // Copy fixed slots are snapshotted into the task environment. Only their
+                    // contained views keep pointing at caller storage; a captured slice itself
+                    // retains its View header and therefore still protects the original slots.
+                    let copied = headers.leaves.iter().filter(|(_, leaf)| leaf.descriptor
+                        .is_some_and(|descriptor| descriptor.kind == StorageHeaderKind::InlineFixed))
+                        .map(|(path, leaf)| (path.clone(), leaf.clone())).collect::<Vec<_>>();
+                    for (path, leaf) in copied {
+                        let roots = leaf.generations.iter().flat_map(|reference|
+                            self.borrows.generation_lifetime_roots(&reference.generation)).collect();
+                        fact = fact.without_root_sources_at_paths(&roots, [path.clone()]);
+                        headers.leaves.remove(&path);
+                    }
+                    value = value.join(&MoveValueFact {
+                        non_storage: fact,
+                        headers,
+                    });
+                }
+            }
+        }
+        self.borrows.tasks.pending.entry(key)
+            .and_modify(|task| task.value = task.value.join(&value))
+            .or_insert(PendingTaskCapture { group, value, span: expression.span });
+    }
+
+    /// Invocation access occurs after all eager operands, including when the invoked body diverges.
+    fn record_invocation_access(&mut self, expression: &Expr) {
+        let roots = match &expression.kind {
+            ExprKind::Call { func, args, .. } => self.direct_mutable_access(func, args),
+            ExprKind::CallFnValue { callee, args } => self.indirect_mutable_access(callee, args),
+            _ => return,
+        };
+        self.record_mutable_access_roots(roots);
+    }
+
     fn parallel_argument_fact(&self, argument: &Expr, mode: Option<ast::ParamMode>) -> BorrowFact {
         if matches!(
             mode,
@@ -40347,6 +40760,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn add_direct_parallel_transfer(&mut self, target: &str, arguments: &[Expr]) {
+        self.record_mutable_access_roots(self.direct_mutable_access(target, arguments));
         let summary = self.named_parallel_transfer.get(target);
         let modes = self.named_param_modes.get(target);
         let Some(hir::ReturnBorrowSummary::Roots { params, .. }) = summary else {
@@ -40438,6 +40852,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn add_indirect_parallel_transfer(&mut self, callee: &Expr, arguments: &[Expr]) {
+        self.record_mutable_access_roots(self.indirect_mutable_access(callee, arguments));
         let signature = match callee.ty {
             Ty::Fn(id) => self.fn_types.get(id as usize),
             _ => None,
@@ -40506,17 +40921,20 @@ impl<'a> MoveCheck<'a> {
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
-            ExprKind::ArrayReduce { source, init, .. } => {
-                let lifetimes = self.borrow_fact(source).without_readonly_origin().flatten();
-                let initial = self.borrow_fact(init).flatten_lifetimes();
-                let initial = if matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::Result(..))
+            ExprKind::ArrayReduce { source, stages, func, captures, init, .. } => {
+                let (_, element) = self.pipeline_element_fact(source, stages);
+                let result = self.pipeline_accumulator_fact(func, captures, init, &element).flatten_lifetimes();
+                if matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::Result(..))
                     && expand_tagged_ty(e.ty, self.tagged_types) != expand_tagged_ty(init.ty, self.tagged_types)
                 {
-                    initial.prefixed(BorrowProjection::ResultOk)
+                    result.prefixed(BorrowProjection::ResultOk)
                 } else {
-                    initial
-                };
-                BorrowFact::from_direct(lifetimes).join(&initial)
+                    result
+                }
+            }
+            ExprKind::ArrayScan { source, stages, func, captures, init, .. } => {
+                let (_, element) = self.pipeline_element_fact(source, stages);
+                self.pipeline_accumulator_fact(func, captures, init, &element).flatten_lifetimes()
             }
             ExprKind::ArrayBuilderBuild(builder) => self.borrow_fact(builder).flatten_lifetimes(),
             ExprKind::ArrayGroupAgg { base, key_field, .. }
@@ -40866,10 +41284,14 @@ impl<'a> MoveCheck<'a> {
                 .unwrap_or_default(),
             ExprKind::ArrayToArray { source, stages, .. }
             | ExprKind::ArraySort { source, stages, .. }
-            | ExprKind::ArraySortBy { source, stages, .. }
-            | ExprKind::ArrayParMap { source, stages, .. } => {
+            | ExprKind::ArraySortBy { source, stages, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, stages);
                 element.flatten_lifetimes()
+            }
+            ExprKind::ArrayParMap { source, stages, func, captures, .. } => {
+                let (_, element) = self.pipeline_element_fact(source, stages);
+                self.pipeline_callback_return_fact(func, captures, &[element],
+                    self.collection_element_ty(e.ty).unwrap_or(e.ty)).flatten_lifetimes()
             }
             ExprKind::ArrayPartition { source, stages, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, stages);
@@ -40910,10 +41332,15 @@ impl<'a> MoveCheck<'a> {
                         )
                     },
                 );
-                match self.callable_target_ids.get(lifted).copied() {
+                let mut fact = match self.callable_target_ids.get(lifted).copied() {
                     Some(target) => fact.prefixed(BorrowProjection::ClosureTarget(target)),
                     None => BorrowFact::from_direct(fact.flatten()),
+                };
+                if !captures.is_empty() {
+                    fact.projected.entry(vec![BorrowProjection::ClosureEnvironment]).or_default()
+                        .insert(Self::closure_environment_root(e));
                 }
+                fact
             }
             ExprKind::FnValue(_) => BorrowFact::default(),
             ExprKind::Block(block)
@@ -41845,6 +42272,9 @@ impl<'a> MoveCheck<'a> {
             destination_path.extend(&header.path);
             let origin = StorageOrigin::inline_place(local, &destination_path);
             let mut generation = StorageGeneration::current(origin.clone());
+            // Replacement and loop re-entry both write this physical frame slot, even when
+            // lifetime analysis advances Current to Prior. All binding forms use this install.
+            self.record_mutable_access_roots([BorrowRoot::Observation(generation.clone())].into());
             let preserves_live_destination = replacing
                 && self
                     .borrows
@@ -42165,6 +42595,19 @@ impl<'a> MoveCheck<'a> {
         element_path: &[u32],
         value: &Expr,
     ) {
+        // Every indexed store reaches this action, including projected collections and both
+        // walkers. Select the collection's own backing, not the views stored in its elements.
+        let path = collection_path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
+        let mut headers = self.local_headers(base).project_path(&path);
+        headers.leaves.retain(|path, _| path.is_empty());
+        let mut roots = if !headers.leaves.is_empty() && headers.leaves.values().all(|leaf| leaf.known) {
+            self.borrows.header_release_roots(&headers)
+        } else {
+            self.local_borrow_fact(base).live_roots()
+        };
+        roots.extend(headers.leaves.values().flat_map(|leaf| leaf.generations.iter())
+            .map(|reference| BorrowRoot::Observation(reference.generation.clone())));
+        self.record_mutable_access_roots(roots);
         self.reject_readonly_local_write(base, index.span);
         self.mark_borrow_mut_modified(base);
         let backing = self.local_mutable_backing(base);
@@ -42341,6 +42784,10 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn invalidate_mutable_place(&mut self, root: LocalId, path: &[u32]) {
+        if let Some(position) = self.f.params.iter().position(|parameter| *parameter == root)
+            && matches!(self.f.param_modes.get(position), Some(ast::ParamMode::BorrowMut | ast::ParamMode::Out)) {
+            self.record_mutable_access_roots([BorrowRoot::ParamStorage(position as u32)].into());
+        }
         self.borrows
             .invalidate_mutable_places(root, path, BorrowEnd::Consumed);
         self.borrows.local_origin_places.retain(|local, (origin_root, origin_path)| {
@@ -42490,6 +42937,7 @@ impl<'a> MoveCheck<'a> {
     /// the completed target. Backing/storage facts come from operand completion, so a later eager
     /// sibling cannot retarget an already-evaluated slice alias before the action runs.
     fn invalidate_collection_mutation_target(&mut self, target: &Expr) {
+        self.record_storage_access(target);
         let backing = self.completed_backing_fact(target);
         let storage = self.completed_storage_fact(target);
         let byte_backing = self.byte_backing(&self.completed_headers(target), &storage, &backing);
@@ -42615,6 +43063,7 @@ impl<'a> MoveCheck<'a> {
     /// buffer whatever names it. A temporary root reaching here is left alone: the operation
     /// replaces the *named* storage, not the hidden owner, which only its loop edge frees.
     fn invalidate_storage(&mut self, storage: &Expr) {
+        self.record_storage_access(storage);
         self.invalidate_source_mutation_target(storage);
         let storage_roots = self.completed_storage_fact(storage).live_roots();
         // A caller-owned `borrow mut` buffer has no local release generation, but its
@@ -42656,6 +43105,7 @@ impl<'a> MoveCheck<'a> {
                             | BorrowProjection::ArrayElement(_)
                             | BorrowProjection::ClosureTarget(_)
                             | BorrowProjection::ClosureCapture(_)
+                            | BorrowProjection::ClosureEnvironment
                             | BorrowProjection::EnumPayload { .. }
                             | BorrowProjection::OptionSome
                             | BorrowProjection::ResultOk
@@ -43167,6 +43617,7 @@ impl<'a> MoveCheck<'a> {
         let mut sink = Diagnostics::new();
         let reported_invalid_value_actions =
             self.reported_invalid_value_actions.clone();
+        let task_conflicts = self.borrows.tasks.conflicts.borrow().clone();
         std::mem::swap(self.diags, &mut sink);
         self.loop_breaks.push(Vec::new());
         self.borrows = entry_borrows.clone();
@@ -43250,6 +43701,7 @@ impl<'a> MoveCheck<'a> {
         // otherwise the real pass would suppress the only user-visible invalid-snapshot error.
         self.reported_invalid_value_actions =
             reported_invalid_value_actions;
+        *self.borrows.tasks.conflicts.borrow_mut() = task_conflicts;
         std::mem::swap(self.diags, &mut sink); // restore real diagnostics; discard probes'
         // Real pass from the back-edge fixpoint, collecting `break` snapshots.
         let mut body_state = &entry | &back_edge;
@@ -43512,6 +43964,7 @@ impl<'a> MoveCheck<'a> {
                     let key = Self::expr_key(e);
                     self.validate_value_snapshot(key, key, e.span);
                     self.transfer_completed_value_to_returned(e);
+                    self.borrows.tasks.pending.clear();
                     self.end_active_staging_releases(false, BorrowEnd::Dropped);
                     // Control expressions establish match-arm payload bindings while they are
                     // walked. Query after that walk so an explicit `return match ...` observes the
@@ -43520,6 +43973,7 @@ impl<'a> MoveCheck<'a> {
                     self.collect_borrow_mut_exit_roots();
                 }
                 Stmt::Return(None) => {
+                    self.borrows.tasks.pending.clear();
                     self.end_active_staging_releases(false, BorrowEnd::Dropped);
                     self.collect_borrow_mut_exit_roots();
                 }
@@ -43936,6 +44390,7 @@ impl<'a> MoveCheck<'a> {
         self.begin_value_snapshot_frame();
         let falls_through = self.expr_inner(e, moved, consuming, direct);
         let mut child_snapshots = self.finish_value_snapshot_frame();
+        if falls_through { self.record_pipeline_access(e); }
         if falls_through
             && !Self::defers_child_snapshot_validation(&e.kind)
         {
@@ -44750,6 +45205,7 @@ impl<'a> MoveCheck<'a> {
         enum Work<'e> {
             Eval(&'e Expr, bool, bool, bool),
             Children {
+                expression: &'e Expr,
                 children: Vec<(&'e Expr, bool, bool, bool)>,
                 index: usize,
                 own_falls_through: bool,
@@ -44809,12 +45265,14 @@ impl<'a> MoveCheck<'a> {
                         deferred_action,
                     });
                     work.push(Work::Children {
+                        expression,
                         children,
                         index: 0,
                         own_falls_through,
                     });
                 }
                 Work::Children {
+                    expression,
                     children,
                     index,
                     own_falls_through,
@@ -44827,6 +45285,7 @@ impl<'a> MoveCheck<'a> {
                         children.get(index)
                     {
                         work.push(Work::Children {
+                            expression,
                             children,
                             index: index + 1,
                             own_falls_through,
@@ -44838,6 +45297,7 @@ impl<'a> MoveCheck<'a> {
                             deferred_action,
                         ));
                     } else {
+                        self.record_invocation_access(expression);
                         values.push(own_falls_through);
                     }
                 }
@@ -45233,6 +45693,11 @@ impl<'a> MoveCheck<'a> {
         deferred_action: bool,
     ) {
         self.reject_duplicate_action_sources(expression);
+        if let ExprKind::Closure { captures, .. } = &expression.kind
+            && !captures.is_empty()
+        {
+            self.record_mutable_access_roots([Self::closure_environment_root(expression)].into());
+        }
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
                 self.add_direct_parallel_transfer(func, args);
@@ -45305,6 +45770,7 @@ impl<'a> MoveCheck<'a> {
                 self.finish_successful_aggregate_action(expression, moved);
             }
             ExprKind::Spawn { closure, .. } => {
+                self.register_task_capture(expression, closure);
                 self.parallel_transfer_roots.extend(self.borrows.expand_byte_validation_roots(self.borrow_sources(closure)));
                 let required = self
                     .indirect_parallel_transfer_fact_from_facts(closure, &[])
@@ -45338,6 +45804,8 @@ impl<'a> MoveCheck<'a> {
                     error_ty,
                     result_fact.project_exact(BorrowProjection::ResultErr),
                 )];
+                let access = self.indirect_mutable_access_from_facts(f, &arguments.iter().map(|(_, fact)| (fact.clone(), fact.clone())).collect::<Vec<_>>());
+                self.record_mutable_access_roots(access);
                 let roots = self
                     .indirect_parallel_transfer_fact_from_facts(f, &arguments)
                     .flatten();
@@ -45582,6 +46050,18 @@ impl<'a> MoveCheck<'a> {
     /// Opaque handle interiors are deliberately absent: only operations that replace a visible
     /// source place or write a caller-visible collection backing end a place reservation.
     fn apply_builtin_mutation_action(&mut self, expression: &Expr) {
+        if let Some(action) = Self::source_visible_mutation_action(&expression.kind) {
+            match action {
+                SourceVisibleMutationAction::Storage(value) | SourceVisibleMutationAction::Source(value)
+                | SourceVisibleMutationAction::Collection(value) => self.record_storage_access(value),
+                SourceVisibleMutationAction::Builder { builder, .. } => self.record_storage_access(builder),
+                SourceVisibleMutationAction::StorageAndSource { storage, source }
+                | SourceVisibleMutationAction::Shuffle { source, collection: storage } => {
+                    self.record_storage_access(storage);
+                    self.record_storage_access(source);
+                }
+            }
+        }
         if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
             for receiver in std::iter::once(file).chain(buffer) {
                 let key = Self::expr_key(receiver);
@@ -45592,6 +46072,7 @@ impl<'a> MoveCheck<'a> {
         if let ExprKind::ProcessLive { kind, args } = &expression.kind {
             for (input, argument) in kind.inputs().iter().zip(args) {
                 if matches!(input, process_live::Input::OutBytes) {
+                    self.record_storage_access(argument);
                     self.reject_readonly_view_write(argument);
                     let backing = self.completed_byte_backing(argument);
                     self.borrows.invalidate_validated_bytes(&backing);
@@ -45695,7 +46176,7 @@ impl<'a> MoveCheck<'a> {
         if Self::kind_has_ownership_action(&root.kind)
             || matches!(
             root.kind,
-            ExprKind::If { .. }
+            ExprKind::TaskGroup(_) | ExprKind::Wait | ExprKind::Spawn { .. } | ExprKind::If { .. }
                 | ExprKind::Match { .. }
                 | ExprKind::ElseUnwrap { .. }
                 | ExprKind::Binary {
@@ -45789,7 +46270,7 @@ impl<'a> MoveCheck<'a> {
             if Self::kind_has_ownership_action(&current.kind)
                 || matches!(
                 current.kind,
-                ExprKind::If { .. }
+                ExprKind::TaskGroup(_) | ExprKind::Wait | ExprKind::Spawn { .. } | ExprKind::If { .. }
                     | ExprKind::Match { .. }
                     | ExprKind::ElseUnwrap { .. }
                     | ExprKind::Binary {
@@ -46633,6 +47114,7 @@ impl<'a> MoveCheck<'a> {
                     None
                 }
                 Post::Pipeline { source, snapshot, .. } => {
+                    if falls_through { self.record_pipeline_access(wrapper); }
                     if let Some(snapshot) = snapshot {
                         self.finish_pipeline_source_snapshot(
                             snapshot,
@@ -46730,6 +47212,7 @@ impl<'a> MoveCheck<'a> {
                             value.span,
                         );
                         self.transfer_completed_value_to_returned(value);
+                        self.borrows.tasks.pending.clear();
                         self.end_active_staging_releases(false, BorrowEnd::Dropped);
                         self.return_roots
                             .extend(self.borrows.summary_roots(self.borrow_sources(value)));
@@ -47140,6 +47623,7 @@ impl<'a> MoveCheck<'a> {
                 return false;
             }
             match &expression.kind {
+                ExprKind::TaskGroup(_) | ExprKind::Wait | ExprKind::Spawn { .. } => return false,
                 ExprKind::Field { .. }
                 | ExprKind::SoaColumn { .. }
                 | ExprKind::IndexField { .. } => return false,
@@ -47147,7 +47631,6 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::FloatScope { block, .. }
                 | ExprKind::Arena(block)
                 | ExprKind::NamedArena { block, .. }
-                | ExprKind::TaskGroup(block)
                 | ExprKind::Unsafe(block)
                 | ExprKind::Loop { body: block, .. }
                     if block
@@ -48167,11 +48650,16 @@ impl<'a> MoveCheck<'a> {
             // A plain block is transparent: its tail inherits this position's consuming/direct.
             ExprKind::Block(b)
             | ExprKind::FloatScope { block: b, .. }
-            | ExprKind::TaskGroup(b)
             | ExprKind::Unsafe(b) => {
                 if !self.block(b, moved, consuming, direct) {
                     return false;
                 }
+            }
+            ExprKind::TaskGroup(block) => {
+                let falls_through = self.block(block, moved, consuming, direct);
+                let group = Self::expr_key(e);
+                self.borrows.tasks.pending.retain(|_, task| task.group != group);
+                if !falls_through { return false; }
             }
             // `arena { … }` is transparent the same way, but the walk must know it is inside one:
             // MIR mints no hidden `string` owner for a `template` there, so no per-iteration borrow
@@ -48311,6 +48799,8 @@ impl<'a> MoveCheck<'a> {
                         error_ty,
                         result_fact.project_exact(BorrowProjection::ResultErr),
                     )];
+                    let access = self.indirect_mutable_access_from_facts(f, &arguments.iter().map(|(_, fact)| (fact.clone(), fact.clone())).collect::<Vec<_>>());
+                    self.record_mutable_access_roots(access);
                     let roots = self
                         .indirect_parallel_transfer_fact_from_facts(f, &arguments)
                         .flatten();
@@ -48324,7 +48814,11 @@ impl<'a> MoveCheck<'a> {
                     is_owned_droppable(e.ty, self.structs, self.enums, self.tagged_types);
                 move_expr!(self, inner, moved, consuming, consuming);
             }
-            ExprKind::Wait => {}
+            ExprKind::Wait => {
+                if let Some(&group) = self.task_groups.get(&Self::expr_key(e)) {
+                    self.borrows.tasks.pending.retain(|_, task| task.group != group);
+                }
+            }
             ExprKind::If { cond, then, els } => {
                 if !self.move_if(e, cond, then, els, moved, consuming) {
                     return false;
@@ -49999,6 +50493,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_region: sig.return_region.clone(),
             return_cleanup: hir::ReturnCleanupAbi::None,
             parallel_transfer: hir::ReturnBorrowSummary::None,
+            mutable_access: None,
             mutable_retention: None,
             mutable_view_effect: None,
             locals,
@@ -53156,7 +53651,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `spawn(fn { … })` — defer a task in the enclosing `task_group`. The argument is a
+    /// `spawn(fn { … })` — publish a task in the enclosing `task_group`. The argument is a
     /// `fn() -> R` value (a no-parameter lambda, captures by value); the result is `Task<R>`.
     fn check_spawn(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -53223,7 +53718,7 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::Spawn { closure: Box::new(closure), fallible }, ty: Ty::Task(ok), span }
     }
 
-    /// `wait()` — join all spawned tasks. ④a: a no-op marker (eager execution).
+    /// `wait()` — join all tasks registered in the current group generation.
     fn check_wait(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         if self.task_group_depth == 0 {
             self.diags.error("'wait' is only valid inside a `task_group { … }` scope".to_string(), span);
@@ -59558,6 +60053,7 @@ impl<'a, 't> Checker<'a, 't> {
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             parallel_transfer: hir::ReturnBorrowSummary::None,
+            mutable_access: None,
             mutable_retention: None,
             mutable_view_effect: None,
             locals,
@@ -79701,6 +80197,8 @@ fn main() -> i32 = 0
                     diags: $sink,
                     named_return_borrow: &named,
                     named_parallel_transfer: &named,
+            named_mutable_access: &MutableAccessMap::new(),
+            task_groups: std::collections::HashMap::new(),
                     named_param_modes: &named_modes,
                     named_borrow_mut_retention: &named_borrow_mut_retention,
                     named_view_effect: &named_view_effect,
@@ -79734,6 +80232,7 @@ fn main() -> i32 = 0
                     arena_depth: 0,
                     return_roots: BorrowRoots::new(),
                     parallel_transfer_roots: BorrowRoots::new(),
+            mutable_access_roots: BorrowRoots::new(),
                     borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
                     view_effect_exits: None,
                     non_fallthrough: std::collections::HashSet::new(),
@@ -82905,6 +83404,138 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn task_capture_lifetime_and_access_matrix() {
+        let cases = [
+            ("replace_pending", "mut owned := \"old\".clone()\nview: str := owned\ntask_group { spawn(fn { print(view) }); owned = \"new\".clone(); wait() }", true),
+            ("replace_joined", "mut owned := \"old\".clone()\nview: str := owned\ntask_group { spawn(fn { print(view) }); wait(); owned = \"new\".clone() }", false),
+            ("write_pending", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); data[0] = 9; wait() }", true),
+            ("write_joined", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); wait(); data[0] = 9 }", false),
+            ("worker_write", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { mut alias := view; alias[0] = 9 }); wait() }", true),
+            ("worker_helper_write", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { change(view) }); wait() }", true),
+            ("caller_helper_write", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); change(view); wait() }", true),
+            ("caller_helper_read", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); read(view); wait() }", false),
+            ("task_local_write", "task_group { spawn(fn { mut values := [1, 2]; values[0] = 9; values[0] }); wait() }", false),
+            ("implicit_join", "owned := \"live\".clone()\nview: str := owned\ntask_group { spawn(fn { print(view) }); () }", false),
+            ("early_join", "owned := \"live\".clone()\nview: str := owned\ntask_group { spawn(fn { print(view) }); return 0 }", false),
+            ("moved_owner_pending", "owned := \"old\".clone()\nview: str := owned\ntask_group { spawn(fn { print(view) }); mut moved := owned; moved = \"new\".clone(); wait() }", true),
+            ("moved_owner_joined", "owned := \"old\".clone()\nview: str := owned\ntask_group { spawn(fn { print(view) }); wait(); mut moved := owned; moved = \"new\".clone() }", false),
+            ("nested_wait", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); task_group { wait() }; data[0] = 9; wait() }", true),
+            ("branch_wait", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); if read(view) == 1 { wait() }; data[0] = 9; wait() }", true),
+            ("branch_wait_both", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); if read(view) == 1 { wait() } else { wait() }; data[0] = 9 }", false),
+            ("loop_pending", "mut data := [1, 2]\nview := data[..]\ntask_group { loop { spawn(fn { view[0] }); data[0] = 9; break }; wait() }", true),
+            ("loop_joined", "mut data := [1, 2]\nview := data[..]\ntask_group { loop { spawn(fn { view[0] }); wait(); data[0] = 9; break } }", false),
+            ("copied_array", "mut data := [1, 2]\ntask_group { spawn(fn { data[0] }); data[0] = 9; wait() }", false),
+            ("local_array_of_views", "owned := \"old\".clone()\nview: str := owned\ntask_group { spawn(fn { mut data := [view]; data[0] = \"new\"; data[0].len() }); wait() }", false),
+            ("worker_pipeline_write", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { pipeline_write(view) }); wait() }", true),
+            ("caller_pipeline_write", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); [1].map(fn x { change(view); x }).sum(); wait() }", true),
+            ("worker_pipeline_read", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { pipeline_read(view) }); wait() }", false),
+            ("validated_bytes_pending", "owner := [(65 as u8)].to_array()\nmut bytes: slice<u8> := owner\ntext := bytes.as_str() else { return 0 }\ntask_group { spawn(fn { print(text) }); change_bytes(bytes); wait() }", true),
+            ("validated_bytes_joined", "owner := [(65 as u8)].to_array()\nmut bytes: slice<u8> := owner\ntext := bytes.as_str() else { return 0 }\ntask_group { spawn(fn { print(text) }); wait(); change_bytes(bytes) }", false),
+            ("callback_reused", "task_group { mut count := 0; loop { if count == 2 { break }; callback := fn { count }; spawn(fn { local := callback; print(local()) }); count = count + 1 }; wait() }", true),
+            ("callback_joined", "task_group { mut count := 0; loop { if count == 2 { break }; callback := fn { count }; spawn(fn { local := callback; print(local()) }); wait(); count = count + 1 } }", false),
+            ("indirect_write", "mut data := [1, 2]\nview := data[..]\nwriter := change\ntask_group { spawn(fn { view[0] }); writer(view); wait() }", true),
+            ("worker_indirect_write", "mut data := [1, 2]\nview := data[..]\nwriter := change\ntask_group { spawn(fn { local := writer; local(view) }); wait() }", true),
+            ("pipeline_projected_input_write", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); [Holder { values: view }].map(fn item { change(item.values); 1 }).sum(); wait() }", true),
+            ("match_wait_one", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); match read(view) { 1 => wait(), _ => () }; data[0] = 9; wait() }", true),
+            ("match_wait_both", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); match read(view) { 1 => wait(), _ => wait() }; data[0] = 9 }", false),
+            ("map_err_write", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); result: Result<(), Error> := Ok(()); _ := result.map_err(fn e: Error { change(view); e }); wait() }", true),
+            ("map_err_joined", "mut data := [1, 2]\nview := data[..]\ntask_group { spawn(fn { view[0] }); wait(); result: Result<(), Error> := Ok(()); _ := result.map_err(fn e: Error { change(view); e }) }", false),
+            ("exclusive_no_write", "mut data := [1, 2]\nmut view := data[..]\ntask_group { spawn(fn { view[0] }); exclusive(view); wait() }", true),
+            ("consumed_owner", "owned := \"old\".clone()\nview: str := owned\ntask_group { spawn(fn { print(view) }); consume(owned); wait() }", true),
+            ("callback_snapshot", "mut count := 1\ncallback := fn { count }\ntask_group { spawn(fn { local := callback; local() }); count = 2; wait() }", false),
+        ];
+        let mut failures = Vec::new();
+        for (name, body, rejected) in cases {
+            let source = format!("Holder {{ values: slice<i64> }}\nfn exclusive(borrow mut value: slice<i64>) {{ _ := value.len() }}\nfn consume(value: string) {{ _ := value.len() }}\nfn change(values: slice<i64>) {{ mut alias := values; alias[0] = 9 }}\nfn read(values: slice<i64>) -> i64 = values[0]\nfn change_bytes(values: slice<u8>) {{ mut alias := values; alias[0] = 255 }}\nfn pipeline_write(values: slice<i64>) -> i64 = [1].map(fn x {{ change(values); x }}).sum()\nfn pipeline_read(values: slice<i64>) -> i64 = [1].map(fn x {{ read(values) + x }}).sum()\nfn main() -> i32 {{ {body}\nreturn 0 }}");
+            let (program, diagnostics) = check(&source);
+            let messages = diagnostics.iter().map(|diagnostic| diagnostic.message.clone()).collect::<Vec<_>>();
+            if diagnostics.has_errors() != rejected {
+                failures.push(format!("{name}: expected rejection {rejected}: {messages:?}"));
+                continue;
+            }
+            if rejected {
+                if !messages.iter().any(|message| message.contains("spawned task")) { failures.push(format!("{name}: {messages:?}")); }
+            } else {
+                if !checked_hir_body_facts_are_valid_impl(&program) { failures.push(format!("{name}: replay")); }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn task_capture_physical_storage_and_pipeline_matrix() {
+        let setup = "mut data := [1,2]; view := data[..];";
+        let pipeline = "[1].map(fn x { Holder { values: view } }).map(fn item { change(item.values); 1 }).sum()";
+        let materialized = "{ rows := [1].map(fn x { Holder { values: view } }).to_array(); rows.map(fn item { change(item.values); 1 }).sum() }";
+        let readonly = "[1].map(fn x { Holder { values: view } }).map(fn item { item.values[0] }).sum()";
+        let reduce = "[1,2].reduce(Holder { values: other[..] }, fn acc, x { change(acc.values); Holder { values: view } })";
+        let scan = "[1,2].scan(other[..], fn acc, x { change(acc); view })";
+        let mut cases = Vec::new();
+        for (name, before, write) in [
+            ("field", "mut table := Table { values: [1,2] }; view := table.values[..];", "table.values[0] = 9"),
+            ("nested_field", "mut table := Nested { table: Table { values: [1,2] } }; view := table.table.values[..];", "table.table.values[0] = 9"),
+            ("whole", setup, "data = [3,4]"),
+            ("whole_field", "mut table := Table { values: [1,2] }; view := table.values[..];", "table.values = [3,4]"),
+            ("index_block", "mut table := Table { values: [1,2] }; view := table.values[..];", "table.values[{ 0 }] = 9"),
+            ("value_block", "mut table := Table { values: [1,2] }; view := table.values[..];", "table.values[0] = { 9 }"),
+            ("fused_map", setup, pipeline),
+            ("materialized_map", setup, materialized),
+            ("reduce_accumulator", "mut data := [1,2]; view := data[..]; mut other := [3,4];", reduce),
+            ("scan_accumulator", "mut data := [1,2]; view := data[..]; mut other := [3,4];", scan),
+        ] {
+            for joined in [false, true] {
+                let wait = if joined { "wait();" } else { "" };
+                cases.push((format!("{name}/{joined}"), format!("{before} task_group {{ spawn(fn {{ view[0] }}); {wait} {write}; wait() }}"), !joined));
+            }
+        }
+        for (name, binding) in [
+            ("binding", "data := [i,2]; view := data[..]"),
+            ("temporary", "view := [i,2][..]"),
+        ] {
+            for joined in [false, true] {
+                let wait = if joined { "wait();" } else { "" };
+                cases.push((format!("{name}/{joined}"), format!("task_group {{ mut i := 0; loop {{ if i == 2 {{ break }}; {binding}; spawn(fn {{ view[0] }}); {wait} i = i + 1 }}; wait() }}"), !joined));
+            }
+        }
+        for (name, body, rejected) in [
+            ("worker_fused", format!("{setup} task_group {{ spawn(fn {{ local := view; {} }}); wait() }}", pipeline.replace("view", "local")), true),
+            ("worker_materialized", format!("{setup} task_group {{ spawn(fn {{ local := view; {} }}); wait() }}", materialized.replace("view", "local")), true),
+            ("worker_readonly", format!("{setup} task_group {{ spawn(fn {{ local := view; {} }}); wait() }}", readonly.replace("view", "local")), false),
+            ("caller_readonly", format!("{setup} task_group {{ spawn(fn {{ view[0] }}); {readonly}; wait() }}"), false),
+            ("copy_views", "mut data := [\"a\",\"b\"]; task_group { spawn(fn { data[0].len() }); data[0] = \"c\"; wait() }".into(), false),
+            ("copy_nested", "mut data := TextTable { values: [\"a\",\"b\"] }; task_group { spawn(fn { local := data; local.values[0].len() }); data.values = [\"c\",\"d\"]; wait() }".into(), false),
+            ("view_of_slots", "mut data := [\"a\",\"b\"]; view := data[..]; task_group { spawn(fn { view[0].len() }); data[0] = \"c\"; wait() }".into(), true),
+            ("copied_nonstatic", "mut owned := \"a\".clone(); text: str := owned; data := [text]; task_group { spawn(fn { data[0].len() }); owned = \"b\".clone(); wait() }".into(), true),
+            ("copied_nonstatic_joined", "mut owned := \"a\".clone(); text: str := owned; data := [text]; task_group { spawn(fn { data[0].len() }); wait(); owned = \"b\".clone() }".into(), false),
+        ] { cases.push((name.into(), body, rejected)); }
+        let mut failures = Vec::new();
+        for (name, body, rejected) in cases {
+            let source = format!("Table {{ values: [i64; 2] }}\nNested {{ table: Table }}\nTextTable {{ values: [str; 2] }}\nHolder {{ values: slice<i64> }}\nfn change(values: slice<i64>) {{ mut alias := values; alias[0] = 9 }}\nfn main() {{ {body} }}");
+            let (program, diagnostics) = check(&source);
+            let messages = diagnostics.iter().map(|diagnostic| diagnostic.message.clone()).collect::<Vec<_>>();
+            if diagnostics.has_errors() != rejected || (rejected && !messages.iter().any(|message| message.contains("spawned task"))) {
+                failures.push(format!("{name}: expected rejection {rejected}: {messages:?}"));
+            } else if !rejected && !checked_hir_body_facts_are_valid_impl(&program) {
+                failures.push(format!("{name}: replay"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn mutable_access_checked_hir_rejects_forged_facts() {
+        let (program, diagnostics) = check("fn change(values: slice<i64>) { mut alias := values; alias[0] = 9 }\nfn main() -> i32 = 0");
+        assert!(!diagnostics.has_errors());
+        assert!(checked_hir_body_facts_are_valid_impl(&program));
+        let index = program.fns.iter().position(|function| function.name == "change").unwrap();
+        for replacement in [None, Some(vec![]), Some(vec![hir::MutableAccessRoot::Contained(99)])] {
+            let mut forged = replay_clone::clone_program(&program).unwrap();
+            forged.fns[index].mutable_access = replacement;
+            assert!(!checked_hir_body_facts_are_valid_impl(&forged));
+        }
+    }
+
+    #[test]
     fn callable_availability_keeps_unknown_alternatives() {
         let source = r#"
 fn identity(text: str) -> str = text
@@ -85726,6 +86357,8 @@ fn main() -> i32 = 0
             diags: &mut sink,
             named_return_borrow: &named,
             named_parallel_transfer: &named,
+            named_mutable_access: &MutableAccessMap::new(),
+            task_groups: std::collections::HashMap::new(),
             named_param_modes: &named_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
             named_view_effect: &named_view_effect,
@@ -85759,6 +86392,7 @@ fn main() -> i32 = 0
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
+            mutable_access_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
             view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
@@ -86065,6 +86699,8 @@ fn main() -> i32 = 0
             diags: &mut sink,
             named_return_borrow: &named,
             named_parallel_transfer: &named,
+            named_mutable_access: &MutableAccessMap::new(),
+            task_groups: std::collections::HashMap::new(),
             named_param_modes: &named_modes,
             named_borrow_mut_retention: &named_borrow_mut_retention,
             named_view_effect: &named_view_effect,
@@ -86098,6 +86734,7 @@ fn main() -> i32 = 0
             arena_depth: 0,
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
+            mutable_access_roots: BorrowRoots::new(),
             borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
             view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),

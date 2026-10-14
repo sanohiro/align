@@ -771,7 +771,12 @@ captured values but not mutate external state), and every worker capture must in
 Send. In particular, the Copy `region` capability is non-Send because it can advance one shared
 arena cursor, and a function value that closes over that capability remains non-Send at every
 nested capture depth. A `task_group` task, by contrast, *may* be impure — it performs I/O — and its
-safety comes from by-value capture of transitively Send values rather than from purity.
+safety combines transitively Send capture snapshots with shared-backing protection. Copying a
+view descriptor does not copy its bytes: task-side writes are forbidden and the group retains
+caller-side protection until join, independently of handle liveness. Producer-checked access
+summaries preserve that rule through helpers and callbacks. Publishing at spawn overlaps caller
+work; caller-assisted joining retains progress when the worker pool is saturated. Plan180 owns
+the exact access record and publication/reclamation invariants.
 Successful-Wait evidence follows the Result value only through transparent local/control
 operations. It is not inferred through a call, return, capture, import, or aggregate: those
 boundaries would require a second hidden effect/provenance summary. Each fallible Wait also has a

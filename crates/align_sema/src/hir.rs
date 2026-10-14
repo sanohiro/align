@@ -265,6 +265,38 @@ impl MutableRetentionRoot {
 /// `None` is unavailable; `Some` has one entry for every logical parameter.
 pub type MutableRetentionSummary = Option<Vec<Vec<MutableRetentionRoot>>>;
 
+/// Parameter-relative backing an invocation may modify or access exclusively. Storage and
+/// contained dependencies are distinct: changing a fresh array element does not modify a view
+/// stored in that element. Lifted captures follow the explicit parameters in logical order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum MutableAccessRoot {
+    Contained(u32),
+    Storage(u32),
+}
+
+/// None is unavailable (conservatively accesses all inputs); Some([]) is proven input-read-only.
+pub type MutableAccessSummary = Option<Vec<MutableAccessRoot>>;
+
+pub fn validate_mutable_access(
+    summary: &MutableAccessSummary,
+    parameter_count: usize,
+    generic: bool,
+) -> Result<(), &'static str> {
+    let Some(roots) = summary else { return Ok(()); };
+    if generic
+        || roots.windows(2).any(|pair| pair[0] >= pair[1])
+        || roots.iter().any(|root| {
+            let index = match root {
+                MutableAccessRoot::Contained(index) | MutableAccessRoot::Storage(index) => *index,
+            };
+            usize::try_from(index).map_or(true, |index| index >= parameter_count)
+        })
+    {
+        return Err("mutable-access roots");
+    }
+    Ok(())
+}
+
 /// Effects of an eligible direct Copy-view `borrow mut` parameter. The source lists are
 /// parameter-relative and retain transient writes even when the final header is rebound.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -390,6 +422,7 @@ pub struct ImportedFn {
     /// Canonical parameter roots whose contained views may be transferred to a worker by the
     /// imported body. This validation-only interface fact is stripped before MIR construction.
     pub parallel_transfer_params: Vec<u32>,
+    pub mutable_access: MutableAccessSummary,
     pub mutable_retention: MutableRetentionSummary,
     pub mutable_view_effect: MutableViewEffectSummary,
 }
@@ -645,6 +678,7 @@ pub struct Fn {
     /// Parameter/capture roots whose contained views may reach `spawn` or `par_map` workers.
     /// Source functions have no capture roots; lifted functions retain capture-relative roots.
     pub parallel_transfer: ReturnBorrowSummary,
+    pub mutable_access: MutableAccessSummary,
     /// Re-inferred from the checked body; imported interfaces consume this exact result.
     pub mutable_retention: MutableRetentionSummary,
     pub mutable_view_effect: MutableViewEffectSummary,

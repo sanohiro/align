@@ -100,6 +100,11 @@ fn main() -> Result<(), Error> {
 
 `spawn(fn { ... })` starts a task and returns a handle; `wait()` joins all of them; `.get()` reads a result after the join. The block is the lifetime: tasks cannot outlive their `task_group`, structurally — no detached threads, no forgotten joins, because the scope won't let you write them.
 
+The task is eligible to run before `spawn` returns, even when it is the only task. A busy worker
+pool can delay its start. A captured view shares its original bytes: keep that backing unchanged
+and alive until `wait`. Dropping or reassigning the task handle does not end this protection.
+Tasks may read shared views and modify storage they create themselves.
+
 Tasks that can fail return `Result`. Propagate a group failure with `wait()?`:
 
 ```align

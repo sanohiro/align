@@ -112,14 +112,16 @@ a prerequisite for independent work.
   implementation deadline or selected migration. Existing native consumers may
   continue; no language widening or kernel rewrite is implied.
 
-## External align-llm boundary
+## External consumer boundary
 
-Read `../align-llm/docs/align-requests.md` before align-llm-driven work. Its live
-request/adoption state belongs to that register, not historical handoffs.
-Provider implementations and consumer verification are separate. Align's
-responses may update the register, left uncommitted unless requested; do not
-change consumer code, tests, pins, branches, commits or merge state merely to
-advance a status. The canonical scope rule is in [CLAUDE.md](CLAUDE.md).
+Before request-driven work, read `docs/align-requests.md` in each of
+`../align-llm`, `../align-media`, and `../align-voice`. Reconcile shared needs,
+follow the owner's priority, and inspect affected use in all three consumers.
+Their registers own live request/adoption state. Provider implementation and
+consumer verification are separate; write Align's responses to affected
+registers, leaving those edits uncommitted unless requested. Do not change
+consumer code, tests, pins, branches, commits or merge state merely to advance
+a status. [CLAUDE.md](CLAUDE.md) owns the complete scope rule.
 
 At a completed request batch, run exactly `cargo build --release --workspace`
 with the required local LLVM/native environment. That builds artifacts only;

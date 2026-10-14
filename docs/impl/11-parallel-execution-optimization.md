@@ -203,12 +203,13 @@ at the boundary and made the pool/caller case about 7% slower because it created
 the shipped first slice therefore keeps the common scalar floor conservative while still carrying the
 body hint and byte model. The value remains host-sensitive; rerun the probe before any broader retune.
 
-`align_rt_tg_wait` reuses the same pool but has a different execution rule. Runners claim a small
-contiguous batch with `AtomicUsize::fetch_add`; the caller runs the same loop until the cursor is
-drained. After each claimed batch, the runner publishes one completion decrement through
-`TgCompletion`, records the lowest error index atomically, and records only the panic payload under
-a mutex. The final decrement wakes the caller through a `notify_one` guarded by the parker mutex
-([wait loop](../../crates/align_runtime/src/lib.rs)).
+[Plan180](180-structured-task-progress.md) makes registration publish fully initialized tasks to
+the process pool, including singleton groups. A generation mutex protects queue claims, helper
+reservation/retirement and completion. Runners claim small contiguous batches and publish their
+completion only after their final environment/result/error access. The waiter drains its own
+generation and waits for all registered tasks, preserving finite-pool nesting progress. Lowest
+registration index selects errors and panic payloads. Late queued helpers retain generation
+metadata only and cannot dereference the reclaimed task arena.
 
 Codegen separately allocates each spawned task's capture environment, result slot, and optional
 error slot, then registers one descriptor

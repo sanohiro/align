@@ -420,25 +420,35 @@ checklist sentence for an already-recurred class is not closure.
 Consult `HANDOFF.md` and the roadmap for the current Rust and LLVM versions,
 milestone gates, and specialized verification bundles.
 
-## align-llm requests and releases
+## External consumer requests and releases
 
-`../align-llm/docs/align-requests.md` is the request register for the external
-align-llm client. For align-llm-driven work:
+The external consumer request registers are:
 
-The sibling `../align-llm` repository is an external consumer. Work there is
-limited to reading its requests and writing Align's answers or status back to
-this register. Unless the user explicitly asks for additional work in that
-repository, never modify its code, tests, fixtures, build machinery, branches,
-commits, pull requests, or merge state. In particular, do not perform
-align-llm adoption work merely to advance a request from `ALIGN_MERGED` to
-`ALIGN_LLM_VERIFIED` or `CLOSED`; report that consumer-owned work as pending
-and continue only with in-scope Align work.
+- `../align-llm/docs/align-requests.md`
+- `../align-media/docs/align-requests.md`
+- `../align-voice/docs/align-requests.md`
 
-1. Read the register before starting.
+Before selecting request-driven work, read all three registers, reconcile
+overlapping requests, and follow the user's stated priority. When changing a
+shared capability, inspect relevant use in all three consumers for assumptions
+and regressions. If a sibling is unavailable, record that limit; do not silently
+treat its requests or usage as absent.
+
+These sibling repositories are external consumers. Work there is limited to
+reading requests and relevant source/evidence, and writing Align's answers or
+status back to their request registers. Unless the user explicitly asks for
+additional work in a consumer repository, never modify its code, tests,
+fixtures, compiler pins, build machinery, branches, commits, pull requests, or
+merge state. Do not perform consumer adoption merely to advance a request from
+provider-delivered to consumer-verified or closed (including align-llm's
+`ALIGN_MERGED`, `ALIGN_LLM_VERIFIED`, and `CLOSED` states). Report consumer-owned
+work as pending and continue only with in-scope Align work.
+
+1. Read all three registers before starting and identify the affected requests.
 2. Implement the request in Align's normal design-first discipline.
-3. Update the same register with Align's status, shipped surface, ownership
-   model, limits, and PR numbers. Leave that separate repository's edit
-   uncommitted unless asked.
+3. Update each affected register with Align's status, shipped surface, ownership
+   model, limits, and PR numbers. Keep provider delivery separate from consumer
+   verification. Leave each separate repository's edit uncommitted unless asked.
 4. When a request batch is complete, run exactly:
 
 ```text
