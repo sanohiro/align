@@ -128,7 +128,7 @@ The following notation is closed and exact:
   `$tuple_drop<ordinal>` name returned by
   `tuple_drop_local_name(ordinal: usize) -> String`; `$` cannot occur in a
   source identifier. At that exact `LetTuple` ordinal and only when the shared
-  `tuple_discard_needs_hidden_local(Ty, structs, enums, tagged_types) -> bool`
+  `tuple_discard_needs_hidden_local(Ty, structs, tuples, enums, tagged_types) -> bool`
   producer predicate succeeds, the source-hidden local does not enter the
   visible-name set. Its id still activates after the initializer, remains
   initialized until block exit, and retains its exact Drop membership/cleanup.
@@ -2383,3 +2383,21 @@ range checks and generic unavailability are shared validation. [Plan180](180-str
 owns the exact bytes and closure matrix. Task captures additionally retain completed
 borrow/storage facts through control joins, generation renaming and pruning until their
 covering join. Discarded handles do not weaken protection.
+
+## Tuple carrier composition (Plan190)
+
+`Scalar::Tuple(id)` names the existing ordered `Program.tuples` table; conversion
+with `Ty::Tuple(id)` is reversible. Checked HIR admits that scalar in Option,
+both Result payloads, ordinary user sums, direct/tagged record fields, and Align
+function-value parameters/returns. Every definition has at least two elements
+from the unchanged flat tuple grammar. Missing ids, invalid widths/elements,
+nested tuples, inline cycles, and tuple collection/box/task elements fail before
+body-fact replay or lowering. Shared Move tuple sum projection remains excluded.
+
+Contextual Drop and layout use the tuple table through every enclosing carrier;
+return-borrow/region summaries and cleanup records are replayed against those
+same ordered elements. `tuple_carrier_checked_hir_validation` owns malformed
+records, `tuple_carrier_provenance_replay` owns stale facts, and the driver
+`tuple_carriers` owner runs source and executable twins in both compilation modes.
+Canonical MIR v3 scalar tag 62 and its exact ordinal/golden are specified once in
+Plan17; the source interface tuple codec does not change.

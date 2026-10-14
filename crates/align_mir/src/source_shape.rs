@@ -347,6 +347,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
         }
         match left {
             Scalar::Struct(left) => node!(Struct, Struct, left),
+            Scalar::Tuple(left) => node!(Tuple, Tuple, left),
             Scalar::DynStructArray(left) => node!(DynStructArray, Struct, left),
             Scalar::Soa(left) => node!(Soa, Struct, left),
             Scalar::Enum(left) => node!(Enum, Enum, left),

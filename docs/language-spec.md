@@ -87,6 +87,12 @@ bitset        // designed, not built yet (its layout is the SIMD vec/mask model)
 `()` is unit and `(e)` is grouping, so a **tuple has arity ≥ 2**. Its ownership derives from its
 elements (Move if any element is Move), exactly like a struct.
 
+Existing flat tuples are admitted in `Option`, either `Result` payload, user sums,
+ordinary record fields, and Align function-value parameters/returns. Element order,
+source lifetimes, and recursive Drop are preserved without implicit allocation or
+cloning. Tuple elements, collection elements, boxes, globals, native signatures,
+and shared borrowed Move-payload projection keep their existing restrictions.
+
 `[T; N]` names the same fixed inline array inferred for an array literal. It is valid in every type
 annotation position. `N` is part of the structural type and is not an expression or const generic.
 The written `;` is required on the same logical line; a newline cannot replace it, and explicit

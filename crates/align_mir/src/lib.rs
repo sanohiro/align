@@ -6411,7 +6411,7 @@ fn source_move_statements(b: &Builder, e: &hir::Expr, out: &mut Vec<Stmt>) {
                 && (e.ty == Ty::String
                     || matches!(e.ty, Ty::Resource(_))
                     || (matches!(e.ty, Ty::Option(_) | Ty::Result(..) | Ty::Tagged(_))
-                        && align_sema::drop_plan(e.ty, &b.structs, &b.enums, &b.tagged_types)
+                        && align_sema::drop_plan(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types)
                             .needs_drop())
                     || align_sema::is_move_handle(e.ty)) =>
         {
@@ -6434,7 +6434,7 @@ fn source_move_statements(b: &Builder, e: &hir::Expr, out: &mut Vec<Stmt>) {
         // field case above, one level up (the scrutinee is the field place, so `path` is `[idx]`).
         hir::ExprKind::Field { root, path }
             if path.len() == 1
-                && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.enums, &b.tagged_types)) =>
+                && matches!(e.ty, Ty::Enum(eid) if enum_is_move(eid, &b.structs, &b.tuples, &b.enums, &b.tagged_types)) =>
         {
             out.push(Stmt::NullStructField(*root, path[0]));
         }
@@ -7333,7 +7333,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // value-position struct producer: later members may read retained sources, replace
             // this root, or exit before publication. Fresh members retain its partial cleanup.
             let leaf_ty = field_ty_at(b, *root, path);
-            let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.enums, &b.tagged_types);
+            let leaf_plan = drop_plan(leaf_ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
             let (replacement, owner) = if matches!(value.kind, hir::ExprKind::ArrayLit { .. }) {
                 // Fixed arrays keep their complete inline materializer and temporary ownership.
                 let Some((replacement, owner, _)) = materialize_array_literal(b, value) else {
@@ -7550,7 +7550,7 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 // A Move-struct element: free the *old* element's owned fields before overwriting it
                 // (else its buffers leak), and null the RHS's moved source so its own drop is a no-op
                 // (no double-free). A POD element needs neither. (Slice 4b.)
-                if struct_is_move(*struct_id, &b.structs, &b.enums, &b.tagged_types) {
+                if struct_is_move(*struct_id, &b.structs, &b.tuples, &b.enums, &b.tagged_types) {
                     b.push(Stmt::DropElem(*base, idx.clone(), *struct_id));
                     null_moved_source(b, value);
                 }
@@ -14941,7 +14941,7 @@ fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bo
         } => align_sema::par_map_parallelizable(
             inner.ty,
             stages,
-            &b.structs,
+            &b.structs, &b.tuples,
             &b.enums,
             &b.tagged_types,
         ),
@@ -15464,7 +15464,7 @@ fn par_map_form_decision(
     let decision = if !align_sema::par_map_parallelizable(
         source,
         stages,
-        &b.structs,
+        &b.structs, &b.tuples,
         &b.enums,
         &b.tagged_types,
     ) {
@@ -18170,6 +18170,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         // Total or PartialFloat.
         Scalar::Unit
         | Scalar::Struct(_)
+        | Scalar::Tuple(_)
         | Scalar::String
         | Scalar::DynArray(_)
         | Scalar::DynStructArray(_)

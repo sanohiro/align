@@ -113,7 +113,7 @@ pub(crate) fn json_scan_validation_reason(
             }
             if !align_sema::json_scan_row_is_copy(
                 *struct_id,
-                &program.structs,
+                &program.structs, &program.tuples,
                 &program.enums,
                 &program.tagged_types,
             ) {
@@ -1453,6 +1453,7 @@ impl<'a> PlacementValidator<'a> {
 
     fn tuples_valid(&self) -> bool {
         for (id, tuple) in self.program.tuples.iter().enumerate() {
+            if tuple.elems.len() < 2 { return false; }
             for &element in &tuple.elems {
                 if self.stream_carrier_class(align_sema::scalar_to_ty(element))
                     != align_sema::HttpStreamCarrierClass::None
@@ -1613,6 +1614,9 @@ impl<'a> PlacementValidator<'a> {
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
             Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Rng => true,
+            Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple|
+                tuple.elems.len() >= 2 && tuple.elems.iter().all(|&element|
+                    self.tuple_element_ok(element) && self.field_scalar_ok(element, allow_param))),
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Resource(id) | Ty::ResourceRef(id) => {
                 self.program.resources.get(id as usize).is_some()
@@ -1831,6 +1835,8 @@ impl<'a> PlacementValidator<'a> {
                 ScalarPlacement::Payload { allow_param: true }
                     | ScalarPlacement::FnParameter { allow_param: true }
             ),
+            Scalar::Tuple(id) => !matches!(mode, ScalarPlacement::Collection)
+                && self.program.tuples.get(id as usize).is_some(),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Scalar::Resource(id) => {
                 !matches!(mode, ScalarPlacement::Collection)
@@ -1923,6 +1929,8 @@ impl<'a> PlacementValidator<'a> {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
             Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
+            Scalar::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple|
+                tuple.elems.len() >= 2 && tuple.elems.iter().all(|&element| self.tuple_element_ok(element))),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Scalar::Resource(id) | Scalar::ResourceRef(id) => {
                 self.program.resources.get(id as usize).is_some()
@@ -1953,7 +1961,7 @@ impl<'a> PlacementValidator<'a> {
                 self.dynamic_struct_array_ok(id)
                     && !align_sema::struct_is_move(
                         id,
-                        &self.program.structs,
+                        &self.program.structs, &self.program.tuples,
                         &self.program.enums,
                         &self.program.tagged_types,
                     )
@@ -2202,10 +2210,10 @@ impl<'a> PlacementValidator<'a> {
             return false;
         }
         match payload {
-            Scalar::Struct(_) | Scalar::Enum(_) | Scalar::Str => false,
+            Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Str => false,
             Scalar::Tagged(id) => !align_sema::drop_plan(
                 Ty::Tagged(id),
-                &self.program.structs,
+                &self.program.structs, &self.program.tuples,
                 &self.program.enums,
                 &self.program.tagged_types,
             )
@@ -2618,6 +2626,7 @@ impl<'a> Validator<'a> {
                 true
             }
             Scalar::Struct(id) => self.push_ref(Node::Struct(id), edge, facts),
+            Scalar::Tuple(id) => self.push_ref(Node::Tuple(id), edge, facts),
             Scalar::Enum(id) => self.push_ref(Node::Enum(id), edge, facts),
             Scalar::Tagged(id) => self.push_ref(Node::Tagged(id), edge, facts),
             Scalar::Fn(id) => self.push_ref(Node::Fn(id), Edge::Header, facts),
@@ -3242,7 +3251,7 @@ impl<'a> LocalScopeValidator<'a> {
         local.name == align_sema::tuple_drop_local_name(ordinal)
             && align_sema::tuple_discard_needs_hidden_local(
                 local.ty,
-                &self.program.structs,
+                &self.program.structs, &self.program.tuples,
                 &self.program.enums,
                 &self.program.tagged_types,
             )
@@ -3951,6 +3960,7 @@ impl<'a> BodyValidator<'a> {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
             Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::Str | Scalar::String => true,
+            Scalar::Tuple(id) => self.program.tuples.get(id as usize).is_some(),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
             Scalar::Tagged(id) => self.program.tagged_types.get(id as usize).is_some(),
@@ -4039,7 +4049,7 @@ impl<'a> BodyValidator<'a> {
         ) && !matches!(ty, Ty::Struct(id)
             if align_sema::struct_is_move(
                 id,
-                &self.program.structs,
+                &self.program.structs, &self.program.tuples,
                 &self.program.enums,
                 &self.program.tagged_types,
             ))
@@ -4055,7 +4065,7 @@ impl<'a> BodyValidator<'a> {
                 self.program.enums.get(id as usize).is_some()
                     && !align_sema::enum_is_move(
                         id,
-                        &self.program.structs,
+                        &self.program.structs, &self.program.tuples,
                         &self.program.enums,
                         &self.program.tagged_types,
                     )
@@ -4202,7 +4212,7 @@ impl<'a> BodyValidator<'a> {
             || (!soa
                 && align_sema::struct_is_move(
                     id,
-                    &self.program.structs,
+                    &self.program.structs, &self.program.tuples,
                     &self.program.enums,
                     &self.program.tagged_types,
                 ))
@@ -4227,7 +4237,7 @@ impl<'a> BodyValidator<'a> {
                 leaf == Ty::String
                     || !align_sema::drop_plan(
                         leaf,
-                        &self.program.structs,
+                        &self.program.structs, &self.program.tuples,
                         &self.program.enums,
                         &self.program.tagged_types,
                     )
@@ -5330,7 +5340,7 @@ impl<'a> BodyValidator<'a> {
             ArrayBuilderElem::Scalar(Scalar::String) => true,
             ArrayBuilderElem::Scalar(Scalar::Struct(id)) => align_sema::struct_is_move(
                 id,
-                &self.program.structs,
+                &self.program.structs, &self.program.tuples,
                 &self.program.enums,
                 &self.program.tagged_types,
             ),
@@ -6017,7 +6027,7 @@ impl<'a> BodyValidator<'a> {
             && {
                 let drop = align_sema::drop_plan(
                     Ty::Struct(plan.root),
-                    &self.program.structs,
+                    &self.program.structs, &self.program.tuples,
                     &self.program.enums,
                     &self.program.tagged_types,
                 );
@@ -7882,7 +7892,7 @@ impl<'a> BodyValidator<'a> {
                     Ty::Struct(id)
                         if align_sema::struct_is_move(
                             id,
-                            &self.program.structs,
+                            &self.program.structs, &self.program.tuples,
                             &self.program.enums,
                             &self.program.tagged_types,
                         ) => elems.iter().all(|element| {
@@ -13022,7 +13032,7 @@ impl<'a> BodyValidator<'a> {
     fn scalar_copy_ok(&self, scalar: Scalar) -> bool {
         !align_sema::scalar_is_move(
             scalar,
-            &self.program.structs,
+            &self.program.structs, &self.program.tuples,
             &self.program.enums,
             &self.program.tagged_types,
         )

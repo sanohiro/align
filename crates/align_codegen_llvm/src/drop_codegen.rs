@@ -5,6 +5,7 @@ fn index_drop_plan(
     root_ty: Ty,
     root: &DropPlan,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[EnumDef],
     tagged: &[hir::TaggedType],
 ) {
@@ -30,6 +31,13 @@ fn index_drop_plan(
                 for (index, child) in fields.iter().rev() {
                     if let Some(field) = definition.fields.get(*index as usize) {
                         work.push((field.ty, child.as_ref()));
+                    }
+                }
+            }
+            (Ty::Tuple(id), DropPlan::Tuple { elements, .. }) => {
+                if let Some(definition) = tuples.get(id as usize) {
+                    for (&element, child) in definition.elems.iter().zip(elements).rev() {
+                        work.push((scalar_to_ty(element), child.as_ref()));
                     }
                 }
             }
@@ -65,12 +73,13 @@ fn cached_plan_needs_drop(
     cache: &mut HashMap<Ty, DropPlan>,
     ty: Ty,
     structs: &[StructDef],
+    tuples: &[hir::TupleDef],
     enums: &[EnumDef],
     tagged: &[hir::TaggedType],
 ) -> bool {
     if !cache.contains_key(&ty) {
-        let plan = drop_plan(ty, structs, enums, tagged);
-        index_drop_plan(cache, ty, &plan, structs, enums, tagged);
+        let plan = drop_plan(ty, structs, tuples, enums, tagged);
+        index_drop_plan(cache, ty, &plan, structs, tuples, enums, tagged);
     }
     cache.get(&ty).is_none_or(DropPlan::needs_drop)
 }
@@ -104,6 +113,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 ty: Ty,
             },
             Struct {
+                base: inkwell::values::PointerValue<'c>,
+                id: u32,
+                next: usize,
+            },
+            Tuple {
                 base: inkwell::values::PointerValue<'c>,
                 id: u32,
                 next: usize,
@@ -143,6 +157,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             &mut drop_plans,
             ty,
             self.structs,
+            self.tuples,
             self.enums,
             self.tagged_defs,
         );
@@ -150,6 +165,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         while let Some(item) = work.pop() {
             match item {
                 Work::Drop { base, ty } => match ty {
+                    Ty::Tuple(id) => work.push(Work::Tuple { base, id, next: 0 }),
                     Ty::Option(payload) => {
                         let option_ty = option_struct_type(
                             self.ctx,
@@ -222,6 +238,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                     &mut drop_plans,
                                     *ty,
                                     self.structs,
+                                    self.tuples,
                                     self.enums,
                                     self.tagged_defs,
                                 )
@@ -295,6 +312,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                                             &mut drop_plans,
                                             ty,
                                             self.structs,
+                                            self.tuples,
                                             self.enums,
                                             self.tagged_defs,
                                         )
@@ -348,7 +366,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         }
                     }
                     Ty::DynStructArray(id, _)
-                        if struct_is_move(id, self.structs, self.enums, self.tagged_defs) =>
+                        if struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_defs) =>
                     {
                         let aggregate = self
                             .builder
@@ -457,7 +475,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|error| self.err(error))?;
                     }
                     Ty::StructArray(id, len)
-                        if struct_is_move(id, self.structs, self.enums, self.tagged_defs) =>
+                        if struct_is_move(id, self.structs, self.tuples, self.enums, self.tagged_defs) =>
                     {
                         work.push(Work::FixedArray {
                             base,
@@ -547,6 +565,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         &mut drop_plans,
                         ty,
                         self.structs,
+                        self.tuples,
                         self.enums,
                         self.tagged_defs,
                     )
@@ -566,6 +585,42 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         base: field_ptr,
                         ty,
                     });
+                }
+                Work::Tuple { base, id, next } => {
+                    let definition = self
+                        .tuples
+                        .get(id as usize)
+                        .ok_or_else(|| self.err(format!("tuple definition id {id} is missing")))?;
+                    let Some(&element) = definition.elems.get(next) else {
+                        continue;
+                    };
+                    work.push(Work::Tuple {
+                        base,
+                        id,
+                        next: next + 1,
+                    });
+                    let ty = scalar_to_ty(element);
+                    if !cached_plan_needs_drop(
+                        &mut drop_plans,
+                        ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_defs,
+                    ) {
+                        continue;
+                    }
+                    let aggregate = self
+                        .tuple_types
+                        .get(id as usize)
+                        .copied()
+                        .ok_or_else(|| self.err(format!("tuple type id {id} is missing")))?;
+                    let index = u32::try_from(next).map_err(|error| self.err(error))?;
+                    let pointer = self
+                        .builder
+                        .build_struct_gep(aggregate, base, index, "droptuple")
+                        .map_err(|error| self.err(error))?;
+                    work.push(Work::Drop { base: pointer, ty });
                 }
                 Work::FixedArray {
                     base,

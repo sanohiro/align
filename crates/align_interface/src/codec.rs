@@ -1077,6 +1077,50 @@ fn deserialize_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tuple_carrier_interface_round_trip() {
+        let named = |name: &str, args| IType::Named {
+            path: name.into(),
+            args,
+        };
+        let tuple = IType::Tuple(vec![named("i64", vec![]), named("bool", vec![])]);
+        let ty = named("Result", vec![tuple.clone(), named("Error", vec![])]);
+        // Existing structural IType codec: Named=0, Tuple=1; every count is u32 LE.
+        let expected = vec![
+            0, 6, 0, 0, 0, b'R', b'e', b's', b'u', b'l', b't', 2, 0, 0, 0, 1, 2, 0, 0, 0, 0, 3, 0,
+            0, 0, b'i', b'6', b'4', 0, 0, 0, 0, 0, 4, 0, 0, 0, b'b', b'o', b'o', b'l', 0, 0, 0, 0,
+            0, 5, 0, 0, 0, b'E', b'r', b'r', b'o', b'r', 0, 0, 0, 0,
+        ];
+        let mut writer = Writer::new();
+        write_type(&mut writer, &ty);
+        assert_eq!(writer.buf, expected);
+        let mut reader = Reader::new(&expected);
+        assert_eq!(read_type(&mut reader), Ok(ty));
+        assert_eq!(reader.finish(), Ok(()));
+        for end in 0..expected.len() {
+            assert!(read_type(&mut Reader::new(&expected[..end])).is_err());
+        }
+        let changed = named(
+            "Result",
+            vec![
+                IType::Tuple(vec![named("i64", vec![]), named("i64", vec![])]),
+                named("Error", vec![]),
+            ],
+        );
+        let mut writer = Writer::new();
+        write_type(&mut writer, &changed);
+        assert_ne!(writer.buf, expected);
+        for ty in [
+            named("Option", vec![tuple.clone()]),
+            named("Choice", vec![tuple]),
+        ] {
+            let mut writer = Writer::new();
+            write_type(&mut writer, &ty);
+            let mut reader = Reader::new(&writer.buf);
+            assert_eq!(read_type(&mut reader), Ok(ty));
+            assert_eq!(reader.finish(), Ok(()));
+        }
+    }
 
     #[test]
     fn function_body_kinds_have_independent_v16_byte_goldens() {

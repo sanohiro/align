@@ -615,6 +615,11 @@ impl<'a> GraphValidator<'a> {
                     self.record_inline_edge(inline_from, node, ordinal);
                 }
             }
+            Scalar::Tuple(id) => {
+                let node = Node::Tuple(id);
+                self.scan_reference(node, ordinal, references);
+                self.record_inline_edge(inline_from, node, ordinal);
+            }
             Scalar::Enum(id) => {
                 let node = Node::Enum(id);
                 self.scan_reference(node, ordinal, references);
@@ -1586,6 +1591,7 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         57 => Ok(Scalar::ProcessImage),
         58 => Ok(Scalar::ProcessUserNamespace),
         61 => Ok(Scalar::Command),
+        62 => Ok(Scalar::Tuple(node(cursor)?)),
         59 => Ok(Scalar::ProcessChildScope),
         60 => Ok(Scalar::ProcessMember),
         54 => Ok(Scalar::ProcessSignalSubscription),
@@ -1820,6 +1826,7 @@ fn remap_decoded_scalar(
     let (id, tag) = match value {
         Scalar::Struct(id) | Scalar::DynStructArray(id) | Scalar::Soa(id) => (id, 0),
         Scalar::Enum(id) => (id, 1),
+        Scalar::Tuple(id) => (id, 2),
         Scalar::Tagged(id) => (id, 3),
         Scalar::Fn(id) => (id, 4),
         Scalar::Resource(id) | Scalar::ResourceRef(id) => (id, 5),
@@ -2343,6 +2350,7 @@ fn scalar_nodes(value: Scalar) -> Vec<Node> {
             vec![Node::Struct(id)]
         }
         Scalar::Enum(id) => vec![Node::Enum(id)],
+        Scalar::Tuple(id) => vec![Node::Tuple(id)],
         Scalar::Tagged(id) => vec![Node::Tagged(id)],
         Scalar::Fn(id) => vec![Node::Fn(id)],
         Scalar::Resource(id) | Scalar::ResourceRef(id) => vec![Node::Resource(id)],
@@ -2510,6 +2518,7 @@ fn scalar(
             Scalar::Char => leaf!(3),
             Scalar::Unit => leaf!(4),
             Scalar::Struct(id) => node!(5, Struct, id),
+            Scalar::Tuple(id) => node!(62, Tuple, id),
             Scalar::String => leaf!(6),
             Scalar::DynArray(elem) => {
                 out.push(7);
@@ -3059,6 +3068,56 @@ fn remap_ty_fn(value: &mut Ty, remap: &[Option<u32>]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tuple_carrier_validation_and_identity() -> Result<(), String> {
+        let mut program = mir_program(&baseline_program());
+        let root = Ty::Option(Scalar::Tuple(0));
+        // v3, one Tuple definition, ordered [i64, bool], Option root, tuple ordinal zero.
+        let expected = [3, 1, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1, 64, 2, 4, 62, 0, 0, 0, 0];
+        let canonical =
+            CanonicalTy::from_program(root, &program).map_err(|error| format!("{error:?}"))?;
+        assert_eq!(canonical.as_bytes(), expected);
+        assert_eq!(
+            CanonicalTy::decode(&expected).map_err(|error| format!("{error:?}"))?,
+            canonical
+        );
+        for end in 0..expected.len() {
+            assert!(CanonicalTy::decode(&expected[..end]).is_err());
+        }
+        for (index, value) in [(15, 63), (16, 1), (16, 255)] {
+            let mut malformed = expected;
+            malformed[index] = value;
+            assert!(CanonicalTy::decode(&malformed).is_err(), "{index}/{value}");
+        }
+        let mut trailing = expected.to_vec();
+        trailing.push(0);
+        assert!(CanonicalTy::decode(&trailing).is_err());
+        program.tuples.insert(
+            0,
+            hir::TupleDef {
+                elems: vec![Scalar::Bool, Scalar::Bool],
+            },
+        );
+        assert_eq!(
+            CanonicalTy::from_program(Ty::Option(Scalar::Tuple(1)), &program)
+                .map_err(|error| format!("{error:?}"))?,
+            canonical
+        );
+        program.tuples[1].elems[1] = Scalar::Char;
+        assert_ne!(
+            CanonicalTy::from_program(Ty::Option(Scalar::Tuple(1)), &program)
+                .map_err(|error| format!("{error:?}"))?,
+            canonical
+        );
+        program.tuples[1].elems[1] = Scalar::Tuple(1);
+        assert!(CanonicalTy::from_program(Ty::Option(Scalar::Tuple(1)), &program).is_err());
+        let cyclic = [
+            3, 1, 0, 0, 0, 2, 2, 0, 0, 0, 0, 1, 64, 62, 0, 0, 0, 0, 4, 62, 0, 0, 0, 0,
+        ];
+        assert!(CanonicalTy::decode(&cyclic).is_err());
+        Ok(())
+    }
+
     use std::cmp::Ordering;
 
     use align_sema::{FloatTy, IntTy};
@@ -3727,6 +3786,7 @@ mod tests {
             Scalar::Char,
             Scalar::Unit,
             Scalar::Struct(0),
+            Scalar::Tuple(0),
             Scalar::String,
             Scalar::DynArray(PrimScalar::Bool),
             Scalar::DynStructArray(0),
@@ -3796,7 +3856,7 @@ mod tests {
             assert_eq!(CanonicalTy::decode(&expected).as_ref(), Ok(&encoded));
             assert!(CanonicalTy::decode(&expected[..6]).is_err());
         }
-        for tag in 62..=u8::MAX {
+        for tag in 63..=u8::MAX {
             assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, tag]).is_err());
         }
 
@@ -3953,7 +4013,8 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 83], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 62], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 63], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 62], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(
             &[3, 0, 0, 0, 0, 71, 0],
@@ -4287,7 +4348,8 @@ mod tests {
         cases!(encoded_scalar;
             Scalar::Int(i(8)) => [0, 1, 8], Scalar::Float(f(32)) => [1, 32],
             Scalar::Bool => [2], Scalar::Char => [3], Scalar::Unit => [4],
-            Scalar::Struct(1) => [5, 1, 0x10, 0, 0], Scalar::String => [6],
+            Scalar::Struct(1) => [5, 1, 0x10, 0, 0],
+            Scalar::Tuple(1) => [62, 1, 0x30, 0, 0], Scalar::String => [6],
             Scalar::DynArray(PrimScalar::Bool) => [7, 2],
             Scalar::DynStructArray(1) => [8, 1, 0x10, 0, 0],
             Scalar::DynResponseArray => [9], Scalar::Str => [10],

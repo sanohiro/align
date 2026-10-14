@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan190](docs/impl/190-tuple-carrier-composition.md) composes existing flat
+  tuples with Option/Result, user sums, ordinary record fields and Align
+  callbacks for voice V003. Contextual layout, cleanup and borrowed origins
+  preserve the existing ownership model; collection/box/native and shared Move
+  projection restrictions remain. Consumer adoption remains external.
+
 - [Plan189](docs/impl/189-binary-byte-write-effects.md) records binary setter
   guarantees in the existing mutable Copy-view effect model for Request146.
   Repeated subview calls preserve caller backing; empty-capable fill/copy and
@@ -138,8 +144,8 @@ independently. Keep parked source and evidence archived outside the active
 worktree; their adoption is not a prerequisite for independent work.
 
 - Request126's borrowed-session loop refusal and Request28's indexed/view builder
-  readers require their own provenance closure. Request146's repeated mutable
-  subviews remain unselected; do not treat it as authorization to resume K1.
+  readers require their own provenance closure; the shipped binary-write effect
+  producer does not resume K1.
 - Request147's dynamic-array record-field mutation remains closed pending a
   selected-backing lifetime/retention closure. Plans171–173 repair existing
   behavior without admitting that surface.
