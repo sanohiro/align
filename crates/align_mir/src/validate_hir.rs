@@ -4298,7 +4298,7 @@ impl<'a> BodyValidator<'a> {
                 local.id == *base
                     && local.is_mut
                     && place_ty.is_some_and(|ty| {
-                        (path.is_empty() || matches!(ty, Ty::Array(..)))
+                        (path.is_empty() || matches!(ty, Ty::Array(..) | Ty::DynArray(..)))
                             && index_element_ty(ty)
                                 .is_some_and(|ty| self.indexed_element_store_ty_ok(ty))
                     })
@@ -12542,7 +12542,7 @@ impl<'a> BodyValidator<'a> {
                 }) else {
                     return false;
                 };
-                if !path.is_empty() && !matches!(base_ty, Ty::Array(..)) {
+                if !path.is_empty() && !matches!(base_ty, Ty::Array(..) | Ty::DynArray(..)) {
                     return false;
                 }
                 let Some(element_ty) = index_element_ty(base_ty) else {

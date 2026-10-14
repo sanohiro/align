@@ -3103,6 +3103,19 @@ elements) — bind it first. A Copy element reads fine in any position. The firs
 `draft.md` §5 (Types → Tuple), `impl/02-frontend.md`
 §8, `impl/03-types.md`, `impl/07-roadmap.md`.
 
+### Owned dynamic-array field stores
+
+**Settled implementation composition (Plan194):** the existing indexed assignment
+form accepts finite ordinary record paths to owned dynamic scalar arrays, using the
+same integer, float, bool, char and borrowed-str element class as root arrays. Mutable
+ownership or existing whole-record exclusive authority is required. Both eager
+operands complete before the selected current header and bounds are read. View
+retention uses the selected backing's lifetime and updates only that generation's
+contents; offset-free range aliases conservatively join possible slots. This adds
+no allocation, Drop operation, view writability, partial exclusive borrow or owning
+element replacement. Existing conservative function-value mutable-output summaries
+remain unchanged. Record: `draft.md`, `language-spec.md`, `design-notes.md`, Plan19.
+
 ### Type-argument syntax: no turbofish (expression position)
 **Decision (2026-06-22): there is no expression-position type-argument syntax.** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context, including back through `?` (`u: User := json.decode(d)?`). When neither supplies the type it is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. Rationale: keeps "one way" (the binding annotation is the single place a type is written), removes the `<` vs comparison parse ambiguity at expression position outright (the reason Go uses `f[T](x)` and Rust `::<>`), and is friendlier to generate. The headline case — `draft.md` §19's `json.decode<array<User>>(data)` — therefore becomes `users: array<User> := json.decode(data)?`; the checker already takes `decode`'s target from the expected `Result<T,_>` and emits an annotate-the-binding error otherwise (no code change needed — only the spec/comment caught up). **Residual — CLOSED 2026-07-18 (the JSON-completeness design):** the schema-selector builtins `json.validate<T>` / `json.field_table<T>` are **deleted from the catalog** (validate folds into decode-and-discard; field_table is compiler-internal), so no `<T>`-only surface remains there; the one surviving schema-selector is the streaming scanner (`rows: json.scanner<Row> := json.scan(view)`), whose type comes from the binding annotation exactly like `decode` — consistent, no new syntax. This rule scales to general generics (below): a return-only type parameter is supplied by the binding annotation, never a turbofish. Record: `impl/02-frontend.md` §8 (generics `<` vs comparison), `draft.md` §18 (core.json), `language-spec.md` (JSON).
 

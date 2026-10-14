@@ -11604,7 +11604,8 @@ pub fn slice_index_result_matches(program: &Program, source: Ty, result: Ty, noa
 /// Reject malformed or cached MIR before LLVM constructs a GEP/load. Existing `SliceIndex`
 /// producers require their exact physical result type; the sole representation-compatible
 /// projection is ordinary `DynArray(String) -> Str` indexing. The vectorizer-only noalias form
-/// remains exact.
+/// remains exact. Collection `Field` projections authenticate their physical path and exact
+/// header type even when no returned owner demands their producer graph.
 pub fn validate_slice_index_rvalues(program: &Program) -> Result<(), ProducerError> {
     let i64_ty = Ty::Int(IntTy {
         bits: 64,
@@ -11616,6 +11617,26 @@ pub fn validate_slice_index_rvalues(program: &Program) -> Result<(), ProducerErr
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
+                if let Rvalue::Field(slot, path) = rvalue {
+                    let selected = match function.slots.get(*slot as usize) {
+                        Some(Ty::Struct(id)) => inline_struct_path_ty(program, *id, path),
+                        _ => None,
+                    };
+                    let result = function.value_tys.get(*value as usize).copied();
+                    let collection = |ty| matches!(ty,
+                        Ty::Array(..) | Ty::StructArray(..) | Ty::DynArray(..)
+                        | Ty::DynStructArray(..) | Ty::Slice(..));
+                    // Field headers can feed a store without entering a returned owner's graph.
+                    // Equal-layout headers still require the exact selected collection type.
+                    if (selected.is_some_and(collection) || result.is_some_and(collection))
+                        && (selected.is_none() || selected != result)
+                    {
+                        return Err(ProducerError::Lowering(format!(
+                            "collection field MIR in function '{}' has an invalid inline path or result type",
+                            function.name
+                        )));
+                    }
+                }
                 // Plain scalar leaves do not necessarily enter the ownership graph. Certify
                 // physical inline paths here for every result, before any LLVM GEP construction.
                 let field_access = match rvalue {

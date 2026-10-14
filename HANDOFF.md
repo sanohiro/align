@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan194](docs/impl/194-dynamic-array-field-writes.md) admits indexed writes to
+  owned scalar-array record fields for media AM-R01 and LLM R147/R46. Exact selected
+  backing lifetimes retain borrowed text through aliases and checked imported call
+  summaries; eager operands precede current-header selection and bounds. No new allocation,
+  owning-element overwrite or partial exclusive field borrow. Adoption is external.
+
 - [Plan193](docs/impl/193-mixed-json-graphs.md) composes borrowed `str` and owned
   `string` in the existing recursive JSON graph for media AM-R02. Decode retains
   input/explicit-arena text lifetimes while strings and array spines remain
@@ -162,9 +168,15 @@ worktree; their adoption is not a prerequisite for independent work.
 - Request126's borrowed-session loop refusal and Request28's indexed/view builder
   readers require their own provenance closure; the shipped binary-write effect
   producer does not resume K1.
-- Request147's dynamic-array record-field mutation remains closed pending a
-  selected-backing lifetime/retention closure. Plans171–173 repair existing
-  behavior without admitting that surface.
+- Next capability: native exclusive calls on borrowed-content collections already
+  reject on main (root array<str> and whole-field replacement included). Plan194
+  preserves that producer refusal while native local str writes and numeric helpers
+  work. Separate readable payload facts from complete owner/buffer authority; never
+  weaken the proof merely to admit the call.
+- Function-value whole-record exclusive calls retain the existing conservative
+  mutable-output fallback: even supported whole-field replacement can invalidate
+  later destination use. Precise indirect mutable-output summaries are separate
+  from Plan194's direct/imported field-store capability.
 - Request142's exclusive matched owned payload is a separate ownership
   capability. It requires its own complete projection/alias/cleanup design;
   existing shared and owning matches do not imply exclusive admission.

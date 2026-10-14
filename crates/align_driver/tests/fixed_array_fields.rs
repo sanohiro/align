@@ -381,33 +381,34 @@ fn fixed_array_field_slice_cannot_escape_local_record() {
 
 #[test]
 fn fixed_array_field_element_store_preserves_borrow_lifetime() {
-    let mut sources = SourceMap::new();
-    let checked = check(
-        &mut sources,
-        "fixed-field-element-escape.align",
-        concat!(
-            "Holder { values: [str; 1] }\n",
-            "fn bad() -> Holder {\n",
-            "  mut output := Holder{values: [\"\"]}\n",
-            "  arena {\n",
-            "    owned := \"temporary\".clone()\n",
-            "    view: str := owned\n",
-            "    output.values[0] = view\n",
-            "  }\n",
-            "  return output\n",
-            "}\n",
-            "fn main() {}\n",
+    for (producer, expected) in [
+        (
+            "template \"{1}\"",
+            "cannot be stored into a longer-lived array element",
         ),
-    );
-    assert!(checked.diags.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .contains("cannot be stored into a longer-lived array element")
-    }), "a field-rooted element store must not hide an arena borrow");
+        (
+            "\"temporary\".clone()",
+            "cannot return a view that borrows local storage",
+        ),
+    ] {
+        let mut sources = SourceMap::new();
+        let source = format!(
+            "Holder {{values:[str;1]}} fn bad()->Holder {{mut output:=Holder{{values:[\"\"]}};arena {{owned:={producer};view:str:=owned;output.values[0]=view}};return output}} fn main(){{}}\n"
+        );
+        let checked = check(&mut sources, "fixed-field-element-escape.align", &source);
+        assert!(
+            checked
+                .diags
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains(expected)),
+            "{producer}: {}",
+            align_driver::format_diagnostics(&sources, &checked.diags)
+        );
+    }
 }
 
 #[test]
-fn indexed_store_does_not_widen_nonfixed_field_places() {
+fn indexed_store_rejects_slice_field_places() {
     let mut sources = SourceMap::new();
     let checked = check(
         &mut sources,
@@ -421,7 +422,7 @@ fn indexed_store_does_not_widen_nonfixed_field_places() {
     assert!(checked.diags.iter().any(|diagnostic| {
         diagnostic
             .message
-            .contains("only for fixed-array fields")
+            .contains("requires a fixed array or an owned scalar array")
     }));
 }
 

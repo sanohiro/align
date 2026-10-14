@@ -28456,6 +28456,51 @@ impl<'a> EscapeCheck<'a> {
         }
     }
 
+    /// A field selects its own buffer, not the aggregate's contained-value lifetime. Only
+    /// authenticated owned/inline collection headers can supply this new field-write authority.
+    fn field_collection_backing(&self, base: LocalId, fields: &[u32]) -> EscapeBackingStorage {
+        let path = fields.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
+        let Some(ty) = self.escape_projected_local_ty(base, &path) else {
+            return EscapeBackingStorage::unknown();
+        };
+        if !matches!(ty, Ty::Array(..) | Ty::DynArray(..)) {
+            return EscapeBackingStorage::unknown();
+        }
+        let Some(header) = self.state.storage_values.get(&base)
+            .and_then(|value| value.headers.leaves.get(&path)) else {
+            return EscapeBackingStorage::unknown();
+        };
+        let resolved = self.state.resolve_storage_leaf(header, &mut Vec::new());
+        let Some(region) = resolved.storage_region else {
+            return EscapeBackingStorage::unknown();
+        };
+        if !resolved.identity_known || resolved.ended.is_some()
+            || resolved.value_descriptor != resolved.storage_descriptor
+            || resolved.value_descriptor.is_none_or(|descriptor| descriptor.ty != ty
+                || !(descriptor.kind.owns_storage() || descriptor.kind == StorageHeaderKind::InlineFixed))
+        {
+            return EscapeBackingStorage::unknown();
+        }
+        let mut backing = EscapeBackingStorage::known(region).rooted(base);
+        for reference in &header.generations {
+            let Some(entry) = self.state.storage.directory.entries.get(&reference.generation) else {
+                return EscapeBackingStorage::unknown();
+            };
+            if let Region::Caller(position) = entry.storage_region {
+                let Some(parameter) = self.f.params.get(position as usize) else {
+                    return EscapeBackingStorage::unknown();
+                };
+                backing.roots.insert(*parameter);
+            }
+            for release in &entry.releases {
+                if let EscapeReleasePlace::Local { local, .. } = release {
+                    backing.roots.insert(*local);
+                }
+            }
+        }
+        backing
+    }
+
     fn apply_escape_index_store(
         &mut self,
         base: LocalId,
@@ -28505,7 +28550,7 @@ impl<'a> EscapeCheck<'a> {
             }
         });
 
-        for leaf in storage.headers.leaves.values() {
+        if let Some(leaf) = storage.headers.leaves.get(&collection_path) {
             for reference in &leaf.generations {
                 let descriptor = self
                     .state
@@ -28531,7 +28576,8 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }));
                 if let Some(len) = fixed_len {
-                    let indices: Box<dyn Iterator<Item = u32>> = match exact_index {
+                    let exact = local_fixed_len.and(exact_index);
+                    let indices: Box<dyn Iterator<Item = u32>> = match exact {
                         Some(index) if index < u128::from(len) => {
                             Box::new(std::iter::once(index as u32))
                         }
@@ -28540,10 +28586,9 @@ impl<'a> EscapeCheck<'a> {
                     };
                     for selected in indices {
                         let mut path = reference.content_path.clone();
-                        path.extend(&collection_path);
                         path.push(BorrowProjection::ArrayElement(selected));
                         path.extend(&element_path);
-                        if exact_index.is_some() {
+                        if exact.is_some() {
                             content.direct_regions.replace_path(
                                 &path,
                                 incoming_content.direct_regions.clone(),
@@ -28570,7 +28615,6 @@ impl<'a> EscapeCheck<'a> {
                     // A dynamic collection aliases all runtime indices. Preserve the previous
                     // possible elements and add the installed value at the selected field path.
                     let mut path = reference.content_path.clone();
-                    path.extend(&collection_path);
                     path.extend(&element_path);
                     let selected = EscapeGenerationContent {
                         direct_regions: incoming_content
@@ -28716,12 +28760,13 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
                 if self.region_bearing(value.ty) {
-                    let backing = self
-                        .state
-                        .backing_storage
-                        .get(base)
-                        .cloned()
-                        .unwrap_or_else(EscapeBackingStorage::unknown);
+                    let backing = match s {
+                        Stmt::AssignIndex { path, .. } if !path.is_empty() => {
+                            self.field_collection_backing(*base, path)
+                        }
+                        _ => self.state.backing_storage.get(base).cloned()
+                            .unwrap_or_else(EscapeBackingStorage::unknown),
+                    };
                     let incoming = self.retained_contained_region(value, depth);
                     if !backing.known {
                         self.diags.error(
@@ -33979,7 +34024,26 @@ impl BorrowState {
                     if let Some(content) = state.storage.contents.entries.get(generation) {
                         let selected = content.through_reference(reference, &reference.content_path);
                         let nested = resolve(state, &selected.headers, visiting);
-                        let resolved = selected.join(&nested);
+                        let mut resolved = selected.join(&nested);
+                        // A slice retains every possible fixed backing slot, but those slots are
+                        // not fields of its value type. Collapse at this known view boundary so
+                        // later aggregate normalization cannot widen them to unrelated siblings.
+                        // Keep all ended/read-only/validation roots; indexed reads still select
+                        // the unchanged generation content table in its backing coordinates.
+                        if leaf.known && leaf.fallback_roots.is_empty()
+                            && leaf.descriptor.is_some_and(|descriptor| {
+                                descriptor.kind == StorageHeaderKind::View
+                                    && matches!(descriptor.ty, Ty::Slice(_))
+                                    && state.storage.directory.entries.get(generation)
+                                        .and_then(|entry| entry.descriptor)
+                                        .is_some_and(|backing| {
+                                            backing.kind == StorageHeaderKind::InlineFixed
+                                                && indexed_backing_compatible(descriptor.ty, backing.ty, &[])
+                                        })
+                            })
+                        {
+                            resolved.non_storage = BorrowFact::from_direct(resolved.non_storage.flatten());
+                        }
                         result.non_storage.join_at(path, &resolved.non_storage);
                     }
                     let owners = state.generation_lifetime_roots(generation);
@@ -42702,7 +42766,9 @@ impl<'a> MoveCheck<'a> {
             .iter()
             .try_fold(local_ty, |ty, projection| self.projection_ty(ty, *projection));
         let Some((element_ty, len)) = array_ty.and_then(|ty| self.fixed_array_shape(ty)) else {
-            self.join_local_borrow_fallback(local, value);
+            // Dynamic indices join one collection's contents, not unrelated record fields.
+            let path = if array_ty.is_some() { &collection_projections[..] } else { &[] };
+            self.join_local_borrow_projection(local, path, value);
             return;
         };
         let mut current = self.normalize_borrow_fact(
@@ -42769,9 +42835,13 @@ impl<'a> MoveCheck<'a> {
         self.record_mutable_access_roots(roots);
         self.reject_readonly_local_write(base, index.span);
         self.mark_borrow_mut_modified(base);
-        let backing = self.local_mutable_backing(base);
-        let storage = BorrowFact::from_direct(self.local_storage_roots(base));
-        let byte_backing = self.byte_backing(&self.local_headers(base), &storage, &backing);
+        let (backing, storage) = if path.is_empty() {
+            (self.local_mutable_backing(base), BorrowFact::from_direct(self.local_storage_roots(base)))
+        } else {
+            let roots = self.borrows.header_release_roots(&headers);
+            (MutableBackingFact::known(roots.clone()), BorrowFact::from_direct(roots))
+        };
+        let byte_backing = self.byte_backing(&headers, &storage, &backing);
         self.borrows.invalidate_validated_bytes(&byte_backing);
         self.update_generation_collection_contents(
             base,
@@ -42781,6 +42851,9 @@ impl<'a> MoveCheck<'a> {
             value,
         );
         let observers = self.mutable_observer_locals(&backing, &storage);
+        if !collection_path.is_empty() {
+            self.invalidate_mutable_place(base, collection_path);
+        }
         for local in self.resolved_mutable_destinations(&backing, &observers) {
             self.invalidate_mutable_place(local, &[]);
         }
@@ -42794,7 +42867,56 @@ impl<'a> MoveCheck<'a> {
         let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
         destinations.remove(&base);
         for local in destinations {
+            self.join_index_observer_borrow(local, &headers, value);
+        }
+    }
+
+    /// Complete header identities keep legacy observer facts at their matching projections.
+    /// Missing or incompatible metadata retains the whole-local conservative fallback.
+    fn join_index_observer_borrow(
+        &mut self,
+        local: LocalId,
+        selected: &ProjectedHeaderFact,
+        value: &Expr,
+    ) {
+        let Some(record) = self.f.locals.get(local as usize) else { return; };
+        let shape = storage_type_paths(record.ty, self.storage_type_context());
+        let headers = self.local_headers(local);
+        let known = |leaf: &StorageHeaderLeaf| {
+            leaf.known && leaf.fallback_roots.is_empty() && !leaf.generations.is_empty()
+                && leaf.descriptor.is_some_and(|descriptor| leaf.generations.iter().all(|reference| {
+                    self.borrows.storage.directory.entries.get(&reference.generation)
+                        .and_then(|entry| entry.descriptor)
+                        .is_some_and(|backing| storage_header_descriptors_compatible(
+                            descriptor, backing, self.tagged_types,
+                        ))
+                }))
+        };
+        let complete = shape.valid && shape.carriers.is_empty()
+            && !shape.headers.is_empty() && headers.leaves.len() == shape.headers.len()
+            && !selected.leaves.is_empty() && selected.leaves.values().all(known)
+            && shape.headers.iter().all(|expected| {
+                headers.leaves.get(&expected.path).is_some_and(|leaf| {
+                    known(leaf) && leaf.descriptor == Some(StorageHeaderDescriptor {
+                        ty: expected.ty, kind: expected.kind,
+                    })
+                })
+            });
+        if !complete {
             self.join_local_borrow_fallback(local, value);
+            return;
+        }
+        let references = selected.leaves.values()
+            .flat_map(|leaf| leaf.generations.iter()).collect::<Vec<_>>();
+        let paths = headers.leaves.iter().filter_map(|(path, leaf)| {
+            leaf.generations.iter().any(|reference| references.iter().any(|selected| {
+                reference.generation == selected.generation
+                    && (reference.content_path.starts_with(&selected.content_path)
+                        || selected.content_path.starts_with(&reference.content_path))
+            })).then_some(path.clone())
+        }).collect::<Vec<_>>();
+        for path in paths {
+            self.join_local_borrow_projection(local, &path, value);
         }
     }
 
@@ -42831,7 +42953,8 @@ impl<'a> MoveCheck<'a> {
             .collect::<Vec<_>>();
         let references = headers
             .leaves
-            .values()
+            .get(&collection_prefix)
+            .into_iter()
             .flat_map(|leaf| leaf.generations.iter().cloned())
             .collect::<std::collections::BTreeSet<_>>();
         for reference in references {
@@ -42846,10 +42969,7 @@ impl<'a> MoveCheck<'a> {
             };
             if let Some(exact) = exact {
                 let path = reference.select_content_path(
-                    collection_prefix
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(BorrowProjection::ArrayElement(exact)))
+                    std::iter::once(BorrowProjection::ArrayElement(exact))
                         .chain(element_suffix.iter().copied()),
                 );
                 content.non_storage.replace_exact(&path, incoming.clone());
@@ -42859,10 +42979,7 @@ impl<'a> MoveCheck<'a> {
             } else if let Some((_, len)) = fixed {
                 for candidate in 0..len {
                     let path = reference.select_content_path(
-                        collection_prefix
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(BorrowProjection::ArrayElement(candidate)))
+                        std::iter::once(BorrowProjection::ArrayElement(candidate))
                             .chain(element_suffix.iter().copied()),
                     );
                     content.non_storage.join_at(&path, &incoming);
@@ -42874,10 +42991,7 @@ impl<'a> MoveCheck<'a> {
                 }
             } else {
                 let path = reference.select_content_path(
-                    collection_prefix
-                        .iter()
-                        .copied()
-                        .chain(element_suffix.iter().copied()),
+                    element_suffix.iter().copied(),
                 );
                 if path.is_empty() {
                     content.non_storage.direct.extend(incoming.flatten());
@@ -42894,6 +43008,10 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn join_local_borrow_fallback(&mut self, local: LocalId, value: &Expr) {
+        self.join_local_borrow_projection(local, &[], value);
+    }
+
+    fn join_local_borrow_projection(&mut self, local: LocalId, path: &[BorrowProjection], value: &Expr) {
         if !self.local_may_borrow(local) {
             return;
         }
@@ -42903,7 +43021,12 @@ impl<'a> MoveCheck<'a> {
             .get(&local)
             .cloned()
             .unwrap_or_default();
-        current.direct.extend(self.borrow_sources(value));
+        let incoming = BorrowFact::from_direct(self.borrow_sources(value));
+        if path.is_empty() {
+            current.direct.extend(incoming.direct);
+        } else {
+            current.join_at(path, &incoming);
+        }
         self.borrows.update_fact(local, current);
     }
 
@@ -51462,9 +51585,9 @@ impl<'a, 't> Checker<'a, 't> {
                 self.diags.error("invalid assignment target".to_string(), place.span);
                 return Place::Err;
             };
-            if !path.is_empty() && !matches!(local_ty, Ty::Array(..) | Ty::StructArray(..)) {
+            if !path.is_empty() && !matches!(local_ty, Ty::Array(..) | Ty::StructArray(..) | Ty::DynArray(..)) {
                 self.diags.error(
-                    "indexed assignment through a field is supported only for fixed-array fields"
+                    "indexed assignment through a field requires a fixed array or an owned scalar array"
                         .to_string(),
                     place.span,
                 );
@@ -77343,6 +77466,632 @@ fn parse_mask_name(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn with_dynamic_array_field_checkers(
+        source: &str,
+        operation: impl FnOnce(&mut EscapeCheck<'_>, &mut MoveCheck<'_>),
+    ) {
+        let (program, initial) = check(source);
+        assert!(
+            !initial.has_errors(),
+            "{:?}",
+            initial.iter().collect::<Vec<_>>()
+        );
+        let function = program
+            .fns
+            .iter()
+            .find(|function| function.name == "probe")
+            .expect("probe");
+        let named = std::collections::HashMap::new();
+        let named_modes = std::collections::HashMap::new();
+        let named_borrow_mut_retention = std::collections::HashMap::new();
+        let named_view_effect = std::collections::HashMap::new();
+        let callable_targets = vec![CallableTargetSet::new(); program.fn_types.len()];
+        let callable_target_ids = std::collections::HashMap::new();
+        let parallel_targets = CallableTransferSet::new();
+        let mut diagnostics = Diagnostics::new();
+        let mut sink = Diagnostics::new();
+        let mut escape = EscapeCheck {
+            f: function,
+            diags: &mut diagnostics,
+            named_return_region: &std::collections::HashMap::new(),
+            named_param_modes: &std::collections::HashMap::new(),
+            named_borrow_mut_retention: &std::collections::HashMap::new(),
+            named_view_effect: &std::collections::HashMap::new(),
+            callable_targets: &[],
+            callable_target_ids: &std::collections::HashMap::new(),
+            fn_types: &program.fn_types,
+            tuples: &program.tuples,
+            structs: &program.structs,
+            enums: &program.enums,
+            tagged_types: &program.tagged_types,
+            state: EscapeState::default(),
+            drop_region: std::collections::HashMap::new(),
+            drop_individual: std::collections::HashMap::new(),
+            drop_individual_exprs: std::collections::HashMap::new(),
+            decl_depth: std::collections::HashMap::new(),
+            borrowed_projection_owners: std::collections::HashMap::new(),
+            task_group_regions: Vec::new(),
+            allocation_regions: Vec::new(),
+            allocation_region_by_expr: std::collections::HashMap::new(),
+            region_capabilities: std::collections::HashMap::new(),
+            flow: EscapeFlowCfg::new(),
+            flow_current: 0,
+            loop_exit_blocks: Vec::new(),
+            collecting_walk_children: false,
+            walk_children: Vec::new(),
+        };
+        let mut moving = MoveCheck {
+            f: function,
+            diags: &mut sink,
+            named_return_borrow: &named,
+            named_parallel_transfer: &named,
+            named_mutable_access: &MutableAccessMap::new(),
+            task_groups: std::collections::HashMap::new(),
+            named_param_modes: &named_modes,
+            named_borrow_mut_retention: &named_borrow_mut_retention,
+            named_view_effect: &named_view_effect,
+            summary_dependencies: None,
+            tuples: &program.tuples,
+            structs: &program.structs,
+            enums: &program.enums,
+            tagged_types: &program.tagged_types,
+            fn_types: &program.fn_types,
+            callable_targets: &callable_targets,
+            callable_target_ids: &callable_target_ids,
+            callable_parallel_targets: &parallel_targets,
+            loop_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_borrow_breaks: Vec::new(),
+            #[cfg(test)]
+            loop_value_breaks: Vec::new(),
+            borrows: BorrowState::default(),
+            next_pipeline_snapshot: 0,
+            loop_value_facts: std::collections::HashMap::new(),
+            control_value_facts: std::collections::HashMap::new(),
+            walked_value_facts: std::collections::HashMap::new(),
+            walked_storage_facts: std::collections::HashMap::new(),
+            walked_backing_facts: std::collections::HashMap::new(),
+            pending_call_completions: std::collections::HashMap::new(),
+            mutable_call_argument_snapshots: std::collections::HashSet::new(),
+            borrow_mut_place_snapshots: std::collections::HashSet::new(),
+            value_snapshot_frames: Vec::new(),
+            reported_invalid_value_actions: std::collections::HashSet::new(),
+            loop_iter_drops: Vec::new(),
+            arena_depth: 0,
+            return_roots: BorrowRoots::new(),
+            parallel_transfer_roots: BorrowRoots::new(),
+            mutable_access_roots: BorrowRoots::new(),
+            borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+            view_effect_exits: None,
+            non_fallthrough: std::collections::HashSet::new(),
+            borrow_fact_cache: std::cell::RefCell::new(None),
+            collecting_move_children: false,
+            move_children: Vec::new(),
+            borrowed_projection_owners: borrowed_projection_owners(&function.body),
+        };
+        for (position, &local) in function.params.iter().enumerate() {
+            let mode = function.param_modes[position];
+            escape.seed_parameter_storage(position as u32, local, mode);
+            moving.seed_parameter_storage(position as u32, local, mode);
+            if function.locals[local as usize].ty == Ty::Str {
+                moving.borrows.assign(
+                    local,
+                    BorrowFact::from_direct([BorrowRoot::Param(position as u32)].into()),
+                );
+            }
+        }
+        operation(&mut escape, &mut moving);
+    }
+
+    #[test]
+    fn dynamic_array_field_selected_storage() {
+        for ty in ["array<str>", "[str;2]"] {
+            with_dynamic_array_field_checkers(
+                &format!(
+                    "R {{a:{ty},b:{ty}}} fn probe(borrow mut row:R,text:str){{}} fn main(){{}}"
+                ),
+                |escape, moving| {
+                    let base = escape.f.params[0];
+                    let text = escape.f.params[1];
+                    let path = vec![BorrowProjection::StructField(0)];
+                    let sibling = vec![BorrowProjection::StructField(1)];
+                    let left = escape
+                        .state
+                        .storage_values
+                        .get(&base)
+                        .expect("base")
+                        .headers
+                        .leaves[&path]
+                        .generations
+                        .iter()
+                        .next()
+                        .expect("left")
+                        .generation
+                        .clone();
+                    let right = escape
+                        .state
+                        .storage_values
+                        .get(&base)
+                        .expect("base")
+                        .headers
+                        .leaves[&sibling]
+                        .generations
+                        .iter()
+                        .next()
+                        .expect("right")
+                        .generation
+                        .clone();
+                    let before = escape.state.clone();
+                    let backing = escape.field_collection_backing(base, &[0]);
+                    assert!(backing.known && backing.region == Region::Caller(0));
+                    assert!(escape.backing_retention_is_visible(&backing));
+                    for mutation in 0..7 {
+                        escape.state = before.clone();
+                        let mut stored = escape
+                            .state
+                            .storage_values
+                            .get(&base)
+                            .cloned()
+                            .expect("base");
+                        match mutation {
+                            0 => {
+                                stored.headers.leaves.remove(&path);
+                            }
+                            1 => {
+                                stored.headers.leaves.get_mut(&path).expect("header").known = false;
+                            }
+                            2 => {
+                                escape.state.storage.directory.entries.remove(&left);
+                            }
+                            3 => {
+                                escape
+                                    .state
+                                    .storage
+                                    .directory
+                                    .entries
+                                    .get_mut(&left)
+                                    .expect("directory")
+                                    .ended = Some(BorrowEnd::Dropped);
+                            }
+                            4 => {
+                                escape
+                                    .state
+                                    .storage
+                                    .directory
+                                    .entries
+                                    .get_mut(&left)
+                                    .expect("directory")
+                                    .descriptor = None;
+                            }
+                            5 => {
+                                escape
+                                    .state
+                                    .storage
+                                    .directory
+                                    .entries
+                                    .get_mut(&left)
+                                    .expect("directory")
+                                    .descriptor = Some(StorageHeaderDescriptor {
+                                    ty: Ty::Slice(Scalar::Str),
+                                    kind: StorageHeaderKind::View,
+                                });
+                            }
+                            _ => {
+                                stored
+                                    .headers
+                                    .leaves
+                                    .get_mut(&path)
+                                    .expect("header")
+                                    .generations
+                                    .clear();
+                            }
+                        }
+                        escape.state.storage_values.insert(base, stored);
+                        assert!(
+                            !escape.field_collection_backing(base, &[0]).known,
+                            "{ty}/{mutation}"
+                        );
+                    }
+                    for shorter in [Region::Frame, Region::Arena(1), Region::Arena(2)] {
+                        escape.state = before.clone();
+                        let original = escape.state.storage.directory.entries[&left].clone();
+                        let mut alternate = original.clone();
+                        alternate.storage_region = shorter;
+                        alternate.retention_region = shorter;
+                        escape
+                            .state
+                            .storage
+                            .directory
+                            .entries
+                            .insert(left.clone(), original.join(&alternate));
+                        let selected = escape.field_collection_backing(base, &[0]);
+                        assert!(
+                            selected.known && selected.region == Region::Caller(0),
+                            "joined destination must keep its longest lifetime"
+                        );
+                    }
+                    escape.state = before;
+                    escape.state.storage_values.insert(
+                        text,
+                        EscapeValueFact {
+                            non_storage: EscapeRegionFact::from_direct(Region::Arena(2)),
+                            ..EscapeValueFact::default()
+                        },
+                    );
+                    let index = Expr {
+                        kind: ExprKind::Int(0),
+                        ty: Ty::Int(IntTy {
+                            bits: 64,
+                            signed: true,
+                        }),
+                        span: escape.f.span,
+                    };
+                    let value = Expr {
+                        kind: ExprKind::Local(text),
+                        ty: Ty::Str,
+                        span: index.span,
+                    };
+                    let untouched_escape = escape.state.storage.contents.entries[&right].clone();
+                    let untouched_move = moving.borrows.storage.contents.entries[&right].clone();
+                    escape.apply_escape_index_store(base, &[0], &index, &[], &value);
+                    moving.update_generation_collection_contents(base, &[0], &index, &[], &value);
+                    assert_eq!(
+                        escape.state.storage.contents.entries[&right],
+                        untouched_escape
+                    );
+                    assert_eq!(
+                        moving.borrows.storage.contents.entries[&right],
+                        untouched_move
+                    );
+                    let selected = if ty.starts_with('[') {
+                        vec![BorrowProjection::ArrayElement(0)]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(
+                        escape.state.storage.contents.entries[&left]
+                            .direct_regions
+                            .project_path(&selected)
+                            .shortest_region(),
+                        Some(Region::Arena(2))
+                    );
+                    assert!(
+                        moving.borrows.storage.contents.entries[&left]
+                            .non_storage
+                            .project_path(&selected)
+                            .flatten()
+                            .contains(&BorrowRoot::Param(1))
+                    );
+                    assert_eq!(
+                        escape.field_collection_backing(base, &[0]).region,
+                        Region::Caller(0),
+                        "stored text cannot shorten destination"
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_array_field_observer_fallback() {
+        with_dynamic_array_field_checkers(
+            "R {a:array<str>,b:array<str>} fn probe(borrow mut row:R,text:str){} fn main(){}",
+            |escape, moving| {
+                let base = escape.f.params[0];
+                let text = escape.f.params[1];
+                let a = vec![BorrowProjection::StructField(0)];
+                let b = vec![BorrowProjection::StructField(1)];
+                let before = moving.borrows.clone();
+                let value = Expr {
+                    kind: ExprKind::Local(text),
+                    ty: Ty::Str,
+                    span: escape.f.span,
+                };
+                for mutation in 0..7 {
+                    moving.borrows = before.clone();
+                    let mut selected = moving.local_headers(base).project_path(&a);
+                    let generation = selected.leaves[&vec![]]
+                        .generations
+                        .iter()
+                        .next()
+                        .expect("generation")
+                        .generation
+                        .clone();
+                    match mutation {
+                        0 => {}
+                        1 => {
+                            moving
+                                .borrows
+                                .headers
+                                .get_mut(&base)
+                                .expect("headers")
+                                .leaves
+                                .remove(&b);
+                        }
+                        2 => {
+                            moving
+                                .borrows
+                                .headers
+                                .get_mut(&base)
+                                .expect("headers")
+                                .leaves
+                                .get_mut(&b)
+                                .expect("sibling")
+                                .known = false;
+                        }
+                        3 => {
+                            selected.leaves.get_mut(&vec![]).expect("selected").known = false;
+                        }
+                        4 => {
+                            moving.borrows.storage.directory.entries.remove(&generation);
+                        }
+                        5 => {
+                            moving
+                                .borrows
+                                .headers
+                                .get_mut(&base)
+                                .expect("headers")
+                                .leaves
+                                .get_mut(&a)
+                                .expect("field")
+                                .descriptor = None;
+                        }
+                        _ => {
+                            moving
+                                .borrows
+                                .storage
+                                .directory
+                                .entries
+                                .get_mut(&generation)
+                                .expect("entry")
+                                .descriptor = Some(StorageHeaderDescriptor {
+                                ty: Ty::String,
+                                kind: StorageHeaderKind::OwnedOpaque,
+                            });
+                        }
+                    }
+                    moving.join_index_observer_borrow(base, &selected, &value);
+                    let facts = moving.borrows.facts.get(&base).expect("retained facts");
+                    assert!(
+                        facts
+                            .project_path(&a)
+                            .flatten()
+                            .contains(&BorrowRoot::Param(1)),
+                        "selected/{mutation}"
+                    );
+                    assert_eq!(
+                        facts
+                            .project_path(&b)
+                            .flatten()
+                            .contains(&BorrowRoot::Param(1)),
+                        mutation != 0,
+                        "sibling/{mutation}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn dynamic_array_field_slice_content_scope() {
+        let generation = StorageGeneration::current(StorageOrigin::InlinePlace {
+            local: 0,
+            path: vec![].into(),
+        });
+        let validation = StorageGeneration::current(StorageOrigin::ByteValidation {
+            expression: 1,
+            kind: ByteValidationKind::Utf8,
+        });
+        let roots = [
+            BorrowRoot::EndedLocal(1, BorrowEnd::Consumed),
+            BorrowRoot::ReadOnly,
+            BorrowRoot::Observation(validation),
+        ]
+        .into_iter()
+        .collect::<BorrowRoots>();
+        let mut state = BorrowState::default();
+        state.storage.directory.entries.insert(
+            generation.clone(),
+            MoveGenerationEntry {
+                descriptor: Some(StorageHeaderDescriptor {
+                    ty: Ty::Array(Scalar::Str, 1),
+                    kind: StorageHeaderKind::InlineFixed,
+                }),
+                ..MoveGenerationEntry::default()
+            },
+        );
+        let contents = MoveValueFact {
+            non_storage: BorrowFact::from_direct(roots.clone())
+                .prefixed(BorrowProjection::ArrayElement(0)),
+            ..MoveValueFact::default()
+        };
+        state
+            .storage
+            .contents
+            .entries
+            .insert(generation.clone(), contents.clone());
+        let path = vec![
+            BorrowProjection::StructField(0),
+            BorrowProjection::StructField(0),
+        ];
+        let mut leaf = StorageHeaderLeaf::known_typed(
+            generation.clone(),
+            StorageHeaderDescriptor {
+                ty: Ty::Slice(Scalar::Str),
+                kind: StorageHeaderKind::View,
+            },
+        );
+        for known in [true, false] {
+            leaf.known = known;
+            let headers = ProjectedHeaderFact::from_leaf(path.clone(), leaf.clone());
+            let resolved = state.resolve_headers(&headers).non_storage;
+            assert_eq!(
+                resolved.flatten(),
+                roots,
+                "no property or lifetime root is lost"
+            );
+            let mut expected_path = path.clone();
+            if !known {
+                expected_path.push(BorrowProjection::ArrayElement(0));
+            }
+            assert_eq!(
+                resolved.projected.keys().collect::<Vec<_>>(),
+                vec![&expected_path]
+            );
+            assert!(
+                resolved.direct.is_empty(),
+                "siblings never inherit known view contents"
+            );
+            assert_eq!(
+                state.storage.contents.entries[&generation], contents,
+                "indexed reads keep the original backing coordinates"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_array_field_offset_alias_content() {
+        for range in ["0..2", "1..2"] {
+            for dynamic in [false, true] {
+                with_dynamic_array_field_checkers(
+                    &format!(
+                        "fn probe(borrow mut values:[str;2],text:str,index:i64){{mut alias:=values[{range}];mut nested:=alias[..]}} fn main(){{}}"
+                    ),
+                    |escape, moving| {
+                        let base = escape.f.params[0];
+                        let text = escape.f.params[1];
+                        let index = Expr {
+                            kind: if dynamic {
+                                ExprKind::Local(escape.f.params[2])
+                            } else {
+                                ExprKind::Int(0)
+                            },
+                            ty: Ty::Int(IntTy {
+                                bits: 64,
+                                signed: true,
+                            }),
+                            span: escape.f.span,
+                        };
+                        let value = Expr {
+                            kind: ExprKind::Local(text),
+                            ty: Ty::Str,
+                            span: index.span,
+                        };
+                        escape.state.storage_values.insert(
+                            text,
+                            EscapeValueFact {
+                                non_storage: EscapeRegionFact::from_direct(Region::Static),
+                                ..EscapeValueFact::default()
+                            },
+                        );
+                        let original = escape
+                            .state
+                            .storage_values
+                            .get(&base)
+                            .expect("base")
+                            .headers
+                            .clone();
+                        let generation = original.leaves[&vec![]]
+                            .generations
+                            .iter()
+                            .next()
+                            .expect("fixed")
+                            .generation
+                            .clone();
+                        let before = EscapeGenerationContent {
+                            direct_regions: EscapeRegionFact {
+                                direct: None,
+                                projected: [
+                                    (vec![BorrowProjection::ArrayElement(0)], Region::Arena(1)),
+                                    (vec![BorrowProjection::ArrayElement(1)], Region::Arena(2)),
+                                ]
+                                .into(),
+                            },
+                            dependencies: ProjectedHeaderFact::default(),
+                        };
+                        for name in ["values", "alias", "nested"] {
+                            let local = escape
+                                .f
+                                .locals
+                                .iter()
+                                .find(|local| local.name == name)
+                                .expect("local")
+                                .id;
+                            let mut headers = original.clone();
+                            if name != "values" {
+                                headers.leaves.get_mut(&vec![]).expect("root").descriptor =
+                                    Some(StorageHeaderDescriptor {
+                                        ty: Ty::Slice(Scalar::Str),
+                                        kind: StorageHeaderKind::View,
+                                    });
+                            }
+                            escape.state.storage_values.insert(
+                                local,
+                                EscapeValueFact {
+                                    headers: headers.clone(),
+                                    ..EscapeValueFact::default()
+                                },
+                            );
+                            moving.borrows.headers.insert(local, headers);
+                            escape
+                                .state
+                                .storage
+                                .contents
+                                .entries
+                                .insert(generation.clone(), before.clone());
+                            let move_before =
+                                moving.borrows.storage.contents.entries[&generation].clone();
+                            escape.apply_escape_index_store(local, &[], &index, &[], &value);
+                            moving.update_generation_collection_contents(
+                                local,
+                                &[],
+                                &index,
+                                &[],
+                                &value,
+                            );
+                            let after = &escape.state.storage.contents.entries[&generation];
+                            assert_eq!(
+                                after
+                                    .direct_regions
+                                    .project_path(&[BorrowProjection::ArrayElement(0)])
+                                    .shortest_region(),
+                                Some(if name == "values" && !dynamic {
+                                    Region::Static
+                                } else {
+                                    Region::Arena(1)
+                                }),
+                                "{range}/{dynamic}/{name}"
+                            );
+                            assert_eq!(
+                                after
+                                    .direct_regions
+                                    .project_path(&[BorrowProjection::ArrayElement(1)])
+                                    .shortest_region(),
+                                Some(Region::Arena(2))
+                            );
+                            if name != "values" || dynamic {
+                                let after = &moving.borrows.storage.contents.entries[&generation]
+                                    .non_storage;
+                                assert!(
+                                    move_before
+                                        .non_storage
+                                        .flatten()
+                                        .is_subset(&after.flatten())
+                                );
+                            }
+                            moving
+                                .borrows
+                                .storage
+                                .contents
+                                .entries
+                                .insert(generation.clone(), move_before);
+                        }
+                    },
+                );
+            }
+        }
+    }
+
     #[test]
     fn owned_field_extraction_families_and_invalid_plans() {
         for ty in [
