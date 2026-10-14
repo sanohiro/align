@@ -400,6 +400,12 @@ fn main()->i32 {
  mut generic:model.G<i64>:=model.G{a:[1].to_array()}
  model.generic(generic,9)
  if generic.a[0]!=9 {return 2}
+ arena {
+  owner:="live".clone();view:str:=owner
+  mut text:=model.Text{a:["old"].to_array()}
+  model.text(text,view)
+  if text.a[0]!="live" {return 3}
+ }
  return 0
 }"#;
 #[test]
@@ -409,9 +415,7 @@ fn imports_and_cache() {
             let model = stage.join("model.align");
             std::fs::write(&model, MODEL)?;
             execute(stage, IMPORTED, "imported")?;
-            // Existing native call validation conflates borrowed contents with owned storage.
-            // Keep both the new field store and old whole-field replacement fail-closed until
-            // that independent producer/call capability supplies both proofs.
+            // Indexed writes and whole-field replacement share the same call authority proof.
             let text_source = r#"module main
 import model
 fn main()->i32 {
@@ -434,41 +438,28 @@ fn main()->i32 {
                     align_driver::format_diagnostics(&sources, &checked.diags)
                 );
                 assert!(align_sema::checked_hir_body_facts_are_valid(&checked.hir));
-                for per_unit in [false, true] {
-                    let diagnostic = if per_unit {
-                        let mut sources = SourceMap::new();
-                        let built = align_driver::check_per_unit(&mut sources, entry, text_source);
-                        let callee = built
-                            .summaries
-                            .iter()
-                            .flat_map(|summary| &summary.fns)
-                            .find(|function| function.name == "text")
-                            .ok_or("text summary")?;
-                        assert!(
-                            callee
-                                .mutable_retention
-                                .as_ref()
-                                .and_then(|outputs| outputs.first())
-                                .is_some_and(|roots| roots.contains(
-                                    &align_sema::hir::MutableRetentionRoot::Contained(1)
-                                ))
-                        );
-                        assert!(
-                            built.diags.has_errors(),
-                            "per-unit native certification limit"
-                        );
-                        align_driver::format_diagnostics(&sources, &built.diags)
-                    } else {
-                        let built = programs(stage, text_source, false)?;
-                        run_programs(stage, &built, "text-limit", false)
-                            .expect_err("existing borrowed-content native call limit")
-                            .to_string()
-                    };
-                    assert!(
-                        diagnostic.contains("owned-leaf argument provenance mismatch"),
-                        "{body}/{per_unit}: {diagnostic}"
-                    );
-                }
+                let mut sources = SourceMap::new();
+                let built = align_driver::check_per_unit(&mut sources, entry, text_source);
+                assert!(
+                    !built.diags.has_errors(),
+                    "{}",
+                    align_driver::format_diagnostics(&sources, &built.diags)
+                );
+                let callee = built
+                    .summaries
+                    .iter()
+                    .flat_map(|summary| &summary.fns)
+                    .find(|function| function.name == "text")
+                    .ok_or("text summary")?;
+                assert!(
+                    callee
+                        .mutable_retention
+                        .as_ref()
+                        .and_then(|outputs| outputs.first())
+                        .is_some_and(|roots| roots
+                            .contains(&align_sema::hir::MutableRetentionRoot::Contained(1)))
+                );
+                execute(stage, text_source, "text-authority")?;
             }
             std::fs::write(&model, MODEL)?;
             for action in ["consume(owner)", "owner=\"replacement\".clone()"] {

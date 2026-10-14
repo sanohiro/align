@@ -1354,7 +1354,18 @@ fn xml_owned_leaf_paths(
     program: &Program,
     root: Ty,
 ) -> Option<Vec<(Ty, Vec<XmlAccessPathSegment>)>> {
+    xml_access_paths(program, root, false)
+}
+
+/// DropPlan identifies owner leaves but deliberately stops at allocating containers.
+/// Continue through their payloads: a fresh outer array cannot authorize an inner owner.
+fn xml_access_paths(
+    program: &Program,
+    root: Ty,
+    owners: bool,
+) -> Option<Vec<(Ty, Vec<XmlAccessPathSegment>)>> {
     let mut leaves = Vec::new();
+    let mut owner_types = HashMap::new();
     let mut pending = vec![(root, Vec::new(), Vec::<Ty>::new())];
     while let Some((ty, path, mut ancestors)) = pending.pop() {
         // Zero inline length has no owned element to certify. The whole value still carries
@@ -1362,7 +1373,19 @@ fn xml_owned_leaf_paths(
         if matches!(ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) {
             continue;
         }
-        if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) || http_client_owner_leaf(ty) {
+        if owners {
+            let is_owner = if let Some(owner) = owner_types.get(&ty) { *owner } else {
+                let plan = align_sema::drop_plan(ty, &program.structs, &program.tuples,
+                    &program.enums, &program.tagged_types);
+                if !plan.is_valid() { return None; }
+                let owner = matches!(plan, align_sema::DropPlan::Leaf(_));
+                owner_types.insert(ty, owner);
+                owner
+            };
+            if is_owner { leaves.push((ty, path.clone())); }
+            // A Copy view never owns its pointees, even inside an owning record.
+            if matches!(ty, Ty::Slice(_) | Ty::Soa(_)) { continue; }
+        } else if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) || http_client_owner_leaf(ty) {
             leaves.push((ty, path));
             continue;
         }
@@ -1608,6 +1631,7 @@ pub(crate) fn xml_plain_fixed_array_element(element: Scalar) -> bool {
 
 fn xml_fixed_array_load_needs_construction_proof(element: Scalar) -> bool {
     xml_plain_fixed_array_element(element)
+        || element == Scalar::Str
         || align_sema::fixed_owned_header_scalar(scalar_to_ty(element)).is_some()
 }
 
@@ -2249,6 +2273,14 @@ fn assert_xml_stmt_variant_classified(statement: &Stmt) {
     }
 }
 
+fn xml_owning_buffer_ty(ty: Ty) -> bool {
+    matches!(ty, Ty::Box(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos) | Ty::Soa(_)
+        | Ty::DynSliceArray(_) | Ty::DynVecArray(..) | Ty::DynMaskArray(..)
+        | Ty::DynFixedArray(..) | Ty::DynFixedStructArray(..)
+        | Ty::ArrayBuilder(_) | Ty::VecArrayBuilder(..) | Ty::MaskArrayBuilder(..)
+        | Ty::FixedArrayBuilder(..) | Ty::FixedStructArrayBuilder(..))
+}
+
 struct XmlAccessAnalyzer<'a> {
     graph: &'a ValidatedProducerGraph<'a>,
     equations: HashMap<XmlAccessNode, XmlAccessEquation>,
@@ -2323,7 +2355,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
             _ => return XmlAccessSource::Invalid,
         };
         match root.and_then(|root| xml_selected_ty(self.graph.program, *root, path)) {
-            Some(Ty::Slice(_) | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) => match node {
+            Some(Ty::Slice(_)) => match node {
+                XmlAccessNode::Value(value, path) => self.queue(XmlAccessNode::BufferValue(value, path)),
+                XmlAccessNode::Slot(slot, path) => self.queue(XmlAccessNode::BufferSlot(slot, path)),
+                _ => XmlAccessSource::Invalid,
+            },
+            Some(ty) if xml_owning_buffer_ty(ty) => match node {
                 XmlAccessNode::Value(value, path) => self.queue(XmlAccessNode::BufferValue(value, path)),
                 XmlAccessNode::Slot(slot, path) => self.queue(XmlAccessNode::BufferSlot(slot, path)),
                 _ => XmlAccessSource::Invalid,
@@ -2356,16 +2393,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     && self.graph.function.param_modes.get(*index as usize) == Some(&align_ast::ParamMode::Out);
                 XmlAccessSource::Seed(if out { XmlAccessProvenance::Unreadable } else { XmlAccessProvenance::Shared })
             }
-            Operand::Arg(index) if matches!(selected, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) => {
+            Operand::Arg(index) if xml_owning_buffer_ty(selected) => {
                 XmlAccessSource::Seed(xml_argument_access(self.graph.function, *index))
             }
             _ => XmlAccessSource::Invalid,
         }
     }
 
-    fn buffer_dependencies(&mut self, equation: &mut XmlAccessEquation) {
+    fn buffer_dependencies(&mut self, equation: &mut XmlAccessEquation, owning: bool) {
         // A seed lost its operand identity in the ordinary equation. It cannot certify a buffer.
-        if equation.seed.is_some() { equation.seed = Some(XmlAccessProvenance::Shared); }
+        if !owning && equation.seed.is_some() { equation.seed = Some(XmlAccessProvenance::Shared); }
         for node in std::mem::take(&mut equation.dependencies) {
             let source = self.buffer_node(node);
             Self::add_source(equation, source);
@@ -2384,8 +2421,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
         if equation.invalid || equation.absent { return equation; }
         let selected = self.graph.function.value_tys.get(value as usize)
             .and_then(|root| xml_selected_ty(self.graph.program, *root, &path));
-        if let Some(ty @ (Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos))) = selected {
-            let Some(leaves) = xml_owned_leaf_paths(self.graph.program, ty) else {
+        if let Some(ty) = selected.filter(|ty| xml_owning_buffer_ty(*ty)) {
+            let Some(leaves) = (if matches!(ty, Ty::Box(_)) { Some(Vec::new()) }
+                else { xml_owned_leaf_paths(self.graph.program, ty) }) else {
                 equation.invalid = true;
                 return equation;
             };
@@ -2395,6 +2433,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 let source = self.source(&Operand::Value(value), leaf, selected);
                 Self::add_required_source(&mut equation, source, OperandRequirement::READ);
             }
+            // The ordinary graph authenticates shape and every required input. Only this
+            // separate buffer lane can turn a fresh arena allocation into writable storage.
+            if path.is_empty() && matches!(self.graph.value_definitions.get(value as usize),
+                Some(Some(Rvalue::ArenaAlloc { .. } | Rvalue::SoaAlloc { .. })))
+            {
+                equation.seed = Some(XmlAccessProvenance::Exclusive);
+            }
+            self.buffer_dependencies(&mut equation, true);
             return equation;
         }
         let Some(Some(definition)) = self.graph.value_definitions.get(value as usize) else {
@@ -2447,7 +2493,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::OptionSome(_) | Rvalue::OptionNone | Rvalue::OptionUnwrap(_)
             | Rvalue::ResultOk(_) | Rvalue::ResultErr(_)
             | Rvalue::ResultUnwrapOk(_) | Rvalue::ResultUnwrapErr(_) => {
-                self.buffer_dependencies(&mut equation);
+                self.buffer_dependencies(&mut equation, false);
             }
             // A Copy return's lifetime roots do not exclude a static-return alternative.
             // Neither a call nor an unrelated producer may mint writable backing here.
@@ -2459,12 +2505,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
     fn buffer_slot_equation(&mut self, slot: Slot, path: Vec<XmlAccessPathSegment>) -> XmlAccessEquation {
         let selected = self.graph.function.slots.get(slot as usize)
             .and_then(|root| xml_selected_ty(self.graph.program, *root, &path));
-        if matches!(selected, Some(Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos))) {
-            return self.slot_equation(slot, path);
+        if selected.is_some_and(xml_owning_buffer_ty) {
+            let mut equation = self.slot_equation(slot, path);
+            self.buffer_dependencies(&mut equation, true);
+            return equation;
         }
         if !path.is_empty() {
             let mut equation = self.slot_equation(slot, path);
-            self.buffer_dependencies(&mut equation);
+            self.buffer_dependencies(&mut equation, false);
             return equation;
         }
         let mut equation = XmlAccessEquation::default();
@@ -8192,6 +8240,63 @@ fn xml_plain_array_borrow_at_call(
     Some(xml_slot_path_access(graph, place.slot, selected, path))
 }
 
+/// Canonical whole/field calls read selected payloads and authorize owners separately.
+/// Indexed descriptors keep their existing, independently restricted place proof.
+fn xml_place_call_access_valid(
+    graph: &ValidatedProducerGraph<'_>,
+    place: &crate::BorrowedPlace,
+    expected: Ty,
+    mode: align_ast::ParamMode,
+    call: ValueId,
+    leaves: &[(Ty, Vec<XmlAccessPathSegment>)],
+) -> bool {
+    let operand = Operand::BorrowedPlace(Box::new(place.clone()));
+    let Some((physical, prefix)) = graph.function.slots.get(place.slot as usize)
+        .and_then(|root| xml_borrowed_path(graph.program, *root, &place.path)) else { return false; };
+    let storage = xml_borrowed_storage_access(graph, &operand);
+    let exclusive = OperandRequirement { write: true, exclusive: true, ..OperandRequirement::default() };
+    if matches!(mode, align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out)
+        && !exclusive.is_satisfied_by(storage) { return false; }
+    if mode == align_ast::ParamMode::Out { return true; }
+    // Plan170's complete local publication proof is deliberately restricted to plain
+    // elements. Do not authorize an arbitrary named view-bearing array from one writer.
+    if prefix.is_empty() && matches!(physical, Ty::Array(..)) {
+        let initialized = xml_plain_array_borrow_at_call(graph, &operand, call)
+            .unwrap_or_else(|| xml_borrowed_access(graph, &operand));
+        if !OperandRequirement::READ.is_satisfied_by(initialized) { return false; }
+    }
+    let selected_access = |selected: Ty, tail: &[XmlAccessPathSegment], buffer: bool| {
+        let mut path = prefix.clone();
+        path.extend_from_slice(tail);
+        let Some(actual) = graph.function.slots.get(place.slot as usize)
+            .and_then(|root| xml_selected_ty(graph.program, *root, &path)) else {
+                return XmlProducerState::Invalid;
+            };
+        if !xml_flow_matches(graph.program, actual, selected)
+            && !xml_ty_is_view_retype(actual, selected) { return XmlProducerState::Invalid; }
+        if buffer {
+            let mut analysis = XmlAccessAnalyzer::new(graph);
+            let source = analysis.buffer_node(XmlAccessNode::Slot(place.slot, path));
+            analysis.build(source, None)
+        } else { xml_slot_path_access(graph, place.slot, actual, path) }
+    };
+    if leaves.is_empty() {
+        let payload = xml_plain_array_borrow_at_call(graph, &operand, call)
+            .unwrap_or_else(|| xml_borrowed_access(graph, &operand));
+        if !OperandRequirement::READ.is_satisfied_by(payload) { return false; }
+    } else if !leaves.iter().all(|(selected, path)| {
+        let mut requirement = OperandRequirement::READ;
+        requirement.callable = matches!(selected, Ty::Fn(_));
+        requirement.is_satisfied_by(selected_access(*selected, path, false))
+    }) { return false; }
+    if mode != align_ast::ParamMode::BorrowMut { return true; }
+    let Some(owners) = xml_access_paths(graph.program, expected, true) else { return false; };
+    owners.iter().all(|(selected, path)| {
+        OperandRequirement { read: true, ..exclusive }
+            .is_satisfied_by(selected_access(*selected, path, xml_owning_buffer_ty(*selected)))
+    })
+}
+
 fn xml_borrowed_storage_access(
     graph: &ValidatedProducerGraph<'_>,
     operand: &Operand,
@@ -9287,6 +9392,11 @@ fn validate_resource_rvalues_component(
                                 if !canonical_borrow_path {
                                     return false;
                                 }
+                                if let Operand::BorrowedPlace(place) = operand {
+                                    return canonical_shape && by_value_shape
+                                        && xml_place_call_access_valid(&access_graph, place,
+                                            *expected, *mode, call, &leaves);
+                                }
                                 let payload = xml_plain_array_borrow_at_call(&access_graph, operand, call)
                                     .unwrap_or_else(|| xml_borrowed_access(&access_graph, operand));
                                 let storage =
@@ -9376,6 +9486,31 @@ fn validate_resource_rvalues_component(
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
+                // Builder construction certifies its allocation, not arbitrary bytes later
+                // pushed into it. Authenticate every transferred owner at the writer boundary,
+                // including numeric buffers below allocating record/container leaves.
+                if let Rvalue::ArrayBuilderPush { builder, value, .. }
+                    | Rvalue::ArrayBuilderPushStr { builder, value } = rvalue
+                {
+                    let element = xml_operand_base_ty(function, builder)
+                        .filter(|ty| xml_array_builder_output(*ty).is_some())
+                        .and_then(|ty| xml_selected_ty(program, ty, &[XmlAccessPathSegment::Element]));
+                    let declared = match rvalue {
+                        Rvalue::ArrayBuilderPush { scalar, .. } => *scalar,
+                        _ => Ty::String,
+                    };
+                    let valid = result == Ty::Unit
+                        && element.is_some_and(|element| xml_value_flow_matches(program, element, declared))
+                        && xml_operand_base_ty(function, value)
+                            .is_some_and(|actual| xml_value_flow_matches(program, actual, declared))
+                        && xml_access_paths(program, declared, true).is_some_and(|owners| {
+                            owners.into_iter().all(|(owner, path)| {
+                                xml_mode_requirement(program, owner, align_ast::ParamMode::ByValue)
+                                    .is_satisfied_by(cached_path_access(value, owner, path))
+                            })
+                        });
+                    if !valid { return Err(fail(function, "array builder owner transfer provenance mismatch")); }
+                }
                 if native_owner_mir_contract(program, function, rvalue).is_some()
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
@@ -12146,6 +12281,10 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "producer_borrow_call_tests.rs"]
+mod borrow_call_tests;
 
 #[cfg(test)]
 #[path = "producer_copy_tests.rs"]
