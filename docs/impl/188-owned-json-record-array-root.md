@@ -1,5 +1,12 @@
 # Owned JSON record-array root decoding (Request133)
 
+**Current mixed-text contract:** [Plan193](193-mixed-json-graphs.md) supersedes this
+plan's mixed-view exclusions, fully-independent lifetime claim for mixed results,
+and graph/interface versions. It admits Str at existing text positions, retains
+input/explicit-arena lifetimes separately from individually owned allocations,
+and replaces all selected graphs with V4/interface19. Fully owned results and
+all other admission, error, cleanup and numeric rules remain unchanged.
+
 ## Evidence and capability boundary
 
 The real consumer uses `Case { id: string, prompt: string, text: string,

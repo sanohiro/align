@@ -297,15 +297,33 @@ work. The earlier XNU final-link-refusal assumption was disproved by native
 qualification. Self `access` remains supported on Linux/macOS; no alternate
 error/ownership model or weaker platform-dependent success guarantee is added.
 
+**Mixed borrowed and owned graphs (AM-R02).** One selected recursive JSON graph
+admits `str` beside `string`, including Option, dynamic-array and nested-record
+positions, for record and AoS record-array roots. A transitive owned string still
+selects this route; other roots, constructors, layout/depth restrictions, SoA and
+scanner admission stay unchanged. Both encoders shared-borrow the complete input,
+including transitive text through cap evaluation, and return an independent owned
+`Result<string, Error>` with identical bytes on bounded success.
+
+Decode individually owns every string and array spine, including inside arenas.
+Clean `str` borrows input; selected escaped `str` uses the explicit enclosing arena
+or returns `Error.Code(1)` when none exists. A mixed result conservatively retains
+both input and arena lifetimes; fully owned graphs retain neither. Drop releases
+owners only, including on partial failure; `array<str>` owns its spine, not its text.
+No implicit clone, hidden arena or second ownership model is introduced. Plan193
+owns the exact V4 descriptor/envelope and interface19 transition, including distinct
+Str/String identity despite equal machine headers; the native ABI is unchanged.
+This replaces earlier mixed-view exclusions and JSON transport versions below.
+
 **Owned record-array decoding (R133).** `json.decode(input)` also infers
-`Result<array<R>, Error>` for the same closed V3 owned record graph used by
-record decoding and embedded arrays. Every row and its reachable strings/arrays
-are independently owned, including inside arenas; input may expire after the call.
-Empty arrays allocate nothing. Full JSON array syntax is validated before decoded
-allocation; schema failure frees completed rows and the partial row before returning
-`Error.Code(1)`. Element views remain bounded by the array owner. Mixed views, SoA
-and scanner schemas do not widen. Plan188 owns root admission and cleanup; the
-existing V3 element graph, native ABI and interface format remain unchanged.
+`Result<array<R>, Error>` for the same closed V4 graph used by record decoding and
+embedded arrays. Every reachable owner is individually allocated, including inside
+arenas; fully owned results allow input to expire after the call, while mixed
+results retain the text lifetimes above. Empty arrays allocate nothing. Full JSON
+array syntax precedes decoded allocation; schema failure frees completed rows and
+the partial row before `Error.Code(1)`. Element views remain bounded by the array
+owner and any borrowed text. Plan188 owns root admission and cleanup; Plan193
+supersedes its mixed-view exclusion and graph version. SoA/scanner stay unchanged.
 
 **Owned string-array decoding (V005).** The inferred target of `json.decode(input)`
 may be `array<string>`. A complete UTF-8 JSON array of strings produces an
@@ -326,7 +344,7 @@ owned output may outlive it. Exact-fit bounds succeed; negative/exceeded bounds
 and selected nonfinite floats return `Error.Invalid` without partial output.
 There is no implicit copy, wrapper, new element constructor or decode expansion.
 The owner reopened this restriction explicitly; plan 59 supersedes earlier bare
-dynamic-array encoding exclusions. Its V3 graph still describes the element
+dynamic-array encoding exclusions. Its V4 graph still describes the element
 record, while the typed source authenticates the array container.
 
 **R63 contract (2026-09-10).**
@@ -3047,7 +3065,7 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
   borrowed members remain governed separately by Region. A one-owner aggregate can forward a
   path-dependent runtime mode, but mutation requires a definite mode; Move-struct construction
   retains completed field owners through direct struct and fixed-array `let` paths too.
-- **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). An in-arena clone is a bump allocation, so escaping is not a sudden heap cost.
+- **Explicit `.clone()` over hidden copy-on-escape**: a zero-copy decoded view that must escape its input is cloned explicitly (Nothing hidden + Predictable performance; supersedes the old `draft.md` auto-buffer wording). Text `.clone()` creates an independent owned string even inside an arena; `.clone_in(region)` explicitly selects region-owned text.
 - **`json.decode`**: clean `str` and `array<Struct>` views remain region-tied to the input; selected escaped strings materialize in the enclosing arena and therefore bind the result to input plus arena. `array<scalar>` is copied into a fresh buffer (owned / `Static` / returnable, not region-tied).
 SSO is **not** adopted (its own Settled entry above). Element indexing is implemented: `recv[index]` (array/slice/owned array → scalar; **struct array → whole struct by value**, a Copy load region-tied to the array via `region_of`) and `arr[index].field` (a struct-array element's field), both bounds-checked. Since-implemented on separate tracks: tuples / multi-value returns → `partition`; `array<slice<T>>` → `chunks` (`Ty::DynSliceArray`); `out` params + the no-alias check. Still open: `array<Struct>.clone()`, and emitting LLVM `noalias` (below).
 Record: `impl/08-memory-model-v2.md` (full model + slice ledger §11), `design-notes.md` ("one region lattice, explicit copies"), `draft.md` §6/§7/§14, `impl/07-roadmap.md` (Memory Model v2 — DONE).
@@ -5921,7 +5939,7 @@ arena exhaustion retain the existing model. Existing key(i)/as_str parse-arena
 allocation and prefix-walk costs stay unchanged. [Plan186](impl/186-json-doc-keys.md)
 owns the shared Values/Keys IR discriminator and exact native output contract.
 
-**Direct owned JSON records — SETTLED AND IMPLEMENTED (2026-08-17).** A direct
+**Historical direct owned JSON boundary (2026-08-17; superseded by Plans25/47/193).** A direct
 record with at least one `string`, `Option<string>`, or `array<string>` field selects one closed
 owned route. Its only other fields are required fixed-width integers or bool; borrowed text,
 floats, nested aggregates, other optionals, and explicit layout/alignment reject before allocation.
@@ -5937,7 +5955,7 @@ scanner rows, a dynamic JSON tree, or the later recursive Request 13 graph.
 R63 supersedes the following historical float/result/transport restrictions; see
 its entry in Settled and [plan 47](impl/47-json-numeric-contract.md).
 
-**Recursive owned JSON records — DESIGN SETTLED 2026-08-17 (implementation pending).** Request 13
+**Historical recursive JSON boundary (2026-08-17; implemented, amended by Plans47/188/193).** Request 13
 reuses the ownership-directed materializer for one acyclic, view-free graph of fixed-width integers,
 bool, owned `string`, natural-layout records, `Option<T>` payloads, and dynamic arrays whose elements
 are an integer, bool, string, or accepted record. An option payload cannot itself be an option because

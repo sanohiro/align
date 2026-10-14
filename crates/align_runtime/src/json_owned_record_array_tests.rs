@@ -228,3 +228,237 @@ fn json_owned_record_array_v3_value_and_cleanup_matrix() {
         }
     }
 }
+
+#[test]
+fn json_mixed_graph_borrowed_leaf_and_owner_cleanup_matrix() {
+    let Some(_isolated) = crate::allocation_test::enter() else {
+        return;
+    };
+    align_rt_requested_live_reset();
+    struct ArenaOwner(*mut Arena);
+    impl Drop for ArenaOwner {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { align_rt_arena_end(self.0) };
+            }
+        }
+    }
+    let inner = [field(b"owned", 0x810, 0), field(b"text", 0x310, 16)];
+    let sub = JsonSubTable {
+        descs: inner.as_ptr(),
+        n_fields: 2,
+        store_size: 32,
+        phf: core::ptr::null(),
+        phf_len: 0,
+        phf_seed: 0,
+    };
+    for (tag, clean, escaped) in [
+        (0x310, "\"text\"", "\"a\\n\\u0000\\u304c\""),
+        (
+            (16 << 24) | (3 << 20) | 0x710,
+            "[\"text\",\"\"]",
+            "[\"a\\n\\u0000\\u304c\",\"\"]",
+        ),
+        (
+            0x400,
+            "{\"owned\":\"inner\",\"text\":\"text\"}",
+            "{\"owned\":\"inner\",\"text\":\"a\\n\\u0000\\u304c\"}",
+        ),
+        (
+            0x510,
+            "[{\"owned\":\"inner\",\"text\":\"text\"}]",
+            "[{\"owned\":\"inner\",\"text\":\"a\\n\\u0000\\u304c\"}]",
+        ),
+    ] {
+        for optional in [false, true] {
+            let mut payload = field(b"value", tag, 16);
+            if matches!((tag >> 8) & 255, 4 | 5) {
+                payload.sub = &sub;
+            }
+            if optional {
+                payload.opt_tag = 48;
+            }
+            let descs = [
+                field(b"lead", 0x810, 0),
+                payload,
+                field(b"end", 0x10008, 56),
+            ];
+            for arena_enabled in [false, true] {
+                for array_root in [false, true] {
+                    for (label, body, valid, expected_text) in [
+                        (
+                            "clean",
+                            format!("{{\"lead\":\"owner\",\"value\":{clean},\"end\":7}}"),
+                            true,
+                            Some("text"),
+                        ),
+                        (
+                            "escaped",
+                            format!("{{\"lead\":\"owner\",\"value\":{escaped},\"end\":7}}"),
+                            arena_enabled,
+                            Some("a\n\0が"),
+                        ),
+                        (
+                            "late-error",
+                            format!("{{\"lead\":\"owner\",\"value\":{escaped},\"end\":false}}"),
+                            false,
+                            None,
+                        ),
+                        (
+                            "duplicate",
+                            format!(
+                                "{{\"lead\":\"owner\",\"value\":{clean},\"end\":7,\"lead\":\"again\"}}"
+                            ),
+                            false,
+                            None,
+                        ),
+                        (
+                            "trailing",
+                            format!("{{\"lead\":\"owner\",\"value\":{clean},\"end\":7}} false"),
+                            false,
+                            None,
+                        ),
+                        (
+                            "missing",
+                            "{\"lead\":\"owner\",\"end\":7}".into(),
+                            optional,
+                            None,
+                        ),
+                        (
+                            "null",
+                            "{\"lead\":\"owner\",\"value\":null,\"end\":7}".into(),
+                            optional,
+                            None,
+                        ),
+                    ] {
+                        let before = (align_rt_alloc_count(), align_rt_free_count());
+                        let arena = ArenaOwner(if arena_enabled {
+                            align_rt_arena_begin()
+                        } else {
+                            core::ptr::null_mut()
+                        });
+                        let source = if array_root {
+                            format!("[{body},{body}]")
+                        } else {
+                            body
+                        };
+                        let mut row = [0_u64; 8];
+                        let sentinel = core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const();
+                        let mut out = AlignStr {
+                            ptr: sentinel,
+                            len: 73,
+                        };
+                        let status = if array_root {
+                            unsafe {
+                                align_rt_json_decode_struct_array(
+                                    source.as_ptr(),
+                                    i64::try_from(source.len()).unwrap(),
+                                    descs.as_ptr(),
+                                    3,
+                                    64,
+                                    &mut out,
+                                    core::ptr::null(),
+                                    0,
+                                    0,
+                                    arena.0,
+                                )
+                            }
+                        } else {
+                            unsafe {
+                                align_rt_json_decode(
+                                    source.as_ptr(),
+                                    i64::try_from(source.len()).unwrap(),
+                                    descs.as_ptr(),
+                                    3,
+                                    row.as_mut_ptr().cast(),
+                                    64,
+                                    core::ptr::null(),
+                                    0,
+                                    0,
+                                    arena.0,
+                                )
+                            }
+                        };
+                        assert_eq!(
+                            status,
+                            if valid { 0 } else { 1 },
+                            "{tag:x}/{optional}/{arena_enabled}/{array_root}/{label}"
+                        );
+                        if valid {
+                            let (base, count) = if array_root {
+                                assert_eq!(out.len, 2);
+                                (out.ptr.cast_mut(), 2)
+                            } else {
+                                (row.as_mut_ptr().cast::<u8>(), 1)
+                            };
+                            for index in 0..count {
+                                let base = unsafe { base.add(index * 64) };
+                                if let Some(expected) = expected_text {
+                                    let payload = unsafe { base.add(16) };
+                                    let text = unsafe {
+                                        match (tag >> 8) & 255 {
+                                            3 => payload.cast::<AlignStr>().read_unaligned(),
+                                            7 => payload
+                                                .cast::<AlignStr>()
+                                                .read_unaligned()
+                                                .ptr
+                                                .cast::<AlignStr>()
+                                                .read_unaligned(),
+                                            4 => {
+                                                payload.add(16).cast::<AlignStr>().read_unaligned()
+                                            }
+                                            5 => payload
+                                                .cast::<AlignStr>()
+                                                .read_unaligned()
+                                                .ptr
+                                                .add(16)
+                                                .cast::<AlignStr>()
+                                                .read_unaligned(),
+                                            _ => unreachable!(),
+                                        }
+                                    };
+                                    assert_eq!(
+                                        unsafe { safe_slice(text.ptr, text.len) },
+                                        expected.as_bytes()
+                                    );
+                                    if label == "clean" {
+                                        assert!(
+                                            text.ptr.addr() >= source.as_ptr().addr()
+                                                && text.ptr.addr()
+                                                    < source.as_ptr().addr() + source.len()
+                                        );
+                                    }
+                                }
+                                unsafe { drop_decoded_owned(base, &descs, None) };
+                                let freed = align_rt_free_count();
+                                unsafe { drop_decoded_owned(base, &descs, None) };
+                                assert_eq!(
+                                    align_rt_free_count(),
+                                    freed,
+                                    "owners nulled, borrowed text never freed"
+                                );
+                            }
+                            if array_root {
+                                unsafe { align_rt_free(out.ptr.cast_mut()) };
+                            }
+                        } else if array_root {
+                            assert_eq!(out.ptr, sentinel);
+                            assert_eq!(out.len, 73);
+                        }
+                        drop(arena);
+                        assert_eq!(
+                            align_rt_alloc_count() - before.0,
+                            align_rt_free_count() - before.1,
+                            "{label}: every owner freed"
+                        );
+                        assert_eq!(
+                            align_rt_requested_live_bytes(),
+                            0,
+                            "{label}: no retained allocation"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

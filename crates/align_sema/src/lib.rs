@@ -2057,7 +2057,7 @@ enum JsonShapeRoot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OwnedJsonRoute {
     Existing,
-    Owned(hir::OwnedJsonGraphPlanV3),
+    Owned(hir::OwnedJsonGraphPlanV4),
 }
 
 const OWNED_JSON_MAX_CONSTRUCTOR_DEPTH: u16 = 128;
@@ -2066,10 +2066,10 @@ const OWNED_JSON_MAX_CONSTRUCTOR_DEPTH: u16 = 128;
 /// canonical root-first DFS order; a repeated completed record is a DAG edge, while an active
 /// record is a cycle. Constructor depth counts the root record as one and every record, Option, or
 /// dynamic-array edge thereafter.
-pub fn owned_json_graph_plan_v3(
+pub fn owned_json_graph_plan_v4(
     structs: &[hir::StructDef],
     root: u32,
-) -> Result<hir::OwnedJsonGraphPlanV3, String> {
+) -> Result<hir::OwnedJsonGraphPlanV4, String> {
     enum Work {
         Record(u32, u16),
         Type(Ty, u16),
@@ -2149,7 +2149,8 @@ pub fn owned_json_graph_plan_v3(
                 })
                 | Ty::Float(FloatTy { bits: 32 | 64 })
                 | Ty::Bool
-                | Ty::String => {}
+                | Ty::String
+                | Ty::Str => {}
                 Ty::Struct(id) => work.push(Work::Record(id, next_depth(depth)?)),
                 Ty::Option(payload) => {
                     let depth = next_depth(depth)?;
@@ -2160,7 +2161,8 @@ pub fn owned_json_graph_plan_v3(
                         })
                         | Scalar::Float(FloatTy { bits: 32 | 64 })
                         | Scalar::Bool
-                        | Scalar::String => {}
+                        | Scalar::String
+                        | Scalar::Str => {}
                         Scalar::Struct(id) => work.push(Work::Record(id, next_depth(depth)?)),
                         Scalar::DynArray(
                             PrimScalar::Int(IntTy {
@@ -2169,7 +2171,8 @@ pub fn owned_json_graph_plan_v3(
                             })
                             | PrimScalar::Float(FloatTy { bits: 32 | 64 })
                             | PrimScalar::Bool
-                            | PrimScalar::String,
+                            | PrimScalar::String
+                            | PrimScalar::Str,
                         ) => {
                             next_depth(depth)?;
                         }
@@ -2191,7 +2194,8 @@ pub fn owned_json_graph_plan_v3(
                     })
                     | Scalar::Float(FloatTy { bits: 32 | 64 })
                         | Scalar::Bool
-                    | Scalar::String,
+                    | Scalar::String
+                    | Scalar::Str,
                 ) => {
                     next_depth(depth)?;
                 }
@@ -2211,12 +2215,12 @@ pub fn owned_json_graph_plan_v3(
         .into_iter()
         .map(|id| {
             let definition = &structs[id as usize];
-            hir::OwnedJsonGraphRecordV3 {
+            hir::OwnedJsonGraphRecordV4 {
                 id,
                 fields: definition
                     .fields
                     .iter()
-                    .map(|field| hir::OwnedJsonGraphFieldV3 {
+                    .map(|field| hir::OwnedJsonGraphFieldV4 {
                         name: field.name.clone(),
                         ty: field.ty,
                     })
@@ -2224,7 +2228,7 @@ pub fn owned_json_graph_plan_v3(
             }
         })
         .collect();
-    Ok(hir::OwnedJsonGraphPlanV3 { root, records })
+    Ok(hir::OwnedJsonGraphPlanV4 { root, records })
 }
 
 fn struct_has_transitive_owned_json_text(structs: &[hir::StructDef], root: u32) -> bool {
@@ -20743,14 +20747,17 @@ impl<'a> EscapeCheck<'a> {
                 ExprKind::ArrayToSlice(inner)
                     if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
             );
-        let owns_dynamic_storage = ty_owns_dyn_array_storage(
+        // A loop forwards this completed allocation fact for every Move carrier, including
+        // records that own strings but contain no dynamic-array header. Borrowed text lifetime
+        // cannot stand in for the independent ownership of those strings.
+        let owns_storage = needs_drop_flag(
             expression.ty,
             self.structs,
             self.tuples,
             self.enums,
             self.tagged_types,
         );
-        let (individual, may_individual) = if owns_dynamic_storage {
+        let (individual, may_individual) = if owns_storage {
             (
                 self.drop_is_individual(expression, depth),
                 self.drop_may_be_individual(expression, depth),
@@ -22095,10 +22102,17 @@ impl<'a> EscapeCheck<'a> {
             // value here would falsely keep a frame-local input alive through the explicit copy.
             StorageContentInitializer::CloneIn => EscapeValueFact::default(),
             StorageContentInitializer::JsonDecoded => match &expression.kind {
-                // The owned route copies every accepted leaf into free-standing storage. Its
-                // generation must not retain the input fact: doing so turns a returned owner into
-                // a false frame/arena borrow even though `region_of` and `BorrowRootAnalyzer`
-                // correctly classify the same producer as independent.
+                // Mixed graphs own their allocations but retain borrowed text in their content.
+                // Array generations need the arena fact here as well as in `region_of`: their
+                // independent spine must not erase the shorter lifetime of escaped elements.
+                ExprKind::JsonOwnedDecode { plan, input, .. } if plan.borrows_text() => {
+                    let mut content = self.completed_escape_value(input);
+                    content.non_storage = content.non_storage.join(
+                        &EscapeRegionFact::from_direct(self.allocation_region(expression)),
+                    );
+                    content
+                }
+                // Fully owned graphs copy every text leaf and retain neither input nor arena.
                 ExprKind::JsonOwnedDecode { .. }
                 | ExprKind::JsonDecodeArray { .. } => EscapeValueFact::default(),
                 ExprKind::JsonDecode { input, .. }
@@ -23648,6 +23662,11 @@ impl<'a> EscapeCheck<'a> {
     /// cannot answer this question for a heap array materialized from an arena-borrowed slice.
     /// Explicit-region clones and builder results have their own ownership rules below.
     fn fresh_storage_is_individual(&self, expression: &Expr) -> Option<bool> {
+        // Native owners remain individual even when text borrows an arena/input. This applies
+        // to inline string-bearing records too, not only values with dynamic-array headers.
+        if native_storage_is_individual(&expression.kind) {
+            return Some(true);
+        }
         if !ty_owns_dyn_array_storage(
             expression.ty,
             self.structs,
@@ -23662,13 +23681,6 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::CloneIn { .. } | ExprKind::ArrayBuilderBuild(_)
         ) {
             return None;
-        }
-        // The dedicated owned JSON runtime ignores the enclosing arena and allocates every
-        // accepted owner free-standing. Keep this producer aligned with `region_of` and the
-        // checked-HIR allocation-mode contract instead of deriving its Drop mode from lexical
-        // allocation context like the ordinary arena-aware collection producers below.
-        if native_storage_is_individual(&expression.kind) {
-            return Some(true);
         }
         if matches!(
             expression.kind,
@@ -23722,13 +23734,13 @@ impl<'a> EscapeCheck<'a> {
                         values.push(true);
                         continue;
                     }
-                    if ty_owns_dyn_array_storage(
+                    if (matches!(expression.kind, ExprKind::Loop { .. }) || ty_owns_dyn_array_storage(
                         expression.ty,
                         self.structs,
                         self.tuples,
                         self.enums,
                         self.tagged_types,
-                    ) && let Some(snapshot) = self
+                    )) && let Some(snapshot) = self
                         .state
                         .completed_expressions
                         .get(&Self::expr_key(expression))
@@ -23970,13 +23982,13 @@ impl<'a> EscapeCheck<'a> {
                         continue;
                     }
                     match &expression.kind {
-                        _ if ty_owns_dyn_array_storage(
+                        _ if (matches!(expression.kind, ExprKind::Loop { .. }) || ty_owns_dyn_array_storage(
                             expression.ty,
                             self.structs,
                             self.tuples,
                             self.enums,
                             self.tagged_types,
-                        ) && let Some(snapshot) = self
+                        )) && let Some(snapshot) = self
                             .state
                             .completed_expressions
                             .get(&Self::expr_key(expression)) =>
@@ -24809,6 +24821,9 @@ impl<'a> EscapeCheck<'a> {
             // the enclosing arena. The runtime ABI carries the nullable arena handle explicitly,
             // so the inferred region is the meet of input and allocation region only for
             // str-bearing targets.
+            ExprKind::JsonOwnedDecode { plan, input, .. } if plan.borrows_text() => {
+                push_fold(&mut work, self.allocation_region(expression), vec![(input, depth, None)]);
+            }
             ExprKind::JsonDecode { input, struct_id } if self.struct_has_str(*struct_id) => {
                 push_fold(&mut work, self.allocation_region(expression), vec![(input, depth, None)]);
             }
@@ -41734,8 +41749,11 @@ impl<'a> MoveCheck<'a> {
             ExprKind::Template(_) => {
                 self.template_owner_root(e).into_iter().collect()
             }
-            // Owned JSON materialization copies source bytes into free-standing owners; neither
-            // its Ok payload nor its Error payload borrows the input.
+            // Mixed JSON keeps text borrows independently of its individually owned storage.
+            ExprKind::JsonOwnedDecode { plan, input, .. } if plan.borrows_text() => {
+                self.storage_roots(input)
+            }
+            // Encoded output and fully owned decoded graphs retain no source borrow.
             ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::JsonDecodeArray { .. }
@@ -63325,7 +63343,7 @@ impl<'a, 't> Checker<'a, 't> {
         if !struct_has_transitive_owned_json_text(self.structs, sid) {
             return Some(OwnedJsonRoute::Existing);
         }
-        match owned_json_graph_plan_v3(self.structs, sid) {
+        match owned_json_graph_plan_v4(self.structs, sid) {
             Ok(plan) => Some(OwnedJsonRoute::Owned(plan)),
             Err(reason) => {
                 self.diags.error(format!("'{}' {reason}", dir.name()), span);
@@ -92713,7 +92731,7 @@ fn exit_branch(flag: bool) -> i64 {
         let dag = "import core.json\nLeaf { text: string }\nLeft { leaf: Leaf }\nRight { leaf: Leaf }\nRoot { left: Left, right: Right }\nfn decode(data: str) -> Result<Root, Error> = json.decode(data)\nfn main() -> i32 = 0\n";
         let (program, diagnostics) = check(dag);
         assert!(!diagnostics.has_errors());
-        let plan = owned_json_graph_plan_v3(&program.structs, 3).expect("DAG plan");
+        let plan = owned_json_graph_plan_v4(&program.structs, 3).expect("DAG plan");
         assert_eq!(
             plan.records
                 .iter()

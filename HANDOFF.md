@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan193](docs/impl/193-mixed-json-graphs.md) composes borrowed `str` and owned
+  `string` in the existing recursive JSON graph for media AM-R02. Decode retains
+  input/explicit-arena text lifetimes while strings and array spines remain
+  individually owned; encoders return independent owned output. V4 graph and
+  interface19 distinguish equal-layout text ownership. Consumer adoption is external.
+
 - [Plan192](docs/impl/192-owned-field-extraction.md) completes direct owning
   record-field extraction for voice V002 and LLM R36: arrays, nested Move
   records and tuples transfer through the existing ownership model, with exact

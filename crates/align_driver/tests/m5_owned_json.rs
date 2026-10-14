@@ -259,7 +259,7 @@ fn recursive_owned_json_c6_graph_manifest() {
     );
 
     for root in 0..manifest.len() as u32 {
-        let plan = align_sema::owned_json_graph_plan_v3(&checked.hir.structs, root)
+        let plan = align_sema::owned_json_graph_plan_v4(&checked.hir.structs, root)
             .unwrap_or_else(|error| panic!("C6 root {root} must form a V2 graph: {error}"));
         assert_eq!(plan.root, root);
         let mut ids = std::collections::HashSet::new();
@@ -556,7 +556,7 @@ fn main() -> Result<(), Error> {
         "recursive-owned-json-mixed",
         "import core.json\nMixed { owned: string, borrowed: str }\nfn main() -> Result<(), Error> { value: Mixed := json.decode(\"{}\")?; return Ok(()) }\n",
     );
-    assert!(checked.diags.has_errors());
+    assert!(!checked.diags.has_errors(), "mixed graph must be admitted");
 }
 
 #[test]
@@ -587,10 +587,10 @@ fn owned_json_formation_routing_and_multi_invalid_precedence_are_deterministic()
             ["unsupported type str", "max_bytes"],
         ),
         (
-            "first-mixed-field",
-            "import core.json\nBad { first: str, second: f64, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
-            "owned JSON graph has unsupported type str",
-            ["unsupported type f64", "max_bytes"],
+            "supported-before-unsupported-field",
+            "import core.json\nBad { first: str, second: char, owned: string }\nfn main() -> Result<(), Error> { value: Bad := json.decode(\"{}\")?; return Ok(()) }\n",
+            "owned JSON graph has unsupported type char",
+            ["unsupported type str", "max_bytes"],
         ),
         (
             "graph-before-bounded-limit",
@@ -600,8 +600,8 @@ fn owned_json_formation_routing_and_multi_invalid_precedence_are_deterministic()
         ),
         (
             "generic-substitution",
-            "import core.json\nGeneric<T> { value: T, note: Option<string> }\nfn main() -> Result<(), Error> { value: Generic<str> := json.decode(\"{}\")?; return Ok(()) }\n",
-            "owned JSON graph has unsupported type str",
+            "import core.json\nGeneric<T> { value: T, note: Option<string> }\nfn main() -> Result<(), Error> { value: Generic<char> := json.decode(\"{}\")?; return Ok(()) }\n",
+            "owned JSON graph has unsupported type char",
             ["field 'note'", "unsupported type string"],
         ),
     ];

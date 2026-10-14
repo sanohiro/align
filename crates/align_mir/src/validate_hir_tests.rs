@@ -12010,6 +12010,7 @@ fn assert_owned_json_body_mutation(
 
 #[test]
 fn owned_json_checked_hir_mutation_sweep_fails_closed_at_all_lowering_entrypoints() {
+    for mixed in [false, true] {
     for array in [false, true] {
     let source = r#"
 import core.json
@@ -12026,6 +12027,7 @@ fn owned_bounded(value: Owned, limit: i64) -> i32 {
 fn main() -> i32 = 0
 "#;
     let source = if array { source.replace("value: Owned", "value: array<Owned>").replace("Result<Owned, Error>", "Result<array<Owned>, Error>") } else { source.to_owned() };
+    let source = if mixed { source.replace("note: Option<string>, tags: array<string>", "note: Option<str>, tags: array<str>") } else { source };
     let base = checked_source_program(&source);
     assert!(
         align_sema::checked_hir_body_facts_are_valid(&base),
@@ -12033,6 +12035,25 @@ fn main() -> i32 = 0
     );
     assert!(body_core_metadata_is_valid(&base));
     assert!(!is_empty(&lower_program(&base)));
+
+    if mixed {
+        // Keep the graph canonical and its array Drop obligation intact, but remove the
+        // transitive string that selects this route. Every operation must still reject it.
+        let mut nonowned = base.clone();
+        nonowned.structs[0].fields[0].ty = Ty::Str;
+        let plan = match align_sema::owned_json_graph_plan_v4(&nonowned.structs, 0) {
+            Ok(plan) => plan,
+            Err(error) => panic!("borrowed graph remains structurally valid: {error}"),
+        };
+        if let hir::ExprKind::JsonOwnedDecode { plan: selected, .. } =
+            &mut body_value_expression_mut(&mut nonowned, "owned_decode").kind { *selected = plan.clone(); }
+        for name in ["owned_encode", "owned_bounded"] {
+            if let hir::ExprKind::JsonEncode { plan: hir::JsonEncodePlan::Owned(selected), .. } =
+                &mut body_first_let_init_mut(&mut nonowned, name).kind { *selected = plan.clone(); }
+        }
+        assert!(!body_core_metadata_is_valid(&nonowned));
+        assert_body_entrypoints_empty("nonowning graph discriminator", &nonowned);
+    }
 
     assert_owned_json_body_mutation(&base, "owned-decode-root-kind", |program| {
         let expression = body_value_expression_mut(program, "owned_decode");
@@ -12152,6 +12173,7 @@ fn main() -> i32 = 0
         };
         plan.records[0].fields.swap(1, 2);
     });
+    }
     }
 }
 

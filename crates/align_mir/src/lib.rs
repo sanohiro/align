@@ -1677,13 +1677,14 @@ pub enum Rvalue {
         out: Slot,
         arena: Option<Operand>,
     },
-    /// Owned record/record-array JSON decode. Its descriptor kinds materialize every text leaf into
-    /// free-standing allocations; no arena operand is legal.
+    /// Declared owning JSON decode. Owners are individual allocations; borrowed escaped text
+    /// uses the optional lexical arena while clean text borrows the input.
     JsonOwnedDecode {
         root_kind: hir::JsonOwnedRoot,
-        plan: hir::OwnedJsonGraphPlanV3,
+        plan: hir::OwnedJsonGraphPlanV4,
         input: Operand,
         out: Slot,
+        arena: Option<Operand>,
     },
     /// `json.decode` into an owned `array<elem>`: parse JSON int/float/bool/owned-string elements
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
@@ -3042,10 +3043,10 @@ pub enum TemplatePiece {
     FloatHole(Operand),
     /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
     JsonStrHole(Operand),
-    /// One owned record or AoS record array rendered through the validated V3 element graph.
+    /// One owned record or AoS record array rendered through the validated V4 element graph.
     OwnedJsonRecords {
         value: Operand,
-        plan: hir::OwnedJsonGraphPlanV3,
+        plan: hir::OwnedJsonGraphPlanV4,
     },
     /// A `json.encode` `Option<T>` field (REST-gateway runway, Slice B): when `opt` is `Some`, append
     /// `"name":<payload>,` (payload rendered per its scalar kind — int/float/bool raw, str
@@ -7927,7 +7928,7 @@ fn lower_local(b: &mut Builder, id: hir::LocalId, requested_ty: Ty) -> Operand {
 fn owned_json_piece(
     b: &mut Builder,
     base: hir::LocalId,
-    plan: &hir::OwnedJsonGraphPlanV3,
+    plan: &hir::OwnedJsonGraphPlanV4,
 ) -> TemplatePiece {
     // A shared match binding is a projection into its source, not an initialized local slot.
     // Use the ordinary local read so JSON and every other borrowed consumer select the same place.
@@ -19344,18 +19345,20 @@ fn lower_json_decode_declared(
     struct_id: u32,
     input: &hir::Expr,
     result_ty: Ty,
-    owned: Option<(hir::JsonOwnedRoot, hir::OwnedJsonGraphPlanV3)>,
+    owned: Option<(hir::JsonOwnedRoot, hir::OwnedJsonGraphPlanV4)>,
 ) -> Operand {
     let sty = owned.as_ref().map_or(Ty::Struct(struct_id), |(kind, _)| kind.ty(struct_id));
     let out = b.new_slot(sty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
     let rvalue = if let Some((root_kind, plan)) = owned {
+        let arena = plan.borrows_text().then(|| b.arenas.last().copied()).flatten().map(Operand::Value);
         Rvalue::JsonOwnedDecode {
             root_kind,
             plan,
             input: inp,
             out,
+            arena,
         }
     } else {
         let arena = b.arenas.last().copied().map(Operand::Value);
@@ -26564,7 +26567,7 @@ mod tests {
             };
         }
         let owned = hir::Expr {
-            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV3 {
+            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
                     root: 0,
                     records: Vec::new(),
                 }), max_bytes: None },
@@ -26572,7 +26575,7 @@ mod tests {
             span,
         };
         let bounded = hir::Expr {
-            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV3 {
+            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
                     root: 0,
                     records: Vec::new(),
                 }), max_bytes: Some(Box::new(max_bytes)) },

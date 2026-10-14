@@ -1458,6 +1458,15 @@ validates tag, UTF-8, complete array and trailing input before publishing the
 spine; failure leaves the caller-zeroed output untouched and frees staged
 payloads. This adds no arena or input lifetime, descriptor or serialized field.
 
+## AM-R02 mixed JSON provenance (Plan193)
+
+No native signature or RuntimeKey changes. `JsonOwnedDecode` now passes its checked
+optional lexical arena to the existing record/AoS decoders for mixed graphs.
+Kind3 text and kind7 Str-array elements borrow input/arena; kind8 text and every
+array spine remain individual allocations. Exact selected Str provenance is Shared;
+owned leaves/spines retain Owned authority independently of content lifetime.
+Fully owned schemas pass a null arena and retain their existing contract.
+
 ## Request 13 recursive owned JSON replacement (design accepted)
 
 Request 13 added no runtime key, symbol, LLVM function shape, C signature, or

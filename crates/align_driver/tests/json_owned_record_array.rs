@@ -222,7 +222,7 @@ fn json_owned_record_array_rejects_invalid_source_and_view_escape() {
                     Some("invalidated borrow"),
                 ),
                 (
-                    "R{text:string,view:str}\nfn bad()->Result<array<R>,Error> = json.decode(\"[]\")",
+                    "R{text:string,view:char}\nfn bad()->Result<array<R>,Error> = json.decode(\"[]\")",
                     None,
                 ),
                 (

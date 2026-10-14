@@ -1,5 +1,12 @@
 # Recursive owned declared JSON plan
 
+**Current mixed-text contract:** [Plan193](193-mixed-json-graphs.md) supersedes this
+plan's mixed-view exclusions, fully-independent lifetime claim for mixed results,
+and graph/interface versions. It admits Str at existing text positions, retains
+input/explicit-arena lifetimes separately from individually owned allocations,
+and replaces all selected graphs with V4/interface19. Fully owned results and
+all other admission, error, cleanup and numeric rules remain unchanged.
+
 **R133 decode root composition:** [Plan188](188-owned-json-record-array-root.md)
 admits `array<R>` decoding with the same V3 owned element-record graph and
 independent deep ownership as record decoding. It supersedes direct-record-only
@@ -20,7 +27,7 @@ dynamic AoS arrays of accepted element records to both encoders. The V3 graph
 remains rooted at the element record; the typed source authenticates the array.
 This supersedes earlier direct-record-only encoding root restrictions here.
 
-Status: **ACCEPTED DESIGN; IMPLEMENTATION PENDING**.
+Status: **Implemented; current amendments are listed above**.
 
 This document is the plan of record for align-llm Request 13. It replaces the
 flat implementation boundary in `24-owned-json-plan.md` with one recursive,

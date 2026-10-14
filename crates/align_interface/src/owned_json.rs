@@ -35,6 +35,7 @@ enum Node {
     Float { bits: u8 },
     Bool,
     String,
+    Str,
     Record(usize),
     Option(Box<Node>),
     Array(Box<Node>),
@@ -85,6 +86,9 @@ fn parse_node(ty: &IType, names: &HashMap<&str, usize>) -> Result<Node, ()> {
         if path == "bool" {
             return Ok(Node::Bool);
         }
+        if path == "str" {
+            return Ok(Node::Str);
+        }
         if path == "string" {
             return Ok(Node::String);
         }
@@ -127,7 +131,7 @@ fn node_has_string(node: &Node, structs: &[IStructDef], seen: &mut HashSet<usize
                     }
                 }
             }
-            Node::Record(_) | Node::Int { .. } | Node::Float { .. } | Node::Bool => {}
+            Node::Record(_) | Node::Int { .. } | Node::Float { .. } | Node::Bool | Node::Str => {}
         }
     }
     false
@@ -155,7 +159,7 @@ fn records_reaching_string(structs: &[IStructDef]) -> HashSet<usize> {
                     }
                     Node::Record(id) => reverse_edges[id].push(owner),
                     Node::Option(payload) | Node::Array(payload) => work.push(*payload),
-                    Node::Int { .. } | Node::Float { .. } | Node::Bool => {}
+                    Node::Int { .. } | Node::Float { .. } | Node::Bool | Node::Str => {}
                 }
             }
         }
@@ -188,7 +192,7 @@ fn node_storage_layout(node: &Node, record_layouts: &[Option<Layout>]) -> Option
             })
         }
         Node::Bool => Some(Layout { size: 1, align: 1 }),
-        Node::String | Node::Array(_) => Some(Layout { size: 16, align: 8 }),
+        Node::Str | Node::String | Node::Array(_) => Some(Layout { size: 16, align: 8 }),
         Node::Record(id) => record_layouts.get(*id).copied().flatten(),
         Node::Option(payload) => {
             let payload = node_storage_layout(payload, record_layouts)?;
@@ -207,7 +211,7 @@ fn node_owns(node: &Node, owning: &[bool]) -> bool {
         Node::String | Node::Array(_) => true,
         Node::Record(id) => owning.get(*id).copied().unwrap_or(false),
         Node::Option(payload) => node_owns(payload, owning),
-        Node::Int { .. } | Node::Float { .. } | Node::Bool => false,
+        Node::Int { .. } | Node::Float { .. } | Node::Bool | Node::Str => false,
     }
 }
 
@@ -222,7 +226,7 @@ fn node_record_edges(node: &Node, depth: u16, out: &mut Vec<(usize, u16)>) -> Re
         Node::Option(payload) | Node::Array(payload) => {
             node_record_edges(payload, next_depth(depth)?, out)?;
         }
-        Node::Int { .. } | Node::Float { .. } | Node::Bool | Node::String => {}
+        Node::Int { .. } | Node::Float { .. } | Node::Bool | Node::String | Node::Str => {}
     }
     Ok(())
 }
@@ -405,6 +409,7 @@ fn encode_node(bytes: &mut Vec<u8>, node: &Node, graph: &Graph) -> Option<()> {
         Node::Float { .. } => (0x02, 0),
         Node::Bool => (0x03, 0),
         Node::String => (0x10, 1),
+        Node::Str => (0x11, 0),
         Node::Record(_) => (0x20, if owns { 2 } else { 0 }),
         Node::Option(_) => (0x21, if owns { 3 } else { 0 }),
         Node::Array(_) => (0x22, 4),
@@ -420,7 +425,7 @@ fn encode_node(bytes: &mut Vec<u8>, node: &Node, graph: &Graph) -> Option<()> {
             bytes.push(u8::from(*unsigned));
         }
         Node::Float { bits } => bytes.push(*bits),
-        Node::Bool | Node::String => {}
+        Node::Bool | Node::String | Node::Str => {}
         Node::Record(id) => bytes.extend_from_slice(&graph.ordinal.get(id)?.to_le_bytes()),
         Node::Option(payload) => {
             let payload_layout = node_storage_layout(
@@ -473,7 +478,7 @@ fn encode_owned_json_graph_descriptor_from_graph(
         .enumerate()
         .map(|(index, definition)| (definition.name.as_str(), index))
         .collect::<HashMap<_, _>>();
-    let mut bytes = vec![3, 0, 1];
+    let mut bytes = vec![4, 0, 1];
     bytes.extend_from_slice(&u32::try_from(graph.records.len()).ok()?.to_le_bytes());
     bytes.extend_from_slice(&0u32.to_le_bytes());
     for &id in &graph.records {
@@ -504,7 +509,7 @@ pub fn encode_owned_json_graph_envelope(
     {
         return None;
     }
-    let mut prefix = vec![3];
+    let mut prefix = vec![4];
     prefix.extend_from_slice(&u32::try_from(target.triple.len()).ok()?.to_le_bytes());
     prefix.extend_from_slice(target.triple.as_bytes());
     prefix.push(match target.object_format {
@@ -613,6 +618,7 @@ fn validate_type_node(
         Node::Float { .. } => (0x02, 0),
         Node::Bool => (0x03, 0),
         Node::String => (0x10, 1),
+        Node::Str => (0x11, 0),
         Node::Record(_) => (0x20, if expected_owns { 2 } else { 0 }),
         Node::Option(_) => (0x21, if expected_owns { 3 } else { 0 }),
         Node::Array(_) => (0x22, 4),
@@ -652,7 +658,7 @@ fn validate_type_node(
         Node::Float { bits } => {
             if cursor.u8()? != *bits { return Err("owned JSON float bits"); }
         }
-        Node::Bool | Node::String => {}
+        Node::Bool | Node::String | Node::Str => {}
         Node::Record(id) => {
             let actual = cursor
                 .u32()
@@ -718,7 +724,7 @@ fn validate_descriptor(
     if cursor
         .u8()
         .map_err(|_| "owned JSON descriptor version bound")?
-        != 3
+        != 4
     {
         return Err("owned JSON descriptor version");
     }
@@ -855,6 +861,7 @@ fn descriptor_node(
         }
         0x03 => Ok(named("bool".to_string())),
         0x10 => Ok(named("string".to_string())),
+        0x11 => Ok(named("str".to_string())),
         0x20 => {
             let ordinal = usize::try_from(cursor.u32()?)
                 .map_err(|_| "owned JSON record reference bounds")?;
@@ -956,7 +963,7 @@ fn root_shape_matches(expected: &IStructDef, actual: &IStructDef) -> bool {
                 && ty_matches(&expected_args[0], &actual_args[0]);
         }
         if integer(expected_path).is_some()
-            || matches!(expected_path.as_str(), "bool" | "string" | "f32" | "f64")
+            || matches!(expected_path.as_str(), "bool" | "str" | "string" | "f32" | "f64")
         {
             return expected_path == actual_path
                 && expected_args.is_empty()
@@ -964,7 +971,7 @@ fn root_shape_matches(expected: &IStructDef, actual: &IStructDef) -> bool {
         }
         if matches!(
             expected_path.as_str(),
-            "str" | "char" | "Result" | "slice" | "soa" | "raw" | "()"
+            "char" | "Result" | "slice" | "soa" | "raw" | "()"
         ) {
             return false;
         }
@@ -1020,7 +1027,7 @@ pub(crate) fn validate_entries(
             bytes: &entry.envelope,
             pos: 0,
         };
-        if cursor.u8()? != 3 {
+        if cursor.u8()? != 4 {
             return Err("owned JSON envelope version");
         }
         let triple_len = usize::try_from(cursor.u32()?).map_err(|_| "target triple length")?;
@@ -1187,7 +1194,7 @@ mod tests {
         assert_eq!(descriptor.len(), 221);
         assert_eq!(
             descriptor,
-            hex("03 00 01 02 00 00 00 00 00 00 00 48 00 00 00 08
+            hex("04 00 01 02 00 00 00 00 00 00 00 48 00 00 00 08
              00 00 00 01 02 04 00 00 00 07 00 00 00 76 65 72
              73 69 6f 6e 01 02 00 00 00 02 00 00 00 00 00 10
              01 40 00 00 00 05 00 00 00 63 68 69 6c 64 20 18
@@ -1209,19 +1216,19 @@ mod tests {
         let envelope = encode_owned_json_graph_envelope(&target, &descriptor).unwrap();
         assert_eq!(
             &envelope[..40],
-            &hex("03 13 00 00 00 78 38 36 5f 36 34 2d 70 63 2d 6c
+            &hex("04 13 00 00 00 78 38 36 5f 36 34 2d 70 63 2d 6c
              69 6e 75 78 2d 67 6e 75 00 00 08 08 01 01 10 08
              10 08 01 01 04 04 08 08")
         );
         assert_eq!(
             &envelope[40..56],
-            &hex("9c b2 b1 ae 7d 03 21 43 a2 ea 80 fc ee 9f 4d 39")
+            &hex("83 02 52 f0 d1 7f fd 3b dd e2 a1 ef f2 f9 e1 82")
         );
     }
 
 
     #[test]
-    fn r63_graph_v3_golden_and_rejection() {
+    fn r63_graph_v4_golden_and_rejection() {
         // Independent rational/layout/byte oracle recorded in plan 47; no producer-derived bytes.
         let structs = vec![
             definition("NumericRoot", vec![("label", ty("string")), ("direct", ty("f64")),
@@ -1229,11 +1236,11 @@ mod tests {
                 ("samples", app("array", ty("f32"))), ("child", ty("NumericLeaf"))]),
             definition("NumericLeaf", vec![("flag", ty("bool")), ("weight", ty("f32")), ("note", ty("string"))]),
         ];
-        let descriptor = hex("03 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
+        let descriptor = hex("04 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
         assert_eq!(encode_owned_json_graph_descriptor(&structs, "NumericRoot").unwrap(), descriptor);
         {
             let target = OwnedJsonTarget { triple: "x86_64-pc-linux-gnu".into(), object_format: OwnedJsonObjectFormat::Elf };
-            let golden = hex("03 13 00 00 00 78 38 36 5f 36 34 2d 70 63 2d 6c 69 6e 75 78 2d 67 6e 75 00 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 9c b2 b1 ae 7d 03 21 43 a2 ea 80 fc ee 9f 4d 39 2c 01 00 00 03 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
+            let golden = hex("04 13 00 00 00 78 38 36 5f 36 34 2d 70 63 2d 6c 69 6e 75 78 2d 67 6e 75 00 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 83 02 52 f0 d1 7f fd 3b dd e2 a1 ef f2 f9 e1 82 2c 01 00 00 04 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
             assert_eq!(encode_owned_json_graph_envelope(&target, &descriptor).unwrap(), golden);
             let entries = entries_for_structs(&structs, &target).unwrap();
             assert!(validate_entries(&structs, &entries, Some(&target)).is_ok());
@@ -1247,7 +1254,7 @@ mod tests {
         }
         {
             let target = OwnedJsonTarget { triple: "aarch64-unknown-linux-gnu".into(), object_format: OwnedJsonObjectFormat::Elf };
-            let golden = hex("03 19 00 00 00 61 61 72 63 68 36 34 2d 75 6e 6b 6e 6f 77 6e 2d 6c 69 6e 75 78 2d 67 6e 75 00 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 61 0d da 27 4e df 54 2a 03 94 11 b8 01 ab 69 a1 2c 01 00 00 03 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
+            let golden = hex("04 19 00 00 00 61 61 72 63 68 36 34 2d 75 6e 6b 6e 6f 77 6e 2d 6c 69 6e 75 78 2d 67 6e 75 00 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 2e 33 cf 12 9a 32 f2 12 aa e5 af 2b 4f ec ec 4f 2c 01 00 00 04 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
             assert_eq!(encode_owned_json_graph_envelope(&target, &descriptor).unwrap(), golden);
             let entries = entries_for_structs(&structs, &target).unwrap();
             assert!(validate_entries(&structs, &entries, Some(&target)).is_ok());
@@ -1261,7 +1268,7 @@ mod tests {
         }
         {
             let target = OwnedJsonTarget { triple: "arm64-apple-darwin".into(), object_format: OwnedJsonObjectFormat::MachO };
-            let golden = hex("03 12 00 00 00 61 72 6d 36 34 2d 61 70 70 6c 65 2d 64 61 72 77 69 6e 01 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 0d 9d 00 0a 26 68 71 54 69 52 2f c0 94 1c 69 7e 2c 01 00 00 03 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
+            let golden = hex("04 12 00 00 00 61 72 6d 36 34 2d 61 70 70 6c 65 2d 64 61 72 77 69 6e 01 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 c3 7c cb 8a 4a 1b 8d 5b 59 7d 67 f9 49 82 ae 3c 2c 01 00 00 04 00 01 02 00 00 00 00 00 00 00 58 00 00 00 08 00 00 00 01 02 06 00 00 00 05 00 00 00 6c 61 62 65 6c 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00 06 00 00 00 64 69 72 65 63 74 02 08 00 00 00 08 00 00 00 00 00 40 10 00 00 00 05 00 00 00 73 6d 61 6c 6c 02 04 00 00 00 04 00 00 00 00 00 20 50 00 00 00 08 00 00 00 6f 70 74 69 6f 6e 61 6c 21 10 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 02 08 00 00 00 08 00 00 00 00 00 40 18 00 00 00 07 00 00 00 73 61 6d 70 6c 65 73 22 10 00 00 00 08 00 00 00 01 04 01 02 04 00 00 00 04 00 00 00 00 00 20 28 00 00 00 05 00 00 00 63 68 69 6c 64 20 18 00 00 00 08 00 00 00 01 02 01 00 00 00 38 00 00 00 18 00 00 00 08 00 00 00 01 02 03 00 00 00 04 00 00 00 66 6c 61 67 03 01 00 00 00 01 00 00 00 00 00 14 00 00 00 06 00 00 00 77 65 69 67 68 74 02 04 00 00 00 04 00 00 00 00 00 20 10 00 00 00 04 00 00 00 6e 6f 74 65 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00");
             assert_eq!(encode_owned_json_graph_envelope(&target, &descriptor).unwrap(), golden);
             let entries = entries_for_structs(&structs, &target).unwrap();
             assert!(validate_entries(&structs, &entries, Some(&target)).is_ok());
@@ -1274,6 +1281,69 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn mixed_graph_v4_independent_vectors_and_exact_identity() {
+        // Hand-encoded Plan193 record, independent of this module's serializer/layout.
+        let structs = vec![definition("Mixed", vec![
+            ("label", ty("str")), ("owned", ty("string")),
+            ("maybe", app("Option", ty("str"))), ("tags", app("array", ty("str"))),
+        ])];
+        let descriptor = hex("04 00 01 01 00 00 00 00 00 00 00 48 00 00 00 08 00 00 00 01 02 04 00 00 00 05 00 00 00 6c 61 62 65 6c 11 10 00 00 00 08 00 00 00 00 00 00 00 00 00 05 00 00 00 6f 77 6e 65 64 10 10 00 00 00 08 00 00 00 01 01 10 00 00 00 05 00 00 00 6d 61 79 62 65 21 18 00 00 00 08 00 00 00 00 00 00 00 00 00 08 00 00 00 11 10 00 00 00 08 00 00 00 00 00 20 00 00 00 04 00 00 00 74 61 67 73 22 10 00 00 00 08 00 00 00 01 04 01 11 10 00 00 00 08 00 00 00 00 00 38 00 00 00");
+        assert_eq!(encode_owned_json_graph_descriptor(&structs, "Mixed"), Some(descriptor.clone()));
+        assert!(validate_descriptor(&structs, "Mixed", &descriptor).is_ok());
+        let reconstructed = descriptor_structs("Mixed", &descriptor).unwrap();
+        assert!(root_shape_matches(&structs[0], &reconstructed[0]));
+        for (triple, format, prefix) in [
+            ("x86_64-pc-linux-gnu", OwnedJsonObjectFormat::Elf, "04 13 00 00 00 78 38 36 5f 36 34 2d 70 63 2d 6c 69 6e 75 78 2d 67 6e 75 00 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 83 02 52 f0 d1 7f fd 3b dd e2 a1 ef f2 f9 e1 82"),
+            ("aarch64-unknown-linux-gnu", OwnedJsonObjectFormat::Elf, "04 19 00 00 00 61 61 72 63 68 36 34 2d 75 6e 6b 6e 6f 77 6e 2d 6c 69 6e 75 78 2d 67 6e 75 00 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 2e 33 cf 12 9a 32 f2 12 aa e5 af 2b 4f ec ec 4f"),
+            ("arm64-apple-darwin", OwnedJsonObjectFormat::MachO, "04 12 00 00 00 61 72 6d 36 34 2d 61 70 70 6c 65 2d 64 61 72 77 69 6e 01 00 08 08 01 01 10 08 10 08 01 01 04 04 08 08 c3 7c cb 8a 4a 1b 8d 5b 59 7d 67 f9 49 82 ae 3c"),
+        ] {
+            let target = OwnedJsonTarget { triple: triple.into(), object_format: format };
+            let mut golden = hex(prefix);
+            golden.extend(151_u32.to_le_bytes());
+            golden.extend(&descriptor);
+            assert_eq!(encode_owned_json_graph_envelope(&target, &descriptor), Some(golden.clone()));
+            let entries = vec![OwnedJsonGraphInterfaceEntry { type_name: "Mixed".into(), envelope: golden.clone() }];
+            assert!(validate_entries(&structs, &entries, Some(&target)).is_ok());
+            for offset in 0..golden.len() {
+                let mut bad = entries.clone();
+                bad[0].envelope[offset] ^= 1;
+                assert!(validate_entries(&structs, &bad, Some(&target)).is_err(), "{triple}: byte {offset}");
+            }
+            let mut owning = structs.clone();
+            owning[0].fields[0].1 = ty("string");
+            assert!(validate_entries(&owning, &entries, Some(&target)).is_err());
+        }
+        // Independent nested graph: Root { owned:string, leaf:Leaf }, Leaf { view:str }.
+        // Root is 32/8 with one owning child; Leaf is 16/8 and has no Drop obligation.
+        let nested = vec![definition("Root", vec![("owned", ty("string")), ("leaf", ty("Leaf"))]),
+            definition("Leaf", vec![("view", ty("str"))])];
+        let nested_bytes = hex("04 00 01 02 00 00 00 00 00 00 00
+            20 00 00 00 08 00 00 00 01 02 02 00 00 00
+            05 00 00 00 6f 77 6e 65 64 10 10 00 00 00 08 00 00 00 01 01 00 00 00 00
+            04 00 00 00 6c 65 61 66 20 10 00 00 00 08 00 00 00 00 00 01 00 00 00 10 00 00 00
+            10 00 00 00 08 00 00 00 00 00 01 00 00 00
+            04 00 00 00 76 69 65 77 11 10 00 00 00 08 00 00 00 00 00 00 00 00 00");
+        assert_eq!(encode_owned_json_graph_descriptor(&nested, "Root"), Some(nested_bytes.clone()));
+        assert!(validate_descriptor(&nested, "Root", &nested_bytes).is_ok());
+        let reconstructed = descriptor_structs("Root", &nested_bytes).unwrap();
+        assert!(root_shape_matches(&nested[0], &reconstructed[0]));
+        assert!(root_shape_matches(&nested[1], &reconstructed[1]));
+        // Every possible leaf tag is judged against the expected Str, including String's
+        // equal machine header. Forged owns/drop cannot turn borrowed bytes into an owner.
+        let tag = 34;
+        assert_eq!(descriptor[tag], 0x11);
+        for byte in 0..=u8::MAX {
+            let mut bad = descriptor.clone();
+            bad[tag] = byte;
+            assert_eq!(validate_descriptor(&structs, "Mixed", &bad).is_ok(), byte == 0x11);
+        }
+        for offset in [tag + 9, tag + 10] {
+            let mut bad = descriptor.clone(); bad[offset] = 1;
+            assert!(validate_descriptor(&structs, "Mixed", &bad).is_err());
+        }
+    }
+
     #[test]
     fn shared_dag_depth_is_checked_on_every_path() {
         let mut structs = vec![
