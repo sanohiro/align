@@ -541,6 +541,19 @@ and aliases of the consumed source expire. Contained views retain their original
 Borrowed roots cannot be consumed. Deeper `owner.inner.field` and indexed Move-element extraction
 remain outside this direct-field rule. See Plan192.
 
+A mutable owning record, or an existing whole-record exclusive parameter, permits
+`owner.field[index] = value` through a finite ordinary record path when the field is
+`array<T>` and T is an integer, float, bool, char, or borrowed `str`. Evaluate the index
+and RHS once, then read the current field header, check bounds, and store one Copy
+element. Completed replacement during either operand selects the new backing; a
+terminating operand performs no final write. The store allocates nothing and leaves
+ownership, length and sibling fields intact. A stored `str` must outlive the selected
+backing and retains its source dependency through existing aliases and caller
+summaries; the same rule applies to fixed-array fields. Sequential local aliases may
+observe writes under the existing call/task conflict rules. Slice fields, owning
+element replacement and partial exclusive field calls retain their existing limits.
+See Plan194.
+
 `Option`, `Result`, and user sum payloads recursively accept finite non-recursive types with a
 known Drop plan. A tagged value is Move when any possible live payload is Move; Drop follows the
 active tag, while construction and owning-place extraction move the payload and clear its old owner.

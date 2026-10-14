@@ -20529,3 +20529,210 @@ fn unicode_nfc_checked_hir() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+#[test]
+fn dynamic_array_field_checked_hir_shape() -> Result<(), &'static str> {
+    let program = checked_source_program(
+        "R {a:array<i64>,view:slice<i64>,owned:array<string>} fn store(borrow mut row:R,index:i64,value:i64){row.a[index]=value} fn main(){}\n",
+    );
+    assert!(body_core_metadata_is_valid(&program));
+    for mutation in 0..8 {
+        let mut invalid = program.clone();
+        let function = invalid
+            .fns
+            .iter_mut()
+            .find(|function| function.name == "store")
+            .ok_or("store")?;
+        let root = *function.params.first().ok_or("root")?;
+        if mutation == 0 {
+            function
+                .locals
+                .get_mut(root as usize)
+                .ok_or("local")?
+                .is_mut = false;
+        }
+        let hir::Stmt::AssignIndex {
+            base,
+            path,
+            index,
+            value,
+        } = function.body.stmts.first_mut().ok_or("statement")?
+        else {
+            return Err("index statement");
+        };
+        match mutation {
+            0 => {}
+            1 => *base = u32::MAX,
+            2 => *path = vec![u32::MAX],
+            3 => *path = vec![1],
+            4 => *path = vec![2],
+            5 => index.ty = Ty::Bool,
+            6 => value.ty = Ty::Bool,
+            _ => {
+                index.ty = Ty::Int(IntTy {
+                    bits: 7,
+                    signed: true,
+                })
+            }
+        }
+        assert!(!body_core_metadata_is_valid(&invalid), "shape {mutation}");
+        assert!(
+            lower_program_checked(&invalid, false, None).is_err(),
+            "checked {mutation}"
+        );
+        assert_body_entrypoints_empty(&format!("field shape {mutation}"), &invalid);
+    }
+    Ok(())
+}
+
+#[test]
+fn dynamic_array_field_checked_hir_lifetime_replay() -> Result<(), &'static str> {
+    let program = checked_source_program(
+        "R {a:array<i64>} fn consume(value:R)->i64=0 fn run(){mut left:=R{a:[1].to_array()};right:=R{a:[2].to_array()};left.a[0]=consume(right)} fn main(){}\n",
+    );
+    let mut invalid = program.clone();
+    let function = invalid
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "run")
+        .ok_or("run")?;
+    let left = function
+        .locals
+        .iter()
+        .find(|local| local.name == "left")
+        .ok_or("left")?
+        .id;
+    let value = function
+        .body
+        .stmts
+        .iter_mut()
+        .find_map(|stmt| {
+            if let hir::Stmt::AssignIndex { value, .. } = stmt {
+                Some(value)
+            } else {
+                None
+            }
+        })
+        .ok_or("write")?;
+    let hir::ExprKind::Call { args, .. } = &mut value.kind else {
+        return Err("consume call");
+    };
+    args.first_mut().ok_or("argument")?.kind = hir::ExprKind::Local(left);
+    let mut escaped = checked_source_program(
+        "R {a:array<str>} fn store(borrow mut row:R){owner:=\"short\".clone();view:str:=owner;row.a[0]=\"safe\"} fn main(){}\n",
+    );
+    let function = escaped
+        .fns
+        .iter_mut()
+        .find(|function| function.name == "store")
+        .ok_or("store")?;
+    let local = function
+        .locals
+        .iter()
+        .find(|local| local.name == "view")
+        .ok_or("view")?
+        .id;
+    let value = function
+        .body
+        .stmts
+        .iter_mut()
+        .find_map(|stmt| {
+            if let hir::Stmt::AssignIndex { value, .. } = stmt {
+                Some(value)
+            } else {
+                None
+            }
+        })
+        .ok_or("view store")?;
+    value.kind = hir::ExprKind::Local(local);
+    for (label, invalid) in [("eager consumption", invalid), ("view retention", escaped)] {
+        assert!(body_core_metadata_is_valid(&invalid), "same typed {label}");
+        assert!(
+            !align_sema::checked_hir_body_facts_are_valid(&invalid),
+            "{label}"
+        );
+        assert!(
+            lower_program_checked(&invalid, false, None).is_err(),
+            "{label}"
+        );
+        let sources = SourceMap::new();
+        for lowered in [
+            lower_program(&invalid),
+            lower_program_located(&invalid, &sources),
+            lower_program_per_unit(&invalid),
+            lower_program_per_unit_located(&invalid, &sources),
+        ] {
+            assert!(lowered.fns.is_empty(), "field {label}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn dynamic_array_field_mir_selected_header() -> Result<(), String> {
+    let hir = checked_source_program(
+        "R {a:array<i64>,view:slice<i64>} fn store(borrow mut row:R,index:i64,value:i64)->array<i64>{row.a[index]=value;return [1].to_array()} fn main(){}\n",
+    );
+    let program = lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?;
+    producer::validate_mir_producers(&program).map_err(|error| format!("{error:?}"))?;
+    for mutation in 0..7 {
+        let mut invalid = program.clone();
+        let function = invalid
+            .fns
+            .iter_mut()
+            .find(|function| function.name.as_str() == "store")
+            .ok_or("store")?;
+        let (result, root, path) = function
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.stmts)
+            .find_map(|stmt| match stmt {
+                Stmt::Let(result, Rvalue::Field(root, path)) if path.as_slice() == [0] => {
+                    Some((*result, root, path))
+                }
+                _ => None,
+            })
+            .ok_or("field header")?;
+        match mutation {
+            0 => *path = vec![u32::MAX],
+            1 => *path = vec![1],
+            2 => *root = u32::MAX,
+            3 => path.clear(),
+            4 => {
+                *function
+                    .value_tys
+                    .get_mut(result as usize)
+                    .ok_or("result")? = Ty::DynArray(Scalar::Int(IntTy {
+                    bits: 32,
+                    signed: true,
+                }))
+            }
+            5 => {
+                *function
+                    .value_tys
+                    .get_mut(result as usize)
+                    .ok_or("result")? = Ty::Slice(Scalar::Int(IntTy {
+                    bits: 64,
+                    signed: true,
+                }))
+            }
+            _ => {
+                *function
+                    .value_tys
+                    .get_mut(result as usize)
+                    .ok_or("result")? = Ty::Bool
+            }
+        }
+        assert!(
+            producer::validate_mir_producers(&invalid).is_err(),
+            "header mutation {mutation}"
+        );
+        // Both whole-program and partition codegen run this scope-independent validator,
+        // including non-emitted peers whose typed headers may be referenced by cached MIR.
+        assert!(
+            producer::validate_slice_index_rvalues(&invalid).is_err(),
+            "peer mutation {mutation}"
+        );
+    }
+    Ok(())
+}

@@ -7362,9 +7362,14 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 field_ty_at(b, *base, path)
             };
             match base_ty {
-                Ty::Slice(s) | Ty::DynArray(s) if path.is_empty() => {
+                Ty::Slice(s) | Ty::DynArray(s) => {
                     let sv = b.fresh_value(base_ty);
-                    b.push(Stmt::Let(sv, Rvalue::Load(*base)));
+                    let header = if path.is_empty() {
+                        Rvalue::Load(*base)
+                    } else {
+                        Rvalue::Field(*base, path.clone())
+                    };
+                    b.push(Stmt::Let(sv, header));
                     let len = b.fresh_value(i64_ty());
                     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(sv))));
                     emit_bounds_check(b, &idx, Operand::Value(len));

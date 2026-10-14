@@ -451,6 +451,15 @@ inline backing that materializes elsewhere; sibling ownership remains independen
 completes this composition without widening field formation, deeper extraction or exclusive
 partial-field borrowing.
 
+**Owned array fields retain the existing indexed-store model.** An owned dynamic
+array field already identifies its allocation and release owner. Plan194 composes
+that evidence with the existing Copy-element store instead of introducing a numeric
+exception or writable-view privilege. Destination lifetime follows the selected
+backing, independently of sibling fields and previous contents; only that backing's
+contents acquire the incoming view dependency. Range aliases lack absolute offsets,
+so their updates conservatively retain possible old contents. Eager operands finish
+before the current header is read, preserving replacement and termination semantics.
+
 **Borrowed sum matching is a projection, not a copy.** The same distinction matters when a library
 must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
 a stable place whose exact root/path pair is directly shared- or exclusively-borrowed reads the tag

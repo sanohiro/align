@@ -110,13 +110,14 @@ the Request147 field-admission work remains deferred.
 
 ## Request147 boundary discovered during the audit
 
-Dynamic-array field admission remains closed. Its source checker, both checked-
-HIR validators and MIR selected-header lowering must eventually change together.
+At this audit's boundary, dynamic-array field admission remained closed. Plan194
+now closes its source checker, both checked-HIR validators and selected-header
+lowering together with the selected-backing lifetime and retention proof.
 The existing indexed element family includes borrowed `str`, but EscapeCheck's
 backing-lifetime table is keyed by collection locals, not selected record fields.
-Even a static `str` store through an existing fixed-array field currently rejects.
+Even a static `str` store through an existing fixed-array field then rejected.
 An aggregate's contained-value region cannot substitute for the selected buffer's
-allocation lifetime. The complete field extension therefore needs a separate
-reviewed lifetime/retention closure; this repair does not resume the parked K1 or
+allocation lifetime. The complete field extension required Plan194's separate
+reviewed lifetime/retention closure; neither repair resumes the parked K1 or
 general aggregate-provenance work and does not introduce a numeric-only special
 case for Request147.
