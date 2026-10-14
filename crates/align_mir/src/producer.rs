@@ -6958,13 +6958,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     },
                 )
             }
-            Rvalue::JsonOwnedDecode { plan, input, out } => {
+            Rvalue::JsonOwnedDecode { root_kind, plan, input, out } => {
                 let canonical = align_sema::owned_json_graph_plan_v3(
                         &self.graph.program.structs,
                         plan.root,
                     )
                     .is_ok_and(|canonical| canonical == *plan);
-                if slot_ty != Ty::Struct(plan.root)
+                if slot_ty != root_kind.ty(plan.root)
                     || !canonical
                     || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
                 {
@@ -11989,6 +11989,45 @@ mod subslice_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_json_owned_root_output() -> Result<(), Box<dyn std::error::Error>> {
+        for root in ["Owned", "array<Owned>"] {
+            let source = format!("import core.json\nOwned {{text:string}}\nfn decode(input:str)->Result<{root},Error> = json.decode(input)\n");
+            let mut diagnostics = align_diag::Diagnostics::new();
+            let tokens = align_lexer::tokenize(0, &source, &mut diagnostics);
+            let ast = align_parser::parse_file(tokens, &mut diagnostics);
+            let hir = align_sema::check_file(&ast, &mut diagnostics);
+            assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+            let base = crate::lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?;
+            let defined = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+            validate_mir_producers(&base)?;
+            validate_partition_resource_rvalues(&base, &defined)?;
+            for mutation in 0..7 {
+                let mut malformed = base.clone();
+                let function = malformed.fns.iter_mut().find(|f| f.name.as_str() == "decode").ok_or("decode fixture")?;
+                let operation = function.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| {
+                    if let Stmt::Let(_, r @ Rvalue::JsonOwnedDecode { .. }) = s { Some(r) } else { None }
+                }).ok_or("owned operation")?;
+                let Rvalue::JsonOwnedDecode { root_kind, plan, input, out } = operation else { return Err("owned fixture".into()); };
+                match mutation {
+                    0 => *root_kind = match root_kind {
+                        hir::JsonOwnedRoot::Record => hir::JsonOwnedRoot::Array,
+                        hir::JsonOwnedRoot::Array => hir::JsonOwnedRoot::Record,
+                    },
+                    1 => plan.root = u32::MAX,
+                    2 => plan.records.clear(),
+                    3 => *out = u32::MAX,
+                    4 => *input = Operand::Const(Const::Bool(true)),
+                    5 => *function.slots.get_mut(usize::try_from(*out)?).ok_or("output slot")? = Ty::DynArray(Scalar::Bool),
+                    _ => plan.records.get_mut(0).ok_or("graph record")?.fields.get_mut(0).ok_or("graph field")?.ty = Ty::Str,
+                }
+                assert!(validate_mir_producers(&malformed).is_err(), "{root}: mutation {mutation}");
+                assert!(validate_partition_resource_rvalues(&malformed, &defined).is_err(), "{root}: partition mutation {mutation}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn producer_json_string_array_output() -> Result<(), Box<dyn std::error::Error>> {

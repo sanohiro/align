@@ -1677,9 +1677,10 @@ pub enum Rvalue {
         out: Slot,
         arena: Option<Operand>,
     },
-    /// Direct-owned record JSON decode. Its descriptor kinds materialize every text leaf into
+    /// Owned record/record-array JSON decode. Its descriptor kinds materialize every text leaf into
     /// free-standing allocations; no arena operand is legal.
     JsonOwnedDecode {
+        root_kind: hir::JsonOwnedRoot,
         plan: hir::OwnedJsonGraphPlanV3,
         input: Operand,
         out: Slot,
@@ -8905,10 +8906,10 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::Template(_) => lower_template_spine(b, e),
             hir::ExprKind::JsonEncode { base, plan, max_bytes } => lower_json_encode(b, *base, plan, max_bytes.as_deref(), e.ty),
             hir::ExprKind::JsonDecode { struct_id, input } => {
-                lower_json_decode_record(b, *struct_id, input, e.ty, None)
+                lower_json_decode_declared(b, *struct_id, input, e.ty, None)
             }
-            hir::ExprKind::JsonOwnedDecode { plan, input } => {
-                lower_json_decode_record(b, plan.root, input, e.ty, Some(plan.clone()))
+            hir::ExprKind::JsonOwnedDecode { root_kind, plan, input } => {
+                lower_json_decode_declared(b, plan.root, input, e.ty, Some((*root_kind, plan.clone())))
             }
             hir::ExprKind::JsonDecodeArray { elem, input } => {
                 lower_json_decode_array(b, *elem, input, e.ty)
@@ -19338,19 +19339,20 @@ fn lower_json_decode_union(
     Operand::Value(r)
 }
 
-fn lower_json_decode_record(
+fn lower_json_decode_declared(
     b: &mut Builder,
     struct_id: u32,
     input: &hir::Expr,
     result_ty: Ty,
-    owned: Option<hir::OwnedJsonGraphPlanV3>,
+    owned: Option<(hir::JsonOwnedRoot, hir::OwnedJsonGraphPlanV3)>,
 ) -> Operand {
-    let sty = Ty::Struct(struct_id);
+    let sty = owned.as_ref().map_or(Ty::Struct(struct_id), |(kind, _)| kind.ty(struct_id));
     let out = b.new_slot(sty);
     let inp = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
     let code = b.fresh_value(status_ty());
-    let rvalue = if let Some(plan) = owned {
+    let rvalue = if let Some((root_kind, plan)) = owned {
         Rvalue::JsonOwnedDecode {
+            root_kind,
             plan,
             input: inp,
             out,
@@ -19381,7 +19383,7 @@ fn lower_json_decode_record(
     let rslot = b.new_slot(result_ty);
     b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
 
-    // Ok: load the filled struct and wrap it.
+    // Ok: load the filled record or array and wrap it.
     b.cur = ok_bb;
     let s = b.fresh_value(sty);
     b.push(Stmt::Let(s, Rvalue::Load(out)));

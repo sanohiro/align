@@ -730,9 +730,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonDecode { struct_id, input, out, .. } => {
             format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))
         }
-        Rvalue::JsonOwnedDecode { plan, input, out } => {
+        Rvalue::JsonOwnedDecode { root_kind, plan, input, out } => {
             format!(
-                "json_owned_decode_v2(struct#{}, graph={:?}, {}, -> _{out})",
+                "json_owned_decode_v3({root_kind:?} struct#{}, graph={:?}, {}, -> _{out})",
                 plan.root,
                 plan.records,
                 operand_str(input)

@@ -1,5 +1,10 @@
 # JSON dynamic-array root composition (R87)
 
+**R133 decode root composition:** [Plan188](188-owned-json-record-array-root.md)
+admits `array<R>` decoding with the same V3 owned element-record graph and
+independent deep ownership as record decoding. It supersedes direct-record-only
+decode root restrictions below without widening mixed-view, SoA or scanner schemas.
+
 Status: implemented; provider delivery gates and consumer adoption are separate.
 The owner explicitly reopened R87 on 2026-09-12 after comparing the restriction
 with Align's principles. No friction-count prerequisite remains. Plan 58's R87

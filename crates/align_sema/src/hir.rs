@@ -1363,9 +1363,10 @@ pub enum ExprKind {
     /// `json.decode(input)` for struct `struct_id` — parse the `str` `input` into that
     /// struct at runtime. The expression `ty` is `Result<Struct, Error>`.
     JsonDecode { struct_id: u32, input: Box<Expr> },
-    /// `json.decode(input)` for a direct record containing owned text. Runtime materialization is
+    /// `json.decode(input)` for a record or record-array root containing owned text. Materialization is
     /// always free-standing and therefore carries no input or arena region.
     JsonOwnedDecode {
+        root_kind: JsonOwnedRoot,
         plan: OwnedJsonGraphPlanV3,
         input: Box<Expr>,
     },
@@ -2691,6 +2692,22 @@ pub enum StrTrimKind {
     Start,
     /// `s.trim_end()` — strip trailing ASCII whitespace.
     End,
+}
+
+/// The container around the canonical owned record graph; never inferred in codegen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum JsonOwnedRoot {
+    Record,
+    Array,
+}
+
+impl JsonOwnedRoot {
+    pub fn ty(self, record: u32) -> crate::Ty {
+        match self {
+            Self::Record => crate::Ty::Struct(record),
+            Self::Array => crate::Ty::DynStructArray(record, crate::Layout::Aos),
+        }
+    }
 }
 
 /// Checked, deterministic root-first record graph for the recursive owned-JSON route.

@@ -26969,6 +26969,7 @@ impl<'a> EscapeCheck<'a> {
                     | ExprKind::ArraySort { .. }
                     | ExprKind::ArraySortBy { .. }
                     | ExprKind::ArrayParMap { .. }
+                    | ExprKind::JsonOwnedDecode { root_kind: hir::JsonOwnedRoot::Array, .. }
                     | ExprKind::JsonDecodeArray { .. }
                     | ExprKind::JsonDecodeStructArray { .. } => {
                         let region = self.allocation_region(expression);
@@ -63186,7 +63187,7 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Select and validate the recursive owned JSON route. Selection observes the complete record
-    /// graph; once a transitive owned-text leaf selects V2, the closed grammar is replayed in
+    /// graph; once a transitive owned-text leaf selects V3, the closed grammar is replayed in
     /// deterministic source order before HIR construction.
     fn owned_json_route(&mut self, sid: u32, span: Span, dir: JsonDir) -> Option<OwnedJsonRoute> {
         if self.structs.get(sid as usize).is_none() {
@@ -63393,18 +63394,33 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `array<Struct>` target (MMv2 slice 8d, the draft.md §19 headline): parse a JSON
             // array of objects into an owned, dynamic AoS. Each element decodes like the single
-            // struct path; clean `str` fields borrow the input and selected escaped strings use
-            // the enclosing arena, so the whole array is region-tied to both where applicable
-            // (see `region_of`) and cannot escape those sources.
+            // struct path: a closed owned graph is independent of input/arena, while clean `str`
+            // fields borrow the input and selected escaped strings use the enclosing arena.
+            // The existing view-bearing route remains region-tied to those sources.
             Some(Ty::Result(Scalar::DynStructArray(id), _)) => {
-                if !self.json_struct_fields_ok(id, span, JsonDir::Decode) {
+                let route = match self.owned_json_route(id, span, JsonDir::Decode) {
+                    Some(route) => route,
+                    None => return err,
+                };
+                if matches!(route, OwnedJsonRoute::Existing)
+                    && !self.json_struct_fields_ok(id, span, JsonDir::Decode)
+                {
                     return err;
                 }
-                // The input region bounds the result (its `str` fields borrow the input), so use
-                // `check_str_init` — a borrowed owned `string`'s region then bounds the array.
+                // Only the existing view-bearing route retains input/arena regions. The closed
+                // owned graph materializes every reachable leaf independently, like its record root.
                 let input = self.check_str_init(&args[0]);
+                if input.ty == Ty::Error { return err; }
+                let kind = match route {
+                    OwnedJsonRoute::Existing => ExprKind::JsonDecodeStructArray {
+                        struct_id: id, input: Box::new(input),
+                    },
+                    OwnedJsonRoute::Owned(plan) => ExprKind::JsonOwnedDecode {
+                        root_kind: hir::JsonOwnedRoot::Array, plan, input: Box::new(input),
+                    },
+                };
                 return Expr {
-                    kind: ExprKind::JsonDecodeStructArray { struct_id: id, input: Box::new(input) },
+                    kind,
                     ty: Ty::Result(Scalar::DynStructArray(id), Scalar::Enum(self.error_enum_id)),
                     span,
                 };
@@ -63504,6 +63520,7 @@ impl<'a, 't> Checker<'a, 't> {
                 input: Box::new(input),
             },
             OwnedJsonRoute::Owned(plan) => ExprKind::JsonOwnedDecode {
+                root_kind: hir::JsonOwnedRoot::Record,
                 plan,
                 input: Box::new(input),
             },

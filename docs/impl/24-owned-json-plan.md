@@ -1,5 +1,10 @@
 # Owned declared JSON plan
 
+**R133 decode root composition:** [Plan188](188-owned-json-record-array-root.md)
+admits `array<R>` decoding with the same V3 owned element-record graph and
+independent deep ownership as record decoding. It supersedes direct-record-only
+decode root restrictions below without widening mixed-view, SoA or scanner schemas.
+
 **R63 implementation contract:**
 [Plan 47](47-json-numeric-contract.md) supersedes this document's JSON float
 exclusions, infallible/arena-view encoder result, bounded-only encoder IR/native
