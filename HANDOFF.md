@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan187](docs/impl/187-indexed-json-array-grammar.md) validates complete JSON
+  record-array syntax for AoS/SoA and consumes selected numeric tokens exactly.
+  Malformed syntax rejects before decoded allocation; valid-syntax schema
+  failures retain the existing partial-owner cleanup. Request133 schema
+  admission remains separate.
+
 - [Plan186](docs/impl/186-json-doc-keys.md) adds linear `json.doc.keys()`
   materialization for voice V001, preserving document order, duplicates and
   `elems()` pairing with explicit arena/input lifetimes. Consumer adoption
