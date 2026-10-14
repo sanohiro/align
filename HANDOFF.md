@@ -138,8 +138,8 @@ independently. Keep parked source and evidence archived outside the active
 worktree; their adoption is not a prerequisite for independent work.
 
 - Request126's borrowed-session loop refusal and Request28's indexed/view builder
-  readers require their own provenance closure. Request146's repeated mutable
-  subviews remain unselected; do not treat it as authorization to resume K1.
+  readers require their own provenance closure; the shipped binary-write effect
+  producer does not resume K1.
 - Request147's dynamic-array record-field mutation remains closed pending a
   selected-backing lifetime/retention closure. Plans171–173 repair existing
   behavior without admitting that surface.
