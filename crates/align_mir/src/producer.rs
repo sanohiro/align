@@ -9499,9 +9499,10 @@ fn validate_resource_rvalues_component(
                         Rvalue::ArrayBuilderPush { scalar, .. } => *scalar,
                         _ => Ty::String,
                     };
-                    let valid = result == Ty::Unit && element == Some(declared)
+                    let valid = result == Ty::Unit
+                        && element.is_some_and(|element| xml_value_flow_matches(program, element, declared))
                         && xml_operand_base_ty(function, value)
-                            .is_some_and(|actual| xml_flow_matches(program, actual, declared))
+                            .is_some_and(|actual| xml_value_flow_matches(program, actual, declared))
                         && xml_access_paths(program, declared, true).is_some_and(|owners| {
                             owners.into_iter().all(|(owner, path)| {
                                 xml_mode_requirement(program, owner, align_ast::ParamMode::ByValue)

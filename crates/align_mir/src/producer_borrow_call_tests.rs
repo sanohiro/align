@@ -364,3 +364,54 @@ fn mutable_borrow_call_owner_inventory() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn mutable_borrow_call_builder_tagged_identity() -> TestResult {
+    // RegionPlain admits Option (including nested Option), but excludes Result.
+    for (ty, value) in [
+        ("Option<i64>", "Some(7)"),
+        ("Option<i64>", "None"),
+        ("Option<Option<i64>>", "Some(Some(7))"),
+    ] {
+        let source = format!(
+            "fn main(){{arena out{{mut builder:array_builder<{ty}>:=array_builder(out);builder.push({value});values:=builder.build();print(values.len())}}}}"
+        );
+        let base = lower(&source)?;
+        validate(&base, true, &source);
+        for mutation in 0..4 {
+            let mut bad = base.clone();
+            let f = bad
+                .fns
+                .iter_mut()
+                .find(|f| f.name.as_str() == "main")
+                .ok_or("main")?;
+            let mut changed = 0;
+            for statement in f.blocks.iter_mut().flat_map(|b| &mut b.stmts) {
+                if let Stmt::Let(_, Rvalue::ArrayBuilderPush { value, scalar, .. }) = statement {
+                    let wrong = match *scalar {
+                        Ty::Option(_) => Ty::Option(Scalar::Bool),
+                        Ty::Result(_, error) => Ty::Result(Scalar::Bool, error),
+                        _ => return Err("tagged body fixture".into()),
+                    };
+                    match mutation {
+                        0 => *scalar = wrong,
+                        1 => {
+                            let Operand::Value(id) = value else {
+                                return Err("tagged value".into());
+                            };
+                            f.value_tys[*id as usize] = wrong;
+                        }
+                        2 => {
+                            *value = Operand::Value(u32::MAX);
+                        }
+                        _ => *scalar = Ty::Result(Scalar::Bool, Scalar::Bool),
+                    }
+                    changed += 1;
+                }
+            }
+            assert_eq!(changed, 1);
+            validate(&bad, false, &format!("{ty}/{mutation}"));
+        }
+    }
+    Ok(())
+}

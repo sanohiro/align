@@ -28443,11 +28443,7 @@ fn main() -> i32 = 0
     #[test]
     fn malformed_array_builder_push_types_are_rejected_before_llvm() {
         let source = "fn fill(value: i64) -> i64 { mut b: array_builder<i64> := array_builder(1)\n b.push(value)\n return b.build()[0] }\nfn main() -> i32 = 0\n";
-        for (axis, expected) in [
-            ("receiver", "array_builder push receiver is not an array_builder"),
-            ("value", "array_builder push element type mismatch"),
-            ("scalar", "array_builder push element type mismatch"),
-        ] {
+        for axis in ["receiver", "value", "scalar"] {
             let mut program = mir(source);
             let mut changed = false;
             for function in &mut program.fns {
@@ -28484,7 +28480,9 @@ fn main() -> i32 = 0
                 None,
             )
             .expect_err("forged array_builder metadata must be rejected");
-            assert!(error.to_string().contains(expected), "{axis}: {error}");
+            // Producer publication now authenticates the receiver and transferred owners
+            // before the backend's redundant type guard can run.
+            assert!(error.to_string().contains("array builder owner transfer provenance mismatch"), "{axis}: {error}");
         }
     }
 
