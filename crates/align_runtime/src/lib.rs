@@ -64,6 +64,9 @@ mod sample_permutation_tests;
 mod regex_match_storage_tests;
 use buffer_storage::BufferStorage;
 mod json_number;
+mod unicode_data;
+mod unicode_nfc;
+pub use unicode_nfc::align_rt_unicode_nfc;
 mod time_formats;
 pub use time_formats::*;
 mod str_prims;
@@ -18200,7 +18203,8 @@ unsafe fn owned_raw_realloc(ptr: *mut u8, size: usize) -> *mut u8 {
 }
 
 /// Test-only allocation counters (feature `alloc-count`, off by default). `ALLOC_CALLS` is the
-/// monotonic count of successful [`align_rt_alloc`] allocations; `FREE_CALLS` the count of non-null
+/// monotonic count of successful `try_owned_alloc` allocations (the hard-OOM wrapper and NFC);
+/// `FREE_CALLS` counts non-null
 /// [`align_rt_free`]s. The `bench/adaptive_sort` probe snapshots [`align_rt_alloc_count`] around a
 /// sort to prove the short-size (`len <= 32`) path allocates only the materialize buffer(s). Zero
 /// cost when the feature is off (the whole block, the increments, and the getter compile out).
@@ -18211,7 +18215,7 @@ static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64
 
 // Test-only whole-Rust-allocation counter for the runtime effects registry's allocation-parity
 // owner. This is deliberately separate from `ALLOC_CALLS`: the shipped probe continues to count
-// only `align_rt_alloc`, while this allocator sees `Box`, `Vec`, `String`, and formatting too.
+// the counted owned allocator, while this allocator sees `Box`, `Vec`, `String`, and formatting too.
 // `cfg(test)` avoids exporting an allocator from the library into `alignc`, which owns its own
 // measured mimalloc selection. A thread-local count keeps the snapshot deterministic while the
 // ordinary runtime test suite executes on other libtest workers.
@@ -18403,8 +18407,8 @@ pub extern "C" fn align_rt_requested_live_peak() -> i64 {
     i64::try_from(probe.peak).unwrap_or(i64::MAX)
 }
 
-/// Monotonic count of successful [`align_rt_alloc`] allocations since process start (feature
-/// `alloc-count` only). The delta across a sort equals the number of heap buffers it allocated.
+/// Monotonic count of successful counted owned allocations since process start (feature
+/// `alloc-count` only): `align_rt_alloc` plus fallible NFC scratch/output. The delta across a sort equals the number of heap buffers it allocated.
 #[cfg(feature = "alloc-count")]
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_alloc_count() -> i64 {
@@ -18430,10 +18434,17 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
     let Ok(size) = safe_len(size) else {
         panic_abort("allocation too large");
     };
-    let ptr = unsafe { owned_raw_alloc(size) };
+    let ptr = try_owned_alloc(size);
     if ptr.is_null() {
         panic_abort("out of memory");
     }
+    ptr
+}
+
+/// Fallible member of the owned malloc/free family. Callers admit nonzero extents first.
+fn try_owned_alloc(size: usize) -> *mut u8 {
+    let ptr = unsafe { owned_raw_alloc(size) };
+    if ptr.is_null() { return ptr; }
     #[cfg(feature = "alloc-count")]
     ALLOC_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "alloc-count")]
@@ -18445,7 +18456,7 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
 /// value whose slot was never initialised is harmless.
 ///
 /// # Safety
-/// `ptr` must be null or a pointer previously returned by [`align_rt_alloc`] and not yet freed.
+/// `ptr` must be null or a pointer from the owned allocation family (`align_rt_alloc` or a fallible producer) and not yet freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_free(ptr: *mut u8) {
     #[cfg(feature = "alloc-count")]
@@ -28725,6 +28736,8 @@ const _: extern "C" fn() -> i64 = align_rt_test_par_map_min_chunk;
 const _: extern "C" fn(i64, i64, i64) -> i64 = align_rt_test_par_map_min_chunk_for;
 #[cfg(feature = "par-map-probe")]
 const _: extern "C" fn() -> i64 = align_rt_test_par_map_workers;
+
+const _: unsafe extern "C" fn(*mut AlignStr, *const u8, i64) -> i32 = align_rt_unicode_nfc;
 
 const _: extern "C" fn(f32) -> u32 = align_rt_f32_to_bits;
 const _: extern "C" fn(u32) -> f32 = align_rt_f32_from_bits;

@@ -968,6 +968,7 @@ fn walk_body_records<'a>(
                 | ExprKind::EncodingEncode { data: recv, .. }
                 | ExprKind::TimeFormat { ns: recv, .. }
                 | ExprKind::TimeParse { input: recv, .. }
+                | ExprKind::UnicodeNfc { input: recv }
                 | ExprKind::EncodingDecode { input: recv, .. }
                 | ExprKind::Utf8Valid { data: recv }
                 | ExprKind::Decompress { data: recv, .. }

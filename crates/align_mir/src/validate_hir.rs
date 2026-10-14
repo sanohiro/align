@@ -3415,6 +3415,13 @@ impl<'a> BodyValidator<'a> {
     fn validate(mut self) -> Result<(), String> {
         for (function_index, function) in self.program.fns.iter().enumerate() {
             let reject = || Err(function.name.clone());
+            if function.name == "pkg.unicode$nfc" {
+                let canonical_body = function.body.stmts.is_empty()
+                    && matches!(function.body.value.as_deref().map(|e| &e.kind),
+                        Some(hir::ExprKind::UnicodeNfc { input })
+                            if matches!(input.kind, hir::ExprKind::Local(id) if function.params.as_slice() == [id]));
+                if !canonical_body { return reject(); }
+            }
             if !valid_span(function.span) || !self.locals_valid(function) {
                 return reject();
             }
@@ -4856,6 +4863,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::EncodingEncode { .. }
             | hir::ExprKind::TimeFormat { .. }
             | hir::ExprKind::TimeParse { .. }
+            | hir::ExprKind::UnicodeNfc { .. }
             | hir::ExprKind::EncodingDecode { .. }
             | hir::ExprKind::Utf8Valid { .. }
             | hir::ExprKind::Compress { .. }
@@ -5125,6 +5133,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::PathComponent { .. }
             | hir::ExprKind::TimeFormat { .. }
             | hir::ExprKind::TimeParse { .. }
+            | hir::ExprKind::UnicodeNfc { .. }
             | hir::ExprKind::EncodingEncode { .. }
             | hir::ExprKind::CryptoDigestNew | hir::ExprKind::CryptoDigestUpdate { .. } | hir::ExprKind::CryptoDigestFinish { .. }
             | hir::ExprKind::CryptoHash { .. }
@@ -9699,6 +9708,16 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::TimeFormat { ns, .. } => {
                 (ns.ty == i64).then(|| result(Ty::String, &[ns]))?
+            }
+            hir::ExprKind::UnicodeNfc { input } => {
+                let function = self.program.fns.get(context.function)?;
+                (input.ty == Ty::Str && function.name == "pkg.unicode$nfc"
+                    && matches!(function.origin, hir::FnOrigin::Source { is_entry: false, is_public: true } | hir::FnOrigin::ImportedInline)
+                    && function.params.len() == 1
+                    && function.param_modes == [align_ast::ParamMode::ByValue]
+                    && function.locals.get(usize::try_from(*function.params.first()?).ok()?)?.ty == Ty::Str
+                    && self.body_ty_matches(function.ret, self.native_result_ty(Ty::String)?))
+                    .then(|| result(Ty::String, &[input]))?
             }
             hir::ExprKind::TimeParse { input, .. } => {
                 (input.ty == Ty::Str).then(|| result(i64, &[input]))?

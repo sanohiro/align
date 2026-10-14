@@ -4071,6 +4071,16 @@ open or new handle model is introduced. Positional methods, readonly denial and
 Drop retain their contracts. Plan 185 owns the public ledger and typed native
 publication; media AM-R03 supplies the consumer need.
 
+### Explicit Unicode NFC package
+
+Voice V004 selects `pkg.unicode.nfc(str) -> Result<string, Error>` with Unicode
+16.0.0 data and `version() -> str`. This explicit Pure transform returns independent
+owned UTF-8 with fallible scratch/output allocation, accepting NUL, noncharacters
+and unassigned scalars. No implicit normalization or change to byte equality/order
+is introduced. Locale operations stay out of core/std; other normalization forms
+and grapheme work remain unselected. [Plan191](impl/191-unicode-nfc.md) and the
+[package design](impl/pkg-design/unicode.md) fix ownership, errors and conformance.
+
 ## Open (to be decided)
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)
@@ -4109,8 +4119,8 @@ Recommendations recorded here for confirmation; on approval each moves to Settle
 - **i18n** — Unicode correctness (UTF-8 validation, text carried unbroken) is already met;
   locale-dependent behavior (collation, locale formats, case-fold, TZ display, translation) is
   permanently out of core/std, consistent with ASCII-only `eq_ignore_ascii_case` and
-  byte-lexicographic `Ord(str)`. Normalization/grapheme work, if a real consumer appears, is an
-  isolated `pkg.unicode`.
+  byte-lexicographic `Ord(str)`. Explicit NFC is now selected for voice V004 in isolated
+  `pkg.unicode` (see Settled); other normalization/grapheme work remains consumer-gated.
 - **Server-side TLS** — v1 assumes a reverse proxy; requires a pkg.web forwarded-header trust
   discipline (interpret `X-Forwarded-*` only from a configured trusted proxy; default distrust),
   without which the proxy assumption is a client-IP spoofing hole. Revisit at HTTP/2 (ALPN) or real

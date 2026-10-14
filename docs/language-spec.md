@@ -2190,6 +2190,16 @@ reachable reader/writer/logger carrier owner graph. A fresh complete review acce
 repair with no P0–P3 finding; implementation then shipped the accepted package source and runtime
 row together.
 
+`pkg.unicode.version() -> str` returns static `"16.0.0"`.
+`pkg.unicode.nfc(input: str) -> Result<string, Error>` explicitly normalizes UTF-8
+with Unicode 16.0.0 NFC into an independent owned string. Input and its arena are
+not retained; empty input allocates nothing. Scratch and output allocations are
+fallible: unrepresentable extents return `Error.Invalid`, allocator refusal returns
+`Error.Code(ENOMEM)`. Embedded NUL/noncharacters/unassigned scalars are accepted.
+The Pure operation changes no implicit conversion, equality, ordering or locale
+behavior. The canonical vendorable package and private bridge are specified in
+`docs/impl/pkg-design/unicode.md`; Plan191 owns ABI, data identity and conformance.
+
 The implemented `pkg.csv` v1 surface is:
 
 ```text

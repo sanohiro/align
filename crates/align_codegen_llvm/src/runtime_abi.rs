@@ -800,6 +800,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::UdpSocketFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::Utf8BoundaryFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
         RuntimeAbiId::Keyed(RuntimeKey::Utf8DecodeLossy) => RuntimeEffects { class: EffectClass::ArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::UnicodeNfc) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[ParamEffect { ordinal: 1, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::Utf8Valid) => RuntimeEffects { class: EffectClass::DispatchCache, argmem: ArgMem::Unstated, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::XmlAttributeCount) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::XmlAttributeName) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
@@ -3009,6 +3010,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_time_format",
             shape: RuntimeAbiShape::A124,
         },
+        RuntimeKey::UnicodeNfc => RuntimeAbi { key, symbol: "align_rt_unicode_nfc", shape: RuntimeAbiShape::A20 },
         RuntimeKey::TimeParse => RuntimeAbi {
             key,
             symbol: "align_rt_time_parse",
@@ -3181,15 +3183,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 468 || keyed_runtime_abis().len() != 468 {
+    if RuntimeKey::ALL.len() != 469 || keyed_runtime_abis().len() != 469 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 486 {
+    if runtime_abis().count() != 487 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(486);
+    let mut symbols = HashSet::with_capacity(487);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -3497,6 +3499,7 @@ pub(super) fn native_extern_abi_matches<'c>(
     ctx: &'c Context,
 ) -> bool {
     match runtime_abi_for_symbol(symbol) {
+        Some(RuntimeAbiId::Keyed(RuntimeKey::UnicodeNfc)) => false,
         Some(RuntimeAbiId::Unkeyed(key))
             if is_test_control_key(key) || key == UnkeyedRuntimeKey::ArgsBuild => false,
         Some(id) => actual == function_type(id, ctx),
@@ -4520,7 +4523,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_abi_registry_is_complete_and_unique() {
+    fn runtime_abi_registry_is_complete_and_unique() -> Result<(), Box<dyn std::error::Error>> {
         fn assert_ord<T: Ord>() {}
 
         assert_ord::<RuntimeAbiId>();
@@ -4530,17 +4533,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 486);
+        assert_eq!(rows.len(), 487);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            486
+            487
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            486
+            487
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4564,12 +4567,33 @@ mod tests {
             assert_eq!(runtime_abi_for_symbol(symbol), Some(id));
         }
         assert!(runtime_abi_for_symbol("align_rt_not_a_fixed_row").is_none());
+
+        // Identity rows name one symbol each; shared ABI shapes do not share identities.
+        let ledger = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../docs/impl/20-runtime-abi-ledger.md"
+        ))?;
+        let table = ledger.split_once("| Registry row | Physical symbol | `EffectClass` |\n")
+            .ok_or("missing runtime identity ledger header")?.1;
+        let documented: Vec<_> = table.lines().skip(1)
+            .take_while(|line| line.starts_with('|')).collect();
+        let expected: HashSet<_> = rows.iter().map(|row| {
+            let id = match row.key {
+                RuntimeAbiId::Keyed(key) => format!("{key:?}"),
+                RuntimeAbiId::Unkeyed(key) => format!("Unkeyed::{key:?}"),
+            };
+            format!("| `{id}` | `{}` | `{:?}` |", row.symbol, runtime_effects(row.key).class)
+        }).collect();
+        assert_eq!(documented.len(), expected.len(), "runtime identity ledger cardinality");
+        assert_eq!(documented.into_iter().collect::<HashSet<_>>(),
+            expected.iter().map(String::as_str).collect::<HashSet<_>>(),
+            "runtime identity ledger must match every key, symbol and effect class");
+        Ok(())
     }
 
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 486);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 487);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4696,13 +4720,14 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 486);
+        assert_eq!(rows.len(), 487);
 
         for row in rows {
             let symbol = row.symbol;
             let expected = row.function_type(&ctx);
             let compiler_private = matches!(row.key, RuntimeAbiId::Unkeyed(key)
-                if is_test_control_key(key) || key == super::UnkeyedRuntimeKey::ArgsBuild);
+                if is_test_control_key(key) || key == super::UnkeyedRuntimeKey::ArgsBuild)
+                || row.key == RuntimeAbiId::Keyed(RuntimeKey::UnicodeNfc);
             assert_eq!(
                 native_extern_abi_matches(symbol, expected, &ctx),
                 !compiler_private,

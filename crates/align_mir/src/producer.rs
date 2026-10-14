@@ -2008,6 +2008,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::TimeFormat { out, .. }
         | Rvalue::TimeParse { out, .. }
         | Rvalue::BufferTryNew { out, .. }
+        | Rvalue::UnicodeNfc { out, .. }
         | Rvalue::EncodingDecode { out, .. }
         | Rvalue::CompressCompress { out, .. }
         | Rvalue::CompressDecompress { out, .. }
@@ -2080,6 +2081,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::RegexCompile { pattern: input, .. }
         | Rvalue::TimeFormat { ns: input, .. }
         | Rvalue::TimeParse { input, .. }
+        | Rvalue::UnicodeNfc { input, .. }
         | Rvalue::EncodingDecode { input, .. }
         | Rvalue::CompressDecompress { data: input, .. }
         | Rvalue::CryptoPrivateKeyFromPem { pem: input, .. }
@@ -6721,6 +6723,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::TimeFormat { .. }
             | Rvalue::TimeParse { .. }
             | Rvalue::BufferTryNew { .. }
+            | Rvalue::UnicodeNfc { .. }
             | Rvalue::EncodingDecode { .. }
             | Rvalue::CompressCompress { .. }
             | Rvalue::CompressDecompress { .. }
@@ -7162,6 +7165,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return;
                 }
                 self.check_read_operand(equation, ns, i64_ty);
+                (*out, XmlAccessProvenance::Owned)
+            }
+            Rvalue::UnicodeNfc { input, out } => {
+                if slot_ty != Ty::String || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str) {
+                    equation.invalid = true;
+                    return;
+                }
+                self.check_read_operand(equation, input, Ty::Str);
                 (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::TimeParse { input, out, .. } => {
@@ -9447,8 +9458,8 @@ fn validate_resource_rvalues_component(
                     return Err(fail(function, "XML primary result definition is not unique"));
                 }
                 let valid = match rvalue {
-                    Rvalue::TimeFormat { out, .. } | Rvalue::TimeParse { out, .. } => {
-                        let output_ty = if matches!(rvalue, Rvalue::TimeFormat { .. }) { Ty::String } else { i64_ty };
+                    Rvalue::UnicodeNfc { out, .. } | Rvalue::TimeFormat { out, .. } | Rvalue::TimeParse { out, .. } => {
+                        let output_ty = if matches!(rvalue, Rvalue::UnicodeNfc { .. } | Rvalue::TimeFormat { .. }) { Ty::String } else { i64_ty };
                         // Scalar parser outputs also require the complete native producer proof:
                         // they do not otherwise reach the protected string/callable leaf walk.
                         result == i32_ty && matches!(

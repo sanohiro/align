@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 468] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 469] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -480,6 +480,7 @@ runtime_keys! {
     UdpRecvFrom => "udp_recv_from",
     UdpSendTo => "udp_send_to",
     UdpSocketFree => "udp_socket_free",
+    UnicodeNfc => "unicode_nfc",
     Utf8BoundaryFail => "utf8_boundary_fail",
     Utf8DecodeLossy => "utf8_decode_lossy",
     Utf8Valid => "utf8_valid",
@@ -493,7 +494,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 468] = [(); RuntimeKey::ALL.len()];
+const _: [(); 469] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -502,7 +503,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 468);
+        assert_eq!(RuntimeKey::ALL.len(), 469);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

@@ -1409,6 +1409,7 @@ merely because its `Ty` matches.
 | `RunBytesStdout` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
 | `RunBytesStderr` *(Request 11)* | `env[]; child[out]`; `LocalHandle(RunBytes,out); result bytes; view inherits out provenance; Pure`. |
 | `EncodingEncode` | `env[kind]`; `child[data]`; `Str for Html, byte-view for other kinds; result String; fresh owned output; Pure`. |
+| `UnicodeNfc` | Canonical `pkg.unicode$nfc` body with one ByValue Str parameter; exact Local child and builtin `Result<string, Error>` output; fresh owned output, no input retention, Pure. Source or imported-inline origin only; malformed signature/body/origin/child/result/cleanup rejects. Plan191 owns the complete boundary. |
 | `EncodingDecode` | `env[kind]`; `child[input]`; `Str; result ERR(Buffer); fresh owned output on success; Pure`. |
 | `Utf8Valid` | `env[]; child[data]`; `bytes; result Bool; borrowed; Pure`. |
 | `Compress` | `env[kind]`; `child[data,level]`; `byte-view,i64; result ERR(Buffer); fresh owned output; Impure`. |

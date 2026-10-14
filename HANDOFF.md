@@ -24,6 +24,10 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan191](docs/impl/191-unicode-nfc.md) supplies explicit Unicode16 NFC through
+  `pkg.unicode` for voice V004, with independent owned output, fallible allocation
+  and official complete NFC conformance. Tokenizer adoption remains external.
+
 - [Plan190](docs/impl/190-tuple-carrier-composition.md) composes existing flat
   tuples with Option/Result, user sums, ordinary record fields and Align
   callbacks for voice V003. Contextual layout, cleanup and borrowed origins

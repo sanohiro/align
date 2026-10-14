@@ -19063,6 +19063,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.builder.build_call(self.runtime(RuntimeKey::TimeFormat), &[out_ptr.into(), value.into(), tag.into()], "timefmt")
                     .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("time format ABI result"))?
             }
+            Rvalue::UnicodeNfc { input, out } => {
+                let out_ptr = *self.slots.get(out).ok_or_else(|| self.err("missing NFC output slot"))?;
+                let (ptr, len) = self.split_str(input)?;
+                self.builder.build_call(self.runtime(RuntimeKey::UnicodeNfc), &[out_ptr.into(), ptr.into(), len.into()], "nfc")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("NFC must return i32 status"))?
+            }
             Rvalue::TimeParse { kind, input, out } => {
                 let out_ptr = *self.slots.get(out).ok_or_else(|| self.err("missing time parser output slot"))?;
                 self.builder.build_store(out_ptr, self.ctx.i64_type().const_zero()).map_err(|e| self.err(e))?;
@@ -33445,6 +33452,41 @@ fn main() -> i32 = 0
                 available_externally: false,
             }];
         program
+    }
+
+    #[test]
+    fn unicode_nfc_mir_validation() -> Result<(), &'static str> {
+        let base = xml_out_producer_program(Rvalue::UnicodeNfc { input: Operand::Arg(0), out: 1 }, vec![Ty::Str], Ty::String);
+        assert!(validate_resource_rvalues(&base).is_ok());
+        for unused in [false, true] {
+            let mut valid = base.clone();
+            if unused {
+                let function = &mut valid.fns[0];
+                function.ret = Ty::Unit;
+                function.return_cleanup = hir::ReturnCleanupAbi::None;
+                function.blocks[0].stmts.truncate(1);
+                function.blocks[0].stmt_lines.truncate(1);
+                function.blocks[0].term = Term::Return(None);
+            }
+            assert!(validate_resource_rvalues(&valid).is_ok(), "unused={unused}");
+            for axis in ["input", "out", "result", "missing", "unreadable"] {
+                let mut bad = valid.clone();
+                let function = &mut bad.fns[0];
+                match axis {
+                    "input" => function.slots[0] = Ty::Bool,
+                    "out" => function.slots[1] = Ty::Str,
+                    "result" => function.value_tys[0] = Ty::Bool,
+                    "unreadable" => function.param_modes[0] = align_ast::ParamMode::Out,
+                    "missing" => {
+                        let Stmt::Let(_, Rvalue::UnicodeNfc { out, .. }) = &mut function.blocks[0].stmts[0] else { return Err("NFC producer"); };
+                        *out = u32::MAX;
+                    }
+                    _ => return Err("NFC mutation"),
+                }
+                assert_xml_producer_rejected(&bad, &format!("NFC {axis} unused={unused}"));
+            }
+        }
+        Ok(())
     }
 
     #[test]

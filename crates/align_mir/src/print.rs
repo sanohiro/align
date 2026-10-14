@@ -1050,6 +1050,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::EnvGet { name, out } => format!("env_get({}, -> _{out})", operand_str(name)),
         Rvalue::EnvSet { name, value } => format!("env_set({}, {})", operand_str(name), operand_str(value)),
         Rvalue::TimeFormat { kind, ns, out } => format!("time_format({kind:?}, {}, s{out})", operand_str(ns)),
+        Rvalue::UnicodeNfc { input, out } => format!("unicode_nfc({}, s{out})", operand_str(input)),
         Rvalue::TimeParse { kind, input, out } => format!("time_parse({kind:?}, {}, s{out})", operand_str(input)),
         Rvalue::TimeNow => "time_now()".to_string(),
         Rvalue::OsMemory { available, out } => format!("os_memory(available={available}, {out:?})"),

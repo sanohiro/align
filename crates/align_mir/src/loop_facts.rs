@@ -321,7 +321,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::PathNormalize { .. } | Rvalue::EnvGet { .. } | Rvalue::EnvSet { .. } |
         Rvalue::TimeNow { .. } | Rvalue::OsHost { .. } | Rvalue::OsIdentity { .. } | Rvalue::OsMemory { .. } |
         Rvalue::ProcessCpuCount { .. } | Rvalue::TimeInstant { .. } | Rvalue::TimeSleep { .. } |
-        Rvalue::TimeFormat { .. } | Rvalue::TimeParse { .. } | Rvalue::EncodingEncode { .. } |
+        Rvalue::UnicodeNfc { .. } | Rvalue::TimeFormat { .. } | Rvalue::TimeParse { .. } | Rvalue::EncodingEncode { .. } |
         Rvalue::RegexCompile { .. } | Rvalue::RegexIsMatch { .. } | Rvalue::RegexFind { .. } |
         Rvalue::RegexFindAll { .. } | Rvalue::RegexSplit { .. } | Rvalue::RegexReplace { .. } |
         Rvalue::RegexCaptures { .. } | Rvalue::RegexGroupCount { .. } | Rvalue::RegexGroupIndex { .. } |
