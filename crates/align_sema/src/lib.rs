@@ -36898,9 +36898,9 @@ impl<'a> MoveCheck<'a> {
             let ExprKind::Local(local) = &argument.kind else { return None; };
             if modes.get(index) != Some(&ast::ParamMode::BorrowMut)
                 || !mutable_view_effect_eligible(argument.ty, self.storage_type_context())
-                || !view_summary.and_then(Option::as_ref)
+                || view_summary.and_then(Option::as_ref)
                     .and_then(|effects| effects.get(index)).and_then(Option::as_ref)
-                    .is_some_and(|effect| !effect.may_rebind)
+                    .is_none_or(|effect| effect.may_rebind)
             {
                 return None;
             }
