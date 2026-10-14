@@ -117,8 +117,16 @@ fn imported_access_facts_reject_shared_writes() {
             ("spawn(fn { model.read(view) }); wait(); model.change(view)", true),
             ("spawn(fn { model.read(view) }); model.read(view); wait()", true),
             ("spawn(fn { model.read(view) }); model.change(model.identity(view)); wait()", false),
+            ("spawn(fn { model.read(view) }); [1].map(fn x { model.identity(Holder { values: view }) }).map(fn item { model.change(item.values); 1 }).sum(); wait()", false),
+            ("spawn(fn { model.read(view) }); wait(); [1].map(fn x { model.identity(Holder { values: view }) }).map(fn item { model.change(item.values); 1 }).sum()", true),
+            ("spawn(fn { local := view; [1].map(fn x { model.identity(Holder { values: local }) }).map(fn item { model.change(item.values); 1 }).sum() }); wait()", false),
+            ("spawn(fn { local := view; [1].map(fn x { model.identity(Holder { values: local }) }).map(fn item { model.read(item.values) }).sum() }); wait()", true),
+            ("spawn(fn { model.read(view) }); { rows := [1].map(fn x { model.identity(Holder { values: view }) }).to_array(); rows.map(fn item { model.change(item.values); 1 }).sum() }; wait()", false),
+            ("spawn(fn { model.read(view) }); wait(); { rows := [1].map(fn x { model.identity(Holder { values: view }) }).to_array(); rows.map(fn item { model.change(item.values); 1 }).sum() }", true),
+            ("spawn(fn { local := view; { rows := [1].map(fn x { model.identity(Holder { values: local }) }).to_array(); rows.map(fn item { model.change(item.values); 1 }).sum() } }); wait()", false),
+            ("spawn(fn { local := view; { rows := [1].map(fn x { model.identity(Holder { values: local }) }).to_array(); rows.map(fn item { model.read(item.values) }).sum() } }); wait()", true),
         ].into_iter().enumerate() {
-            let source = format!("module main\nimport model\nfn main() {{ mut values := [1,2]; view := values[..]; task_group {{ {body} }} }}");
+            let source = format!("module main\nimport model\nHolder {{ values: slice<i64> }}\nfn main() {{ mut values := [1,2]; view := values[..]; task_group {{ {body}; () }} }}");
             let entry = stage.join(format!("input-{index}.align"));
             std::fs::write(&entry, &source).unwrap();
             let mut sources = SourceMap::new();

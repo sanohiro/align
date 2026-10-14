@@ -63,6 +63,15 @@ and dedup suppression. Synthetic exit joins clear protection before modeled
 cleanup, but never before evaluating a return expression. Distinct fresh task
 storage remains writable even when its elements contain shared captured views.
 
+Inline write checks use physical storage identity across Current/Prior generations.
+The common collection-store and projected-install actions cover field-index stores,
+whole replacement and loop reinitialization; fixed-literal formation
+covers repeated temporary slots. Copy captures exclude the copied InlineFixed
+slots while retaining their contained view and function-environment dependencies.
+Each pipeline map instantiates checked return roots from its input and completed
+captures. The same facts cross materialization, and reduce/scan include backing
+introduced into the accumulator by earlier callback results.
+
 ## Scheduler publication authority
 
 Enqueue, registered-count increment, helper reservation and empty-queue helper
@@ -117,6 +126,13 @@ and owners; none requires reopening deferred capture admission:
   pipeline/error callbacks, primitive snapshots, fresh task storage, closure
   environment reuse, nested groups, branch/match joins and loop back edges.
   `mutable_access_checked_hir_rejects_forged_facts` authenticates replay.
+- `task_capture_physical_storage_and_pipeline_matrix` closes the independent
+  review's inline-write and stage-result findings at their shared authorities:
+  projected index/whole stores, binding/temporary re-entry, fused and
+  materialized callbacks, reduce/scan recurrence, Copy view-array snapshots and
+  their nonstatic backing. Pending rejection and post-wait/read-only controls
+  discriminate real shared storage from copied slots. The imported/generic
+  callback cases also run in both driver compilation modes.
 - `MoveCheck::record_invocation_access` and `record_pipeline_access` collect
   action effects using completed operands; each pipeline stage consumes its
   own input prefix. The inference worklist propagates these facts to callers.
