@@ -81,3 +81,12 @@ Sibling usage inspection finds media Safetensors reopening after reader admissio
 llm gguf and voice util/assets use ordinary read-only positional windows. The
 ordinary constructors and all existing read-window semantics remain unchanged.
 Consumer source, compiler pin, real-model execution and adoption remain external.
+
+The independent code review found one test-isolation P2: both changed negative
+owners reached a legacy helper that removed a predictable path before acquiring
+it. They now run direct whole/per-unit checks inside owned_fixture's exclusive
+stage and bounded process group, preserving the same source/diagnostic assertions.
+The entire changed test diff was swept for this class; the lifecycle owner already
+uses that supervisor and native fixtures acquire exclusive directories. Existing
+ArtifactStage collision/symlink and supervisor-lifecycle owners supply the shared
+mechanical proof; no global test helper or public implementation changed.

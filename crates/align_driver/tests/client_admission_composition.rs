@@ -358,27 +358,21 @@ fn main() -> Result<(), Error> {{
 
 #[test]
 fn regular_reader_requires_import_and_exact_path_type() {
-    for constructor in ["open_regular", "open_ro_regular"] {
-        for source in [
-            "fn main() { fs.open_regular(\"x\") }",
-            "import std.fs\nfn main() { fs.open_regular(3) }",
-            "import std.fs\nfn main() { fs.open_regular() }",
-            "import std.fs\nfn main() { fs.open_regular(\"x\", 1) }",
-        ] {
-            let source = source.replace("open_regular", constructor);
-            let checked = diff_check_multi(
-                "r88-invalid-source",
-                &[("main.align", source.as_str())],
-                "main.align",
-            );
-            assert!(
-                checked.whole_errors && checked.per_unit_errors,
-                "{}\n{}",
-                checked.whole_diags,
-                checked.per_unit_diags
-            );
-        }
-    }
+    owned_fixture::run(
+        "regular_reader_requires_import_and_exact_path_type",
+        |stage| {
+            for constructor in ["open_regular", "open_ro_regular"] {
+                for source in [
+                    "fn main() { fs.open_regular(\"x\") }",
+                    "import std.fs\nfn main() { fs.open_regular(3) }",
+                    "import std.fs\nfn main() { fs.open_regular() }",
+                    "import std.fs\nfn main() { fs.open_regular(\"x\", 1) }",
+                ] {
+                    regular_source_errors(stage, &source.replace("open_regular", constructor));
+                }
+            }
+        },
+    );
 }
 
 fn private_fixture() -> Proj {
@@ -818,32 +812,45 @@ fn regular_file_execute(stage: &std::path::Path, programs: &[align_mir::Program]
 
 #[test]
 fn regular_file_preserves_effect_type_and_move_rules() {
-    for (source, diagnostic) in [
-        (
-            "fn inspect(x:i64)->i64 { result:=fs.open_ro_regular(\"input\"); return x }\nfn main(){ values:=[1,2].par_map(inspect); print(values.sum()) }",
-            "requires a Pure function",
-        ),
-        (
-            "fn take(value:file) {}\nfn main()->Result<(),Error> { value:=fs.open_ro_regular(\"input\")?; take(value); value.len()?; return Ok(()) }",
-            "moved",
-        ),
-        (
-            "fn main()->Result<(),Error> { value:reader:=fs.open_ro_regular(\"input\")?; return Ok(()) }",
-            "type mismatch",
-        ),
-    ] {
-        let source = format!("import std.fs\n{source}\n");
-        let checked = diff_check_multi(
-            "regular-file-restrictions",
-            &[("main.align", &source)],
-            "main.align",
-        );
-        assert!(checked.whole_errors && checked.per_unit_errors);
-        assert!(
-            checked.whole_diags.contains(diagnostic) && checked.per_unit_diags.contains(diagnostic),
-            "{}\n{}",
-            checked.whole_diags,
-            checked.per_unit_diags
-        );
-    }
+    owned_fixture::run(
+        "regular_file_preserves_effect_type_and_move_rules",
+        |stage| {
+            for (source, diagnostic) in [
+                (
+                    "fn inspect(x:i64)->i64 { result:=fs.open_ro_regular(\"input\"); return x }\nfn main(){ values:=[1,2].par_map(inspect); print(values.sum()) }",
+                    "requires a Pure function",
+                ),
+                (
+                    "fn take(value:file) {}\nfn main()->Result<(),Error> { value:=fs.open_ro_regular(\"input\")?; take(value); value.len()?; return Ok(()) }",
+                    "moved",
+                ),
+                (
+                    "fn main()->Result<(),Error> { value:reader:=fs.open_ro_regular(\"input\")?; return Ok(()) }",
+                    "type mismatch",
+                ),
+            ] {
+                let source = format!("import std.fs\n{source}\n");
+                for errors in regular_source_errors(stage, &source) {
+                    assert!(errors.contains(diagnostic), "{errors}");
+                }
+            }
+        },
+    );
+}
+
+fn regular_source_errors(stage: &std::path::Path, source: &str) -> [String; 2] {
+    let entry = stage.join("main.align");
+    std::fs::write(&entry, source).unwrap();
+    let entry = entry.to_str().unwrap();
+    let mut sources = align_span::SourceMap::new();
+    let whole = align_driver::check(&mut sources, entry, source);
+    assert!(whole.diags.has_errors(), "whole-program accepted {source}");
+    let whole_errors = align_driver::format_diagnostics(&sources, &whole.diags);
+    let mut sources = align_span::SourceMap::new();
+    let units = align_driver::check_per_unit(&mut sources, entry, source);
+    assert!(units.diags.has_errors(), "per-unit accepted {source}");
+    [
+        whole_errors,
+        align_driver::format_diagnostics(&sources, &units.diags),
+    ]
 }
