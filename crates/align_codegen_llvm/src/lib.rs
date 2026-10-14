@@ -18143,6 +18143,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .build_call(self.runtime(RuntimeKey::CliFlagI64), &[c.into(), np.into(), nl.into(), dv.into()], "")
                             .map_err(|e| self.err(e))?;
                     }
+                    align_sema::hir::CliFlagKind::F64 => {
+                        let d = default.as_ref().ok_or_else(|| self.err("flag_f64 requires a default"))?;
+                        let dv = self.operand(d)?;
+                        self.builder
+                            .build_call(self.runtime(RuntimeKey::CliFlagF64), &[c.into(), np.into(), nl.into(), dv.into()], "")
+                            .map_err(|e| self.err(e))?;
+                    }
                 }
                 return Ok(None);
             }
@@ -18173,6 +18180,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::CliGetI64), &[p.into(), np.into(), nl.into()], "cligeti")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("cli_get_i64 returns i64")
+            }
+            Rvalue::CliGetF64 { parsed, name } => {
+                let p = self.operand(parsed)?.into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::CliGetF64), &[p.into(), np.into(), nl.into()], "cligetf")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().ok_or_else(|| self.err("cli_get_f64 must return f64"))?
+            }
+            Rvalue::CliOccurrences { parsed, name } => {
+                let p = self.operand(parsed)?.into_pointer_value();
+                let (np, nl) = self.split_str(name)?;
+                self.builder
+                    .build_call(self.runtime(RuntimeKey::CliOccurrences), &[p.into(), np.into(), nl.into()], "clicount")
+                    .map_err(|e| self.err(e))?
+                    .try_as_basic_value().basic().ok_or_else(|| self.err("cli_occurrences must return i64"))?
             }
             Rvalue::CliGetStr { parsed, name } => {
                 let p = self.operand(parsed)?.into_pointer_value();

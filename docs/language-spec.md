@@ -1834,7 +1834,7 @@ constant-time for secret contents at fixed public lengths under the pointer-veri
 OpenSSL default-provider dependency. The implementation shipped on 2026-08-30; the exact surface, formats,
 bounds, secret cleanup, error precedence, ownership, ABI, timing boundary, and closure matrix are
 `impl/std-design/crypto.md`.
-`std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/
+`std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/`flag_f64`/
 `c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
 `array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every
 flag has a value or its default, like `json.decode`), but the lookup itself is checked at
@@ -1842,6 +1842,15 @@ flag has a value or its default, like `json.decode`), but the lookup itself is c
 runtime (Align has no comptime evaluator to statically validate against the builder's registered
 flags); input errors surface from `parse` as `Error.Invalid`. A v1 provisional pending derive — a
 future declarative flag-spec can move `get_*` validation to compile time. (`draft.md` §18.2, M10.)
+`flag_f64`/`get_f64` use exact binary64 defaults/results. Parse first rejects
+all nonfinite registered defaults, then accepts complete ASCII JSON-number argv
+tokens with nearest/ties-to-even conversion, rejecting malformed/nonfinite or
+overflowing values. Signed zero, subnormals and underflow are valid.
+`p.occurrences(name: str) -> i64` counts explicit occurrences across every kind
+and spelling; defaults count zero, empty values count one, separate value tokens
+are consumed verbatim, and last-value-wins remains. Unknown names and wrong-kind
+getters abort; scalar observations borrow synchronously and allocate nothing.
+[Plan181](impl/181-cli-float-occurrences.md) owns exact grammar and closure.
 
 `std.log` is a designed, not-yet-implemented explicit line sink. `log.level` is the Copy closed
 order `Debug < Info < Warn < Error < Off`; `log.new(writer, minimum) -> log.logger` consumes the

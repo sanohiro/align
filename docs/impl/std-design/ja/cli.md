@@ -20,10 +20,13 @@ c := cli.command(name: str)                    // builder; returns a cli command
 c.flag_bool(name: str)                          // register a bool flag (default false)
 c.flag_str(name: str, default: str)             // str flag with a default
 c.flag_i64(name: str, default: i64)             // i64 flag with a default
+c.flag_f64(name: str, default: f64)             // f64 flag with a default
 c.parse(args: array<str>) -> Result<parsed, Error>
 p.get_bool(name: str) -> bool                   // total after a successful parse
 p.get_str(name: str) -> str
 p.get_i64(name: str) -> i64
+p.get_f64(name: str) -> f64
+p.occurrences(name: str) -> i64                 // explicit uses; zero when absent
 c.usage() -> string
 ```
 
@@ -32,9 +35,9 @@ c.usage() -> string
 肝となる決定は次のとおり。
 
 - `command` と `parsed` は **Move 型** とし、内部に新たに `Ty::CliCommand` / `Ty::CliParsed` を設ける。どちらも内部にヒープバッファを所有する — 登録済みフラグのテーブルと、値が所有権を持つ（owned）`string` であるパース結果（name→value）マップである。したがって、Copy 可能な rng の系統ではなく、reader / writer / buffer と同じ Move の系統に属する。Drop 時にはこれら内部バッファ（所有権を持つ default / parsed 文字列を含むフラグテーブルのエントリ）を解放する。解放処理は `read_dir` の `array<string>`（#339）と同じ deep-drop であり、内部が所有する `string` を一つずつ解放していく（用語の確認: `str` は借用の read-only ビュー、`string` はヒープを所有する Move 型であり、これらのテーブルが所有するのは `string` の方である）。
-- **`parse` は `c` を借用するだけで、消費（consume）しない。** `c.parse(args)` は `c` を可変借用で受け取り、フラグテーブルを読むだけでコマンド自体をムーブしない。そのため `parse` の後でも `c.usage()` を呼ぶことができる。これは `Err` パスでも同様であり、まさにヘルプメッセージを表示したい場面で有用である。仮に `parse` が `c` を消費してしまうと、パース失敗時に usage を描画できなくなる — ここでこの点を明記しているのはそのためである。
+- **`parse` は `c` を借用するだけで、消費（consume）しない。** `c.parse(args)` は `c` を共有借用で受け取り、フラグテーブルを読むだけでコマンド自体をムーブしない。そのため `parse` の後でも `c.usage()` を呼ぶことができる。これは `Err` パスでも同様であり、まさにヘルプメッセージを表示したい場面で有用である。仮に `parse` が `c` を消費してしまうと、パース失敗時に usage を描画できなくなる — ここでこの点を明記しているのはそのためである。
 - どちらも array / slice / vec / box の要素型や Option / Result のペイロードとしては、`scalar_arg` という単一のチョークポイントで一律に拒否される — reader / writer と同じ扱いである（Slice 1 の前例）。ただし `parse` は `Result<parsed, Error>` を返すため、`parsed` は Result の `Ok` ペイロードとしては出現する。reader / writer が Option / Result のペイロード位置で例外的に許可されたのと同じ要領で、`parsed` も `Ok` 位置に限り許可される。buffer の `Scalar::Buffer`（#346）がそのテンプレートとなる。
-- `p.get_*` の戻り値について。`bool` / `i64` は Copy である。`get_str` は **パース結果の構造体を指すビュー** として `str` を返し、`p`（パース結果）にリージョン束縛される — `json.decode` のフィールドビューがデコード済みの arena / value に束縛されるのと同じ関係である。したがって `region_of(CliGetStr) = region_of(p)` であり、`p` の Drop の寿命を越えて `str` を持ち出すことはコンパイルエラーとして捕捉・拒否される。取り出して保持したければ `.clone()` でコピーする。Static リージョンを返してはならない — それは #297 で問題になったワイルドカード・トラップである。`region_of` の分岐を明示的に追加すること。
+- `p.get_*` の戻り値について。`bool` / `i64` / `f64` と指定回数は Copy である。`get_str` は **パース結果の構造体を指すビュー** として `str` を返し、`p`（パース結果）にリージョン束縛される — `json.decode` のフィールドビューがデコード済みの arena / value に束縛されるのと同じ関係である。したがって `region_of(CliGetStr) = region_of(p)` であり、`p` の Drop の寿命を越えて `str` を持ち出すことはコンパイルエラーとして捕捉・拒否される。取り出して保持したければ `.clone()` でコピーする。Static リージョンを返してはならない — それは #297 で問題になったワイルドカード・トラップである。`region_of` の分岐を明示的に追加すること。
 
 ## Effect classification
 
@@ -42,12 +45,40 @@ cli の操作はすべて **Pure** である（argv は `main(args)` の引数�
 
 ## Error policy
 
-- `c.parse(args)` の入力エラー — 未知のフラグ、str / i64 フラグの値の欠落、不正な i64 リテラル、フラグの種類の不一致 — はいずれも `Error.Invalid` を返す。これは固定のマッピングであり、errno 経由の syscall パスは通らない。エンコーディングの decode と同じく、Error を直接構築する。
-- 一度も登録していない名前に対して、あるいはフラグの種類と食い違う型で `p.get_bool` / `get_str` / `get_i64` を呼んだ場合は **ランタイムの abort** とする。これは #345 のレビューで確定した方針である。Align には comptime がないため、`get_*` の呼び出しをビルダーが実行時に登録したフラグ集合と静的に突き合わせることはできない。そこで OOB インデックスや 0 除算と同様に abort する —「プログラマのバグは abort させ、決して黙って誤動作させない」という原則に従う。これはコンパイル時エラーでも Result によるハンドリング対象でもない。
+- `c.parse(args)` の入力エラー — 未知のフラグ、str / i64 / f64 フラグの値の欠落、不正な i64 / f64 リテラル、フラグの種類の不一致 — はいずれも `Error.Invalid` を返す。これは固定のマッピングであり、errno 経由の syscall パスは通らない。エンコーディングの decode と同じく、Error を直接構築する。
+- 一度も登録していない名前に対して、あるいはフラグの種類と食い違う型で `p.get_bool` / `get_str` / `get_i64` / `get_f64` を呼んだ場合は **ランタイムの abort** とする。これは #345 のレビューで確定した方針である。Align には comptime がないため、`get_*` の呼び出しをビルダーが実行時に登録したフラグ集合と静的に突き合わせることはできない。そこで OOB インデックスや 0 除算と同様に abort する —「プログラマのバグは abort させ、決して黙って誤動作させない」という原則に従う。これはコンパイル時エラーでも Result によるハンドリング対象でもない。
+
+## 有限の浮動小数点数と指定回数
+
+`flag_f64` の既定値は厳密に `f64` 型とする。`parse` は argv の参照や
+パース結果のエントリ割り当てより前に、登録されたすべての既定値の有限性を
+検査する。重複登録や argv で上書きされる既定値も対象であり、非有限値は
+`Error.Invalid` となる。argv の値は完全な ASCII JSON 数値トークン
+`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` とする。前後の空白、先頭の
+プラス、不要な先頭ゼロ、16進表記、NaN、無限大、埋め込み NUL、後続バイトは
+拒否する。変換はホストの丸めモードに依存せず binary64 の最近接・偶数丸めを
+使う。オーバーフローは拒否し、非正規化数、符号付きゼロへのアンダーフロー、
+負のゼロは許可する。用途固有の範囲検査は呼び出し側が明示する。
+
+`occurrences` は登録済みのすべての種類で明示的な指定回数を返す。
+省略時の既定値は0回、空文字の明示指定は1回、bool の繰り返しも各1回と数える。
+スペース形式と等号形式を合計し、値は従来どおり最後の指定を採用する。
+別トークンの値はフラグに見えてもそのまま値として消費し、回数には含めない。
+同名の重複登録は従来どおり最初の種類・既定値を採用する。
+毎回のパースで回数はリセットされ、回数のオーバーフローは `Error.Invalid`。
+未登録名は既存 getter と同様に abort し、`get_f64` は種類の不一致も abort する。
+
+どちらの観測も束縛済みの parsed ローカルと名前を呼び出し中だけ借用し、
+割り当てを行わず、独立した Copy スカラーを返す。文字列ビューの寿命は
+変わらない。パース結果は文字列コピーを所有し、失敗時は途中のエントリを
+解放する。command は再利用できる。usage は登録順に f64 の既定値を既存の
+表示方式で出力し、パースで拒否される前の非有限既定値も表示できる。
+正確な契約とコンパイラ・ランタイムの検証範囲は
+[plan181](../../181-cli-float-occurrences.md) を参照する。
 
 ## New machinery required
 
-新たに必要になるのは次のとおり。Move 型の `Ty` 2 種（CliCommand, CliParsed）と、それに対応するランタイム構造体および Drop 処理。ビルダーメソッド（flag_bool / str / i64）、parse、3 つの total な getter、usage を、`import std.cli` の下にある sema 組み込み（builtin）として実装する（シャドーイング対策の `name_in_scope` ガードには #340 のヘルパーを使う）。加えて `CliGetStr`（parsed を指すビュー）用の `region_of` 分岐を新設する。
+新たに必要になるのは次のとおり。Move 型の `Ty` 2 種（CliCommand, CliParsed）と、それに対応するランタイム構造体および Drop 処理。ビルダーメソッド（flag_bool / str / i64 / f64）、parse、4 つの total な getter、指定回数の観測、usage を、`import std.cli` の下にある sema 組み込み（builtin）として実装する（シャドーイング対策の `name_in_scope` ガードには #340 のヘルパーを使う）。加えて `CliGetStr`（parsed を指すビュー）用の `region_of` 分岐を新設する。
 新しい effect や新しい syscall の追加は不要である。
 
 ## Slice breakdown
@@ -55,8 +86,8 @@ cli の操作はすべて **Pure** である（argv は `main(args)` の引数�
 スライスは 1 つだが、作業の順序は次のとおり。
 
 1. 2 つの Move 型 + ランタイム構造体 + Drop（所有権を持つ文字列の deep-free）+ 全パスにわたる Gate-1 スイープ（reader / writer と `read_dir` の `array<string>` をテンプレートにする）。
-2. ビルダー: `command` と `flag_bool` / `str` / `i64`（名前・種類・デフォルト値をコマンドのテーブルに格納する）。
-3. `parse`: argv をトークン化する（`--name`、`--name=value`、`--name value`、draft に従った `-` の慣習。v1 は最小限に絞り、bool は `--name` のみ、str / i64 は `--name value` と `--name=value` のみ受け付ける）。テーブルと突き合わせて検証し、入力エラーが一つでもあれば `Error.Invalid` を返し、なければ parsed を構築する。
+2. ビルダー: `command` と `flag_bool` / `str` / `i64` / `f64`（名前・種類・デフォルト値をコマンドのテーブルに格納する）。
+3. `parse`: argv をトークン化する（`--name`、`--name=value`、`--name value`、draft に従った `-` の慣習。v1 は最小限に絞り、bool は `--name` のみ、str / i64 / f64 は `--name value` と `--name=value` のみ受け付ける）。テーブルと突き合わせて検証し、入力エラーが一つでもあれば `Error.Invalid` を返し、なければ parsed を構築する。
 4. getter 群（total であり、未登録や型不一致では abort する）と `usage`（テーブルからヘルプを描画する）。
 
 ## Pitfalls
@@ -70,11 +101,11 @@ cli の操作はすべて **Pure** である（argv は `main(args)` の引数�
 ## Test checklist
 
 - bool の有無（デフォルトは false）
-- str / i64 のデフォルト値とコマンドライン引数による上書き
+- str / i64 / f64 のデフォルト値とコマンドライン引数による上書き
 - `--name=value` と `--name value` の両形式のパース
 - 未知のフラグ → `Error.Invalid`
 - 値の欠落 → `Error.Invalid`
-- 不正な i64 → `Error.Invalid`
+- 不正な i64 / f64、非有限な浮動小数点数 → `Error.Invalid`
 - `get_*` に未登録の名前を指定 → abort
 - `get_*` に誤った型を指定 → abort
 - `get_str` のビューが `p` のスコープを越えて escape → コンパイルエラー

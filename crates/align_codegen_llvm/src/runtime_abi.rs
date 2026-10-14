@@ -176,6 +176,8 @@ enum RuntimeAbiShape {
     A136,
     A137,
     A138,
+    CliFlagF64,
+    CliGetF64,
 }
 
 #[derive(Clone, Copy)]
@@ -409,10 +411,13 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::CliCommand) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliCommandFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliFlagBool) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliFlagF64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliFlagI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliFlagStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliGetBool) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliGetF64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliGetI64) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CliOccurrences) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliGetStr) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliParse) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CliParsedFree) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Indirect, returns_fresh: false, diverges: false },
@@ -1499,6 +1504,11 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_cli_flag_i64",
             shape: RuntimeAbiShape::A75,
         },
+        RuntimeKey::CliFlagF64 => RuntimeAbi {
+            key,
+            symbol: "align_rt_cli_flag_f64",
+            shape: RuntimeAbiShape::CliFlagF64,
+        },
         RuntimeKey::CliFlagStr => RuntimeAbi {
             key,
             symbol: "align_rt_cli_flag_str",
@@ -1513,6 +1523,16 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             key,
             symbol: "align_rt_cli_get_i64",
             shape: RuntimeAbiShape::A37,
+        },
+        RuntimeKey::CliOccurrences => RuntimeAbi {
+            key,
+            symbol: "align_rt_cli_occurrences",
+            shape: RuntimeAbiShape::A37,
+        },
+        RuntimeKey::CliGetF64 => RuntimeAbi {
+            key,
+            symbol: "align_rt_cli_get_f64",
+            shape: RuntimeAbiShape::CliGetF64,
         },
         RuntimeKey::CliGetStr => RuntimeAbi {
             key,
@@ -3149,15 +3169,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 463 || keyed_runtime_abis().len() != 463 {
+    if RuntimeKey::ALL.len() != 466 || keyed_runtime_abis().len() != 466 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 481 {
+    if runtime_abis().count() != 484 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(481);
+    let mut symbols = HashSet::with_capacity(484);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -3508,6 +3528,14 @@ fn native_return_type<'c>(ctx: &'c Context, ret: NativeReturn) -> BasicTypeEnum<
 
 fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
     match shape {
+        RuntimeAbiShape::CliFlagF64 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::Void,
+            params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::F64],
+        },
+        RuntimeAbiShape::CliGetF64 => RuntimeAbiShapeSpec {
+            ret: NativeReturn::F64,
+            params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64],
+        },
         RuntimeAbiShape::A00 => RuntimeAbiShapeSpec {
             ret: NativeReturn::I32,
             params: &[NativeType::Ptr, NativeType::I64],
@@ -4490,17 +4518,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 481);
+        assert_eq!(rows.len(), 484);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            481
+            484
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            481
+            484
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4529,7 +4557,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 481);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 484);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4656,7 +4684,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 481);
+        assert_eq!(rows.len(), 484);
 
         for row in rows {
             let symbol = row.symbol;

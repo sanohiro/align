@@ -225,6 +225,49 @@ fn checked_source_program(source: &str) -> hir::Program {
 }
 
 #[test]
+fn cli_receiver_lifetime_checked_hir_replay() -> Result<(), &'static str> {
+    let mut cases = vec![
+        ("c.flag_bool({other=cli.command(\"new\");\"f\"})".to_string(), "other"),
+        ("c.flag_str(\"f\",{other=cli.command(\"new\");\"default\"})".into(), "other"),
+        ("c.flag_i64(\"f\",{other=cli.command(\"new\");1})".into(), "other"),
+        ("c.flag_f64(\"f\",{other=cli.command(\"new\");1.0})".into(), "other"),
+        ("c.parse({other=cli.command(\"new\");args})".into(), "other"),
+    ];
+    for method in ["get_bool", "get_str", "get_i64", "get_f64", "occurrences"] {
+        cases.push((format!("p.{method}({{q=c.parse(args)?;\"f\"}})"), "q"));
+    }
+    for (action, target) in cases {
+        let source = format!("import std.cli\nfn probe(args:array<str>)->Result<(),Error>{{c:=cli.command(\"c\");mut other:=cli.command(\"other\");p:=c.parse(args)?;mut q:=c.parse(args)?;observed:={action};return Ok(())}}");
+        let mut program = checked_source_program(&source);
+        assert!(lower_program_checked(&program, false, None).is_ok(), "{action}");
+        let function = program.fns.iter_mut().find(|f| f.name == "probe").ok_or("CLI probe")?;
+        let replacement = function.locals.iter().find(|local| local.name == target).ok_or("CLI replacement local")?.id;
+        let receiver = function.body.stmts.iter_mut().rev().find_map(|statement| {
+            let hir::Stmt::Let { init: expression, .. } = statement else { return None; };
+            match &mut expression.kind {
+                hir::ExprKind::CliFlag { cmd, .. } | hir::ExprKind::CliParse { cmd, .. } => Some(cmd),
+                hir::ExprKind::CliGetBool { parsed, .. } | hir::ExprKind::CliGetI64 { parsed, .. }
+                | hir::ExprKind::CliGetF64 { parsed, .. } | hir::ExprKind::CliGetStr { parsed, .. }
+                | hir::ExprKind::CliOccurrences { parsed, .. } => Some(parsed),
+                _ => None,
+            }
+        }).ok_or("CLI action receiver")?;
+        receiver.kind = hir::ExprKind::Local(replacement);
+        assert!(body_core_metadata_is_valid(&program), "same-typed receiver: {action}");
+        assert!(!align_sema::checked_hir_body_facts_are_valid(&program), "{action}");
+        assert!(lower_program_checked(&program, false, None).is_err(), "{action}");
+        let sources = SourceMap::new();
+        for lowered in [
+            lower_program(&program), lower_program_located(&program, &sources),
+            lower_program_per_unit(&program), lower_program_per_unit_located(&program, &sources),
+        ] {
+            assert!(is_empty(&lowered), "invalid CLI receiver published MIR: {action}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn copy_string_sort_hir_rejects_forged_metadata() {
     let mut bool_element = checked_source_program("fn f(xs: slice<bool>) -> array<bool> { value := xs.sort_by_key(fn b: bool { 1 }); return value }");
     let expression = body_first_let_init_mut(&mut bool_element, "f");
@@ -13893,6 +13936,20 @@ fn hir_body_validator_native() {
         Ty::Unit
     );
     add!(
+        "native_cli_flag_f64",
+        body_test_expr(
+            hir::ExprKind::CliFlag {
+                cmd: Box::new(native_local(0, Ty::CliCommand)),
+                kind: hir::CliFlagKind::F64,
+                name: Box::new(native_str()),
+                default: Some(Box::new(body_test_expr(hir::ExprKind::Float(1.0), Ty::Float(FloatTy { bits: 64 })))),
+            },
+            Ty::Unit,
+        ),
+        vec![body_test_local(0, "cmd", Ty::CliCommand, false, false)],
+        Ty::Unit
+    );
+    add!(
         "native_cli_flag_str",
         body_test_expr(
             hir::ExprKind::CliFlag {
@@ -13937,6 +13994,30 @@ fn hir_body_validator_native() {
         "native_cli_get_i64",
         body_test_expr(
             hir::ExprKind::CliGetI64 {
+                parsed: Box::new(native_local(0, Ty::CliParsed)),
+                name: Box::new(native_str()),
+            },
+            i64_ty,
+        ),
+        vec![body_test_local(0, "parsed", Ty::CliParsed, false, false)],
+        i64_ty
+    );
+    add!(
+        "native_cli_get_f64",
+        body_test_expr(
+            hir::ExprKind::CliGetF64 {
+                parsed: Box::new(native_local(0, Ty::CliParsed)),
+                name: Box::new(native_str()),
+            },
+            Ty::Float(FloatTy { bits: 64 }),
+        ),
+        vec![body_test_local(0, "parsed", Ty::CliParsed, false, false)],
+        Ty::Float(FloatTy { bits: 64 })
+    );
+    add!(
+        "native_cli_occurrences",
+        body_test_expr(
+            hir::ExprKind::CliOccurrences {
                 parsed: Box::new(native_local(0, Ty::CliParsed)),
                 name: Box::new(native_str()),
             },
@@ -14853,6 +14934,43 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+    for name in ["native_cli_get_f64", "native_cli_occurrences"] {
+        for fault in 0..4 {
+            let mut reject = program.clone();
+            let expression = body_statement_expression_mut(&mut reject, name);
+            let (parsed, flag) = match &mut expression.kind {
+                hir::ExprKind::CliGetF64 { parsed, name }
+                | hir::ExprKind::CliOccurrences { parsed, name } => (parsed, name),
+                _ => panic!("CLI observation fixture discriminator"),
+            };
+            match fault {
+                0 => parsed.ty = Ty::Bool,
+                1 => **parsed = body_test_expr(hir::ExprKind::Block(hir::Block {
+                    stmts: Vec::new(), value: Some(Box::new(native_local(0, Ty::CliParsed))),
+                }), Ty::CliParsed),
+                2 => flag.ty = Ty::Bool,
+                _ => expression.ty = Ty::Bool,
+            }
+            assert!(!body_core_metadata_is_valid(&reject), "{name}: malformed field {fault}");
+        }
+    }
+    for fault in 0..6 {
+        let mut reject = program.clone();
+        let expression = body_statement_expression_mut(&mut reject, "native_cli_flag_f64");
+        let hir::ExprKind::CliFlag { cmd, name, default, .. } = &mut expression.kind else {
+            panic!("CLI float registration fixture discriminator");
+        };
+        match fault {
+            0 => cmd.ty = Ty::Bool,
+            1 => **cmd = body_test_expr(hir::ExprKind::CliCommand { name: Box::new(native_str()) }, Ty::CliCommand),
+            2 => name.ty = Ty::Bool,
+            3 => *default = Some(Box::new(native_i64())),
+            4 => *default = None,
+            _ => expression.ty = Ty::Bool,
+        }
+        assert!(!body_core_metadata_is_valid(&reject), "CLI float registration malformed field {fault}");
+    }
+
 
     // The former Option-only result and malformed nested payload must both fail closed.
     for bad in [Ty::Option(Scalar::String), native_result(Ty::String, error)] {

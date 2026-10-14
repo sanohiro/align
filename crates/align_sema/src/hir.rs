@@ -2086,6 +2086,10 @@ pub enum ExprKind {
     /// `p.get_i64(name)` — the parsed `i64` value of flag `name` (the `ty` is `i64`). Abort on
     /// unregistered / wrong-kind (see [`Self::CliGetBool`]). `parsed` is a bound local. Pure.
     CliGetI64 { parsed: Box<Expr>, name: Box<Expr> },
+    /// Finite f64 value; independent Copy result, with the same lookup abort policy.
+    CliGetF64 { parsed: Box<Expr>, name: Box<Expr> },
+    /// Explicit option count; independent Copy i64, aborting on an unregistered name.
+    CliOccurrences { parsed: Box<Expr>, name: Box<Expr> },
     /// `p.get_str(name)` — the parsed `str` value of flag `name`, a **view into `parsed`'s storage**
     /// (the `ty` is [`crate::Ty::Str`]), so it is region-bound to `parsed` (must not outlive it —
     /// `.clone()` copies out). Abort on unregistered / wrong-kind. `parsed` is a bound local. Pure.
@@ -2500,6 +2504,8 @@ pub enum CliFlagKind {
     Str,
     /// `c.flag_i64(name, default)` — an `i64` flag with a default, set by `--name value` / `--name=value`.
     I64,
+    /// A binary64 flag with a default; parse rejects nonfinite defaults and input.
+    F64,
 }
 
 /// Closed wire-format discriminator, shared by HIR and MIR; native tags are explicit.

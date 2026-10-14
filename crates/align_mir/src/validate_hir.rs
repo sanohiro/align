@@ -4872,7 +4872,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CliFlag { .. }
             | hir::ExprKind::CliParse { .. }
             | hir::ExprKind::CliGetBool { .. }
-            | hir::ExprKind::CliGetI64 { .. }
+            | hir::ExprKind::CliGetI64 { .. } | hir::ExprKind::CliGetF64 { .. } | hir::ExprKind::CliOccurrences { .. }
             | hir::ExprKind::CliGetStr { .. }
             | hir::ExprKind::CliUsage { .. }
             | hir::ExprKind::HttpRequest { .. }
@@ -5102,7 +5102,7 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::CliFlag { kind, default, .. } => match kind {
                 hir::CliFlagKind::Bool => default.is_none(),
-                hir::CliFlagKind::I64 | hir::CliFlagKind::Str => default.is_some(),
+                hir::CliFlagKind::I64 | hir::CliFlagKind::F64 | hir::CliFlagKind::Str => default.is_some(),
             },
             hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
             hir::ExprKind::BytesRead { .. }
@@ -5253,7 +5253,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CliCommand { .. }
             | hir::ExprKind::CliParse { .. }
             | hir::ExprKind::CliGetBool { .. }
-            | hir::ExprKind::CliGetI64 { .. }
+            | hir::ExprKind::CliGetI64 { .. } | hir::ExprKind::CliGetF64 { .. } | hir::ExprKind::CliOccurrences { .. }
             | hir::ExprKind::CliGetStr { .. }
             | hir::ExprKind::CliUsage { .. }
             | hir::ExprKind::HttpRequest { .. }
@@ -9913,6 +9913,7 @@ impl<'a> BodyValidator<'a> {
                 match (kind, default) {
                     (hir::CliFlagKind::Bool, None) => {}
                     (hir::CliFlagKind::I64, Some(default)) if default.ty == i64 => {}
+                    (hir::CliFlagKind::F64, Some(default)) if default.ty == Ty::Float(align_sema::FloatTy { bits: 64 }) => {}
                     (hir::CliFlagKind::Str, Some(default)) if default.ty == Ty::Str => {}
                     _ => return None,
                 }
@@ -9931,6 +9932,14 @@ impl<'a> BodyValidator<'a> {
                     .then(|| strict(Ty::Bool, &[parsed, name]))?
             }
             hir::ExprKind::CliGetI64 { parsed, name } => {
+                (local(parsed, Ty::CliParsed) && parsed.ty == Ty::CliParsed && name.ty == Ty::Str)
+                    .then(|| strict(i64, &[parsed, name]))?
+            }
+            hir::ExprKind::CliGetF64 { parsed, name } => {
+                (local(parsed, Ty::CliParsed) && parsed.ty == Ty::CliParsed && name.ty == Ty::Str)
+                    .then(|| strict(Ty::Float(align_sema::FloatTy { bits: 64 }), &[parsed, name]))?
+            }
+            hir::ExprKind::CliOccurrences { parsed, name } => {
                 (local(parsed, Ty::CliParsed) && parsed.ty == Ty::CliParsed && name.ty == Ty::Str)
                     .then(|| strict(i64, &[parsed, name]))?
             }

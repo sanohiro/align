@@ -68,11 +68,14 @@ key|Chunks|chunks|ArgRead|declare { ptr, i64 } @align_rt_chunks(ptr readonly, i6
 key|CliCommand|cli_command|AllocNew|declare noalias ptr @align_rt_cli_command_new(ptr readonly captures(none), i64) #4
 key|CliCommandFree|cli_command_free|IndirectStorage|declare void @align_rt_cli_command_free(ptr) #2
 key|CliFlagBool|cli_flag_bool|IndirectStorage|declare void @align_rt_cli_flag_bool(ptr, ptr, i64) #2
+key|CliFlagF64|cli_flag_f64|IndirectStorage|declare void @align_rt_cli_flag_f64(ptr, ptr, i64, double) #2
 key|CliFlagI64|cli_flag_i64|IndirectStorage|declare void @align_rt_cli_flag_i64(ptr, ptr, i64, i64) #2
 key|CliFlagStr|cli_flag_str|IndirectStorage|declare void @align_rt_cli_flag_str(ptr, ptr, i64, ptr, i64) #2
 key|CliGetBool|cli_get_bool|IndirectStorage|declare i32 @align_rt_cli_get_bool(ptr, ptr, i64) #2
+key|CliGetF64|cli_get_f64|IndirectStorage|declare double @align_rt_cli_get_f64(ptr, ptr, i64) #2
 key|CliGetI64|cli_get_i64|IndirectStorage|declare i64 @align_rt_cli_get_i64(ptr, ptr, i64) #2
 key|CliGetStr|cli_get_str|IndirectStorage|declare { ptr, i64 } @align_rt_cli_get_str(ptr, ptr, i64) #2
+key|CliOccurrences|cli_occurrences|IndirectStorage|declare i64 @align_rt_cli_occurrences(ptr, ptr, i64) #2
 key|CliParse|cli_parse|IndirectStorage|declare i32 @align_rt_cli_parse(ptr, ptr, i64, ptr) #2
 key|CliParsedFree|cli_parsed_free|IndirectStorage|declare void @align_rt_cli_parsed_free(ptr) #2
 key|CliUsage|cli_usage|IndirectStorage|declare { ptr, i64 } @align_rt_cli_usage(ptr) #2

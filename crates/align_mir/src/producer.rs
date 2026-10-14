@@ -6668,7 +6668,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::CliFlag { .. }
             | Rvalue::CliParse { .. }
             | Rvalue::CliGetBool { .. }
-            | Rvalue::CliGetI64 { .. }
+            | Rvalue::CliGetI64 { .. } | Rvalue::CliGetF64 { .. } | Rvalue::CliOccurrences { .. }
             | Rvalue::HttpRequest { .. }
             | Rvalue::HttpHeader { .. }
             | Rvalue::HttpBody { .. }

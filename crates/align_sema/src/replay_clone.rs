@@ -1450,6 +1450,14 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             parsed: boxed!(parsed),
             name: boxed!(name),
         },
+        ExprKind::CliGetF64 { parsed, name } => ExprKind::CliGetF64 {
+            parsed: boxed!(parsed),
+            name: boxed!(name),
+        },
+        ExprKind::CliOccurrences { parsed, name } => ExprKind::CliOccurrences {
+            parsed: boxed!(parsed),
+            name: boxed!(name),
+        },
         ExprKind::CliGetStr { parsed, name } => ExprKind::CliGetStr {
             parsed: boxed!(parsed),
             name: boxed!(name),
@@ -2507,6 +2515,14 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             name: rhs,
         }
         | ExprKind::CliGetI64 {
+            parsed: lhs,
+            name: rhs,
+        }
+        | ExprKind::CliGetF64 {
+            parsed: lhs,
+            name: rhs,
+        }
+        | ExprKind::CliOccurrences {
             parsed: lhs,
             name: rhs,
         }

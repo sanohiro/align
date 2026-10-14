@@ -29,6 +29,10 @@ impl Command {
         unsafe { align_rt_cli_flag_i64(self.0, name.as_ptr(), length(name), value) };
     }
 
+    fn float(&self, name: &[u8], value: f64) {
+        unsafe { align_rt_cli_flag_f64(self.0, name.as_ptr(), length(name), value) };
+    }
+
     fn usage(&self) -> Usage {
         Usage(unsafe { align_rt_cli_usage(self.0) })
     }
@@ -105,6 +109,10 @@ fn usage_decimal_boundaries_and_long_defaults_are_complete() {
         command.integer(b"n", value);
         expected.push_str(&format!("  --n  (i64, default: {value})\n"));
     }
+    for value in [-0.0, 0.5, f64::MIN, f64::MAX, f64::MIN_POSITIVE, f64::from_bits(1), f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        command.float(b"f", value);
+        expected.push_str(&format!("  --f  (f64, default: {value})\n"));
+    }
     let long = "日本語\0\n".repeat(4096);
     command.string(b"long", long.as_bytes());
     expected.push_str(&format!("  --long  (str, default: {long})\n"));
@@ -126,7 +134,8 @@ fn usage_extent_admission_and_fill_refuse_incomplete_publication() {
     }
     let command = Command::new(b"x");
     command.integer(b"n", i64::MIN);
-    let expected = b"usage: x [flags]\n  --n  (i64, default: -9223372036854775808)\n";
+    command.float(b"f", -0.0);
+    let expected = b"usage: x [flags]\n  --n  (i64, default: -9223372036854775808)\n  --f  (f64, default: -0)\n";
     for capacity in [0, 1, expected.len() - 1, expected.len(), expected.len() + 1] {
         let mut storage = vec![MaybeUninit::new(0xa5); capacity + 2];
         let result = cli_usage_fill(unsafe { &*command.0 }, &mut storage[1..capacity + 1]);
@@ -231,6 +240,9 @@ fn usage_allocates_no_rust_temporary_storage() {
         for i in 0..n {
             let name = format!("flag-{i}");
             command.integer(name.as_bytes(), i64::MIN + i);
+        }
+        for value in [-0.0, f64::MAX, f64::from_bits(1), f64::NAN, f64::INFINITY] {
+            command.float(b"f", value);
         }
         for long in [false, true] {
             if long {

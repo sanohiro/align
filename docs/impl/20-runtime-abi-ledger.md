@@ -8,8 +8,8 @@ ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
 returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Plan 65's
 SIMD-surface consistency capability adds `BufferAppendFilled`. Unsigned integer display adds `PrintU64`, a non-retaining `u64` input with
 `void(i64)` native ABI and the same stdout/flush behavior as signed display.
-Current inventory: 463 keyed,
-481 base, 488 alloc-count, 485 par-map-probe and 492 maximum exports.
+Current inventory: 466 keyed,
+484 base, 491 alloc-count, 488 par-map-probe and 495 maximum exports.
 
 **R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
@@ -79,7 +79,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 463 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 466 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -92,7 +92,7 @@ runtime records have no `RuntimeKey` and instead use the eighteen-variant
 `align_rt_f64_from_bits`, `align_rt_f32_text_len`, `align_rt_f64_text_len`,
 `align_rt_f32_text_write`, and `align_rt_f64_text_write`, plus the four compiler-private
 `core.test` child-control rows recorded below and the package-internal checked TCP timeout row
-`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 481 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
+`align_rt_tcp_conn_set_io_timeout`. The base native registry therefore has 484 records. R63 replaces Request 12's two bounded-only rows with four unified JSON builder rows
 (A127–A130), including separate finite-only f32/f64 writers.
 The explicit `alloc-count` runtime feature may expose seven
 test/benchmark-only definitions: the allocation/free and finder counters plus
@@ -104,10 +104,10 @@ test/benchmark-only definitions: the allocation/free and finder counters plus
 `i64 @align_rt_test_par_map_workers()`. `task-group-probe` and
 `crypto-asymmetric-probe` change internal Rust state only and add no unmangled native export.
 
-The compiler-visible native registry is always exactly the 481 base records.
+The compiler-visible native registry is always exactly the 484 base records.
 There is no target option, environment variable, Cargo feature, linked-runtime
 inspection, or other ambient input that changes it. The eleven optional probe
-records extend only the verification-time maximum runtime-export table to 492.
+records extend only the verification-time maximum runtime-export table to 495.
 They never gain a `RuntimeKey`, callable/declaration policy, collision
 reservation, or compatible-extern reuse. Their spellings remain ordinary
 program/extern/export identities in a normal build. Probe-feature runtime
@@ -126,14 +126,14 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 463 keyed records, 481 base records, and 492 records in the maximum optional-probe export table.
+are 466 keyed records, 484 base records, and 495 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
 
 ## Runtime effect classification
 
-Every one of the 481 base rows has one `RuntimeEffects` record in
+Every one of the 484 base rows has one `RuntimeEffects` record in
 `align_codegen_llvm::runtime_abi`. The record is a total match over
 `RuntimeAbiId`; there is no unclassified/default arm. Its exact fields are
 `class`, `argmem`, per-pointer `params`, `escapes`, `releases`,
@@ -214,11 +214,14 @@ declaration golden owns the emitted declaration and the class token together.
 | `CliCommand` | `align_rt_cli_command_new` | `AllocNew` |
 | `CliCommandFree` | `align_rt_cli_command_free` | `IndirectStorage` |
 | `CliFlagBool` | `align_rt_cli_flag_bool` | `IndirectStorage` |
+| `CliFlagF64` | `align_rt_cli_flag_f64` | `IndirectStorage` |
 | `CliFlagI64` | `align_rt_cli_flag_i64` | `IndirectStorage` |
 | `CliFlagStr` | `align_rt_cli_flag_str` | `IndirectStorage` |
 | `CliGetBool` | `align_rt_cli_get_bool` | `IndirectStorage` |
+| `CliGetF64` | `align_rt_cli_get_f64` | `IndirectStorage` |
 | `CliGetI64` | `align_rt_cli_get_i64` | `IndirectStorage` |
 | `CliGetStr` | `align_rt_cli_get_str` | `IndirectStorage` |
+| `CliOccurrences` | `align_rt_cli_occurrences` | `IndirectStorage` |
 | `CliParse` | `align_rt_cli_parse` | `IndirectStorage` |
 | `CliParsedFree` | `align_rt_cli_parsed_free` | `IndirectStorage` |
 | `CliUsage` | `align_rt_cli_usage` | `IndirectStorage` |
@@ -1540,7 +1543,7 @@ from the bodies. A merged body also carries no producer string attribute.
 | A34 | `i64 @SYM(ptr, i64, i64, i64, ptr, ptr, i64)` | `align_rt_dict_encode_str` |
 | A35 | `i64 @SYM(ptr, i64, ptr, ptr, i64)` | `align_rt_group_count_i64` |
 | A36 | `i64 @SYM(ptr, ptr)` | `align_rt_udp_recv_from`, `align_rt_io_reader_read`, `align_rt_io_reader_read_line`, `align_rt_io_copy` |
-| A37 | `i64 @SYM(ptr, ptr, i64)` | `align_rt_io_file_pread`, `align_rt_cli_get_i64`, `align_rt_regex_group_index` |
+| A37 | `i64 @SYM(ptr, ptr, i64)` | `align_rt_io_file_pread`, `align_rt_cli_get_i64`, `align_rt_cli_occurrences`, `align_rt_regex_group_index` |
 | A38 | `i64 @SYM(ptr, ptr, i64, i64)` | `align_rt_io_file_pwrite` |
 | A39 | `i64 @SYM(ptr, ptr, i64, i64, i64, i64, ptr)` | `align_rt_par_map_reduce` |
 | A40 | `i64 @SYM(ptr, ptr, i64, ptr, i64, i64)` | `align_rt_udp_send_to` |
@@ -1723,24 +1726,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 463 keys, mapped symbols, LLVM declaration types, and derived effects
+- all 466 keys, mapped symbols, LLVM declaration types, and derived effects
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 481 base native symbols against default-feature `align_runtime` exports,
+- the 484 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 488 `alloc-count` and 485 `par-map-probe` native symbols against
+- the 491 `alloc-count` and 488 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 492 maximum native symbols against `align_runtime` built with
+- the 495 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 463 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  463 exact registry function types through the production compatibility
+- all 466 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  466 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; explicit `ArgsBuild` exact status/out-pointer source
@@ -2256,3 +2259,14 @@ TgWait participates in claiming and joins completion before returning the lowest
 error slot. TgEnd defensively joins before reclamation. Late helpers retain generation
 metadata only, and completion follows every descriptor/environment/slot access.
 [Plan180](180-structured-task-progress.md) owns the exact mutex and lifetime invariants.
+
+### CLI admission observations (plan181)
+
+`CliFlagF64` adds `void @align_rt_cli_flag_f64(ptr, ptr, i64, double)`;
+`CliGetF64` adds `double @align_rt_cli_get_f64(ptr, ptr, i64)`;
+`CliOccurrences` uses A37, `i64 @align_rt_cli_occurrences(ptr, ptr, i64)`.
+All use conservative IndirectStorage effects, with pointer operands unannotated
+like existing CLI registration/getter operations. Opaque handles retain their
+external layout; parsed entries internally hold checked i64 counts. Native
+pointer/span preconditions and null receiver behavior match the corresponding
+integer operations. No output retains a new borrowed view or allocation.

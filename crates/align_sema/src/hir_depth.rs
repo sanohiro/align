@@ -652,6 +652,14 @@ fn walk_body_records<'a>(
                     parsed: lhs,
                     name: rhs,
                 }
+                | ExprKind::CliGetF64 {
+                    parsed: lhs,
+                    name: rhs,
+                }
+                | ExprKind::CliOccurrences {
+                    parsed: lhs,
+                    name: rhs,
+                }
                 | ExprKind::CliGetStr {
                     parsed: lhs,
                     name: rhs,

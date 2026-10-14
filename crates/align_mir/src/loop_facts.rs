@@ -333,7 +333,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::CryptoSign { .. } | Rvalue::CryptoVerify { .. } | Rvalue::RandSeed { .. } |
         Rvalue::RandNext { .. } | Rvalue::RandRange { .. } | Rvalue::RandShuffle { .. } |
         Rvalue::RandSample { .. } | Rvalue::CliCommand { .. } | Rvalue::CliFlag { .. } |
-        Rvalue::CliParse { .. } | Rvalue::CliGetBool { .. } | Rvalue::CliGetI64 { .. } |
+        Rvalue::CliParse { .. } | Rvalue::CliGetBool { .. } | Rvalue::CliGetI64 { .. } | Rvalue::CliGetF64 { .. } | Rvalue::CliOccurrences { .. } |
         Rvalue::CliGetStr { .. } | Rvalue::CliUsage { .. } | Rvalue::HttpRequest { .. } |
         Rvalue::HttpHeader { .. } | Rvalue::HttpBody { .. } | Rvalue::HttpRequestTimeout { .. } |
         Rvalue::HttpRequestMaxResponseBodyBytes { .. } | Rvalue::HttpClientTimeout { .. } | Rvalue::HttpClientMaxResponseBodyBytes { .. } |

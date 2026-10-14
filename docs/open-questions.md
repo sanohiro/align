@@ -3681,6 +3681,18 @@ owned output remain. [Plan 122](impl/122-html-text-admission.md) owns admission,
 ordering, allocation and compiler/runtime validation. Other byte encoders retain
 their input domain; K1 remains deferred.
 
+### CLI finite floats and occurrence counts — SETTLED (2026-10-14)
+
+Extend the existing builder with `flag_f64(name: str, default: f64)` and parsed
+`get_f64(name: str) -> f64` / `occurrences(name: str) -> i64`. Parse rejects every
+nonfinite registered default before argv processing; argv floats use complete
+ASCII JSON-number grammar and nearest/ties-to-even binary64 conversion, with
+finite overflow rejection and valid underflow/signed zero. Counts distinguish
+omission, empty values and duplicates without changing last-value-wins. Scalar
+lookups borrow synchronously and allocate nothing; unknown names/wrong-kind
+getters retain runtime aborts. No new argv source or duplicate/range policy.
+[Plan181](impl/181-cli-float-occurrences.md) owns the exact contract and tests.
+
 ### M10 scope decision (2026-07-04)
 
 Settled ahead of any `std.encoding`/`std.rand`/`std.cli` implementation (`impl/07-roadmap.md` M10;

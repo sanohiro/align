@@ -3999,19 +3999,22 @@ c := cli.command(name: str)                    // builder
 c.flag_bool(name: str)                          // register a bool flag (default false)
 c.flag_str(name: str, default: str)             // register a str flag with a default
 c.flag_i64(name: str, default: i64)             // register an i64 flag with a default
+c.flag_f64(name: str, default: f64)             // register an f64 flag with a default
 c.parse(args: array<str>) -> Result<parsed, Error>
 p.get_bool(name: str) -> bool                   // total after a successful parse (see below)
 p.get_str(name: str) -> str
 p.get_i64(name: str) -> i64
+p.get_f64(name: str) -> f64
+p.occurrences(name: str) -> i64                 // explicit uses; zero for an omitted flag
 c.usage() -> string
 ```
 
 **Lookups are total, not fallible — validation happens once, at `parse`.** Every registered flag
 has a value after `c.parse(args)?` succeeds: the one given on the command line, or the default from
-its `flag_*` registration (`bool` defaults to `false`). So `p.get_bool`/`get_str`/`get_i64` never
+its `flag_*` registration (`bool` defaults to `false`). So `p.get_bool`/`get_str`/`get_i64`/`get_f64` never
 fail and return the value directly — the same shape as `json.decode`, where decoding validates the
 whole input and field access is then a plain read. But the lookup itself is only **checked at
-runtime**: `p.get_bool(name)`/`get_str`/`get_i64` return the parsed value or default for a
+runtime**: `p.get_bool(name)`/`get_str`/`get_i64`/`get_f64` return the parsed value or default for a
 registered flag, and a `get_*` call for a name that was never registered, or against the wrong
 flag's type, **aborts at runtime** — the same "programmer error aborts, never silently misbehaves"
 rule as out-of-bounds indexing or div-by-zero. Align has no comptime evaluator, so there is no
@@ -4031,14 +4034,40 @@ render usage.)
 
 **v1 argv grammar.** `parse` treats `args[0]` as the program name (the `main(args)` convention) and
 reads flags from `args[1..]` in three forms: `--name` (a bool flag, set to `true`), `--name value`
-(the value is the next token), and `--name=value` (str/i64 flags). A bool flag takes no value; a
-str/i64 flag with no following value, an unknown flag, a bare positional token, or a malformed `i64`
+(the value is the next token), and `--name=value` (str/i64/f64 flags). A bool flag takes no value; a
+str/i64/f64 flag with no following value, an unknown flag, a bare positional token, or a malformed `i64`/`f64`
 is an *input* error (`Error.Invalid`). Richer conventions (`-x` short flags, `--` end-of-flags,
 clustered bools, positionals) are deferred behind this same signature.
 
 **v1 is an explicit flag-registration builder API.** Align has no derive/attributes yet, so
 decoding straight into a struct (the `json.decode`-shaped ideal) waits for that mechanism. This API
 shape is a v1 provisional: builder vs. a declarative spec is revisited once derive lands.
+
+**Finite floats and occurrences.** `flag_f64` takes an exact `f64` default.
+Before reading argv or allocating parsed entries, `parse` rejects any registered
+nonfinite default with `Error.Invalid`, including a duplicate registration or an
+overridden default. Float argv values must be complete ASCII JSON numbers:
+`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`. Whitespace, leading plus/zeros,
+hex, NaN, infinity, embedded NUL and trailing bytes reject. Conversion rounds to
+binary64 with nearest/ties-to-even independently of host rounding mode; overflow
+rejects, while subnormals, underflow to signed zero and negative zero are valid.
+Application-specific ranges remain explicit caller checks.
+
+`occurrences` accepts every registered flag kind. It counts explicit options,
+including repeated bools and empty string values, across both value spellings;
+defaults count zero. Separate value tokens are consumed verbatim, even if they
+look like flags. Values still use the last occurrence; repeated registrations
+still select the first registered kind/default for that name. Each parse starts
+new counts. Checked count overflow returns `Error.Invalid`. Unknown names abort
+like an unknown getter; `get_f64` also aborts on the wrong kind. Both operations
+borrow their bound parsed local and name only during the call, allocate nothing,
+and return independent Copy scalars. They do not extend string-view lifetimes.
+Parsing still owns its copied strings, releases partial entries on failure and
+keeps the command reusable. Usage adds registration-order f64 defaults, including
+nonfinite defaults before parse rejects them, using existing display rendering.
+
+The exact compiler/runtime closure and tests are in
+[plan181](docs/impl/181-cli-float-occurrences.md).
 
 ### std.log
 
