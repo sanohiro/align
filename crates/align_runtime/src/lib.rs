@@ -36792,9 +36792,8 @@ mod tests {
     #[test]
     fn json_decoded_owner_aos_slow_failure_matrix() {
         let Some(_isolated) = crate::allocation_test::enter() else { return; };
-        // These cases exercise a completed row plus a current partial row across malformed element,
-        // missing top-level delimiter, and trailing-input failures. Staging bytes are not owners; all
-        // nested arrays must be deep-cleaned before the staging Vec is dropped.
+        // Complete grammar errors reject before staging. Valid JSON with a schema failure still
+        // exercises completed/current-row cleanup; staging bytes do not own nested arrays.
         let (x, arr) = (b"x", b"arr");
         let inner_descs = [JsonField {
             name_ptr: x.as_ptr(),
@@ -36824,8 +36823,8 @@ mod tests {
             (br#"[] trailing"#, 0),
             (br#"[{"arr":[{"x":1}]},{"arr":5}]"#, 1),
             (br#"[{"arr":[{"x":1}]},{"arr":[{"x":2}]},{"arr":5}]"#, 2),
-            (br#"[{"arr":[{"x":1}]} ,"#, 1),
-            (br#"[{"arr":[{"x":1}]}] trailing"#, 1),
+            (br#"[{"arr":[{"x":1}]} ,"#, 0),
+            (br#"[{"arr":[{"x":1}]}] trailing"#, 0),
         ];
         for &(src, expected_allocations) in cases {
             let (a0, f0) = (align_rt_alloc_count(), align_rt_free_count());

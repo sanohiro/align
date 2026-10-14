@@ -45,3 +45,21 @@ hand-written lines; any larger boundary needs an updated explanation.
 The fresh independent strategy review was CLEAN before implementation. It
 checked both reproduced array layouts, selected-value boundaries, lexical
 projection, staged owner cleanup and the iterative-state/measurement scope.
+
+## Local measurement setup
+
+The sealed json_decode wrapper was attempted before the change. Missing locked
+crates were fetched, after which this Mac's system linker rejected the produced
+Rust runtime dylib with `mis-aligned LINKEDIT string pool`. The failed wrapper
+retired its children and cleared executable/build artifacts; compact failure
+logs remain. This is a host linking limit, not a parser result.
+
+The local cost comparison therefore uses the unchanged json_decode/json_soa
+Align kernels through the ordinary static-runtime executable build. It retains
+the same LCG-generated four-field input, full/projected AoS/SoA paths, row-count
+and exact aggregate checks, and three fresh processes with forty samples per
+path/size. Compiler/runtime/source/input identities and all raw samples are
+retained. Both sides use release compiler/runtime, release generated code, native
+CPU, disabled runtime LTO and codegen cache. Input I/O and validation checks are
+outside timing; every measured aggregate must equal the independent generator.
+This is a before/after Align cost observation, not the unavailable serde duel.
