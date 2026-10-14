@@ -24,6 +24,10 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan182](docs/impl/182-copy-record-producer.md) certifies independent inline
+  Copy data projected from borrowed records beside fresh owned return storage
+  for Request134. Source authority, contained views and Move siblings retain
+  their existing checks; general aggregate provenance remains separate.
 - [Plan181](docs/impl/181-cli-float-occurrences.md) supplies finite `std.cli`
   float flags and explicit occurrence counts for media AM-R04/05. All CLI
   receivers remain live through later eager operands; scalar observations
