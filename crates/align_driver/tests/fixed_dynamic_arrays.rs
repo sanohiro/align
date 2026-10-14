@@ -100,8 +100,9 @@ fn transported() -> i32 {
   if model.first(moved.values[1]) != 13 { return 5 }
   return 0
 }
+fn loop_values() -> [array<i64>; 2] { loop { break model.make_values() } }
 fn shared_whole() -> i32 {
-  values := model.make_values()
+  values := loop_values()
   if model.fixed_count(values, 1) != 1 { return 6 }
   return 0
 }
@@ -371,7 +372,6 @@ fn fixed_dynamic_arrays_reject_invalid_transfers_and_views() {
             std::fs::write(stage.join("model.align"), MODEL).unwrap();
             let prefix = "import model\nimport std.rand\nfn take(values: [array<i64>; 2]) {}\nfn consume(value: array<i64>) {}\n";
             let mut cases = vec![
-            ("loop-owner-export", "fn bad() -> [array<i64>; 2] { loop { break model.make_values() } }\nfn main() {}".into()),
             ("loop-owner-replacement", "fn bad(flag: bool) -> i64 { a := [1].to_array(); b := [2].to_array(); mut values := [a, b]; values = match (if flag { 1 } else { 0 }) { 1 => values, _ => values }; mut again := true; loop { if !again { break }; values = model.make_values(); again = false }; return model.count(values[0]) }\nfn main() {}".into()),
             ("duplicate", "fn main() { a := [1].to_array(); values := [a, a] }".to_string()),
             ("tuple-duplicate", "fn main() { pair := ([1].to_array(), [2].to_array()); values := [pair.0, pair.0] }".into()),

@@ -103,13 +103,15 @@ producer expansion remain excluded. The original review is retained locally.
 
 ## Supported boundary and completed owners
 
-The provider remains conservative for an unbound owned fixed-array call result
-used as a loop's break value, and for some loop-carried replacements of an inline
-owner whose original dynamic headers came from named sources. These shapes reject
-before MIR rather than losing lifetime evidence. The same frame-local escape
+An ordinary helper's owned fixed-array result can pass through a loop break;
+`fixed_dynamic_arrays_lifecycle_and_replay` covers its imported native transfer
+and cleanup. The provider remains conservative for some loop-carried replacements
+of an inline owner whose original dynamic headers came from named sources. These
+shapes reject before MIR rather than losing lifetime evidence. The same frame-local escape
 refusal is observable on the baseline's already-admitted fixed Move-record
 wrapper. General loop/aggregate provenance is deferred; this capability does not
-reopen K1 or the parked experiment. The negative source owner pins both refusals.
+reopen K1 or the parked experiment. The negative source owner pins the remaining
+replacement refusal.
 Loop reads, scalar break/return during partial construction, ordinary whole
 replacement, self-replacement and if/match owner joins are covered positively.
 Fallible aggregate exports and indexed ownership extraction remain separately
