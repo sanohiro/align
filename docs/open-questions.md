@@ -5303,6 +5303,16 @@ and a returned or mutably retained view is rooted in the array generation and co
 roots. By-value Move-element indexing, temporary/nested-index bases, and element `borrow mut`
 remain rejected.
 
+`rows[index].path.values.len()` observes an ordinary dynamic array field of an
+indexed fixed/dynamic AoS record array or record slice as `i64`. The nonempty
+field path and stable base follow the shared-call place rules; both constant and
+runtime indices are admitted. The complete parent is reserved before the once-only
+index evaluation, then signed bounds are checked before the field header is read.
+A terminating index performs no read. No owner or view is produced, no allocation
+or cleanup occurs, and the scalar may outlive the parent. This does not admit
+ordinary Move-field values, slice conversion, indexed writes or exclusive field
+borrows; shared calls retain their fixed-field literal-index restriction.
+
 Owning-place matches retain their current Move extraction, source nulling, cleanup, `else`, `?`,
 branch, loop, and early-exit behavior. There is no new syntax, reference type, lifetime annotation,
 runtime representation, ABI field, allocation path, JSON exception, or package-specific API. The

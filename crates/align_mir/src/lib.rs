@@ -11388,6 +11388,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::Len(inner) => {
+                if matches!(inner.kind, hir::ExprKind::ElemField { .. })
+                    && align_sema::indexed_array_field_has_length(inner.ty)
+                {
+                    let place = lower_required!(b, lower_borrowed_element_field(b, inner), Operand::Const(Const::Unit));
+                    let value = b.fresh_value(e.ty);
+                    b.push(Stmt::Let(value, Rvalue::SliceLen(place)));
+                    return Operand::Value(value);
+                }
                 if let Ty::Array(_, n) | Ty::StructArray(_, n) = inner.ty {
                     if matches!(inner.kind, hir::ExprKind::ArrayLit { .. }) {
                         // Literals are slot-backed. Reuse guarded element initialization so an
@@ -11762,6 +11770,50 @@ fn store_fresh_struct_fields(b: &mut Builder, slot: Slot, value: &hir::Expr) -> 
     flag
 }
 
+/// Reserve and bounds-check one stable selected field before either scalar observation or call.
+fn lower_borrowed_element_field(b: &mut Builder, e: &hir::Expr) -> Operand {
+    let hir::ExprKind::ElemField { recv, index, path, struct_id } = &e.kind else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
+    let Some(base_place) = borrowed_array_base_place(b, recv) else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
+    if checked_struct_field_path(b, *struct_id, path).is_none() {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    }
+    let reservation = b.fresh_borrow_reservation();
+    b.push(Stmt::BorrowedElementReservation {
+        token: reservation,
+        root: base_place.slot,
+    });
+    let index = lower_expr(b, index);
+    if !lowering_continues(b) {
+        return Operand::Const(Const::Unit);
+    }
+    let len = b.fresh_value(i64_ty());
+    b.push(Stmt::Let(
+        len,
+        Rvalue::SliceLen(Operand::BorrowedPlace(Box::new(
+            base_place.clone(),
+        ))),
+    ));
+    let checked_len = Operand::Value(len);
+    emit_signed_bounds_check(b, &index, checked_len.clone());
+    Operand::BorrowedElementPlace(Box::new(BorrowedElementPlace {
+        base: base_place,
+        index,
+        element_ty: e.ty,
+        field_path: path.clone(),
+        guard: BorrowedElementGuard {
+            reservation,
+            len: checked_len,
+        },
+    }))
+}
+
 fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMode) -> Operand {
     if let hir::ExprKind::BorrowedIndex { base, index } = &e.kind {
         debug_assert_eq!(mode, align_ast::ParamMode::Borrow);
@@ -11915,41 +11967,7 @@ fn lower_borrowed_place(b: &mut Builder, e: &hir::Expr, mode: align_ast::ParamMo
                     if mode != align_ast::ParamMode::Borrow {
                         return Operand::Const(Const::Unit);
                     }
-                    let Some(base_place) = borrowed_array_base_place(b, recv) else {
-                        return Operand::Const(Const::Unit);
-                    };
-                    if checked_struct_field_path(b, *struct_id, path).is_none() {
-                        b.terminate(Term::Unreachable);
-                        return Operand::Const(Const::Unit);
-                    }
-                    let reservation = b.fresh_borrow_reservation();
-                    b.push(Stmt::BorrowedElementReservation {
-                        token: reservation,
-                        root: base_place.slot,
-                    });
-                    let index = lower_expr(b, index);
-                    if !lowering_continues(b) {
-                        return Operand::Const(Const::Unit);
-                    }
-                    let len = b.fresh_value(i64_ty());
-                    b.push(Stmt::Let(
-                        len,
-                        Rvalue::SliceLen(Operand::BorrowedPlace(Box::new(
-                            base_place.clone(),
-                        ))),
-                    ));
-                    let checked_len = Operand::Value(len);
-                    emit_signed_bounds_check(b, &index, checked_len.clone());
-                    return Operand::BorrowedElementPlace(Box::new(BorrowedElementPlace {
-                        base: base_place,
-                        index,
-                        element_ty: e.ty,
-                        field_path: path.clone(),
-                        guard: BorrowedElementGuard {
-                            reservation,
-                            len: checked_len,
-                        },
-                    }));
+                    return lower_borrowed_element_field(b, e);
                 }
                 if mode != align_ast::ParamMode::Borrow || move_field {
                     return Operand::Const(Const::Unit);

@@ -2902,6 +2902,8 @@ struct BodyContext {
     /// Child expressions clear this bit, so casts, wrappers, stores and returns cannot turn a
     /// read-only field place into an owning value.
     allow_indexed_move_field_borrow: bool,
+    /// Only the immediate selected array child of Len may be read without a call.
+    allow_indexed_array_field_length: bool,
 }
 
 struct BatchPlanCall<'a> {
@@ -3437,6 +3439,7 @@ impl<'a> BodyValidator<'a> {
                 pooled_initializer: None,
                 signed_min_magnitude: false,
                 allow_indexed_move_field_borrow: false,
+                allow_indexed_array_field_length: false,
             };
             if !self.walk_block(&function.body, context.clone()) {
                 return reject();
@@ -3501,6 +3504,7 @@ impl<'a> BodyValidator<'a> {
                         _ => None,
                     };
                     child_context.allow_indexed_move_field_borrow = false;
+                    child_context.allow_indexed_array_field_length = false;
                     let mut children = statement_children(statement);
                     while let Some(child) = children.pop() {
                         work.push(BodyWork::EnterExpr(child, child_context.clone()));
@@ -6681,6 +6685,7 @@ impl<'a> BodyValidator<'a> {
             pooled_initializer: None,
             signed_min_magnitude: false,
             allow_indexed_move_field_borrow: false,
+            allow_indexed_array_field_length: false,
         };
         let mut work = vec![BodyWork::EnterBlock(root, context)];
         while let Some(item) = work.pop() {
@@ -6749,6 +6754,7 @@ impl<'a> BodyValidator<'a> {
                 child_context.pooled_initializer = None;
                 child_context.signed_min_magnitude = false;
                 child_context.allow_indexed_move_field_borrow = false;
+                child_context.allow_indexed_array_field_length = false;
                 work.push(BodyWork::EnterExpr($child, child_context));
             }};
         }
@@ -6759,6 +6765,7 @@ impl<'a> BodyValidator<'a> {
                 child_context.signed_min_magnitude = *op == align_ast::UnOp::Neg
                     && matches!(expr.kind, hir::ExprKind::Int(_));
                 child_context.allow_indexed_move_field_borrow = false;
+                child_context.allow_indexed_array_field_length = false;
                 work.push(BodyWork::EnterExpr(expr, child_context));
             }
             hir::ExprKind::Cast(expr)
@@ -6817,6 +6824,7 @@ impl<'a> BodyValidator<'a> {
                     let mut arg_context = context.clone();
                     arg_context.pooled_initializer = None;
                     arg_context.signed_min_magnitude = false;
+                    arg_context.allow_indexed_array_field_length = false;
                     arg_context.allow_indexed_move_field_borrow = self
                         .function_value_arg_is_shared_borrow(callee, index);
                     work.push(BodyWork::EnterExpr(arg, arg_context));
@@ -6845,6 +6853,7 @@ impl<'a> BodyValidator<'a> {
                     .push(self.task_group_is_fallible(block));
                 child.pooled_initializer = None;
                 child.allow_indexed_move_field_borrow = false;
+                child.allow_indexed_array_field_length = false;
                 work.push(BodyWork::EnterBlock(block, child));
             }
             hir::ExprKind::Match { scrutinee, arms, .. } => {
@@ -6852,6 +6861,7 @@ impl<'a> BodyValidator<'a> {
                     let mut arm_context = context.clone();
                     arm_context.pooled_initializer = None;
                     arm_context.allow_indexed_move_field_borrow = false;
+                    arm_context.allow_indexed_array_field_length = false;
                     work.push(BodyWork::EnterArm(arm, scrutinee, arm_context));
                 }
                 push_expr!(scrutinee, context.clone());
@@ -6876,6 +6886,7 @@ impl<'a> BodyValidator<'a> {
                     let mut arg_context = context.clone();
                     arg_context.pooled_initializer = None;
                     arg_context.signed_min_magnitude = false;
+                    arg_context.allow_indexed_array_field_length = false;
                     arg_context.allow_indexed_move_field_borrow =
                         self.direct_call_arg_is_shared_borrow(func, index);
                     work.push(BodyWork::EnterExpr(arg, arg_context));
@@ -6885,10 +6896,12 @@ impl<'a> BodyValidator<'a> {
                 let mut else_context = context.clone();
                 else_context.pooled_initializer = None;
                 else_context.allow_indexed_move_field_borrow = false;
+                else_context.allow_indexed_array_field_length = false;
                 work.push(BodyWork::EnterBlock(els, else_context));
                 let mut then_context = context.clone();
                 then_context.pooled_initializer = None;
                 then_context.allow_indexed_move_field_borrow = false;
+                then_context.allow_indexed_array_field_length = false;
                 work.push(BodyWork::EnterBlock(then, then_context));
                 push_expr!(cond, context.clone());
             }
@@ -6898,6 +6911,7 @@ impl<'a> BodyValidator<'a> {
                 child.float_mode = child.float_mode.union(*mode);
                 child.pooled_initializer = None;
                 child.allow_indexed_move_field_borrow = false;
+                child.allow_indexed_array_field_length = false;
                 work.push(BodyWork::EnterBlock(block, child));
             }
             hir::ExprKind::Block(block)
@@ -6907,6 +6921,7 @@ impl<'a> BodyValidator<'a> {
                 let mut child = context.clone();
                 child.pooled_initializer = None;
                 child.allow_indexed_move_field_borrow = false;
+                child.allow_indexed_array_field_length = false;
                 if matches!(
                     &expression.kind,
                     hir::ExprKind::Arena(_) | hir::ExprKind::NamedArena { .. }
@@ -6922,6 +6937,7 @@ impl<'a> BodyValidator<'a> {
                 let mut child = context.clone();
                 child.pooled_initializer = None;
                 child.allow_indexed_move_field_borrow = false;
+                child.allow_indexed_array_field_length = false;
                 child.loop_targets.push(LoopTarget {
                     ty: expression.ty,
                     arena_depth: context.arena_depth,
@@ -7121,8 +7137,16 @@ impl<'a> BodyValidator<'a> {
                 push_expr!(n, context.clone());
                 push_expr!(source, context.clone());
             }
-            hir::ExprKind::ArrayToSlice(source) | hir::ExprKind::Len(source) => {
+            hir::ExprKind::ArrayToSlice(source) => {
                 push_expr!(source, context.clone());
+            }
+            hir::ExprKind::Len(source) => {
+                let mut child = context.clone();
+                child.pooled_initializer = None;
+                child.signed_min_magnitude = false;
+                child.allow_indexed_move_field_borrow = false;
+                child.allow_indexed_array_field_length = true;
+                work.push(BodyWork::EnterExpr(source, child));
             }
             hir::ExprKind::Index { recv, index } => {
                 push_expr!(index, context.clone());
@@ -7277,6 +7301,7 @@ impl<'a> BodyValidator<'a> {
                 let mut child_context = context.clone();
                 child_context.pooled_initializer = None;
                 child_context.allow_indexed_move_field_borrow = false;
+                child_context.allow_indexed_array_field_length = false;
                 work.push(BodyWork::EnterExpr($child, child_context));
             }};
         }
@@ -11322,15 +11347,19 @@ impl<'a> BodyValidator<'a> {
                     &self.program.enums,
                     &self.program.tagged_types,
                 );
-                // Fixed struct-array element fields use the stack-slot lowering and therefore
-                // retain sema's literal-index restriction. Dynamic AoS/slice views have the
-                // checked runtime-index path; a malformed HIR must not bypass that distinction.
+                let length_observation = context.allow_indexed_array_field_length
+                    && align_sema::indexed_array_field_has_length(leaf)
+                    && matches!(recv.kind, hir::ExprKind::Local(_) | hir::ExprKind::Field { .. });
+                // Shared fixed-field calls retain their literal-index restriction. Immediate
+                // length observations use the bounds-checked descriptor for every base class;
+                // a malformed context must not widen ordinary indexed Move reads.
                 let fixed_resource_field = matches!(
                     (receiver.ty, leaf),
                     (Ty::StructArray(..), Ty::Resource(_))
                 );
                 if indexed_move_field
                     && !fixed_resource_field
+                    && !length_observation
                     && matches!(receiver.ty, Ty::StructArray(..))
                     && !matches!(index.kind, hir::ExprKind::Int(_))
                 {
@@ -11339,6 +11368,7 @@ impl<'a> BodyValidator<'a> {
                 if indexed_move_field
                     && !fixed_resource_field
                     && !context.allow_indexed_move_field_borrow
+                    && !length_observation
                 {
                     return None;
                 }

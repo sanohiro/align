@@ -1,9 +1,16 @@
 # Borrow-safe dynamic aggregate projection
 
+Implemented extension: [Plan196](196-indexed-array-field-length.md) admits immediate
+`rows[index].path.values.len()` on an ordinary dynamic array field. Fixed/dynamic
+AoS and record-slice parents accept constant or runtime indices. This scalar-only
+read reserves the complete parent before index evaluation, checks signed bounds,
+and creates no owner or source-level view. The broader view/authority extension
+remains unselected, and the shared-call grammar below remains unchanged.
+
 Implemented extension: [plan165](165-fixed-dynamic-array-elements.md) admits whole shared
 indexed elements of ordinary fixed arrays, including String and Move-record siblings, at constant
 or runtime indices. It also admits read-only slices of its ordinary owned dynamic-array headers.
-The fixed indexed Move-field path remains integer-literal-only. Historical fixed-base and
+The shared-call fixed indexed Move-field path remains integer-literal-only. Historical fixed-base and
 nested-owning-element exclusions below are superseded only by that exact header domain; ordinary
 by-value Move reads, element replacement/extraction, `borrow mut`, specialized arrays and recursive
 dynamic-array representations remain excluded. Reservation, bounds and payload grammar are unchanged.

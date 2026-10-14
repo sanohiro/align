@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan195](docs/impl/195-mutable-borrow-storage-authority.md) separates readable
+  borrowed-call contents from complete recursive owner and buffer authority.
+  Typed arena dynamic arrays and fixed str-array record fields now execute
+  through existing whole-place mutable calls. Named fixed str-array roots and
+  native arena-decoder outputs retain separate producer limits.
+
 - [Plan194](docs/impl/194-dynamic-array-field-writes.md) admits indexed writes to
   owned scalar-array record fields for media AM-R01 and LLM R147/R46. Exact selected
   backing lifetimes retain borrowed text through aliases and checked imported call
@@ -168,11 +174,11 @@ worktree; their adoption is not a prerequisite for independent work.
 - Request126's borrowed-session loop refusal and Request28's indexed/view builder
   readers require their own provenance closure; the shipped binary-write effect
   producer does not resume K1.
-- Next capability: native exclusive calls on borrowed-content collections already
-  reject on main (root array<str> and whole-field replacement included). Plan194
-  preserves that producer refusal while native local str writes and numeric helpers
-  work. Separate readable payload facts from complete owner/buffer authority; never
-  weaken the proof merely to admit the call.
+- [Plan196](docs/impl/196-indexed-array-field-length.md) implements R137's scalar
+  `rows[index].ids.len()` observation across stable fixed/dynamic AoS and slice
+  bases. The parent remains owned, checked bounds precede the read, and the i64
+  result retains no borrow. Wider indexed Move-field views and their Plan61
+  authority prerequisite remain unselected; consumer adoption is external.
 - Function-value whole-record exclusive calls retain the existing conservative
   mutable-output fallback: even supported whole-field replacement can invalidate
   later destination use. Precise indirect mutable-output summaries are separate

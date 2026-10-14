@@ -19153,7 +19153,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 result.as_basic_value()
             }
             Rvalue::SliceLen(op) => {
-                if let Operand::BorrowedPlace(place) = op {
+                if let Operand::BorrowedElementPlace(place) = op {
+                    if place.field_path.is_empty()
+                        || !align_sema::indexed_array_field_has_length(place.element_ty)
+                    {
+                        return Err(self.err("indexed field length requires an ordinary array field"));
+                    }
+                    let field = self.borrowed_element_ptr(place)?;
+                    let length = self.builder.build_struct_gep(
+                        slice_struct_type(self.ctx), field, 1, "borrow.element.length.field",
+                    ).map_err(|error| self.err(error))?;
+                    self.builder.build_load(self.ctx.i64_type(), length, "borrow.element.length")
+                        .map_err(|error| self.err(error))?
+                } else if let Operand::BorrowedPlace(place) = op {
                     match self.checked_borrowed_place_ty(place)? {
                         Ty::Array(_, length) | Ty::StructArray(_, length) => {
                             self.ctx.i64_type().const_int(u64::from(length), false).into()
@@ -25703,7 +25715,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             return Ok(element);
         }
         let mut struct_id = match place.base.ty {
-            Ty::Slice(Scalar::Struct(id)) | Ty::DynStructArray(id, align_sema::Layout::Aos) => {
+            Ty::Slice(Scalar::Struct(id)) | Ty::StructArray(id, _)
+            | Ty::DynStructArray(id, align_sema::Layout::Aos) => {
                 id
             }
             _ => {
