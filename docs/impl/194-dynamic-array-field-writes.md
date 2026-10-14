@@ -65,7 +65,20 @@ summary expansion, new lattice or iteration limit is introduced.
 Audit both MoveCheck walkers, selected lifetime/read-only checks, mutation roots,
 byte-observation invalidation, mutable retention and fallback observer updates.
 Generation contents are the authority for selected aliases; legacy conservative
-facts must not erase incoming roots or turn a sibling into selected storage.
+facts must not erase incoming roots or turn a sibling into selected storage. The
+syntactic dynamic collection's fallback retains its record prefix. An observer with
+a complete typed header set receives legacy dependencies only at headers sharing a
+selected generation and overlapping content path; unknown/missing/incompatible metadata keeps the whole-local
+fallback. `expired_contents_preserve_independent_siblings` pairs expired selected
+contents with readable field/nested/fixed/root siblings and aggregate observers;
+`dynamic_array_field_observer_fallback` pins complete versus malformed metadata.
+Known fixed backing viewed through a compatible slice collapses its internal slot
+coordinates within that view header before aggregate normalization. Every lifetime,
+ended, read-only and validation root remains; the generation content table still
+supplies indexed selection; `dynamic_array_field_slice_content_scope` pins every
+retained root and the unchanged content table. Generic malformed-path fallback stays conservative;
+`projected_return_provenance_fails_closed` and the readonly/validated observation
+matrices retain that boundary.
 Existing conservative whole-parameter summaries may over-retain input roots;
 this capability does not promise new cross-call field independence.
 

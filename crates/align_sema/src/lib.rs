@@ -34024,7 +34024,26 @@ impl BorrowState {
                     if let Some(content) = state.storage.contents.entries.get(generation) {
                         let selected = content.through_reference(reference, &reference.content_path);
                         let nested = resolve(state, &selected.headers, visiting);
-                        let resolved = selected.join(&nested);
+                        let mut resolved = selected.join(&nested);
+                        // A slice retains every possible fixed backing slot, but those slots are
+                        // not fields of its value type. Collapse at this known view boundary so
+                        // later aggregate normalization cannot widen them to unrelated siblings.
+                        // Keep all ended/read-only/validation roots; indexed reads still select
+                        // the unchanged generation content table in its backing coordinates.
+                        if leaf.known && leaf.fallback_roots.is_empty()
+                            && leaf.descriptor.is_some_and(|descriptor| {
+                                descriptor.kind == StorageHeaderKind::View
+                                    && matches!(descriptor.ty, Ty::Slice(_))
+                                    && state.storage.directory.entries.get(generation)
+                                        .and_then(|entry| entry.descriptor)
+                                        .is_some_and(|backing| {
+                                            backing.kind == StorageHeaderKind::InlineFixed
+                                                && indexed_backing_compatible(descriptor.ty, backing.ty, &[])
+                                        })
+                            })
+                        {
+                            resolved.non_storage = BorrowFact::from_direct(resolved.non_storage.flatten());
+                        }
                         result.non_storage.join_at(path, &resolved.non_storage);
                     }
                     let owners = state.generation_lifetime_roots(generation);
@@ -42747,7 +42766,9 @@ impl<'a> MoveCheck<'a> {
             .iter()
             .try_fold(local_ty, |ty, projection| self.projection_ty(ty, *projection));
         let Some((element_ty, len)) = array_ty.and_then(|ty| self.fixed_array_shape(ty)) else {
-            self.join_local_borrow_fallback(local, value);
+            // Dynamic indices join one collection's contents, not unrelated record fields.
+            let path = if array_ty.is_some() { &collection_projections[..] } else { &[] };
+            self.join_local_borrow_projection(local, path, value);
             return;
         };
         let mut current = self.normalize_borrow_fact(
@@ -42846,7 +42867,56 @@ impl<'a> MoveCheck<'a> {
         let mut destinations = self.resolved_mutable_destinations(&backing, &observers);
         destinations.remove(&base);
         for local in destinations {
+            self.join_index_observer_borrow(local, &headers, value);
+        }
+    }
+
+    /// Complete header identities keep legacy observer facts at their matching projections.
+    /// Missing or incompatible metadata retains the whole-local conservative fallback.
+    fn join_index_observer_borrow(
+        &mut self,
+        local: LocalId,
+        selected: &ProjectedHeaderFact,
+        value: &Expr,
+    ) {
+        let Some(record) = self.f.locals.get(local as usize) else { return; };
+        let shape = storage_type_paths(record.ty, self.storage_type_context());
+        let headers = self.local_headers(local);
+        let known = |leaf: &StorageHeaderLeaf| {
+            leaf.known && leaf.fallback_roots.is_empty() && !leaf.generations.is_empty()
+                && leaf.descriptor.is_some_and(|descriptor| leaf.generations.iter().all(|reference| {
+                    self.borrows.storage.directory.entries.get(&reference.generation)
+                        .and_then(|entry| entry.descriptor)
+                        .is_some_and(|backing| storage_header_descriptors_compatible(
+                            descriptor, backing, self.tagged_types,
+                        ))
+                }))
+        };
+        let complete = shape.valid && shape.carriers.is_empty()
+            && !shape.headers.is_empty() && headers.leaves.len() == shape.headers.len()
+            && !selected.leaves.is_empty() && selected.leaves.values().all(known)
+            && shape.headers.iter().all(|expected| {
+                headers.leaves.get(&expected.path).is_some_and(|leaf| {
+                    known(leaf) && leaf.descriptor == Some(StorageHeaderDescriptor {
+                        ty: expected.ty, kind: expected.kind,
+                    })
+                })
+            });
+        if !complete {
             self.join_local_borrow_fallback(local, value);
+            return;
+        }
+        let references = selected.leaves.values()
+            .flat_map(|leaf| leaf.generations.iter()).collect::<Vec<_>>();
+        let paths = headers.leaves.iter().filter_map(|(path, leaf)| {
+            leaf.generations.iter().any(|reference| references.iter().any(|selected| {
+                reference.generation == selected.generation
+                    && (reference.content_path.starts_with(&selected.content_path)
+                        || selected.content_path.starts_with(&reference.content_path))
+            })).then_some(path.clone())
+        }).collect::<Vec<_>>();
+        for path in paths {
+            self.join_local_borrow_projection(local, &path, value);
         }
     }
 
@@ -42938,6 +43008,10 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn join_local_borrow_fallback(&mut self, local: LocalId, value: &Expr) {
+        self.join_local_borrow_projection(local, &[], value);
+    }
+
+    fn join_local_borrow_projection(&mut self, local: LocalId, path: &[BorrowProjection], value: &Expr) {
         if !self.local_may_borrow(local) {
             return;
         }
@@ -42947,7 +43021,12 @@ impl<'a> MoveCheck<'a> {
             .get(&local)
             .cloned()
             .unwrap_or_default();
-        current.direct.extend(self.borrow_sources(value));
+        let incoming = BorrowFact::from_direct(self.borrow_sources(value));
+        if path.is_empty() {
+            current.direct.extend(incoming.direct);
+        } else {
+            current.join_at(path, &incoming);
+        }
         self.borrows.update_fact(local, current);
     }
 
@@ -77689,6 +77768,183 @@ mod tests {
                         "stored text cannot shorten destination"
                     );
                 },
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_array_field_observer_fallback() {
+        with_dynamic_array_field_checkers(
+            "R {a:array<str>,b:array<str>} fn probe(borrow mut row:R,text:str){} fn main(){}",
+            |escape, moving| {
+                let base = escape.f.params[0];
+                let text = escape.f.params[1];
+                let a = vec![BorrowProjection::StructField(0)];
+                let b = vec![BorrowProjection::StructField(1)];
+                let before = moving.borrows.clone();
+                let value = Expr {
+                    kind: ExprKind::Local(text),
+                    ty: Ty::Str,
+                    span: escape.f.span,
+                };
+                for mutation in 0..7 {
+                    moving.borrows = before.clone();
+                    let mut selected = moving.local_headers(base).project_path(&a);
+                    let generation = selected.leaves[&vec![]]
+                        .generations
+                        .iter()
+                        .next()
+                        .expect("generation")
+                        .generation
+                        .clone();
+                    match mutation {
+                        0 => {}
+                        1 => {
+                            moving
+                                .borrows
+                                .headers
+                                .get_mut(&base)
+                                .expect("headers")
+                                .leaves
+                                .remove(&b);
+                        }
+                        2 => {
+                            moving
+                                .borrows
+                                .headers
+                                .get_mut(&base)
+                                .expect("headers")
+                                .leaves
+                                .get_mut(&b)
+                                .expect("sibling")
+                                .known = false;
+                        }
+                        3 => {
+                            selected.leaves.get_mut(&vec![]).expect("selected").known = false;
+                        }
+                        4 => {
+                            moving.borrows.storage.directory.entries.remove(&generation);
+                        }
+                        5 => {
+                            moving
+                                .borrows
+                                .headers
+                                .get_mut(&base)
+                                .expect("headers")
+                                .leaves
+                                .get_mut(&a)
+                                .expect("field")
+                                .descriptor = None;
+                        }
+                        _ => {
+                            moving
+                                .borrows
+                                .storage
+                                .directory
+                                .entries
+                                .get_mut(&generation)
+                                .expect("entry")
+                                .descriptor = Some(StorageHeaderDescriptor {
+                                ty: Ty::String,
+                                kind: StorageHeaderKind::OwnedOpaque,
+                            });
+                        }
+                    }
+                    moving.join_index_observer_borrow(base, &selected, &value);
+                    let facts = moving.borrows.facts.get(&base).expect("retained facts");
+                    assert!(
+                        facts
+                            .project_path(&a)
+                            .flatten()
+                            .contains(&BorrowRoot::Param(1)),
+                        "selected/{mutation}"
+                    );
+                    assert_eq!(
+                        facts
+                            .project_path(&b)
+                            .flatten()
+                            .contains(&BorrowRoot::Param(1)),
+                        mutation != 0,
+                        "sibling/{mutation}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn dynamic_array_field_slice_content_scope() {
+        let generation = StorageGeneration::current(StorageOrigin::InlinePlace {
+            local: 0,
+            path: vec![].into(),
+        });
+        let validation = StorageGeneration::current(StorageOrigin::ByteValidation {
+            expression: 1,
+            kind: ByteValidationKind::Utf8,
+        });
+        let roots = [
+            BorrowRoot::EndedLocal(1, BorrowEnd::Consumed),
+            BorrowRoot::ReadOnly,
+            BorrowRoot::Observation(validation),
+        ]
+        .into_iter()
+        .collect::<BorrowRoots>();
+        let mut state = BorrowState::default();
+        state.storage.directory.entries.insert(
+            generation.clone(),
+            MoveGenerationEntry {
+                descriptor: Some(StorageHeaderDescriptor {
+                    ty: Ty::Array(Scalar::Str, 1),
+                    kind: StorageHeaderKind::InlineFixed,
+                }),
+                ..MoveGenerationEntry::default()
+            },
+        );
+        let contents = MoveValueFact {
+            non_storage: BorrowFact::from_direct(roots.clone())
+                .prefixed(BorrowProjection::ArrayElement(0)),
+            ..MoveValueFact::default()
+        };
+        state
+            .storage
+            .contents
+            .entries
+            .insert(generation.clone(), contents.clone());
+        let path = vec![
+            BorrowProjection::StructField(0),
+            BorrowProjection::StructField(0),
+        ];
+        let mut leaf = StorageHeaderLeaf::known_typed(
+            generation.clone(),
+            StorageHeaderDescriptor {
+                ty: Ty::Slice(Scalar::Str),
+                kind: StorageHeaderKind::View,
+            },
+        );
+        for known in [true, false] {
+            leaf.known = known;
+            let headers = ProjectedHeaderFact::from_leaf(path.clone(), leaf.clone());
+            let resolved = state.resolve_headers(&headers).non_storage;
+            assert_eq!(
+                resolved.flatten(),
+                roots,
+                "no property or lifetime root is lost"
+            );
+            let mut expected_path = path.clone();
+            if !known {
+                expected_path.push(BorrowProjection::ArrayElement(0));
+            }
+            assert_eq!(
+                resolved.projected.keys().collect::<Vec<_>>(),
+                vec![&expected_path]
+            );
+            assert!(
+                resolved.direct.is_empty(),
+                "siblings never inherit known view contents"
+            );
+            assert_eq!(
+                state.storage.contents.entries[&generation], contents,
+                "indexed reads keep the original backing coordinates"
             );
         }
     }

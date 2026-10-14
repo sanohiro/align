@@ -595,6 +595,83 @@ fn main()->i32 {
 }
 
 #[test]
+fn expired_contents_preserve_independent_siblings() {
+    owned_fixture::run("expired_contents_preserve_independent_siblings", |stage| {
+        let result = (|| -> TestResult {
+            for (label, declaration, initialization, selected, sibling) in [
+                (
+                    "field",
+                    "T {a:array<str>,b:array<str>}",
+                    "mut row:=T{a:[\"old\"].to_array(),b:[\"sibling\"].to_array()}",
+                    "row.a",
+                    "row.b",
+                ),
+                (
+                    "nested",
+                    "T {a:array<str>,b:array<str>} Outer {inner:T}",
+                    "mut row:=Outer{inner:T{a:[\"old\"].to_array(),b:[\"sibling\"].to_array()}}",
+                    "row.inner.a",
+                    "row.inner.b",
+                ),
+                (
+                    "fixed",
+                    "T {a:[str;1],b:[str;1]}",
+                    "mut row:=T{a:[\"old\"],b:[\"sibling\"]}",
+                    "row.a",
+                    "row.b",
+                ),
+                (
+                    "root",
+                    "",
+                    "mut first:=[\"old\"].to_array();second:=[\"sibling\"].to_array()",
+                    "first",
+                    "second",
+                ),
+            ] {
+                let prefix = format!(
+                    "{declaration} Views {{selected:slice<str>,other:slice<str>}} Observer {{inner:Views}} fn consume(value:string){{}} fn main()->i32{{arena {{owner:=\"live\".clone();view:str:=owner;{initialization};observer:=Observer{{inner:Views{{selected:{selected}[..],other:{sibling}[..]}}}};{selected}[0]=view;consume(owner);"
+                );
+                let positive = format!(
+                    "{prefix}if {sibling}[0]!=\"sibling\" || observer.inner.other[0]!=\"sibling\" {{return 1}}}};return 0}}"
+                );
+                execute(stage, &positive, label)?;
+                for observed in [
+                    format!("{selected}[0]"),
+                    "observer.inner.selected[0]".into(),
+                ] {
+                    let source = format!("{prefix}print({observed})}};return 0}}");
+                    let path = stage.join("main.align");
+                    std::fs::write(&path, &source)?;
+                    for per_unit in [false, true] {
+                        let mut sources = SourceMap::new();
+                        let diags = if per_unit {
+                            align_driver::check_per_unit(
+                                &mut sources,
+                                path.to_str().ok_or("path")?,
+                                &source,
+                            )
+                            .diags
+                        } else {
+                            align_driver::check(&mut sources, path.to_str().ok_or("path")?, &source)
+                                .diags
+                        };
+                        let text = align_driver::format_diagnostics(&sources, &diags);
+                        assert!(
+                            diags.has_errors() && text.contains("invalidated"),
+                            "{label}/{observed}/{per_unit}: {text}"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    });
+}
+
+#[test]
 fn malformed_header_precedes_codegen() {
     owned_fixture::run("malformed_header_precedes_codegen", |stage| {
         let result = (|| -> TestResult {
