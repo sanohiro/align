@@ -5369,16 +5369,17 @@ unsafe fn write_field_indexed<D: FieldDst>(
     // is already 0); any other value writes the payload at `p` (the `Option`'s payload slot) and sets
     // the `Some` tag byte. A required field writes the value directly. The per-kind write (incl. the
     // kind-4 nested recursion) is the single-sourced [`write_value`], shared with the slow path.
-    if d.opt_tag >= 0 {
-        if vp.skip_null().is_some() {
-            return Some(());
-        }
+    if d.opt_tag < 0 || vp.skip_null().is_none() {
         unsafe { write_value(&mut vp, kind, width, d, p)? };
-        let tag = unsafe { dst.byte_ptr(d.opt_tag, 1)? };
-        unsafe { *tag = 1 };
-        return Some(());
+        if d.opt_tag >= 0 {
+            let tag = unsafe { dst.byte_ptr(d.opt_tag, 1)? };
+            unsafe { *tag = 1 };
+        }
     }
-    unsafe { write_value(&mut vp, kind, width, d, p) }
+    // A typed value must consume its entire token, not an integer prefix of a
+    // valid JSON fraction/exponent. The enclosing grammar is already validated.
+    vp.ws();
+    matches!(vp.peek(), Some(b',' | b'}')).then_some(())
 }
 
 /// Mison **speculation** fast path: the record's colon count matched the learned pattern, so for each
@@ -5498,10 +5499,14 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
     arena: *mut Arena,
 ) -> i32 {
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    // Validate the whole input once before any clean view or arena materialization is published.
-    if !validate_utf8(src) || !validate_json_string_grammar(src) {
+    if !validate_utf8(src) {
         return 1;
     }
+    // The lean SIMD index omits commas and value tokens. Authenticate complete
+    // syntax and direct-object membership before any decoded owner is staged.
+    let Some(expected_rows) = json_record_array_count(src).and_then(|n| i64::try_from(n).ok()) else {
+        return 1;
+    };
     let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
     let phf_seed = phf_seed as u64;
@@ -5582,7 +5587,7 @@ pub unsafe extern "C" fn align_rt_json_decode_struct_array(
                 _ => {}
             }
         }
-        if !started || depth != 0 {
+        if !started || depth != 0 || count != expected_rows {
             return None;
         }
         // No non-whitespace may follow the array's closing `]` (catches non-structural junk like `]x`).
@@ -5712,9 +5717,9 @@ fn soa_column_start(off: usize, width: usize, first: bool) -> Option<usize> {
 }
 
 /// `json.decode(input)` straight into a column-major `soa<Struct>` (the direct-fill rail) — no AoS
-/// intermediate, no transpose. Two passes over the SIMD structural index: pass 1 counts records (so
-/// the column offsets, which depend on the row count, can be computed) and validates the array
-/// structure; pass 2 decodes each record's values directly into its columns via the shared
+/// intermediate, no transpose. The shared grammar pass counts exact direct object members, so
+/// column offsets can be computed before allocation. One SIMD structural-index walk then
+/// decodes each record's values directly into its columns via the shared
 /// [`json_speculate`]/[`json_fallback`] writers with a [`SoaDst`]. The column buffer is bump-allocated
 /// from `arena` (so the result is region-tied and bulk-freed, like the transpose path it replaces).
 /// Writes the soa `{ptr, len}` view (len = row count) to `out`. Returns 0 on success, 1 on a parse
@@ -5742,62 +5747,16 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     }
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
     // Clean strings borrow src; escaped selected strings materialize in arena.
-    if !validate_utf8(src) || !validate_json_string_grammar(src) {
+    if !validate_utf8(src) {
         return 1;
     }
+    let Some(n_rows) = json_record_array_count(src) else { return 1 };
     let descs: &[JsonField] = unsafe { safe_slice(fields, n_fields) };
     let phf = unsafe { phf_slice(phf, phf_len) };
     let phf_seed = phf_seed as u64;
 
     let mut idx: Vec<u32> = Vec::new();
     json_decode_index(src, &mut idx);
-
-    // Pass 1: validate the array structure and count records (no value parsing). The bracket-depth
-    // logic mirrors the AoS walk; a depth-2 `{` opens a record.
-    let mut depth: i32 = 0;
-    let mut started = false;
-    let mut n_rows: usize = 0;
-    let mut array_close = 0usize;
-    let count_ok = (|| -> Option<()> {
-        for k in 0..idx.len() {
-            let pos = idx[k] as usize;
-            match src[pos] {
-                b'[' => {
-                    depth += 1;
-                    if depth == 1 {
-                        started = true;
-                    }
-                }
-                b'{' => {
-                    depth += 1;
-                    if depth == 2 {
-                        n_rows += 1;
-                    }
-                }
-                b'}' => depth -= 1,
-                b']' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        if k != idx.len() - 1 {
-                            return None; // trailing structural token after the array closed
-                        }
-                        array_close = pos;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if !started || depth != 0 {
-            return None;
-        }
-        if src[array_close + 1..].iter().any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
-            return None;
-        }
-        Some(())
-    })();
-    if count_ok.is_none() {
-        return 1;
-    }
 
     // An empty array allocates nothing — the soa view is `{null, 0}`.
     if n_rows == 0 {
@@ -5854,7 +5813,7 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
         }
         Some(())
     })();
-    if fill_ok.is_none() {
+    if fill_ok.is_none() || row != n_rows {
         return 1;
     }
     unsafe { *out = AlignStr { ptr: base, len: row as i64 } };
@@ -7649,6 +7608,98 @@ fn validate_json_string_grammar(src: &[u8]) -> bool {
         pos = end + 1;
     }
     true
+}
+
+#[derive(Clone, Copy)]
+enum JsonGrammarState {
+    ArrayValue { empty: bool },
+    ArrayDelimiter,
+    ObjectKey { empty: bool },
+    ObjectColon,
+    ObjectValue,
+    ObjectDelimiter,
+}
+
+/// Validate one complete object array before indexed decoding and count its
+/// direct rows. Lexical skipping converts no numbers and materializes no text.
+/// The explicit state stack is bounded by input nesting, not native stack depth.
+fn json_record_array_count(src: &[u8]) -> Option<usize> {
+    use JsonGrammarState::*;
+    let mut p = JsonParser { src, pos: 0, arena: core::ptr::null_mut() };
+    p.ws();
+    p.expect(b'[')?;
+    let mut stack = vec![ArrayValue { empty: true }];
+    let mut rows = 0usize;
+    while let Some(&state) = stack.last() {
+        p.ws();
+        match state {
+            ArrayValue { empty: true } if p.peek() == Some(b']') => {
+                p.pos += 1;
+                stack.pop();
+            }
+            ArrayValue { .. } | ObjectValue => {
+                if stack.len() == 1 {
+                    if p.peek() != Some(b'{') { return None; }
+                    rows = rows.checked_add(1)?;
+                }
+                *stack.last_mut()? = match state {
+                    ArrayValue { .. } => ArrayDelimiter,
+                    _ => ObjectDelimiter,
+                };
+                match p.peek()? {
+                    b'[' => {
+                        p.pos += 1;
+                        stack.push(ArrayValue { empty: true });
+                    }
+                    b'{' => {
+                        p.pos += 1;
+                        stack.push(ObjectKey { empty: true });
+                    }
+                    b'"' => p.skip_string()?,
+                    b'-' | b'0'..=b'9' => p.skip_number()?,
+                    b't' | b'f' => { p.boolean()?; }
+                    b'n' => p.skip_null()?,
+                    _ => return None,
+                }
+            }
+            ArrayDelimiter => match p.peek()? {
+                b',' => {
+                    p.pos += 1;
+                    *stack.last_mut()? = ArrayValue { empty: false };
+                }
+                b']' => {
+                    p.pos += 1;
+                    stack.pop();
+                }
+                _ => return None,
+            },
+            ObjectKey { empty: true } if p.peek() == Some(b'}') => {
+                p.pos += 1;
+                stack.pop();
+            }
+            ObjectKey { .. } => {
+                p.skip_string()?;
+                *stack.last_mut()? = ObjectColon;
+            }
+            ObjectColon => {
+                p.expect(b':')?;
+                *stack.last_mut()? = ObjectValue;
+            }
+            ObjectDelimiter => match p.peek()? {
+                b',' => {
+                    p.pos += 1;
+                    *stack.last_mut()? = ObjectKey { empty: false };
+                }
+                b'}' => {
+                    p.pos += 1;
+                    stack.pop();
+                }
+                _ => return None,
+            },
+        }
+    }
+    p.ws();
+    (p.pos == src.len()).then_some(rows)
 }
 
 /// The key `"..."` immediately before the colon at byte position `cpos`, scanned from the raw bytes
@@ -54259,3 +54310,6 @@ mod batch_byte_transform_tests {
 
 #[cfg(all(test, feature = "alloc-count"))]
 mod json_array_root_tests;
+
+#[cfg(test)]
+mod json_record_array_grammar_tests;
