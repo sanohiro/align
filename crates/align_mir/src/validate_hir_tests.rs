@@ -11257,7 +11257,8 @@ fn hir_body_validator_pipeline_deferred_b2b2() {
             doc: Box::new(unit.clone()),
             index: Box::new(number.clone()),
         },
-        hir::ExprKind::JsonDocElems {
+        hir::ExprKind::JsonDocCollect {
+            kind: hir::JsonDocCollection::Values,
             doc: Box::new(unit.clone()),
         },
         hir::ExprKind::JsonScan {
@@ -11639,7 +11640,7 @@ fn hir_body_validator_pipeline_template_json_group() {
         vec![local(0, "doc", Ty::JsonDoc)],
         arena(
             body_test_expr(
-                hir::ExprKind::JsonDocElems { doc: Box::new(doc_local()) },
+                hir::ExprKind::JsonDocCollect { kind: hir::JsonDocCollection::Values, doc: Box::new(doc_local()) },
                 Ty::Slice(Scalar::JsonDoc),
             ),
             Ty::Slice(Scalar::JsonDoc),
@@ -19981,6 +19982,31 @@ fn checked_byte_views_hir_rejects_forged_type_equations_in_every_entrypoint() {
         }
         assert_body_entrypoints_empty("inverse-byte-view-forged", &malformed);
     }
+}
+
+#[test]
+fn json_doc_collection_hir_exact_discriminator_and_arena() -> Result<(), &'static str> {
+    for method in ["elems", "keys"] {
+        let base = checked_source_program(&format!("import core.json\nfn f(d:json.doc) -> i64 = arena {{ collection:=d.{method}(); collection.len() }}\n"));
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..5 {
+            let mut wrong = base.clone();
+            let function = wrong.fns.iter_mut().find(|f| f.name == "f").ok_or("collection function")?;
+            let tail = function.body.value.as_mut().ok_or("arena tail")?;
+            let hir::ExprKind::Arena(block) = &mut tail.kind else { return Err("arena collection fixture"); };
+            let hir::Stmt::Let { init, .. } = &mut block.stmts[0] else { return Err("collection binding"); };
+            let hir::ExprKind::JsonDocCollect { kind, doc } = &mut init.kind else { return Err("collection operation"); };
+            match mutation {
+                0 => *kind = match kind { hir::JsonDocCollection::Values => hir::JsonDocCollection::Keys, hir::JsonDocCollection::Keys => hir::JsonDocCollection::Values },
+                1 => init.ty = Ty::Slice(Scalar::Bool),
+                2 => **doc = body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+                3 => doc.kind = hir::ExprKind::Local(u32::MAX),
+                _ => { tail.kind = hir::ExprKind::Block(block.clone()); }
+            }
+            assert_body_entrypoints_empty("json-collection-exact", &wrong);
+        }
+    }
+    Ok(())
 }
 
 #[test]

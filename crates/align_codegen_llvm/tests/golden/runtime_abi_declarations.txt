@@ -320,6 +320,7 @@ key|JsonDocAt|json_doc_at|IndirectStorage|declare void @align_rt_json_doc_at(ptr
 key|JsonDocElems|json_doc_elems|IndirectStorage|declare void @align_rt_json_doc_elems(ptr, i64, ptr, ptr) #2
 key|JsonDocGet|json_doc_get|IndirectStorage|declare void @align_rt_json_doc_get(ptr, i64, ptr, i64, ptr) #2
 key|JsonDocKey|json_doc_key|IndirectStorage|declare i32 @align_rt_json_doc_key(ptr, i64, i64, ptr) #2
+key|JsonDocKeys|json_doc_keys|IndirectStorage|declare void @align_rt_json_doc_keys(ptr, i64, ptr, ptr) #2
 key|JsonDocKind|json_doc_kind|IndirectStorage|declare i32 @align_rt_json_doc_kind(ptr, i64) #2
 key|JsonDocLen|json_doc_len|IndirectStorage|declare i64 @align_rt_json_doc_len(ptr, i64) #2
 key|JsonDocParse|json_doc_parse|IndirectStorage|declare i32 @align_rt_json_doc_parse(ptr, i64, ptr, ptr) #2

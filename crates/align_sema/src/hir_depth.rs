@@ -908,7 +908,7 @@ fn walk_body_records<'a>(
                 | ExprKind::JsonDocAsStr { doc: recv }
                 | ExprKind::JsonDocAsScalar { doc: recv, .. }
                 | ExprKind::JsonDocLen { doc: recv }
-                | ExprKind::JsonDocElems { doc: recv }
+                | ExprKind::JsonDocCollect { doc: recv, .. }
                 | ExprKind::JsonScan { input: recv, .. }
                 | ExprKind::FsReadFile { path: recv }
                 | ExprKind::FsCreatePrivateTempDir { prefix: recv }

@@ -813,7 +813,13 @@ writes the live payload bare); schema-unknown JSON is read through the zero-copy
 total Missing-propagating navigation `d.get(k)` / `d.at(i)` (always a `json.doc`), `d.kind()` → the
 builtin `json.kind` sum type, leaf accessors `as_str` / `as_i64` / `as_f64` / `as_bool` → `Option`,
 `d.len()` / `d.key(i)` (objects-as-ordered-data), and `d.elems() -> slice<json.doc>` (materialize a
-level once, then index/`len`/recurse — reuses the slice machinery, no new array type); `json.scan`
+level once, then index/`len`/recurse — reuses the slice machinery, no new array type),
+and `d.keys() -> slice<str>` (ordered decoded Object keys, preserving duplicates
+and paired with `elems()`; non-objects/Missing are empty). `keys()` requires an
+explicit arena for its header array and escaped-key bytes; clean keys borrow
+input. Slice and elements retain both doc/input/parse-arena and call-arena
+lifetimes. Its work is O(member count + key bytes), indexing O(1), with existing
+parse errors and terminal arena allocation failure. `json.scan`
 streams typed rows as a pipeline source. The
 core.json surface is exactly `decode`/`encode`/`encode_bounded`/`doc`/`scan` — `validate<T>`,
 `token`, and `field_table<T>` are deleted. `encode_bounded` is shipped with the same typed encode

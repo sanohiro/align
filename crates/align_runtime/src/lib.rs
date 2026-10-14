@@ -8535,14 +8535,15 @@ pub unsafe extern "C" fn align_rt_json_doc_as_str(tape: *const DocTape, node: i6
         return 0;
     }
     let t = unsafe { &*tape };
-    unsafe { doc_write_str(t, n.a, n.b, out) }
+    unsafe { doc_write_str(t, n.a, n.b, t.arena, out) }
 }
 
 /// Write the JSON string body at input byte-range `[start, start+len)` into `out` as a `str` view:
 /// zero-copy when escape-free, else unescaped into the arena (bulk-freed at arena end). Returns 1
 /// (written) or 0 (a malformed escape — parse validated escapes, so this is defensive only). Shared
-/// by `as_str` (a Str value) and `key` (an object member key).
-unsafe fn doc_write_str(t: &DocTape, start: u32, len: u32, out: *mut AlignStr) -> i32 {
+/// by `as_str`, `key` and `keys`. The caller chooses the live destination arena;
+/// legacy individual accessors use the parse arena, collection uses its call arena.
+unsafe fn doc_write_str(t: &DocTape, start: u32, len: u32, arena: *mut Arena, out: *mut AlignStr) -> i32 {
     let input = unsafe { doc_input(t) };
     let raw = &input[start as usize..start as usize + len as usize];
     if !raw.contains(&b'\\') {
@@ -8552,7 +8553,7 @@ unsafe fn doc_write_str(t: &DocTape, start: u32, len: u32, out: *mut AlignStr) -
     let Some(decoded_len) = json_unescaped_len(raw) else {
         return 0;
     };
-    let arena_ref = unsafe { &mut *t.arena };
+    let arena_ref = unsafe { &mut *arena };
     let dst = arena_ref.alloc_uninit(decoded_len, 1);
     let output = unsafe { core::slice::from_raw_parts_mut(dst, decoded_len) };
     if json_unescape_to(raw, output).is_none() {
@@ -8595,8 +8596,56 @@ pub unsafe extern "C" fn align_rt_json_doc_key(tape: *const DocTape, node: i64, 
         mi = unsafe { &*t.nodes.add(vi) }.next as usize; // the next member's key
     }
     let kn = unsafe { &*t.nodes.add(mi) };
-    unsafe { doc_write_str(t, kn.a, kn.b, out) }
+    unsafe { doc_write_str(t, kn.a, kn.b, t.arena, out) }
 }
+
+/// `d.keys()` — materialize object keys in document order as `slice<str>`.
+/// Duplicates remain distinct entries, paired with the same indices in `elems()`.
+/// Clean keys borrow the input; escaped bytes and the header array use `arena`.
+/// One forward sibling walk costs O(member count + key bytes), skipping values.
+/// Non-objects, Missing and empty objects publish an empty slice.
+///
+/// # Safety
+/// `tape` is null or a live parser-produced tape with its immutable input alive.
+/// `arena` is null or live; `out` is null or a writable, aligned, disjoint header.
+/// The returned views may not outlive the input, parse arena or destination arena.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_doc_keys(tape: *const DocTape, node: i64, arena: *mut Arena, out: *mut AlignStr) {
+    if out.is_null() {
+        return;
+    }
+    let empty = AlignStr { ptr: core::ptr::null(), len: 0 };
+    let (Some(n), false) = (unsafe { doc_node(tape, node) }, arena.is_null()) else {
+        unsafe { out.write(empty) };
+        return;
+    };
+    if n.kind != DOC_OBJECT || n.a == 0 {
+        unsafe { out.write(empty) };
+        return;
+    }
+    let t = unsafe { &*tape };
+    let count = usize::try_from(n.a).unwrap_or_else(|_| align_rt_alloc_size_fail());
+    let bytes = count.checked_mul(core::mem::size_of::<AlignStr>())
+        .filter(|bytes| isize::try_from(*bytes).is_ok())
+        .unwrap_or_else(|| align_rt_alloc_size_fail());
+    // End the mutable Arena borrow before decoding can allocate in that same arena.
+    let buf = unsafe { (&mut *arena).alloc_uninit(bytes, core::mem::align_of::<AlignStr>()) } as *mut AlignStr;
+    let mut ki = usize::try_from(node).ok().and_then(|index| index.checked_add(1))
+        .unwrap_or_else(|| align_rt_alloc_size_fail());
+    for i in 0..count {
+        let key = unsafe { &*t.nodes.add(ki) };
+        if unsafe { doc_write_str(t, key.a, key.b, arena, buf.add(i)) } != 1 {
+            // A live parser-produced tape has already validated every key. Never publish
+            // a successful truncated collection if that private invariant is violated.
+            std::process::abort();
+        }
+        let vi = usize::try_from(key.next).unwrap_or_else(|_| align_rt_alloc_size_fail());
+        ki = usize::try_from(unsafe { &*t.nodes.add(vi) }.next).unwrap_or_else(|_| align_rt_alloc_size_fail());
+    }
+    unsafe { out.write(AlignStr { ptr: buf.cast(), len: i64::from(n.a) }) };
+}
+
+const _: unsafe extern "C" fn(*const DocTape, i64, *mut Arena, *mut AlignStr) = align_rt_json_doc_keys;
 
 /// `d.elems()` — materialize one document level as an arena-backed `slice<json.doc>` `{ptr,len}`:
 /// each Array element, or each Object member **value** (keys are read separately via `key(i)`), as a
@@ -52280,6 +52329,99 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
         unsafe { align_rt_json_doc_elems(n.tape, n.node, arena, &mut esl) };
         assert_eq!(esl.len, 0);
         unsafe { align_rt_arena_end(arena) };
+    }
+
+    #[test]
+    fn json_doc_keys_order_decoding_arena_and_empty_matrix() {
+        struct ArenaOwner(*mut Arena);
+        impl Drop for ArenaOwner {
+            fn drop(&mut self) { unsafe { align_rt_arena_end(self.0) }; }
+        }
+        let empty = || AlignStr { ptr: core::ptr::null(), len: -1 };
+        let bytes = |view: &AlignStr| unsafe {
+            core::slice::from_raw_parts(view.ptr, usize::try_from(view.len).unwrap())
+        };
+        let input = r#"{"plain":0,"":1,"é":2,"\"\\\/\b\f\n\r\t":3,"\u0000":4,"\u304b\u3099":5,"\ud83d\ude00":6,"same":7,"\u0073ame":8,"nested":{"a":[1,{"b":2}]},"last":10}"#;
+        let expected: &[&[u8]] = &[b"plain", b"", "é".as_bytes(), b"\"\\/\x08\x0c\n\r\t", b"\0",
+            "が".as_bytes(), "😀".as_bytes(), b"same", b"same", b"nested", b"last"];
+        for same_arena in [false, true] {
+            let (parse, root) = unsafe { doc_parse(input) }.unwrap();
+            let parse = ArenaOwner(parse);
+            let separate = ArenaOwner(align_rt_arena_begin());
+            let destination = if same_arena { parse.0 } else { separate.0 };
+            let parse_before = unsafe { ((*parse.0).chunks.len(), (*parse.0).off) };
+            let mut keys = empty();
+            unsafe { align_rt_json_doc_keys(root.tape, root.node, destination, &mut keys) };
+            assert_eq!(keys.len, i64::try_from(expected.len()).unwrap());
+            let table = unsafe { core::slice::from_raw_parts(keys.ptr.cast::<AlignStr>(), expected.len()) };
+            let belongs = |ptr: *const u8, len: usize| unsafe { &*destination }.chunks.iter().any(|chunk| {
+                ptr.addr() >= chunk.as_ptr().addr()
+                    && ptr.addr().checked_add(len).is_some_and(|end| end <= chunk.as_ptr().addr() + chunk.len())
+            });
+            assert!(belongs(keys.ptr, expected.len() * core::mem::size_of::<AlignStr>()));
+            for (index, (key, want)) in table.iter().zip(expected).enumerate() {
+                assert_eq!(bytes(key), *want, "key {index}");
+                if matches!(index, 3 | 4 | 5 | 6 | 8) {
+                    assert!(belongs(key.ptr, want.len()), "escaped key {index} uses the destination arena");
+                } else {
+                    let spelling = format!("\"{}\":", core::str::from_utf8(want).unwrap());
+                    let offset = input.find(&spelling).unwrap() + 1;
+                    assert_eq!(key.ptr, unsafe { input.as_ptr().add(offset) }, "clean key {index} borrows exact input span");
+                }
+            }
+            if !same_arena {
+                assert_eq!(unsafe { ((*parse.0).chunks.len(), (*parse.0).off) }, parse_before,
+                    "keys must not allocate into an unrelated parse arena");
+            }
+            let mut repeated = empty();
+            unsafe { align_rt_json_doc_keys(root.tape, root.node, destination, &mut repeated) };
+            assert_ne!(keys.ptr, repeated.ptr);
+            assert_eq!(repeated.len, keys.len);
+            let mut values = empty();
+            unsafe { align_rt_json_doc_elems(root.tape, root.node, destination, &mut values) };
+            assert_eq!(values.len, keys.len);
+            let values = unsafe { core::slice::from_raw_parts(values.ptr.cast::<DocHandle>(), expected.len()) };
+            for (index, value) in values.iter().enumerate() {
+                if index == 9 {
+                    assert_eq!(unsafe { align_rt_json_doc_kind(value.tape, value.node) }, i32::try_from(DOC_OBJECT).unwrap());
+                } else {
+                    let mut integer = -1;
+                    assert_eq!(unsafe { align_rt_json_doc_as_i64(value.tape, value.node, &mut integer) }, 1);
+                    assert_eq!(integer, i64::try_from(index).unwrap());
+                }
+            }
+            // Existing individual accessors still use the parse arena, not destination.
+            let mut old = empty();
+            assert_eq!(unsafe { align_rt_json_doc_key(root.tape, root.node, 8, &mut old) }, 1);
+            assert_eq!(bytes(&old), b"same");
+        }
+        for input in ["{}", "[]", "[1,{}]", "\"x\"", "1", "true", "false", "null"] {
+            let (parse, root) = unsafe { doc_parse(input) }.unwrap();
+            let parse = ArenaOwner(parse);
+            for (tape, node, arena) in [
+                (root.tape, root.node, parse.0), (root.tape, -1, parse.0),
+                (root.tape, i64::MAX, parse.0), (core::ptr::null(), 0, parse.0),
+                (root.tape, root.node, core::ptr::null_mut()),
+            ] {
+                let mut out = [empty(), empty(), empty()];
+                unsafe { align_rt_json_doc_keys(tape, node, arena, &mut out[1]) };
+                assert!(out[1].ptr.is_null());
+                assert_eq!(out[1].len, 0, "{input}");
+                assert_eq!(out[0].len, -1);
+                assert_eq!(out[2].len, -1);
+                unsafe { align_rt_json_doc_keys(tape, node, arena, core::ptr::null_mut()) };
+            }
+        }
+        let (parse, root) = unsafe { doc_parse(r#"{"only":7}"#) }.unwrap();
+        let parse = ArenaOwner(parse);
+        let mut out = [empty(), empty(), empty()];
+        unsafe { align_rt_json_doc_keys(root.tape, root.node, parse.0, &mut out[1]) };
+        assert_eq!(out[1].len, 1);
+        assert_eq!(bytes(unsafe { &*out[1].ptr.cast::<AlignStr>() }), b"only");
+        assert_eq!((out[0].len, out[2].len), (-1, -1));
+        unsafe { align_rt_json_doc_keys(root.tape, root.node, core::ptr::null_mut(), &mut out[1]) };
+        assert!(out[1].ptr.is_null());
+        assert_eq!(out[1].len, 0);
     }
 
     #[test]

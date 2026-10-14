@@ -398,7 +398,7 @@ the few boundaries that remain:
   type, not a JSON matrix-fill; low value). See open-questions "T1b".
 - **`json.doc` (J4):** the schema-unknown lazy view — arena-backed tape; navigation is total and
   Missing-propagating (`get`/`at` always return a doc; absence surfaces once as `None` from a leaf
-  `as_*`); objects-as-data via ordered `key(i)`+`at(i)`; `elems()` materializes a level for
+  `as_*`); objects-as-data via ordered `keys()`+`elems()`; `elems()` materializes a level for
   pipelines (no map type, no serde-style value tree). **Slice 1 SHIPPED:** the `json.doc` type +
   `json.doc(s)?` parse (arena-backed tape, `Result<json.doc, Error>`) + `kind()` (→ builtin
   `json.kind` sum type) + `get`/`at` navigation + the four leaf accessors `as_str`/`as_i64`/`as_f64`/
@@ -412,7 +412,7 @@ the few boundaries that remain:
   The types `json.doc` and `json.kind` are now **nameable** (a `fn f(d: json.doc)` helper / a
   `k: json.kind` binding resolve directly — the two builtin `core.json` type names). **Slice 3 SHIPPED —
   J4 COMPLETE:** `d.elems() -> slice<json.doc>` materializes one level (each Array element, or each
-  Object member **value** — keys via `key(i)`) as an arena-backed `slice<json.doc>` **once** (O(n), then
+  Object member **value** — keys via `keys()` or `key(i)`) as an arena-backed `slice<json.doc>` **once** (O(n), then
   O(1) indexing — vs `at(i)`'s O(i) re-walk). It reuses the existing `slice` machinery:
   `slice<json.doc>` = `Ty::Slice(Scalar::JsonDoc)` (already representable — no new array type), so
   `.len()` and `xs[i] -> json.doc` (region-bound to the slice, a Copy 16-byte handle → no double-free)
@@ -421,11 +421,23 @@ the few boundaries that remain:
   `arena {}`), region-tied to min(input, arena). Full `.map`/`.where` **pipeline fusion** over a
   `slice<json.doc>` (closures taking `json.doc`) is the natural next step but not required — index + len
   + recursion cover level iteration today.
-  **Known systemic leniency (not a J4 regression — shared with `decode`'s scanner):** raw C0 control
-  bytes inside strings and leading zeros in numbers (`007`) are currently accepted; making the shared
-  `find_quote_or_escape` / `number_span` strict (RFC 8259 §7/§6) is a follow-up that must land for
-  `decode` and `doc` together (fixing only one would make `json.doc(s)` and `json.decode(s)` disagree
-  on the same malformed `s`).
+  **Linear keys (Plan186):** `d.keys() -> slice<str>` takes no arguments and
+  requires an explicit enclosing arena. Object keys retain document order and
+  every duplicate, including differently escaped spellings of the same bytes;
+  `keys()[i]` pairs with `elems()[i]`. Non-objects, Missing and empty objects
+  return an empty slice. The contiguous header array and each escaped key's
+  exact UTF-8 bytes allocate in the call's arena; clean keys borrow input.
+  Slice and elements retain the doc/input/parse-arena and call-arena lifetimes.
+  Unicode surrogate pairs and embedded U+0000 decode normally. One sibling
+  walk skips nested values in O(member count + key bytes), then indexing is
+  O(1); repeated calls materialize anew. Parse errors and terminal arena
+  allocation failure are unchanged. Individual key(i)/as_str still decode in
+  the parse arena; key(i) retains its O(i) prefix walk. No map or iterator type.
+  Shared string and number validation rejects raw C0 bytes, malformed escapes,
+  invalid UTF-8/surrogates and leading-zero numbers; the existing owned-JSON
+  and [numeric contract](../47-json-numeric-contract.md) owners govern doc and
+  decode together.
+
 - **`json.scan` (J5):** streaming typed rows, binding-annotation-typed, pipeline source only.
   **Slice 1 SHIPPED:** the `json.scanner<Row>` type (a Copy `{ptr,len}` input view, region-tracked —
   it borrows the input, never materializes an `array<Row>`) + `json.scan(view)` (row type from the

@@ -372,7 +372,7 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   型 `json.doc` / `json.kind` は**名前で書ける**ようになった（`fn f(d: json.doc)` ヘルパや
   `k: json.kind` 束縛が直接解決 — `core.json` の 2 つの組み込み型名）。**Slice 3 SHIPPED — J4 完了:**
   `d.elems() -> slice<json.doc>` は 1 階層（Array の各要素、または Object の各メンバー**値** — キーは
-  `key(i)`）を arena 常駐の `slice<json.doc>` に**一度で** materialize する（O(n)、以降のインデックスは
+  `keys()` または `key(i)`）を arena 常駐の `slice<json.doc>` に**一度で** materialize する（O(n)、以降のインデックスは
   O(1)。`at(i)` の呼び出しごと O(i) 再走査に対して有利）。既存の `slice` 機構を再利用:
   `slice<json.doc>` = `Ty::Slice(Scalar::JsonDoc)`（既に表現可能 — 新配列型は不要）なので `.len()` と
   `xs[i] -> json.doc`（slice に region 拘束、Copy な 16 バイトハンドル → 二重解放なし）がそのまま動き、
@@ -380,10 +380,21 @@ draft §14 + §18.1）。以下は出荷済みスライスと、現在も残る�
   slice バッファは外側 arena に bump-allocate（`arena {}` が必要）、min(input, arena) に region 拘束。
   `slice<json.doc>` 上の `.map`/`.where` **pipeline fusion**（json.doc を取る closure）は自然な次段だが
   必須ではない — index + len + 再帰で階層反復は今日すでにできる。
-  **既知の systemic な緩さ（J4 の退行ではない — `decode` のスキャナと共有）:** 文字列内の生の C0 制御
-  バイトと数値の先頭ゼロ（`007`）を現状は受理する。共有の `find_quote_or_escape` / `number_span` を
-  RFC 8259 §7/§6 準拠に厳格化するのは `decode` と `doc` を**同時に**直す follow-up（片方だけ直すと
-  同じ不正入力 `s` に対し `json.doc(s)` と `json.decode(s)` が食い違う）。
+  **線形なキー列挙 (Plan186):** `d.keys() -> slice<str>` は引数なしで、明示的な
+  外側 arena を必要とする。Object のキーを文書順に返し、異なるエスケープ表記が同じ
+  バイト列になる場合も含め、全ての重複を残す。`keys()[i]` は `elems()[i]` と対応する。
+  Object 以外、Missing、空の Object は空の slice。連続したヘッダ配列とエスケープを
+  解いた各キーの正確な UTF-8 バイト列は呼び出し側 arena に確保し、無加工のキーは
+  入力を借用する。slice と各要素は doc/入力/parse arena と呼び出し側 arena の両方に
+  寿命を拘束される。Unicode サロゲートペアと U+0000 も通常どおりデコードする。
+  兄弟ノードを一度走査し、入れ子の値を飛ばすため O(メンバー数 + キーバイト数)、以後の
+  添字アクセスは O(1)。再呼び出しは再確保する。parse のエラーと arena 確保失敗時の
+  終了規則は不変。個別の key(i)/as_str は引き続き parse arena でデコードし、key(i)
+  は O(i) の先頭からの走査を行う。map 型や iterator 型は追加しない。
+  共通の文字列・数値検証は、生の C0 バイト、不正なエスケープ、UTF-8/サロゲート、
+  数値の先頭ゼロを拒否する。既存の owned-JSON と
+  [数値契約](../../47-json-numeric-contract.md) のテストが doc と decode の両方を担う。
+
 - **`json.scan`（J5）:** 型付き行ストリーミング。binding annotation で型付け、v1 は pipeline
   source 専用。**Slice 1 出荷済み:** `json.scanner<Row>` 型（Copy の `{ptr,len}` 入力ビュー。
   region-tracked — 入力を借用し、`array<Row>` を実体化しない）＋ `json.scan(view)`（行型は binding

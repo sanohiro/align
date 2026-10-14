@@ -940,7 +940,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             doc: boxed!(doc),
             index: boxed!(index),
         },
-        ExprKind::JsonDocElems { doc } => ExprKind::JsonDocElems { doc: boxed!(doc) },
+        ExprKind::JsonDocCollect { kind, doc } => ExprKind::JsonDocCollect { kind: *kind, doc: boxed!(doc) },
         ExprKind::JsonScan { struct_id, input } => ExprKind::JsonScan {
             struct_id: *struct_id,
             input: boxed!(input),
@@ -2801,7 +2801,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::JsonDocAsStr { doc: recv }
         | ExprKind::JsonDocAsScalar { doc: recv, .. }
         | ExprKind::JsonDocLen { doc: recv }
-        | ExprKind::JsonDocElems { doc: recv }
+        | ExprKind::JsonDocCollect { doc: recv, .. }
         | ExprKind::JsonScan { input: recv, .. }
         | ExprKind::FsReadFile { path: recv }
         | ExprKind::FsCreatePrivateTempDir { prefix: recv }

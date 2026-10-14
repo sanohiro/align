@@ -5876,14 +5876,26 @@ missing member / out-of-range index yields `kind() == Missing`, which propagates
 navigation, so absence surfaces exactly once — as `None` from a leaf accessor
 (`as_str/as_i64/as_f64/as_bool -> Option<…>`). `kind() -> json.kind { Object, Array, Str, Number,
 Bool, Null, Missing }` distinguishes JSON `null` from absence when asked; both yield `None` from
-`as_*`. Keys-as-data (object-as-`map`) is `d.key(i) -> Option<str>` + `d.at(i)` over an object's
+`as_*`. Keys-as-data (object-as-`map`) is `d.key(i) -> Option<str>` + `d.elems()[i]` over an object's
 ordered members — NO map type enters the language. `d.len()` is 0 on a non-container; `d.elems()
--> array<json.doc>` bump-materializes child handles so ordinary pipelines run over a document
+-> slice<json.doc>` bump-materializes child handles so ordinary pipelines run over a document
 level (the Align idiom instead of an iterator protocol). `json.doc` is a Copy view handle
 region-tied to min(input, arena); nothing escapes the arena un-cloned. Implementation details
 recorded for the slice: `.at(i)`/`.get(k)` are linear at one nesting level (tape sibling-skip
 offsets make each hop O(1); use `elems()` for whole-level loops); an escaped string in `as_str()`
 unescapes into the arena (bump, bulk-freed — the one allocating accessor, documented).
+
+**Linear JSON keys — SETTLED (2026-10-14).** `d.keys() -> slice<str>`
+materializes Object keys in document order, preserving all decoded duplicates
+and pairing with `elems()` by index; every non-Object/Missing result is empty.
+The zero-argument call requires an explicit arena. Headers and decoded escaped
+bytes allocate in that call's arena, while clean keys borrow input; all views
+retain both the doc/input/parse-arena and materialization-arena roots. Work is
+O(member count + key bytes), with O(1) indexing and no hidden cache. All JSON
+escapes including U+0000 remain semantic bytes. Parsing errors and terminal
+arena exhaustion retain the existing model. Existing key(i)/as_str parse-arena
+allocation and prefix-walk costs stay unchanged. [Plan186](impl/186-json-doc-keys.md)
+owns the shared Values/Keys IR discriminator and exact native output contract.
 
 **Direct owned JSON records — SETTLED AND IMPLEMENTED (2026-08-17).** A direct
 record with at least one `string`, `Option<string>`, or `array<string>` field selects one closed
@@ -6156,7 +6168,7 @@ slice `.len()` + `xs[i]` machinery (`check_index`'s Move-element rejection doesn
 is a Copy 16-byte handle, no double-free; `region_of(Index)` binds the element to the slice). The slice
 is nameable as a param type (`fn f(xs: slice<json.doc>)`), so a level is walked by recursion.
 Runtime `align_rt_json_doc_elems` bump-allocates a `DocHandle` buffer in the arena (checked_mul,
-null-safe) and writes the `{ptr,len}` header; region = arena.shorter(doc). New HIR/MIR `JsonDocElems`
+null-safe) and writes the `{ptr,len}` header; region = arena.shorter(doc). HIR/MIR `JsonDocCollect(Values)` is
 threaded through every exhaustive pass (region = arena-tied like `to_array`; not local-backed).
 Tests: `m5.rs` `json_doc_elems_materialize_and_iterate` (materialize → index → recursive sum) +
 `json-doc-elems-escape` (returning the slice out of the arena rejected, #297), runtime

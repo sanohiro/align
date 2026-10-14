@@ -24,6 +24,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan186](docs/impl/186-json-doc-keys.md) adds linear `json.doc.keys()`
+  materialization for voice V001, preserving document order, duplicates and
+  `elems()` pairing with explicit arena/input lifetimes. Consumer adoption
+  remains external.
+
 - [Plan185](docs/impl/185-read-only-regular-file.md) adds `fs.open_ro_regular`
   for media AM-R03: regular-file admission and positional I/O share one owned
   descriptor and the existing File model. Consumer adoption remains external.
