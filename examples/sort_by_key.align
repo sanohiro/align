@@ -1,6 +1,6 @@
 // sort_by_key(f) sorts the elements ascending by a computed key (draft.md §8). The key
-// function may be named or an inline lambda (which may capture). Reuses the same insertion
-// sort as `sort`, comparing keys instead of elements.
+// function may be named or an inline lambda (which may capture). Each key is evaluated once in
+// input order; the stable sort compares those recorded keys and preserves ties in input order.
 fn main() -> Result<(), Error> {
   arena {
     // sort by the last digit: 10, 21, 32, 3

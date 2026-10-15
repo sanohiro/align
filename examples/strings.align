@@ -1,5 +1,5 @@
 // Strings (M5). `str` is an immutable view `{ ptr, len }`; string literals are
-// interned constants. `print` now accepts strings as well as integers.
+// interned constants. `print` writes their bytes verbatim followed by a newline.
 fn greeting() -> str = "hello, align"
 
 fn main() -> i32 {

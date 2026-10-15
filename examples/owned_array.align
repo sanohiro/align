@@ -1,7 +1,7 @@
-// MMv2 slice 3: a materializing pipeline terminal. `.to_array()` collects the surviving
+// A materializing pipeline terminal. `.to_array()` collects the surviving
 // elements of a fused map/where pipeline into an *owned* `array<T>`, bump-allocated in the
-// enclosing arena (bulk-freed at the block's end — no per-binding drop yet). The owned array
-// is then consumed like a slice (`.len()`, `.sum()`).
+// enclosing arena and bulk-freed when that region ends. Outside an arena, the result is
+// individually owned and freed by Drop. `.len()` and `.sum()` borrow the array without moving it.
 
 fn double(x: i32) -> i32 = x * 2
 fn big(x: i32) -> bool = x > 4

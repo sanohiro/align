@@ -1,5 +1,6 @@
 // Template strings (M5). `template "...{expr}..."` interpolates expressions
-// (int or str) and builds a `str` via the runtime string builder.
+// (integers, floats, bool, char, or text) and builds a `str` via the runtime string builder.
+// Dynamic text borrows its arena, or a frame-owned backing allocation outside an arena.
 fn main() -> i32 {
   name := "align"
   score := 40

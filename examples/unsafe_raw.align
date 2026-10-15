@@ -1,8 +1,7 @@
-// `unsafe {}` + `raw.*` (M8, draft.md §6.5 / §15). Ordinary Align code has no raw pointers and never
-// manually frees — the safe core forbids use-after-free, manual free, and unchecked casts. The escape
-// hatch is an `unsafe {}` block, the only place `raw.*` operations are allowed:
+// `unsafe {}` + `raw.*` (M8, draft.md §6.5 / §15). Safe Align code relies on ownership and checked
+// access. Raw memory operations require an `unsafe {}` block and caller-managed lifetimes:
 //
-//   - `raw.alloc(size)` bump-allocates `size` bytes on the flat heap, yielding a `raw` byte pointer.
+//   - `raw.alloc(size)` allocates `size` bytes on the heap, yielding a `raw` byte pointer.
 //   - `raw.store(p, offset, v)` writes a primitive scalar at a byte offset; `raw.load(p, offset)`
 //     reads one back. No turbofish: the stored type follows the value, and the loaded type is taken
 //     from the expected type (a binding annotation), exactly like `json.decode`.

@@ -1,0 +1,18 @@
+// `loop` is the sequential iteration form. A value-carrying `break` makes it an expression;
+// mutable state lives outside the loop, and skipping work uses an `if` inside its body.
+fn first_at_least(values: slice<i64>, minimum: i64) -> Option<i64> {
+  mut index := 0
+  found: Option<i64> := loop {
+    if index == values.len() { break None }
+    if values[index] >= minimum { break Some(values[index]) }
+    index = index + 1
+  }
+  return found
+}
+
+fn main() -> i32 {
+  values := [3, 8, 13, 21]
+  print(first_at_least(values, 10) else -1) // 13
+  print(first_at_least(values, 30) else -1) // -1
+  return 0
+}

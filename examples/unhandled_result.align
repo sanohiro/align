@@ -1,4 +1,4 @@
-// The "unhandled Result" lint: a Result returned by a call must be handled, never silently
+// The "unhandled Result" error: a Result returned by a call must be handled, never silently
 // dropped (Align makes errors visible). Discarding one as a statement — `save(x)` on its own —
 // is a compile error. Handle it by propagating with `?`, branching with `match`, or binding it.
 

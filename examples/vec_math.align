@@ -1,7 +1,7 @@
-// Element-wise vector math (M6). Each op maps to one lane-wise hardware instruction (not a per-lane
-// loop). The unary float ops — `sqrt`, `abs`, `floor`, `ceil`, `round`, `trunc` — apply to a
-// `vecN<f32>`/`vecN<f64>`; `abs` and the element-wise `min`/`max` of two vectors also work on integer
-// vectors. (`pow` is a libcall, so it stays scalar.)
+// Element-wise vector math (M6). Operations lower through LLVM vector intrinsics; the selected
+// target determines the machine instructions. The unary float ops — `sqrt`, `abs`, `floor`,
+// `ceil`, `round`, `trunc` — apply to a `vecN<f32>`/`vecN<f64>`; `abs` and the element-wise
+// `min`/`max` of two vectors also work on integer vectors. (`pow` is a libcall, so it stays scalar.)
 
 fn main() -> i32 {
   v: vec4<f32> := [1.0, 4.0, 9.0, 16.0]

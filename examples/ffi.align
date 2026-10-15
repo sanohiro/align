@@ -6,8 +6,9 @@
 //
 //   - `extern "C" fn name(params) -> ret` declares a foreign function — bodyless, bound to the C
 //     symbol `name`. A braced group `extern "C" { fn ...\n fn ... }` declares several at once.
-//   - Only `extern "C"` is supported; parameter/return types are FFI-safe scalars (integers, floats,
-//     `raw`) or a `()` (void) return. Aggregates (`str`/`array`/struct) are a later slice.
+//   - Only `extern "C"` is supported. This example uses integers and `raw` pointers.
+//     View parameters lower to data pointers (ffi_views.align); eligible `layout(C)` records
+//     also pass and return by value on supported native targets. `()` is a void return.
 //   - A call is only valid inside an `unsafe {}` block: foreign code sits outside the safe core and
 //     can violate every invariant (ownership, no-alias, non-null), so the danger stays visible —
 //     exactly like a `raw.*` op. A function that calls an extern is therefore inferred impure.

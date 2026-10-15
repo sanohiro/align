@@ -1,7 +1,7 @@
 // Tuples / multi-value return (the anonymous product type `(T, U, ...)`). A function
 // returns more than one value by returning a tuple; the caller destructures it with
 // `(a, b) := ...`. Elements are read positionally (`t.0`) and `_` ignores one.
-// PR1 cut: tuple elements are primitive scalars (int/float/bool/char).
+// This tuple holds Copy scalars; split_array.align shows a tuple that moves owned arrays.
 fn divmod(a: i32, b: i32) -> (i32, i32) = (a / b, a % b)
 
 fn main() -> i32 {

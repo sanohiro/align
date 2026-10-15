@@ -1,0 +1,21 @@
+// `borrow` reads an owned array without moving it; `borrow mut` temporarily grants exclusive
+// access to update it. The caller keeps ownership, so the same array is usable after each call.
+fn total(borrow values: array<i64>) -> i64 = values.sum()
+
+fn add_to_all(borrow mut values: array<i64>, amount: i64) {
+  mut index := 0
+  loop {
+    if index == values.len() { break }
+    values[index] = values[index] + amount
+    index = index + 1
+  }
+}
+
+fn main() -> i32 {
+  // The allocation is explicit. Both helper calls borrow this one owned buffer.
+  mut values := [1, 2, 3].to_array()
+  print(total(values))       // 6
+  add_to_all(values, 2)
+  print(total(values))       // 12; the caller still owns the array
+  return 0
+}

@@ -1,0 +1,19 @@
+// `zip` pairs same-index elements; `map_into` writes directly into caller-provided storage.
+// All slices must have equal lengths, and the `out` buffer must have distinct backing from
+// both inputs. The pipeline allocates no intermediate array or output buffer.
+fn combine(left: slice<i64>, right: slice<i64>, out output: slice<i64>) {
+  zip(left, right)
+    .map(fn pair { pair.0 * 2 + pair.1 })
+    .map_into(output)
+}
+
+fn main() -> i32 {
+  left := [1, 2, 3]
+  right := [10, 20, 30]
+  mut output := [0, 0, 0]
+  combine(left, right, output)
+  print(output[0])           // 12
+  print(output[1])           // 24
+  print(output[2])           // 36
+  return 0
+}

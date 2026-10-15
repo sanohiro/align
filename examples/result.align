@@ -1,6 +1,6 @@
-// Result<T, E> and `?` (M2). A failure propagates with `?`; `main` returning
-// Result maps Ok → exit 0 and Err(code) → reported + exit code. (M2's Error is a
-// placeholder i32 code; the Error sum type comes later.)
+// Result<T, E> and `?`. A failure propagates with `?`; `main` returning Result<(), Error>
+// maps Ok to exit 0 and Err to the builtin Error's exit code. `error(7)` constructs
+// Error.Code(7), so this example deliberately exits with code 7.
 fn try_get(n: i32) -> Result<i32, Error> {
   if n < 0 {
     return Err(error(7))

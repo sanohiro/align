@@ -1,8 +1,8 @@
 // Generic sum types (4c-6): a sum type may take type parameters — `Opt<T>` — and is monomorphized
 // per concrete instantiation, like a generic struct or function. Construct a variant with
 // `Type.Variant(args)`; the type arguments are inferred from the payload (no turbofish), then
-// `match` discriminates. A no-payload variant (`Opt.None`) has nothing to infer `T` from, so it
-// needs a payload-bearing sibling (or a future annotation) to fix the type.
+// `match` discriminates. Here the payload-bearing constructors determine each concrete type;
+// a no-payload variant alone supplies no payload from which to infer the type argument.
 
 Point { x: i32, y: i32 }
 
