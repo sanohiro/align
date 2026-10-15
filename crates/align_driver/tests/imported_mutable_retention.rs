@@ -298,50 +298,6 @@ fn main() -> i32 {
     }
 }
 
-#[test]
-fn indirect_mutable_calls_keep_the_unavailable_summary_fallback() {
-    let helper = "module helper\npub fn ignore(borrow mut dst: str, ignored: str) {}\n";
-    let main = r#"module main
-import helper
-fn apply(call: fn(borrow mut str, str) -> (), borrow mut destination: str) {
-  arena {
-    n := 42
-    short := template "short={n}"
-    call(destination, short)
-  }
-}
-fn main() -> i32 = 0
-"#;
-    let checked = diff_check_multi(
-        "indirect-retention-fallback",
-        &[("main.align", main), ("helper.align", helper)],
-        "main.align",
-    );
-    assert!(
-        checked.whole_errors && checked.per_unit_errors,
-        "whole: {}\nimported: {}",
-        checked.whole_diags,
-        checked.per_unit_diags
-    );
-    for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
-        assert!(diagnostics.contains("shorter-lived"), "{diagnostics}");
-    }
-    let known = main.replace(
-        "fn apply(call: fn(borrow mut str, str) -> (), borrow mut destination: str) {",
-        "fn apply(borrow mut destination: str) {\n  call := helper.ignore",
-    );
-    let checked = diff_check_multi(
-        "indirect-retention-known-target",
-        &[("main.align", known.as_str()), ("helper.align", helper)],
-        "main.align",
-    );
-    assert!(
-        !checked.whole_errors && !checked.per_unit_errors,
-        "whole: {}\nimported: {}",
-        checked.whole_diags,
-        checked.per_unit_diags
-    );
-}
 
 #[test]
 fn retained_local_views_reject_across_helper_boundaries() {

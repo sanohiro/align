@@ -5149,7 +5149,7 @@ Drop, or lifetime rule is introduced.
 
 Interface format20 retains format19 field order and replaces each mutable-retention
 row with a canonical bool byte followed by its root sequence. The field remains
-after `parallel_transfer_params`: None is u8 0; Some is u8 1, outer u32 LE length,
+after `mutable_access`, which follows `parallel_transfer_params`: None is u8 0; Some is u8 1, outer u32 LE length,
 then parameter-ordered rows of u8 bool (0/1), u32 LE root count, and
 (u8 tag, u32 LE ordinal) roots. Plan199 specifies rejection precedence and literal
 goldens. Unknown versions reject before records; there is no compatibility path.

@@ -145,6 +145,56 @@ fn consume(value: string) {}
 }
 
 #[test]
+fn indirect_mutable_calls_keep_the_unavailable_summary_fallback() {
+    owned_fixture::run(
+        "indirect_mutable_calls_keep_the_unavailable_summary_fallback",
+        |stage| {
+            let helper = "module helper\npub fn ignore(borrow mut dst: str, ignored: str) {}\n";
+            let main = r#"module main
+import helper
+fn apply(call: fn(borrow mut str, str) -> (), borrow mut destination: str) {
+  arena {
+    n := 42
+    short := template "short={n}"
+    call(destination, short)
+  }
+}
+fn main() -> i32 = 0
+"#;
+            let known = main.replace(
+                "fn apply(call: fn(borrow mut str, str) -> (), borrow mut destination: str) {",
+                "fn apply(borrow mut destination: str) {\n  call := helper.ignore",
+            );
+            std::fs::write(stage.join("helper.align"), helper).unwrap();
+            for (name, source, invalid) in
+                [("unknown", main, true), ("known", known.as_str(), false)]
+            {
+                let entry = stage.join("main.align");
+                std::fs::write(&entry, source).unwrap();
+                for per_unit in [false, true] {
+                    let mut sources = SourceMap::new();
+                    let diagnostics = if per_unit {
+                        align_driver::check_per_unit(&mut sources, entry.to_str().unwrap(), source)
+                            .diags
+                    } else {
+                        check(&mut sources, entry.to_str().unwrap(), source).diags
+                    };
+                    let rendered = align_driver::format_diagnostics(&sources, &diagnostics);
+                    assert_eq!(
+                        diagnostics.has_errors(),
+                        invalid,
+                        "{name}/{per_unit}: {rendered}"
+                    );
+                    if invalid {
+                        assert!(rendered.contains("shorter-lived"), "{rendered}");
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[test]
 fn recursive_forwarding_keeps_late_retention() {
     let source = r#"
 View { text: str }

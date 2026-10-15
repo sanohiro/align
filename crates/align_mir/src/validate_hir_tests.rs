@@ -19092,16 +19092,19 @@ fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static s
 }
 
 #[test]
-fn mutable_retention_replay_rejects_stale_local_facts() {
+fn mutable_retention_replay_rejects_stale_local_facts() -> Result<(), &'static str> {
     let base = checked_source_program("fn set(borrow mut dst: str, value: str) { dst = value }\nfn main() -> i32 = 0\n");
     assert!(align_sema::checked_hir_body_facts_are_valid(&base));
     let mut wrong_flag = base.fns[0].mutable_retention.clone();
-    wrong_flag.as_mut().unwrap()[0].may_mutate = false;
+    let destination = wrong_flag.as_mut().and_then(|rows| rows.first_mut()).ok_or("retention fixture row")?;
+    assert!(destination.may_mutate);
+    destination.may_mutate = false;
     for replacement in [None, Some(vec![hir::MutableRetentionDestination::default(); 2]), wrong_flag] {
         let mut bad = base.clone();
         bad.fns[0].mutable_retention = replacement;
         assert_replay_rejects_without_mutating(bad, "mutable-retention facts must match the actual body");
     }
+    Ok(())
 }
 
 #[test]

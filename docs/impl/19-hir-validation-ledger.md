@@ -2227,7 +2227,8 @@ exists. The Request 61 receiver extension adds no HIR record or serialized repre
 
 The authoritative record and closure matrix are in
 `17-library-boundary-prerequisites.md`, Request 43/49, refined by Plan199.
-Interface format20 keeps `mutable_retention` after `parallel_transfer_params`
+Interface format20 keeps `mutable_retention` after `mutable_access`, which follows
+`parallel_transfer_params`,
 and records an independent possible-mutation bool before each destination's roots. The HIR stored-function record holds the exact local
 inference result; body replay resets, re-infers, and compares that result. Imported
 records preserve the producer result and pass the shared arity, root-order, index,
