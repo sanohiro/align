@@ -147,10 +147,11 @@ fn imported_fixed_siblings_check_execute_and_replay() {
 }
 
 #[test]
-fn overlapping_and_contained_views_still_reject() {
-    owned_fixture::run("overlapping_and_contained_views_still_reject", |stage| {
+fn view_aliases_preserve_backing_and_reject_owner_expiry() {
+    owned_fixture::run("view_aliases_preserve_backing_and_reject_owner_expiry", |stage| {
         for (name, source) in [
             ("buffer-alias", "Session { bytes: buffer, fixed: [i64; 5] }\nfn write(borrow mut bytes: slice<u8>) { bytes.set_u8(0, 1) }\nfn bad(borrow mut s: Session) -> i32 { old := s.bytes.bytes(); { mut bytes := s.bytes.bytes(); write(bytes) }; return old.u8(0) as i32 }\nfn main() {}\n"),
+            ("buffer-owner-replacement", "Session { bytes: buffer, fixed: [i64; 5] }\nfn bad() -> i32 { mut s := Session { bytes: buffer(8), fixed: [1,2,3,4,5] }; old := s.bytes.bytes(); s.bytes = buffer(8); return old.u8(0) as i32 }\nfn main() {}\n"),
             ("fixed-alias", "Session { bytes: buffer, fixed: [i64; 5] }\nfn write(borrow old: slice<i64>, borrow mut values: slice<i64>) { values[0] = old[0] }\nfn bad(borrow mut s: Session) -> i64 { old := s.fixed[..]; mut values := s.fixed[..]; write(old, values); return old[0] }\nfn main() {}\n"),
             ("contained-view", "Session { owners: array<string>, fixed: [str; 1] }\nfn bad(borrow mut s: Session) -> i64 { s.owners.truncate(0); return s.fixed[0].len() }\nfn main() {}\n"),
             ("escaped-view", "fn bad() -> slice<i64> { values := [1, 2]; return values[..] }\nfn main() {}\n"),
@@ -163,8 +164,12 @@ fn overlapping_and_contained_views_still_reject() {
                     build_per_unit(&mut sources, entry.to_str().unwrap(), source).diags
                 } else { check(&mut sources, entry.to_str().unwrap(), source).diags };
                 let text = align_driver::format_diagnostics(&sources, &diagnostics);
-                assert!(diagnostics.has_errors(), "{name}/{per_unit}: expected rejection");
-                assert!(text.contains("invalidated") || text.contains("outlive") || text.contains("escape") || text.contains("borrow"), "{name}: {text}");
+                // Plan189's guaranteed byte store keeps backing live; owner replacement does not.
+                let rejects = name != "buffer-alias";
+                assert_eq!(diagnostics.has_errors(), rejects, "{name}/{per_unit}: {text}");
+                if rejects {
+                    assert!(text.contains("invalidated") || text.contains("outlive") || text.contains("escape") || text.contains("borrow"), "{name}: {text}");
+                }
                 assert!(!text.contains("parse error") && !text.contains("unknown"), "unrelated rejection: {text}");
             }
         }
