@@ -1,6 +1,5 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, Move/effect classification, error policy, pitfalls, test
-anchors). Authored by the main loop (Fable).
+This directory records the per-area design of the `core` library: signatures,
+ownership and effect classification, error policy, pitfalls, and related tests.
 
 # core — str / string / builder / template
 
@@ -10,8 +9,9 @@ anchors). Authored by the main loop (Fable).
 
 Text (draft §12–§13): a borrowed view type, an owned buffer type, a builder for assembly, and one
 template form. Byte-oriented UTF-8 throughout; the searching methods ride the memchr-class SIMD
-scan layer (#310). The load-bearing policy: **every string allocation has a visible home** — an
-arena, an owner, or a builder; allocation inside pipeline lambdas is a compile error.
+scan layer (#310). Every string allocation has an explicit storage location: an
+arena, an owner, or a builder. A pipeline lambda may consume a temporary template locally;
+returning its frame-bounded view is a compile error.
 
 ## Signatures and settled surface
 
@@ -31,7 +31,8 @@ s.clone()                  -> string     // deep copy; the arena-escape hatch
 a + b                      -> compile error; builder is the one concatenation path
 
 b := builder()  /  builder(cap)
-b.write(s: str|string)  /  b.write_int(i: i64)
+b.write(s: str|string)  /  b.write_int(i)  // any integer type
+b.write_bool(v: bool)  /  b.write_char(c: char)  /  b.write_float(x: f32|f64)
 b.len()                    -> i64        // initialized UTF-8 byte count
 b.to_string()              -> string     // the finisher (there is no finish()/build())
 
@@ -121,14 +122,14 @@ Frame-regioned `str` (owned-structs work).
 
 ## Spec'd but not implemented
 
-- **`split`** and **`find_any`** (§18.1 catalog) — no dispatch arms. `split` is the big one:
-  its return shape (`array<str>` of views — a Move array of regioned views) needs the
-  Move-element collection work; do not ship it as an owned-copies compromise ("ideal form, or
-  defer"). Today: `find`/`rfind` + `s[a..b]` compose the manual split.
+- **`split`** and **`find_any`** (§18.1 catalog) — no string-method dispatch arms.
+  Existing `array<str>` support does not provide a string split method. A selected split
+  capability still needs its exact separator, result, lifetime and allocation contract.
+  Today: `find`/`rfind` + `s[a..b]` compose the manual split.
 - No direct `s[i]` byte access — use the explicit byte view `s.bytes()[i]` so dropping the UTF-8
   obligation is visible at the call site.
 - The §13/§18.1 language template variants (`html`, `raw`, json-template) — only plain
-  `template "…"` exists. The designed `pkg.template` capability deliberately leaves that syntax
+  `template "…"` exists. The shipped `pkg.template` capability deliberately leaves that syntax
   unchanged and instead provides an opaque HTML builder with default-escaped `write` plus explicit
   `raw`; contextual language-template parsing remains deferred.
 
@@ -145,8 +146,10 @@ Frame-regioned `str` (owned-structs work).
 ## Test anchors
 
 `m5.rs` (methods incl. find/rfind pairs, trim family, zero-copy bytes views, builder incl. fuse,
-template, escapes, UTF-8 byte lengths, print type coverage); `lambda.rs:271/280/287/294`
-(template allocation rejection + arena-in-lambda allowance); `hash.rs` (view acceptance);
+template, escapes, UTF-8 byte lengths, print type coverage); `lambda.rs`
+(escaping template/JSON views and string concatenation rejected);
+`template_ownership.rs::arena_free_template_can_be_consumed_inside_a_pipeline_lambda`
+(local consumption and cleanup); `hash.rs` (view acceptance);
 `fuzz_fmt.rs` (formatter round-trips string-heavy sources); examples `strings.align`,
 `template.align`. String-concat rejection is covered uniformly across reducer, named-function,
 and lambda contexts. SIMD scan pin: #310 differential oracle.

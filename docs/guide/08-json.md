@@ -50,7 +50,7 @@ fn main() -> Result<(), Error> {
 
 There is deliberately no `json.decode<User>(...)` call form: Align has no expression-position type arguments. The annotation carries the type, which reads naturally through `?`.
 
-Malformed input, a missing field, a type mismatch, an out-of-range number — all are an `Err`, never a panic and never a silently-wrong value:
+Malformed input, a missing field, a type mismatch or an out-of-range number returns `Err`:
 
 ```align
 r: Result<User, Error> := json.decode("{\"id\": oops}")
@@ -90,6 +90,34 @@ fn main() -> Result<(), Error> {
 ```
 
 `soa<User>` (chapter [11](11-data-oriented.md)) stores each field in a contiguous column. The decoder fills these columns **while parsing**, with no intermediate array of structs or later transpose. Unescaped string fields borrow the input text; selected escaped strings are decoded once into the enclosing arena. The columns share the arena's lifetime.
+
+## Choosing borrowed or owned text
+
+Use `string` fields when the decoded value must outlive the input. Owned record arrays and an `array<string>` root are supported too:
+
+```align
+import core.json
+
+User { name: string, age: i64 }
+
+fn load_users() -> Result<array<User>, Error> {
+    input := "[{\"name\":\"Ada\",\"age\":37}]".clone()
+    users: array<User> := json.decode(input)?
+    return Ok(users)
+}
+
+fn main() -> Result<(), Error> {
+    users := load_users()?
+    print(users[0].name)    // Ada — input has already been dropped
+    names: array<string> := json.decode("[\"Ada\",\"Lin\"]")?
+    print(names[1])         // Lin — indexing borrows str from names
+    return Ok(())
+}
+```
+
+The decoder allocates each owned string and array spine independently, including inside an arena; ordinary recursive Drop releases them. A fully owned result retains neither the input nor its arena. This avoids decoding borrowed text and then cloning each surviving field manually.
+
+A supported recursive record graph may mix `str` and `string`, including optional text and arrays. Each `string` owns its bytes; clean `str` still borrows input, and escaped `str` needs an explicit enclosing arena. Without one, decoding a selected escaped `str` returns `Error.Code(1)`. A mixed result remains tied to both input and enclosing arena; owning its array spine does not own its borrowed text. Encoding either form returns independent owned output. The [JSON design](../impl/core-design/json.md) lists the complete supported shapes and error rules.
 
 ## The shape of a JSON program
 

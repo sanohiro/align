@@ -2,11 +2,11 @@
 
 > 🌐 **English** · [Japanese](./ja/05-memory.md)
 
-Align has no garbage collector, no manual `free`, and no lifetime annotations. Instead: **where data lives is a decision you make**, ownership is **a property of the type**, and the compiler infers every lifetime and rejects the programs that would dangle. This chapter is the core of the model — it is small.
+Safe Align has no garbage collector or manual `free`. Ownership is a property of the type, and lifetimes are inferred without source annotations. Choose between values, arena-backed data and independently owned allocations; the compiler checks moves and borrowed lifetimes and inserts cleanup. Raw memory in `unsafe` has separate obligations (chapter [15](15-unsafe-and-ffi.md)).
 
 ## Values (the default)
 
-Most data is a plain value: a number, a `bool`, a small struct, a tuple of scalars. Values live on the stack and are **Copy** — assigning or passing one duplicates it, both copies are independent, nothing is ever freed because nothing was allocated.
+Numbers, booleans, Copy structs and tuples of scalars are Copy values: assigning or passing them copies their contents. These examples require no heap allocation or resource cleanup.
 
 ```align
 Point { x: f64, y: f64 }
@@ -208,7 +208,7 @@ fn main() -> i32 {
 }
 ```
 
-You will rarely write this — and the compiler will tell you when you didn't need it. The example above actually earns a lint:
+The compiler warns about the allocate-then-read pattern in this example:
 
 ```text
 warning: unnecessary heap allocation: this box is only ever read back with
@@ -220,7 +220,7 @@ Use `heap.new` when a value must outlive the stack frame that computed it while 
 
 ## Views: `str` and `slice<T>`
 
-A `str` is a borrowed view of string data; a `slice<T>` is a borrowed view of an array. Views are cheap Copy values (a pointer and a length), and they carry the **region of the data they point into** — a view of arena data can't escape the arena, a view of a struct's field can't outlive the struct. Same inference, same rule, no annotation.
+A `str` views text; a `slice<T>` views array elements. Both are Copy descriptors containing a pointer and length. The compiler tracks the lifetime of their backing storage: a view of arena data cannot escape that arena, and a view of inline record storage cannot outlive the record.
 
 ```align
 fn main() -> i32 {
@@ -233,11 +233,11 @@ fn main() -> i32 {
 
 ## The decision procedure
 
-That's all of it. When you create data, ask one question — *what is its lifetime?*
+Choose storage according to how long the data must remain available:
 
 - Dies in this expression or scope → **a value**. Do nothing.
-- A batch that dies together at the end of a phase → **arena**, and `.clone()` the survivors out.
+- A batch that dies together at the end of a phase → **arena**. Copy independent scalars out; use `.clone()` for escaping text, or a separate owned-result construction path for collections.
 - One value that must outlive the frame → **`heap.new`** in the arena that matches its lifetime.
 - Reading existing data → **a view** (`str`, `slice`), with no allocation or copy of the underlying data.
 
-Everything else — when to free, whether it escapes, who owns what — is the compiler's job, checked at compile time, invisible in the source except at a few visible points: `arena {}` (or a named `arena r {}`) where a lifetime begins and ends, `.clone()` where you pay for a copy, and a `borrow` / `borrow mut` parameter where a function reads or updates a value it does not own.
+The compiler checks ownership transfers and borrowed lifetimes and inserts cleanup. The source identifies lifetime scopes with `arena {}` or `arena r {}`, explicit text copies with `.clone()`, and access to caller-owned data with `borrow` or `borrow mut`.

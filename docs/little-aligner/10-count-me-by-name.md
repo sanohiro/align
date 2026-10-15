@@ -12,11 +12,11 @@ east 5
 
 Total *per region*?
 
-**A1.** east `8`, west `4`. You grouped, then you summed. Everyone can — the question is saying it without writing a hash map by hand.
+**A1.** east `8`, west `4`. You grouped, then you summed. Now say it without writing a hash map by hand.
 
 ---
 
-**Q2.** Say it in Align, over a soa with `k` (region id) and `v`:
+**Q2.** Say it in Align, over a soa with `i64` fields `k` (region id) and `v`:
 
 **A2.**
 
@@ -24,7 +24,7 @@ Total *per region*?
 g := s.group_by(.k).sum(.v)
 ```
 
-Group by one field, fold another. That single line is the analytics workhorse.
+Group by one field, fold another.
 
 ---
 
@@ -60,9 +60,9 @@ Group by one field, fold another. That single line is the analytics workhorse.
 g := xs.group_by(.name).agg(sum(.a), max(.b), count())
 ```
 
-`agg` folds all three per key in a single pass: `g.0` the names, `g.1` the sums, then the maxes, the counts. One trip through memory, every accumulator riding along.
+`agg` folds all three per key in a single pass: `g.0` the names, `g.1` the sums, then the maxes, the counts. Each input row contributes to all three aggregates.
 
-Mind the source. The fused multi-aggregate reads a **row-shaped** `array<Struct>` with a **string** key — `xs` here is an owned `array<Row>`, the kind `json.decode` hands back (Q12). A soa, or an integer key, is not the shape `agg` takes today; single-aggregate `group_by(.k).sum(.v)` is the one that also rides a soa (Q2).
+Mind the source. The fused multi-aggregate reads a **row-shaped** `array<Struct>` with a **`str`** key — `xs` here is an owned `array<Row>`, the kind `json.decode` hands back (Q12). A soa, or an integer key, is not the shape `agg` takes today; single-aggregate `group_by(.k).sum(.v)` is the one that also rides a soa (Q2).
 
 ---
 
@@ -72,13 +72,13 @@ Mind the source. The fused multi-aggregate reads a **row-shaped** `array<Struct>
 
 ---
 
-**Q9.** We group by `name` — strings — five different times. What is silently expensive?
+**Q9.** We group by `name` — strings — five different times. Which work repeats?
 
 **A9.** Hashing and comparing the same strings, five times over.
 
 ---
 
-**Q10.** The cure?
+**Q10.** How can we reuse that work?
 
 **A10.** Pay once:
 
@@ -100,7 +100,13 @@ Dictionary encoding replaces repeated names with reusable IDs. The source shape 
 
 **Q12.** Drill, from a JSON string of `{"name":..., "a":..., "b":...}` rows: distinct names, and the largest `b` per name — one pass.
 
-**A12.**
+**A12.** Declare the row type at file scope, with `import core.json`:
+
+```align
+Row { name: str, a: i64, b: i64 }
+```
+
+Run this fragment inside `arena { ... }` in a function returning `Result`, so escaped names have storage as well:
 
 ```align
 xs: array<Row> := json.decode(data)?
@@ -121,7 +127,7 @@ print(g.1.max())        // the largest of the per-name maxima
 
 **Q14.** What if every row has a different key?
 
-**A14.** Then the grouped result is nearly as large as the input. The operation is still direct and visible, but not free. Always ask two sizes: *how many rows?* and *how many groups?*
+**A14.** Then the grouped result is nearly as large as the input. Check two sizes: *how many rows?* and *how many groups?*
 
 ---
 
@@ -149,7 +155,13 @@ What per-customer sums must come back?
 
 **Q17.** Say it over fields `.customer` and `.amount`.
 
-**A17.** First say where the rows live — A7's shape, an owned `array<Order>` with a string key:
+**A17.** Use A7's owned `array<Order>` with a `str` key. Declare the type at file scope:
+
+```align
+Order { customer: str, amount: i64 }
+```
+
+Then decode and group inside an arena, as in Q12:
 
 ```align
 orders: array<Order> := json.decode(data)?

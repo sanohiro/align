@@ -6,7 +6,7 @@ The top-level document for implementing `draft.md`. All subsequent `docs/impl/*.
 
 ```text
 Implementation language   Rust
-Backend                   LLVM (the one real target), but always through MIR
+Backend                   LLVM, always through MIR
 Approach                  Fix the whole design first / drive a vertical skeleton through first
 ```
 
@@ -20,33 +20,37 @@ The standard choice for compiler implementation. Lexer/parser generators, LLVM b
 
 A staged strategy of "C backend first → LLVM later" is **not** adopted. Reasons:
 
-- The core of Align is **deterministically lowering** `vecN<T>` / `maskN<T>` / loop fusion **to vector instructions**. Going via C would depend on the host C compiler's auto-vectorization, which breaks the "predictably fast" identity.
+- Direct LLVM lowering preserves explicit `vecN<T>` / `maskN<T>` operations and fused-loop properties without an intervening C compiler. LLVM still selects machine instructions for the target: vector-shaped IR does not guarantee machine SIMD or one instruction per operation. `emit-llvm --stage optimized` and `explain-opt` expose the optimizer's result; final machine shape requires object inspection ([plan 75](75-portable-math-plan.md)).
 - Migrating to LLVM later would be a major rewrite.
 
 Instead, **a backend-agnostic intermediate representation, MIR, is always interposed**. All of Align's semantics (arena / move / fusion / SIMD-ization decisions) live on the MIR side, and `MIR → LLVM` is limited to a pure final-stage lowering. This means:
 
-- If we later want to add a C backend or text output for debugging, it is just "add one lowering" and not a rewrite.
+- A future backend or debugging text output can reuse MIR semantics and supply its own lowering.
 - Backend-driven decisions do not leak as far as the type checker.
 
 Details in `04-mir.md` / `05-backend-llvm.md`.
 
 ### Approach: whole-design → vertical-slice skeleton → fleshing out
 
-The most dangerous thing in compiler development is "building out one stage before the whole pipeline is connected." Building out a complete type system before codegen, then finding at the codegen stage that the shape of the type information does not fit and rewriting the type checker — this is the real nature of a major rewrite.
+Completing one compiler stage before connecting the pipeline can hide integration problems.
+For example, code generation may need type information that the type checker does not retain.
+An early end-to-end implementation helps expose these mismatches.
 
-The countermeasure is to separate two axes.
+The approach separates two axes.
 
 ```text
 Axis A  Feature coverage     few features → add features
 Axis B  Pipeline traversal   does source → executable connect end to end
 ```
 
-The danger is in axis B. Therefore:
+Establish axis B before expanding feature coverage:
 
 > The design (these impl docs) fixes the whole picture first.
 > The implementation drives the smallest vertical-slice skeleton (walking skeleton) through end to end first, then plugs features into it.
 
-First complete a skeleton in which an `x := 1`-level program flows through lexer → parser → typecheck → MIR → LLVM → executable. Once the skeleton is through, `map` / `where` / arena / JSON become a matter of just **plugging** into the same pipeline, and no stage gets rewritten.
+First connect lexer → parser → typecheck → MIR → LLVM → executable for a program as small as
+`x := 1`. Then add `map`, `where`, arenas, and JSON through that pipeline, checking their
+representation and lowering requirements across stages as each feature is added.
 
 ## Crate Structure (current)
 

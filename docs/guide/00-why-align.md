@@ -12,25 +12,27 @@ Align is designed for four participants: the **Human** and **AI** that read and 
 
 ## Nothing hidden
 
-Allocation, errors, side effects, parallelism, and `unsafe` are always visible in the source. There are no hidden copies, no exceptions thrown from nowhere, no threads spawned behind your back. If a line allocates, you can see it. Recoverable errors use `Result`. Bounds violations and invalid integer division terminate the program instead of returning `Err` (chapter [04](04-errors.md)). This is not ceremony — it is what lets both a human and a compiler reason about the code locally.
+Allocation and copies use operations such as `builder`, `.to_array()` and `.clone()`. Parallel work uses `par_map` or `spawn`, and native pointer operations require `unsafe`. Recoverable errors use `Result`; bounds violations and invalid integer division terminate the program instead of returning `Err` (chapter [04](04-errors.md)). These conventions help readers locate operations with costs or failure paths.
 
 ## One way to do things
 
-Align prefers convergence over expressiveness. One error model (`Result<T, E>` + `?`). One optional model (`Option<T>`, no null). One ownership model (value / arena / explicit heap). One parallel model (`map`/`reduce`/`chunks`/`task_group`). When there is one obvious way, the human doesn't choose, the AI doesn't guess, and the reader doesn't decode someone else's cleverness.
+Align uses `Result<T, E>` and `?` for errors, `Option<T>` for absence, and one ownership model for values, arenas and explicit heap allocation. Parallel work uses `par_map` and structured `task_group` scopes; ordinary `map`/`reduce`/`chunks` are sequential. Keeping these conventions consistent limits the number of mechanisms a reader must learn.
 
 ## Data-oriented at the core
 
-The center of Align is not the object — it is the array. Real programs spend their time walking over collections of data: transforming, filtering, summing. Align makes that the natural thing to write, and lowers it to tight, cache-friendly, SIMD-friendly machine code. You write `prices.map(with_tax).where(in_stock).sum()`; the compiler fuses it into one loop with no intermediate arrays. The speed comes from ordinary code lowering well, not from hand-written intrinsics.
+Arrays and slices are central to Align. Pipelines express transformations, filtering and reductions; for example, `prices.map(with_tax).where(in_stock).sum()` fuses into a loop without intermediate arrays. Columnar storage can improve locality for field-wise scans. Whether a particular program benefits depends on its data, operations and target hardware.
 
 ## What this means when you write Align
 
-- You will write very few explicit loops. Align has **no `for` and no `while`**: you describe transformations as pipelines, and the one `loop` expression is reserved for genuinely sequential control — read until EOF, retry until success.
+- Use pipelines for collection transformations and `loop` for sequential control, such as reading to EOF or retrying. Align has no `for` or `while`.
 - You will not manage memory by hand, but you will decide *where* data lives (a value, an arena, the heap).
 - You will handle errors as values, with `?`, not with try/catch.
-- You will lay data out as structure-of-arrays when it's processed in bulk, and the compiler rewards you for it.
+- Consider structure-of-arrays for repeated field-wise scans, and measure it against your existing layout.
 
 ## How to read this book
 
 Chapters 01–05 cover the foundations: the toolchain, expressions, data modeling, errors, and memory. Chapters 06–12 cover pipelines and data processing. Chapters 13–18 cover the standard library, unsafe, FFI, tooling, and idioms. Chapters 19–22 apply these ideas to larger systems, and chapters 23–25 introduce packages, databases, and vector search.
+
+Chapter [26](26-performance.md) gives a measurement-driven optimization workflow; chapter [27](27-multimodal-reference.md) combines the shipped libraries in a bounded application.
 
 [The Little Aligner](../little-aligner/README.md) uses short questions and answers in the style of *The Little Schemer*, focusing on pipelines, data layout, and ownership. This guide adds practical coverage of tools, libraries, and packages. You can use the workbook to practice the language concepts and return here when building a program.

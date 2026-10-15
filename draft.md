@@ -536,8 +536,8 @@ Rules:
 `print(x)` is the builtin output primitive: it writes one value and a newline to stdout. It
 accepts **primitive values only** — integers, floats, `bool`, `char`, `str`/`string`. Printing an
 aggregate (struct / tuple / array / sum value) is a compile error: compose text explicitly with a
-template string (§13) or a `builder` (§12) — a magic deep-formatter would be a hidden recursive
-walk.
+template string (§13) or a `builder` (§12). Automatic aggregate formatting would add a recursive
+traversal not expressed at the call site.
 
 The display of each printable type is a language contract — identical in every build and on every
 target, and shared by `print` and template-string interpolation:
@@ -1387,8 +1387,8 @@ fused loop for `map` / field-projection stages, requires `dst.len() == src.len()
 at runtime, like an out-of-bounds index), and yields `()`. A filtering `where` before `map_into`
 (which would write a variable-length prefix) is not part of this form — filtering materializes with
 `to_array`. The compiler proves `dst` is a distinct buffer from the source (the same root-buffer
-no-alias rule as an `out` argument) and emits the disjoint-buffer `noalias`, so the fused loop
-vectorizes with no runtime overlap guard.
+no-alias rule as an `out` argument) and emits the disjoint-buffer `noalias`. This removes the need
+for a runtime overlap guard; vectorization still depends on the operations, target and profile.
 
 For a same-index transform over multiple inputs, `zip` is the lazy pipeline source:
 
@@ -1759,10 +1759,10 @@ totals := orders.group_by(.customer).sum(.amount)   // (array<Customer>, array<A
 ```
 
 `group_by(.key).sum(.value)` yields two parallel arrays — the distinct keys and their per-key sums —
-not a hash map; idiomatic Rust reaches for a generic `HashMap<K, Acc>`, while Align reads the two
-columns sequentially into a primitive-key aggregate. An **integer** key over a `soa` runs as a
+not a hash map. Align reads the two columns sequentially into a primitive-key aggregate.
+An **integer** key over a `soa` runs as a
 primitive-key open-addressing aggregate, and when the keys fall in a tight range it skips hashing
-entirely (direct-index accumulation — ~5× a `std::HashMap`, beating even `ahash`). A **string** key is
+entirely through direct-index accumulation. A **string** key is
 **interned** to a dense id once, then aggregated by id — yielding `(array<str>, array<Acc>)` whose key
 views borrow the source. This works both over an AoS `array<Struct>` (the key + value read from one
 strided record) and over a `soa<Struct>` **str key column** (the key column and value column read as
@@ -1770,13 +1770,13 @@ two separate contiguous columns). The surface is identical either way (`group_by
 the layout picks the runtime path. (First cut: an `i64` or `str` key over a `soa`, or a `str` key over
 an `array<Struct>`, with an `i64` value and `sum`/`min`/`max`/`count`.)
 
-This is the layout lever that lets Align *beat* an array-of-structs (what a hand-written `Vec<User>`
-gives by default): a one-field scan over `soa<User>` reads only that column, where an AoS scan drags
-whole structs through cache. Measured ≈7× faster than an idiomatic-Rust `Vec<Struct>` field sum on a
-memory-bound workload (`bench/`, `col_sum`). *(Status: a borrowed `soa<T>` of a
+For a one-field scan, `soa<User>` stores the selected field contiguously. An AoS scan instead
+steps over complete rows and can load cache lines containing unused fields. The benefit depends
+on row size, access pattern and reuse; [the benchmark records](bench/README.md) give measured
+comparisons. *(Status: a borrowed `soa<T>` of a
 primitive-scalar struct is implemented — field-column projection `ps.field`, mixed-width columns
-(each padded to its alignment), a column-spanning `rs.where(.active).pay.sum()` (branchless, ≈3× an
-AoS filtered aggregate), `.to_soa()` construction (transpose an `array<Struct>`, arena-allocated),
+(each padded to its alignment), a column-spanning `rs.where(.active).pay.sum()`,
+`.to_soa()` construction (transpose an `array<Struct>`, arena-allocated),
 and decode-direct-to-`soa` (`s: soa<User> := json.decode(d)?`, parsed straight into columns) all
 work, feeding the normal pipeline. A projected column is an ordinary `slice<FieldTy>`, so it
 **windows** like any slice — `s.pay[a..b].sum()` scans rows `a..b` of one column. A field of one
@@ -1788,9 +1788,8 @@ carry **`str` columns** — a `str` field lands in a 16-byte `{ptr,len}` view co
 (`json.decode`, the views borrowing the JSON input) or transposed (`.to_soa()`, the views borrowing
 the source array), so a str-bearing `soa` is region-tied to that borrow (it cannot escape it) while
 primitive columns still scan and reduce as usual; str columns are read-only (no `s[i].name = v`).
-The plain column scan beats AoS ≈7×. The remaining slices are known-schema field-skip decode (parse
-only the used columns), owned/nested columns, and a multi-column `soa_slice<T>` sub-view (`s[a..b]`
-over every column).)*
+Owned/nested columns and a multi-column `soa_slice<T>` sub-view (`s[a..b]` over every column)
+remain outside this surface.)*
 
 ### Over-alignment (`align(N)`)
 
@@ -1970,10 +1969,10 @@ rejected before the spawned environment is published.
 A spawned lambda *escapes* (it outlives the `spawn` call, running later on the task), so it is
 represented as a first-class closure with an environment holding its captured values — distinct
 from a pipeline lambda, which never escapes and is inlined. The compiler's escape analysis chooses
-the representation, so pipelines stay allocation-free and SIMD/GPU-friendly while spawned tasks get
-the environment they need. That environment is **owned by the `task_group` scope** (like an
-`arena {}` allocation) and freed when the scope ends — not a hidden allocation, but a region one,
-with the visible scope as its boundary.
+the representation. Non-escaping pipeline captures need no separate environment allocation;
+spawned tasks retain their captures in an environment **owned by the `task_group` scope**.
+The environment is a region allocation, like an `arena {}` allocation, and is freed when that
+visible scope ends.
 
 async/await is not in the initial specification; structured `task_group` is the one concurrency
 model for I/O.
@@ -2738,7 +2737,7 @@ The exact admission, provenance and repetition contract is
 
 Convergence is valued over expressiveness.
 
-Degrees of freedom that make AI hesitate are reduced.
+The syntax limits equivalent forms so handwritten and generated code use the same conventions.
 
 ---
 
@@ -5089,11 +5088,11 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 # 20. Positioning
 
 ```text
-Allocation and errors are more visible than in Go
-The normal path is safer than in Zig
-Lifetimes are not written, unlike Rust
-Alias and lifetime are clearer than in C
-Faster than Python, and performance is less likely to degrade even when written by AI
+Explicit allocation and Result-based error handling
+Checked ownership, borrows and inferred lifetimes
+Unsafe operations marked in source
+Native AOT compilation and data-oriented collection operations
+Restricted syntax intended to make handwritten and generated code easier to inspect
 ```
 
 ---
@@ -5102,10 +5101,10 @@ Faster than Python, and performance is less likely to degrade even when written 
 
 Align is a data-oriented AOT language designed to align human intent, AI generation, compiler optimization, and modern hardware.
 
-### HTTP client package composition — designed
+### HTTP client package composition — implemented
 
 `http_client`, `http_request`, and `http_response` name the existing distinct
-Move owners. The accepted implementation must close by-value/borrowed helper
+Move owners. The implementation supports by-value/borrowed helper
 boundaries and ordinary recursive owning carriers together. Client network operations accept shared `borrow`; client configuration and
 request setters require `borrow mut` on borrowed receivers. Response inspection accepts shared borrows; request serialization remains an
 internal codec observed through sent bytes. The existing bound-owner

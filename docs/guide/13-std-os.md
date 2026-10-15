@@ -14,6 +14,7 @@ Import the `std` modules for the OS and service APIs you need: `std.io`, `std.fs
 import std.fs
 
 pub fn main(args: array<str>) -> Result<(), Error> {
+    if args.len() != 2 { return Err(Error.Invalid) }
     fs.write_file(args[1], "hello, disk\n")?
     if fs.exists(args[1]) { print("written") }
     data := fs.read_file(args[1])?      // whole file → owned string
@@ -24,6 +25,12 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 ```
 
 `read_file` / `write_file` / `exists` / `remove` / `read_dir` are the whole-file tier — one call, no handle to manage. `write_file` accepts a `str`, a `builder`, or a `buffer`'s bytes. `read_dir` returns `array<string>` of names. Text reads validate UTF-8 (`Error.Invalid` on binary garbage); binary data goes through the streaming tier below.
+
+## Regular files and positional reads
+
+Use `fs.open_regular(path)` for a sequential `reader` that must admit only a regular file. For offset-addressed reads, `fs.open_ro_regular(path)` returns the ordinary owned `file` handle with `pread` and `len`. Both support Linux/macOS, follow ordinary path resolution (including symlinks), check the opened descriptor itself, and reject directories, devices and FIFOs with `Error.Invalid` without waiting for a FIFO writer. The admitted descriptor is kept until Drop; replacing the pathname cannot redirect an already-open handle.
+
+`pread` fills the caller's mutable buffer at the requested offset and returns the actual byte count, with zero at EOF. A read-only handle refuses `pwrite` with `Error.Denied`. These constructors neither confine paths nor freeze file contents; use the explicit beneath-root operations below when symlink traversal must be refused. See the [filesystem contract](../impl/std-design/fs.md).
 
 ## Exclusive publication
 
@@ -56,7 +63,7 @@ only paths that publisher owns; the two renames are not an atomic transaction.
 ## Opening regular files without following symlinks
 
 When a caller must reject symlink traversal rather than use ordinary pathname resolution, `std.fs`
-provides two explicit constructors:
+provides these explicit constructors:
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
@@ -64,7 +71,7 @@ fs.open_beneath_single_link(root: str, relative: str) -> Result<reader, Error>
 fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 ```
 
-The second path is a strict non-empty relative path. Both operations validate the complete root and
+The second path is a strict non-empty relative path. These operations validate the complete root and
 relative spelling, retain directory descriptors, and walk without following root, intermediate, or
 final symlinks. `open_beneath` requires the final entry to be the same regular file before and after
 open and returns the normal owned `reader`; it reads no bytes in the constructor.

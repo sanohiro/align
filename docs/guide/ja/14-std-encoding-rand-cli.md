@@ -124,15 +124,20 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     c.flag_bool("verbose")
     c.flag_str("input", "input.json")
     c.flag_i64("count", 1)
+    c.flag_f64("ratio", 0.5)
 
     p := c.parse(args)?
     if p.get_bool("verbose") { print(p.get_str("input")) }
     print(p.get_i64("count"))
+    print(p.get_f64("ratio"))
+    print(p.occurrences("count"))   // 0 when only the default was used
     return Ok(())
 }
 ```
 
-`flag_bool` の既定値は `false` です。`flag_str` と `flag_i64` には既定値を明示します。形式は `--name value`、bool の場合は `--name` です。未知のフラグ、重複、不正な形式は `Error.Invalid` になります。解析に成功すれば、登録済みのフラグは getter で取得できます。未登録の名前や異なる型で取得しようとすると、プログラミングエラーとして異常終了します。`p.get_str` は `p` 内の文字列へのビューを返すので、`p` より長く保持する場合は `.clone()` します。
+`flag_bool` の既定値は `false` です。`flag_str`、`flag_i64`、`flag_f64` には既定値を明示します。値を取るフラグは `--name value` と `--name=value` に対応し、bool は `--name` で指定します。同じフラグを繰り返すと最後の値を採用します。`occurrences(name)` は登録したどの種類のフラグでも明示的な指定回数を返し、繰り返した bool や空の文字列も数えます。省略したフラグはゼロです。必ず一度だけ指定してほしいフラグは、解析後に回数を検査します。
+
+未知のフラグ、値の欠落、不正な値は `Error.Invalid` になります。浮動小数点の値は ASCII の JSON 数値の文法に完全に一致し、有限でなければなりません。`-0.25` と `1e3` は使えますが、`+1`、`01`、`NaN`、無限大は拒否されます。浮動小数点の既定値も有限である必要があり、アプリケーション固有の範囲は別に検査します。解析に成功すれば getter で取得できますが、未登録の名前や異なる型での取得はプログラミングエラーとしてアボートします。`p.get_str` は `p` 内の文字列へのビューなので、`p` より長く保持する場合は `.clone()` します。
 
 コマンドと解析結果はどちらも Move ハンドルです。メソッドを呼ぶ前にローカル変数へ束縛してください。名前のない所有レシーバは、まだ使えません。`c.usage()` は使用方法を説明する文字列を生成し、解析の成功・失敗にかかわらず呼べます。フラグは通常の関数呼び出しで登録するので、derive マクロや属性 DSL は不要です。
 

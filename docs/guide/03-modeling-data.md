@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/03-modeling-data.md)
 
-Align has exactly two ways to compose types — a struct ("all of these fields") and a sum type ("one of these variants") — plus tuples for the anonymous case. Type declarations are **keyword-less**: what's inside the braces decides which you wrote.
+Structs combine fields, sum types select one of several variants, and tuples group values without a type name. Type declarations are keyword-less: their contents distinguish structs from sum types.
 
 ## Structs
 
@@ -47,7 +47,7 @@ fn main() -> i32 {
 }
 ```
 
-Recursive structs (`Node { next: Node }`) are rejected — there is no null to terminate them with. A struct with an owning field (say `name: string`) is legal and turns the whole struct into a Move type; that story is chapter [05](05-memory.md).
+Recursive structs (`Node { next: Node }`) are rejected: an inline value cannot contain itself with a finite size. Use indices into separate storage for linked structures. A struct with an owning field (say `name: string`) is legal and turns the whole struct into a Move type; that story is chapter [05](05-memory.md).
 
 ## Fixed arrays inside records
 
@@ -66,7 +66,7 @@ fn main() -> i32 {
 
 The four elements live inline in `Table`: no array header or heap allocation. `N` must be a decimal integer literal, not a variable or a const parameter, and the initializer must have exactly that many elements. A Copy-element array is Copy, so passing a large table by value copies its full contents; use `borrow` or a slice when the function only reads it (chapter [05](05-memory.md)). A slice such as `table.weights[1..3]` borrows the table's storage. Bind a returned table before indexing its array field so the storage has a named owner.
 
-`[T; N]` has fixed length. Use `array<T>` for a dynamically sized owned collection. `[string; 4]` owns four strings inline and indexing borrows `str`; whole moves transfer ownership. Nested fixed arrays and other independently owned scalar element families are not supported; the complete element rules are in the [specification](../../draft.md#array).
+`[T; N]` has fixed length. Use `array<T>` for a dynamically sized owned collection. `[string; 4]` stores four owned string headers inline; the text remains separately allocated, and indexing borrows `str`. `[array<i64>; 2]` similarly stores two owned dynamic-array headers inline. The outer array adds no allocation, and whole moves and recursive Drop transfer or release its elements. Read a dynamic-array element through an explicit shared-`borrow` parameter; ordinary indexing cannot extract that owner. Nested fixed arrays, element replacement for these Move elements, and dynamic `array<array<T>>` remain unsupported. The complete element rules are in the [specification](../../draft.md#array).
 
 ## Sum types
 
@@ -98,7 +98,7 @@ Construction is qualified — `Shape.Rect(3, 4)`, `Shape.Dot` — so a reader al
 - Payloads bind positionally: `Rect(w, h) => w * h`.
 - `A | B => ...` covers several variants with one arm (binding nothing).
 - `_ => ...` covers the rest.
-- **Exhaustiveness is mandatory.** Forget a variant and the program does not compile. This is the point: add a variant next month, and the compiler lists every `match` that needs a decision.
+- **Exhaustiveness is mandatory.** A missing variant is a compile error unless a wildcard covers it. Adding a variant can therefore reveal matches that need updating.
 
 ```align
 Signal { Red, Yellow, Green, Off }
@@ -154,7 +154,9 @@ fn main() -> i32 {
 }
 ```
 
-Construct with `(a, b)`, destructure with `(q, r) :=`, or index positionally: `t.0`, `t.1`. If you find yourself passing a tuple through more than one function, give it a name — a struct costs one line.
+Construct with `(a, b)`, destructure with `(q, r) :=`, or access a position with `t.0` or `t.1`. Use a named struct when field names help explain the values or the group has a role in the public API.
+
+Supported flat tuples also fit inside `Option`, either payload of `Result`, user sum types, and ordinary record fields, and may pass through Align callbacks. Their ownership follows their elements: a tuple containing an owner is Move. This does not add tuple elements to collections or permit nested tuples; the [tuple contract](../../draft.md#tuple) gives the complete limits.
 
 ## The built-in `Error`
 

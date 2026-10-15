@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/06-pipelines.md)
 
-This is the heart of Align. You don't write loops; you describe a transformation over a collection, stage by stage, and the compiler generates the loop — fused into a single pass, branch-minimal, vectorizable. This chapter is the full vocabulary.
+Pipelines describe a transformation over a collection, stage by stage. The compiler fuses supported stages into a loop without intermediate arrays; vectorization depends on the operations, target and profile. Use `loop` for sequential control, as in chapter [02](02-language-basics.md).
 
 ## The shape
 
@@ -105,7 +105,7 @@ fn main() -> i32 {
 
 ## Materializing: `to_array` and `map_into`
 
-Most pipelines end in a reduction and never allocate. When you *do* want the transformed collection, say so explicitly:
+A reduction can avoid allocating a result collection. Use an explicit materialization when you need to retain the transformed elements:
 
 ```align
 big := xs.map(fn x { x * 10 }).where(fn x { x > 20 }).to_array()   // owned array<i64>

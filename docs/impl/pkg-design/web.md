@@ -11,23 +11,16 @@ explicitly vendored, never ambiently resolvable.
 
 ## Status
 
-**SHIPPED (W1–W7 complete, 2026-07-22).** This document is the current package contract and keeps
-the design rationale that led to the implementation. The owner's brief,
-restored after a lost conversation record and now pinned here so it cannot be lost again: **the
-deliverable is an Align-idiomatic, data-oriented, blazing-fast zero-copy REST framework — speed is
-the headline, and bloat is rejected** (a small surface; nothing speculative). **References are
-instrumental, not mandates:** when the owner asked "which existing framework matches this vision?",
-*Claude* named **Go's Fiber** (fasthttp's zero-allocation philosophy) as the closest analogue —
-the owner did not choose it, and a better existing reference may replace it at any point. The
-router references are likewise instrumental: **httprouter/fasthttp** (the radix lineage) and
-Rust's **matchit** (the minimal fastest-in-class radix matcher). The judging criterion for every
-decision is Align-ness (data-oriented / nothing hidden / one way / minimal), never "because
-framework X does it". **The router is a first-class requirement**: the first consumer app
-(OpenAI-compatible, fixed paths) would not need one, but a REST framework does — so it gets a
-deliberately Align-idiomatic design (below), not an afterthought. The gateway / LLM apps are
-merely the framework's first consumers ("what we build with it happens to be LLM-related") — they
-do not shape this design. Historical plan of record: `../15-pkg-web-plan.md`. The former hard
-compiler prerequisite, **F1 field-eligibility widening**, is shipped (see Foundations).
+**SHIPPED (W1–W7 complete, 2026-07-22).** This document records the current package contract
+and its design rationale. The design goals are a data-oriented REST framework, low request
+processing overhead, explicit ownership, and a small public surface.
+
+Go's Fiber/fasthttp supplies a reference for buffer reuse; httprouter/fasthttp and Rust's matchit
+supply references for radix routing. They inform comparisons, but do not determine the API.
+Decisions follow Align's data layout, explicit-cost, and ownership rules. Routing is a required
+part of the framework even though the first gateway and LLM consumers use fixed paths; those
+consumers do not limit its scope. Historical plan of record: `../15-pkg-web-plan.md`.
+The compiler prerequisite, **F1 field-eligibility widening**, is shipped (see Foundations).
 
 ## Minimalism (owner constraint)
 
@@ -36,17 +29,14 @@ else. NO template engines, static-file servers, sessions, websockets, ORM hooks,
 or lifecycle callbacks: each is a separate package if a consumer ever demands it. Every addition
 must name its consumer; "frameworks have this" is not a reason ("one way" + the no-bloat brief).
 
-## Why Align can win this
+## Request-path design
 
-Fiber is fast because fasthttp refuses per-request allocation and reuses buffers — but Go still
-pays GC, interface boxing, and copies at the `string([]byte)` boundary. Align's semantics make
-Fiber's discipline the *default*: `std.http` already parses a request into ONE buffer + an offset
-table (R1), every accessor is a `str`/`slice<u8>` **view** (zero-copy by construction, enforced by
-regions — a leaked view is a compile error, not a use-after-free), SIMD JSON decodes into
-view-bearing structs, and the per-request `arena {}` resets in O(1) with no GC ever. The framework's
-job is to add **routing + ergonomics without breaking that chain**: nothing on the hot path may
-copy request bytes or touch the heap. That is the existence claim, and W5/W7 make it a measured,
-regression-pinned number.
+`std.http` parses each request into one buffer and an offset table (R1). Accessors return
+`str`/`slice<u8>` views into that buffer, and region checking rejects views that outlive it.
+SIMD JSON decodes into structs containing views, and the per-request `arena {}` supports an
+O(1) reset without GC. The framework adds routing and request helpers while preserving these
+properties: its hot path must not copy request bytes or allocate on the heap. W5/W7 benchmarks
+measure the resulting overhead and provide regression checks.
 
 ## The performance contract (design invariants, bench-pinned)
 
@@ -74,7 +64,7 @@ regression-pinned number.
 
 Bench anchors (W5/W7): `bench/web_router` (dispatch ns/op vs a hand-written `match` — must be
 within noise), `bench/web_e2e` (req/s: pkg.web vs a raw `std.http` accept loop — framework overhead
-must be ≈ zero; plus a same-box Go Fiber comparison as the external honesty check — the target is
+must be ≈ zero; plus a same-machine Go Fiber comparison — the target is
 **competitive-or-better vs Fiber** on plaintext + JSON echo shapes).
 
 ## Surface (Fiber-informed, Align-idiomatic)
@@ -494,15 +484,15 @@ pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // outright si
 //                    quota, which `cpu_count()` respects) — write `workers = process.cpu_count()`.
 ```
 
-- **Nothing hidden, by parameter:** thread creation is visible at every call site — `serve(...,
+- **Explicit worker count:** thread creation is visible at every call site — `serve(...,
   4)` says four threads in the source. `spawn` inside `serve` is ordinary pkg-level Align
-  (`task_group { spawn(fn { worker(...) }) }`), not runtime magic.
+  (`task_group { spawn(fn { worker(...) }) }`).
 - **No shared mutable state, by construction.** The alternative — one listener handle shared by
   N workers — was rejected by the language itself: a Move `http server` handle cannot be
   captured by value into N closures, and no borrow crosses a `spawn`. `SO_REUSEPORT` dissolves
   the sharing: each worker owns its own Move listener, its own parked keep-alive slot, its own
-  request loop — zero locks, zero contention, the same "no shared mutable state" rule `spawn`'s
-  by-value capture already enforces (draft §Task Group).
+  request loop. Listener ownership requires no shared application lock and follows the
+  "no shared mutable state" rule enforced by `spawn`'s by-value capture (draft §Task Group).
 - **The route table is the only shared input** — a `slice<Route>` of Copy rows, captured by
   value (a 16-byte view descriptor) into each worker; the backing array outlives the structured
   `task_group` by regions. **Probed 2026-07-21: this whole shape compiles and runs correctly

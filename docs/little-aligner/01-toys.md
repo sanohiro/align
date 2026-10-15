@@ -75,7 +75,7 @@ fn cube(x: i64) -> i64 {
 }
 ```
 
-**A10.** `27`. A block body says `return`. Two body forms; there is no third.
+**A10.** `27`. A block body may use `return value`, as here, or end with an expression of the declared return type. Writing just `x * x * x` as its final expression also returns `27`. A non-Unit function must produce a value on every path that completes.
 
 ---
 
@@ -91,7 +91,7 @@ fn cube(x: i64) -> i64 {
 
 ---
 
-**Q13.** What does `print(7 / 0)` do?
+**Q13.** What does `print(7 / divisor)` do when `divisor` is zero at runtime?
 
 **A13.** It stops the program with a division-by-zero error.
 

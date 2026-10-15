@@ -43,6 +43,7 @@ Vendoring means copying a package's source into the consuming project. Copy or m
 | Joins over typed columns | `pkg.frame` | [apps/frame/pkg](../../apps/frame/pkg) |
 | Tokens, password hashes, and session tokens | `pkg.auth` | [apps/auth/pkg](../../apps/auth/pkg) |
 | RESP2 key-value access | `pkg.kv` | [apps/kv/pkg](../../apps/kv/pkg) |
+| Unicode NFC normalization | `pkg.unicode` | [apps/unicode/pkg](../../apps/unicode/pkg) |
 | SQLite and PostgreSQL | `pkg.db` | [apps/db/pkg](../../apps/db/pkg) |
 
 These sources are not embedded in the `alignc` archive, Debian package, or Homebrew formula. When trying a newly added package, use a compiler that includes its support; a packaged release may lag the current repository. Copy a package's internal modules as well as its root file.
@@ -88,7 +89,7 @@ Public companion modules provide focused, composable pieces:
 - `pkg.web.cors` makes CORS policy decisions without silently permitting an invalid wildcard-plus-credentials policy.
 - `pkg.web.multipart` walks `multipart/form-data` bodies as zero-copy `Part` views. The application supplies `pkg.web.body(c)` and owns the iteration offset.
 
-There is no application-state parameter in the handler shape yet. That is a current limitation, not a hidden framework facility. Database access is a separate package, `pkg.db`, below.
+Handlers do not yet accept an application-state parameter. Database access is provided separately by `pkg.db`, below.
 
 ## `pkg.ws`
 
@@ -229,9 +230,26 @@ fn create_session(
 
 `get` returns an owned optional string, `set` reports whether its `Always` / `IfAbsent` / `IfPresent` condition applied, and `delete` reports whether the key existed. Transport, oversized, or malformed replies retire the client; a later operation then returns `Closed`. There is no default endpoint, authentication, TLS, RESP3 negotiation, generic command API, pipeline, retry, redirect, pool, transaction, script, or pub/sub surface. Root `pkg.kv` and its private `pkg.kv.internal.resource` implementation ship together; the exact bounds and error rules are recorded in [`pkg.kv`'s design](../impl/pkg-design/kv.md).
 
+## `pkg.unicode`
+
+Normalize text explicitly when a protocol or application needs canonical Unicode equality. Vendor [apps/unicode/pkg](../../apps/unicode/pkg), then call `nfc`:
+
+```align
+import pkg.unicode
+
+fn main() -> Result<(), Error> {
+    normalized := pkg.unicode.nfc("é")?   // e followed by a combining acute accent
+    print(normalized == "é")              // true
+    print(pkg.unicode.version())           // 16.0.0
+    return Ok(())
+}
+```
+
+`nfc` returns an independent owned `string`, even when nonempty input is already NFC. Scratch and output allocation are fallible and use `Result`; no input or arena lifetime is retained. This is Unicode 16.0.0 NFC, without locale dependence. Ordinary string equality and ordering remain byte-based; normalization is not implicit. Other normalization forms, grapheme segmentation and case folding are outside this package. See the [Unicode design](../impl/pkg-design/unicode.md).
+
 ## `pkg.db`
 
-`pkg.db` is the first-party database package, vendored the same way as the other four: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
+`pkg.db` is the first-party database package, vendored the same way as the other packages: [apps/db/pkg](../../apps/db/pkg) holds `pkg/db.align` plus the `pkg.db.sqlite`, `pkg.db.postgres`, and `pkg.db.pool` modules beneath it.
 
 `pkg.db` provides typed static queries and commands for SQLite and PostgreSQL. Queries can be checked at compile time using schema metadata produced by `alignc db prepare`. The package also supports prepared statements, transactions, typed row streams, one-to-many and many-to-one results, migrations, and read-only catalog inspection with `EXPLAIN`.
 

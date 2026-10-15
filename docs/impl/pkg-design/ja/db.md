@@ -11,14 +11,16 @@
 
 ## 状態
 
-**設計確定 — SQL NativeかつQuery中心のデータベースパッケージ。**
+**D14 まで実装済み — SQL NativeかつQuery中心のデータベースパッケージ。**
+以下の capability ledger が設計の正本である。[ロードマップ](../../07-roadmap.md) に
+完了した依存関係と、別途 consumer の根拠を必要とする将来機能を記録する。
 
 初期ドライバはSQLiteとPostgreSQLの両方である。
 
-この文書の意味論とAPI形状が契約である。ただし、一般的なライブラリ境界の前提機能
+この文書の意味論とAPI形状が契約である。一般的なライブラリ境界の前提機能
 [`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md)
-が実装されるまでDBドライバ実装を開始してはならない。これらはDB専用builtinでも、
-後から直せばよいcleanupでもない。
+は DB 実装に先立って出荷済みである。これらは共通の Align 言語・compiler 機能であり、
+DB専用builtinでも、後から直せばよいcleanupでもない。
 
 ## 1. 結論
 
@@ -341,6 +343,10 @@ user_with_groups.sql
 ```
 
 ```align
+module db.queries.user_with_groups
+
+import pkg.db
+
 pub Params {
   user_id: i64,
 }
@@ -442,6 +448,20 @@ Paramsは名前付きの通常structで、public field名がSQL parameter contra
 SQL内の名前付きparameterをscannerで抽出し、missing/unused/duplicate ambiguityを
 diagnosticにする。
 
+```sql
+SELECT id, name
+FROM users
+WHERE active = :active
+  AND id >= :min_id
+```
+
+```align
+pub Params {
+  active: bool,
+  min_id: i64,
+}
+```
+
 SQLiteはnative named token/indexへbindする。PostgreSQLはsource上の初出順に
 `:name` を `$1`、`$2` ...へrewriteし、同名再出現は同じordinalを再利用する。
 string literal、quoted identifier、line/block comment、dollar quote、`::` castを
@@ -490,6 +510,27 @@ retention classを記録し、Query/execution inspectionは `BindValue` / `BindC
 
 ### 5.7 Row
 
+```sql
+SELECT
+    t.id AS transaction_id,
+    t.amount_cents,
+    s.code AS status_code,
+    s.name AS status_name
+FROM transactions AS t
+JOIN transaction_status AS s
+    ON s.id = t.status_id
+WHERE t.account_id = :account_id
+```
+
+```align
+pub Row {
+  transaction_id: i64,
+  amount_cents: i64,
+  status_code: str,
+  status_name: str,
+}
+```
+
 RowはDBが返す正確でflatな列契約である。compilerがordinal decoder thunkを生成し、
 1行ごとのname lookup/reflectionは行わない。column count、type/storage class、
 NULL/non-NULLをruntimeでも検証してからRowを構築する。
@@ -507,6 +548,13 @@ checked metadataで強化する。Declared modeでもexact ordinal契約をrunti
 
 Outputは任意で、通常のAlign struct/array/Option/Resultからなる。Rowと同じ型である必要は
 ない。DBアクセスを受け取らない通常コードが1-passで組み立てる。
+
+```align
+pub Output {
+  user: User,
+  groups: array<Group>,
+}
+```
 
 ## 6. Execution surface
 
@@ -575,6 +623,46 @@ pub fn run(
 }
 ```
 
+compound Output の骨格は次のとおり。`step` の具体的な検証とコピーは §7.2 に示す。
+
+```align
+State {
+  parent: Option<User>,
+}
+
+fn step(
+  borrow mut state: State,
+  borrow mut groups: array_builder<Group>,
+  row: Row,
+  out: region,
+) -> Result<(), db.Error> {
+  // Pure row-to-state code. Copy row views with `.clone_in(out)` before retaining them.
+  return Ok(())
+}
+
+pub fn run(
+  exec: db.exec,
+  params: Params,
+  out: region,
+) -> Result<Option<Output>, db.Error> {
+  mut state := State {
+    parent: None,
+  }
+  mut groups := array_builder(out)
+  mut rows := db.rows(exec, query(), params, [])?
+  loop {
+    row := db.next(rows)? else { break }
+    step(state, groups, row, out)?
+  }
+  parent := state.parent else return Ok(None)
+  groups_out := groups.build()
+  return Ok(Some(Output {
+    user: parent,
+    groups: groups_out,
+  }))
+}
+```
+
 compound OutputではImpure `run` が1本のrowsを作り、可視な `loop` を1つ持つ。
 genericな `db.fold` は提供しない。L7は通常package functionに必要なnested generic typeだけを
 提供し、higher-order DB execution modelは追加しない。
@@ -598,6 +686,14 @@ PostgreSQL D13 native deliveryは同じdependency/cleanup ruleを持つ
 Queryは `db.exec` を受けるため、conn/txの両方で同じsurfaceを使う。conn/txを抽象化する
 public traitは導入しない。
 
+```align
+outside := db.exec_conn(conn)
+inside := db.exec_tx(tx)
+
+result1 := user_with_groups.run(outside, params, out)?
+result2 := user_with_groups.run(inside, params, out)?
+```
+
 ## 7. Compound Query pattern
 
 ### 7.1 many-to-one/master lookup
@@ -610,20 +706,72 @@ JOINで必要なmaster値を同じRowへ投影し、1回のstatementでdecode/sh
 SQLはparent列とchild列をflatに返す。nullable childの全列がNULLならchildなしと解釈する。
 partial NULLはcontract errorにする。
 
+```sql
+SELECT
+    u.id AS user_id,
+    u.name AS user_name,
+    g.id AS group_id,
+    g.name AS group_name
+FROM users AS u
+LEFT JOIN user_groups AS ug
+    ON ug.user_id = u.id
+LEFT JOIN groups AS g
+    ON g.id = ug.group_id
+WHERE u.id = :user_id
+ORDER BY u.id, g.id
+```
+
+```align
+pub Row {
+  user_id: i64,
+  user_name: str,
+  group_id: Option<i64>,
+  group_name: Option<str>,
+}
+```
+
+```align
+pub Output {
+  user: User,
+  groups: array<Group>,
+}
+```
+
 ```align
 State {
-  seen_parent: bool,
-  parent_id: i64,
-  parent_name: str,
+  seen: bool,
+  user_id: i64,
+  user_name: str,
 }
 
-pub fn step(
+fn step(
   borrow mut state: State,
   borrow mut groups: array_builder<Group>,
   row: Row,
   out: region,
 ) -> Result<(), db.Error> {
-  // parent identityを検証し、childがあればclone_in(out)してpushする
+  if state.seen {
+    if row.user_id != state.user_id {
+      return Err(inconsistent_parent_id())
+    }
+    if row.user_name != state.user_name {
+      return Err(inconsistent_parent_name())
+    }
+  } else {
+    state.seen = true
+    state.user_id = row.user_id
+    state.user_name = row.user_name.clone_in(out)
+  }
+
+  group_id := row.group_id else {
+    _ := row.group_name else return Ok(())
+    return Err(partial_child())
+  }
+  group_name := row.group_name else return Err(partial_child())
+  groups.push(Group {
+    id: group_id,
+    name: group_name.clone_in(out),
+  })
   return Ok(())
 }
 ```
@@ -635,6 +783,28 @@ inputだけにrootedする。builderはstruct fieldへ入れず、runの独立�
 arena-owned arrayを通常functionへby-valueで渡さない。runのrows loopがSQLを1回だけ実行する。
 
 ### 7.3 一対多: 複数parent
+
+```align
+pub Output {
+  users: array<User>,
+  groups: array<Group>,
+  group_offsets: array<i64>,
+}
+```
+
+```text
+users          [u0, u1, u2]
+group_offsets  [0, 2, 2, 5]
+groups         [g0, g1, g2, g3, g4]
+
+u0 groups = groups[0..2]
+u1 groups = groups[2..2]
+u2 groups = groups[2..5]
+```
+
+```sql
+ORDER BY u.id, g.id
+```
 
 SQLのORDER BY contractによりparent key単位でgroupを閉じる。canonicalな多数parent表現は
 並行する `users: array<User>`、`groups: array<Group>`、`group_offsets: array<i64>` の3本を
@@ -1162,22 +1332,22 @@ db.ContractError {
 }
 
 db.Error {
-  Connection(NativeError),
-  Timeout(NativeError),
-  Cancelled(NativeError),
+  Connection(db.NativeError),
+  Timeout(db.NativeError),
+  Cancelled(db.NativeError),
   NotFound,
   PoolExhausted,
-  Cardinality(CardinalityError),
-  Constraint(NativeError),
-  Serialization(NativeError),
-  Deadlock(NativeError),
-  SchemaMismatch(ContractError),
-  DriverMismatch(ContractError),
-  Decode(ContractError),
-  Encode(ContractError),
-  InvalidQuery(ContractError),
-  Unsupported(ContractError),
-  Native(NativeError),
+  Cardinality(db.CardinalityError),
+  Constraint(db.NativeError),
+  Serialization(db.NativeError),
+  Deadlock(db.NativeError),
+  SchemaMismatch(db.ContractError),
+  DriverMismatch(db.ContractError),
+  Decode(db.ContractError),
+  Encode(db.ContractError),
+  InvalidQuery(db.ContractError),
+  Unsupported(db.ContractError),
+  Native(db.NativeError),
 }
 ```
 

@@ -9,7 +9,7 @@ Text uses the memory model from chapter [05](05-memory.md). `str` borrows existi
 - **`str`** — a borrowed, immutable **view**: a pointer and a byte length. String literals are `str`. Copying the view does not copy the text; it carries the region of the data it points into.
 - **`string`** — an **owned** heap buffer. A Move type: assignment transfers ownership, the buffer is dropped when its owner dies.
 
-You get a `string` from `.clone()` (deep copy) or from a `builder` (below). And an owned `string` **auto-borrows** wherever a `str` is expected — passing it to a `str` parameter costs nothing and consumes nothing:
+`.clone()` makes an owned `string` by copying text; a builder produces one from appended pieces. An owned `string` auto-borrows where `str` is expected. Passing it to a `str` parameter does not allocate, copy the text bytes or transfer ownership:
 
 ```align
 fn greet(who: str) -> i64 = who.len()
@@ -72,6 +72,8 @@ The predicate returns false for negative or past-end offsets, true for zero and 
 
 Text's `.bytes()` is a read-only view, including when the source is an owned `string`. Writing `mut` on the byte-view binding does not make the backing text writable. Copy bytes into writable storage when mutation is needed. After validating mutable bytes as text, an overlapping write invalidates that text observation; validate again before reading it as text.
 
+String equality and ordering compare bytes without Unicode normalization. When your application needs NFC, use the explicit `pkg.unicode.nfc` operation in chapter [23](23-packages.md#pkgunicode); its owned output and allocation are visible at the call.
+
 > **Cost:** Copying a `str` or slicing it is O(1), with no allocation or byte copy. `trim`, `trim_start`, and `trim_end` also return views without allocation or byte copying, but they scan for whitespace and take O(n) time in the worst case. `.clone()` is O(n), makes at most one result allocation, and copies n bytes into an owned `string`. Searches are O(n) in the worst case.
 
 ## Concatenation: builder is the one way
@@ -94,10 +96,7 @@ fn main() -> i32 {
 }
 ```
 
-This is "nothing hidden" and "one way" applied to text. A spelling such as
-`xs.reduce("", fn acc, x { acc + x })` would hide an allocation and repeatedly copy a growing
-intermediate; it is rejected rather than receiving a special arena exception. Use the builder for
-both one-shot concatenation and incremental assembly.
+Repeated concatenation, as in `xs.reduce("", fn acc, x { acc + x })`, would allocate and copy a growing intermediate. Align rejects string `+`, including inside arenas. Use a builder for one-shot concatenation or incremental assembly.
 
 ## The builder
 

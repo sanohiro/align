@@ -12,8 +12,8 @@ return a request through `Result`, and could not name a parsed response. The
 S3 composition probe `prepare() -> Result<http_request, Error>` followed by
 `send(borrow mut client: http_client, req: http_request) -> Result<http_response, Error>`
 produced unknown-type diagnostics for all three names and rejected the request
-payload. This is an unimplemented library composition capability, not a
-proposal to change the language's ownership or parallel model.
+payload. The shipped capability closes this library composition gap without
+changing the language's ownership or parallel model.
 
 One implementation adds the complete client/request/response function boundary.
 A signer can return a fallible request, a caller can reuse its explicit client,

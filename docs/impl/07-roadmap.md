@@ -4047,19 +4047,19 @@ An item without a status is not a committed contract: it becomes a gated design 
 An item marked `DESIGNED` is locked by its named design ledger even though implementation remains
 pending. This section records their sequencing and status; it does not lock an unmarked surface.
 
-### Convergence — a few foundations unlock many exits
+### Shared prerequisites for planned packages
 
 ```text
 1. HTTP client streaming receive (de-chunk + incremental read + SSE) — IMPLEMENTED 2026-08-30
-     highest leverage: unlocks pkg.llm, Vertex, all Google APIs, large downloads
+     supports pkg.llm, streaming cloud APIs, and large downloads
 2. Asymmetric signature suite (RS256 / ES256 / Ed25519 + canonical PKCS#8 v1 PEM) — IMPLEMENTED 2026-08-30
-     unlocks GCP SA key, Azure cert credential, CloudFront signed URLs, JWT RS256 / JWKS
+     supports GCP SA keys, Azure certificate credentials, CloudFront signed URLs, JWT RS256 / JWKS
 3. Small pieces: std.xml (well-formed read-only) — IMPLEMENTED 2026-09-05
      std.time named formatters and parsers — IMPLEMENTED #996
-     unlock S3 / Azure Storage / CloudFront / Route53 / SigV4
+     supports S3 / Azure Storage / CloudFront / Route53 / SigV4 integration
      (encoding.percent_encode and '/'-preserving percent_encode_path are implemented)
 4. Transport: mTLS / Unix domain socket / proxy, then HTTP/2
-     unlock Kubernetes, Docker, corporate networks, gRPC-family services
+     prerequisites for Kubernetes, Docker, corporate networks, and gRPC-family services
 ```
 
 ### Planned packages (order)

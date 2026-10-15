@@ -12,20 +12,16 @@
 
 ## ステータス
 
-**出荷済み（W1–W7 完了、2026-07-22）。** 本書は現在のパッケージ契約であり、実装に至った
-設計理由も残している。失われた会話記録から復元し、二度と
-失わないようここに固定する owner の要求: **成果物は「Align らしくデータ志向な、zero-copy の
-くっそ高速 REST フレームワーク」— 速度が主題で、無駄（bloat）は拒否**（最小表面。投機的機能なし）。
-**参照は器具であって命令ではない:** owner が「既存でこれに当たるのは何か」と聞いた時に *Claude* が
-**Go の Fiber**（fasthttp の zero-allocation 哲学）を最近似として挙げた — owner の選択ではなく、
-より良い既存参照があれば随時差し替えてよい。router の参照も同様に器具的: **httprouter/fasthttp**
-（radix 系譜）と Rust の **matchit**（最小・最速級の radix マッチャ）。全決定の判定基準は
-Align らしさ（データ志向 / nothing hidden / one way / 最小）であり、「フレームワーク X が
-そうだから」は理由にならない。**router は第一級の要件**: 最初の消費者アプリ（OpenAI 互換・固定
-パス）には不要でも、REST フレームワークには必須 — だから後付けではなく Align らしい設計
-（下記）を与える。gateway / LLM アプリは単なる最初の消費者（「それで作るものが LLM 系という
-だけ」）— 本設計を規定しない。過去の実行計画: `../../15-pkg-web-plan.md`。以前のハードな
-コンパイラ前提 **F1 フィールド許可拡張**は出荷済み（下の土台の節参照）。
+**出荷済み（W1–W7 完了、2026-07-22）。** 本書は現在のパッケージ契約と設計理由を記録する。
+設計の目標は、データ志向の REST フレームワーク、リクエスト処理の低いオーバーヘッド、
+明示的な所有権、小さな公開 API である。
+
+バッファ再利用の参考として Go の Fiber/fasthttp、radix routing の参考として
+httprouter/fasthttp と Rust の matchit を用いる。これらは比較対象であり、API を決める根拠ではない。
+設計は Align のデータ配置、コストの明示、所有権の規則に従う。最初の gateway / LLM アプリが
+固定パスを使う場合でも、routing はフレームワークの必須機能であり、これらの消費者だけに用途を
+限定しない。過去の実行計画は `../../15-pkg-web-plan.md`。コンパイラ側の前提条件である
+**F1 フィールド許可拡張**は出荷済み（下の土台の節参照）。
 
 ## 最小主義（owner 制約）
 
@@ -34,16 +30,14 @@ Align らしさ（データ志向 / nothing hidden / one way / 最小）であ�
 サイクルコールバックは**なし**: 消費者が要求したら別パッケージ。全追加は消費者名を挙げること。
 「フレームワークには普通ある」は理由にならない（"one way" + no-bloat 要求）。
 
-## なぜ Align が勝てるか
+## リクエスト処理の設計
 
-Fiber が速いのは fasthttp がリクエスト毎アロケーションを拒否しバッファを再利用するから — だが Go は
-GC・interface boxing・`string([]byte)` 境界のコピーを払い続ける。Align では Fiber の規律が
-**デフォルト**になる: `std.http` は既にリクエストを 1 バッファ + オフセット表にパースし（R1）、
-全アクセサは `str`/`slice<u8>` **view**（構造的に zero-copy。region により view の漏出はコンパイル
-エラー）、SIMD JSON は view を持つ struct へ直接デコード、リクエスト毎 `arena {}` は O(1) リセット、
-GC は存在しない。フレームワークの仕事は**その連鎖を壊さずに routing + エルゴノミクスを足す**こと:
-ホットパスでリクエストバイトのコピーもヒープ接触も禁止。これが存在証明であり、W5/W7 が計測・
-回帰固定された数値にする。
+`std.http` は各リクエストを 1 つのバッファとオフセット表に解析する（R1）。アクセサは
+そのバッファを参照する `str` / `slice<u8>` のビューを返し、region 検査はバッファより長生きする
+ビューを拒否する。SIMD JSON はビューを含む struct にデコードし、リクエストごとの
+`arena {}` は GC なしで O(1) のリセットを行う。フレームワークはこれらの性質を保ちながら
+routing とリクエスト操作を追加する。ホットパスでリクエストバイトをコピーしたり、ヒープ確保を
+行ったりしてはならない。W5/W7 のベンチマークでオーバーヘッドを計測し、回帰を検査する。
 
 ## パフォーマンス契約（設計不変条件、ベンチで固定）
 
@@ -260,22 +254,26 @@ web.serve          Impure。テーブル借用。セットアップ Err まで�
 （`NotFound`、`Invalid`、`Denied`、`Code(n)`）を best-effort の stderr 1 行に残し、ログ失敗で
 ループを殺さない。リクエスト由来の panic はゼロ。
 
-## Middleware（確定した所有権モデルに合わせ 2026-07-21 再設計 — 着地は W6）
+## Middleware（2026-07-22 出荷済み）
 
 Fiber の `c.Next()` チェーンはキャプチャクロージャ（延期）を要する。framework がハンドルを所有する
 モデルでは、v1 の形は元の Move 連鎖設計より単純になる: `Ctx` は Copy なので、pre-handler は
-それを消費も返却もしない —
+それを消費も返却もしない。判定には三つの結果を持つ sum 型を使う。
 
 ```text
-fn(c: Ctx) -> Result<Option<response_builder>, Error>
-//   None      -> 続行（次の pre-handler / ハンドラへ）
-//   Some(rb)  -> 短絡: serve が rb を書き、ハンドラは走らない（auth 拒否、リダイレクト）
-//   Err       -> 500（ハンドラの Err と同じ）
+Middleware { Proceed, Respond(response_builder), Failed(Error) }
+fn(c: Ctx) -> Middleware
+//   Proceed     -> 続行（次の pre-handler / ハンドラへ）
+//   Respond(rb) -> 短絡: serve が rb を書き、ハンドラは走らない（auth 拒否、リダイレクト）
+//   Failed(e)   -> request context を log + 500（ハンドラの Err と同じ）
 ```
 
-`Option<response_builder>` は #583 以降合法なペイロードである。グループがリストを保持:
-`web.group_with(prefix, [auth, log], routes)`。auth/logging/CORS ヘッダをクロージャなしで賄う。
-状態付き middleware はキャプチャクロージャ機能と実消費者を待つ。
+グループは同じ型の名前付き関数のリストを保持する:
+`web.group_with("/api", [auth, log], routes)`。`group` と `group_with` は所有する route 配列を返す。
+radix tree は prefix と pattern を二つの zero-copy view として照合し、route ごと・request ごとの
+文字列連結を行わない。prefix は末尾 slash のない、root 以外の literal path である。
+auth、request logging、redirect、preflight response などを扱う。状態付き middleware は
+escaping closure environment の設計を待つ。
 
 
 ## ストリーミング（SSE + 汎用）— 2026-07-21 設計、着地は W6
@@ -467,14 +465,15 @@ pkg.web.serve(host, port, routes, workers) -> Result<(), Error>   // シグネ�
 //                    `workers = process.cpu_count()` と書くこと。
 ```
 
-- **パラメータによる Nothing hidden:** スレッド生成はどの呼び出し箇所でも可視である — `serve(...,
+- **ワーカー数の明示:** スレッド生成はどの呼び出し箇所でも可視である — `serve(...,
   4)` はソース上で 4 スレッドと言っている。`serve` 内の `spawn` は普通の pkg レベル Align
-  （`task_group { spawn(fn { worker(...) }) }`）であって、ランタイムの魔法ではない。
+  （`task_group { spawn(fn { worker(...) }) }`）である。
 - **構築上、共有可変状態なし。** 代替案 — 1 つのリスナーハンドルを N ワーカーで共有する — は言語
   自身に拒否された: Move の `http server` ハンドルは N 個のクロージャに値でキャプチャできず、借用は
   `spawn` を越えない。`SO_REUSEPORT` はその共有を解消する: 各ワーカーは自分の Move リスナー、自分の
-  parked keep-alive スロット、自分のリクエストループを所有する — ロックゼロ、競合ゼロ、`spawn` の値
-  キャプチャが既に強制している「共有可変状態なし」規則そのものである（draft §Task Group）。
+  parked keep-alive スロット、自分のリクエストループを所有する。リスナーの所有にアプリケーション側の
+  共有ロックは不要であり、`spawn` の値キャプチャが強制する「共有可変状態なし」の規則に従う
+  （draft §Task Group）。
 - **唯一の共有入力は route テーブル** — Copy 行の `slice<Route>` で、各ワーカーへ値で（16 バイトの
   view ディスクリプタとして）キャプチャされる; 背後の配列は region により構造化 `task_group` より
   長生きする。**2026-07-21 探査済み: この形状全体は今日そのままコンパイルされ正しく動く** —
@@ -657,12 +656,35 @@ padding、大小無視の名前、quoted と素のパラメータ、quoted な�
 ## `pkg.ws` 用 protocol-neutral Upgrade seam（出荷済み）
 
 `pkg.ws` は別 package だが、この package の route table、middleware 順序、request view、prefork
-worker ownership を共有する。`pkg.web` を WebSocket semantics に依存させず、英語版に固定した
-`UpgradeAccepted { response, selected }`、`UpgradeDecision { Accept, Reject, Failed }`、
-`UpgradeHandler { values_valid, prepare, pump }` を `pkg.web.types` に追加する。`Handler` の末尾 variant は
+worker ownership を共有する。`pkg.web` を WebSocket semantics に依存させず、
+次の型を `pkg.web.types` に追加する。
+
+```align
+pub UpgradeAccepted { response: response_builder, selected: string }
+pub UpgradeDecision {
+  Accept(UpgradeAccepted)
+  Reject(response_builder)
+  Failed(Error)
+}
+pub UpgradeHandler {
+  values_valid: bool,
+  prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
+  pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>,
+}
+```
+
+`Handler` の末尾 variant は
 `Upgrade(UpgradeHandler)`、`Route` の末尾 field は `upgrade_values: slice<str>` である。
 
-exact constructor は `pkg.web.upgrade(method, pattern, values, values_valid, prepare, pump) -> Route`。
+exact constructor は次のとおり。
+
+```text
+pkg.web.upgrade(method: str, pattern: str, values: slice<str>,
+  values_valid: bool,
+  prepare: fn(Ctx, slice<str>) -> UpgradeDecision,
+  pump: fn(Ctx, http_upgrade, string) -> Result<(), Error>) -> Route
+```
+
 Pure かつ protocol-blind で、values は Copy config、protocol package は call 前に values_valid を一回
 計算する。argument expression の effect は call site に明示され、callback として保持・再実行しない。
 既存 pre-bind route validation が common method/pattern/prefix と handler-storage checks 後、segment/pair

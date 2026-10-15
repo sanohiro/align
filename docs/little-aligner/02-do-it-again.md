@@ -102,7 +102,7 @@ factor := 3
 
 **Q14.** Then why is printing inside a pipeline usually a poor habit?
 
-**A14.** It mixes calculation with output, limits optimization, and prevents us from using the same function with `par_map`. Keep a stage Pure when its job allows it. Remember the distinction: sequential `map` permits side effects; explicit parallel work does not.
+**A14.** It mixes calculation with output, limits optimization, and prevents us from using the same function with `par_map`. Keep a stage Pure when its job allows it. Remember the distinction: sequential `map` permits side effects; `par_map` requires Pure callables. The separate `spawn` form in chapter 12 permits I/O tasks.
 
 ---
 

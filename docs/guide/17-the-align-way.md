@@ -19,25 +19,25 @@ Failable functions return `Result`; call them with `?`; convert error types visi
 ## Choose a lifetime for each phase
 
 - Local value → nothing to do.
-- A phase's worth of allocations → `arena {}`, and `.clone()` the survivors out.
-- Text assembly → `builder`, never `+` in a loop.
+- A phase's worth of allocations → `arena {}`. Copy independent scalars out, clone escaping text, and construct independently owned collections when they must survive.
+- Text assembly → `builder`; string `+` is rejected everywhere.
 - Someone else's data → borrow a view (`str`, `slice`) without copying the data.
 
 Choose how long the data must live. The compiler then checks moves and region escapes and inserts the required cleanup.
 
 ## Lay bulk data out as SoA
 
-If a hot path touches one or two fields of many rows, transpose: `to_soa()` at the point data enters, or decode JSON straight into `soa<T>`. Repeated aggregation over a string key → `dict_encode` once. AoS is for data you touch whole and rarely.
+Consider `soa<T>` when a hot path scans a few fields across many records. `to_soa()` transposes existing records, while JSON can decode directly into columns. Repeated aggregation over a string key may benefit from `dict_encode`. Measure conversion cost and repeated access before choosing a layout.
 
 ## Choose between data parallelism and tasks
 
-Use `par_map` when the per-element function is expensive; measure first, because a vectorized sequential pipeline may be faster. Use `task_group`/`spawn` with `wait()?` for independent jobs with different operations. Parallel closures must be Pure. Purity is inferred, so a closure that changes state or performs I/O is rejected.
+Use `par_map` when the per-element function is expensive; measure first, because a vectorized sequential pipeline may be faster. Its callable must be Pure and cannot mutate captured backing. Use `task_group`/`spawn` for independent jobs, including I/O: tasks may be Impure, but captured views remain read-only until the group joins. Use `wait()` for primitive results and `wait()?` to propagate fallible task results. Both forms enforce capture and lifetime rules without user-written purity annotations.
 
 ## Let the compiler see the shape
 
 Align's restrictions give the compiler information it can use for optimization: contiguous memory, no aliasing, non-null values, cold error paths, and arena lifetimes. Pipelines, `Result`, and explicit allocation preserve that information without extra annotations. These idioms help the compiler optimize the code; measure the result on your workload.
 
-## Trust, but verify with the tools
+## Check and measure with the tools
 
 Use `alignc check` while editing and `alignc fmt --write` before committing. Investigate warnings about large copies, unnecessary heap allocation, and lossy casts. To check whether a pipeline vectorized, inspect its optimization remarks with `alignc explain-opt` or its IR with `alignc emit-llvm`. Use a benchmark to measure execution time.
 

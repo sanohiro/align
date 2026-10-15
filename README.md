@@ -26,36 +26,41 @@ brew install align
 curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
 sudo apt install alignc
 ```
-The install script configures the LLVM 22 and Align apt repositories, then `apt install alignc` pulls the compiler and its runtime.
+The install script configures the package repositories, then `apt install alignc` pulls the compiler and its runtime dependencies.
 
 ### Build from source
 
-Building the compiler needs **Rust 1.96+** and **LLVM 22** (with a matching **clang** as the C compiler/linker).
+Building the workspace needs **Rust 1.96+**, **LLVM 22** and a native C toolchain. Matching **clang 22** and its compiler runtime are also needed for instrumented PGO. The native libraries include OpenSSL, zstd, SQLite and **libpq 17+**; a PostgreSQL server is only needed for database applications and integration tests.
 
 #### Linux (Ubuntu 24.04)
 
-Install the LLVM toolchain from the official `apt.llvm.org` repository; `llvm-config-22` must be on your `PATH`:
+From the repository root, use the same signed LLVM and PostgreSQL package repositories as CI. Ubuntu 24.04's default libpq 16 is too old for the streamed database API:
 ```sh
-sudo apt install llvm-22 llvm-22-dev clang-22
+sudo apt install build-essential curl wget gnupg pkg-config
+scripts/ci-pgdg.sh
+ALIGN_APT_PACKAGES="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev" \
+  scripts/ci-apt-llvm.sh install --uncached
+scripts/check-libpq-version.sh
 ```
 
 #### macOS (Apple Silicon)
 
 Install the dependencies with Homebrew:
 ```sh
-brew install llvm openssl@3 zstd
+brew install llvm@22 openssl@3 libpq zstd
 ```
-The `llvm` formula currently provides LLVM 22; if Homebrew has since moved it past 22, install the versioned `llvm@22` formula instead. Homebrew's LLVM is keg-only (its `llvm-config` is not on your `PATH`), so point the build at it and add the linker search paths for the runtime's native libraries (`zstd`, `openssl@3`). Add these to your shell profile, or prefix each `cargo` / `alignc` command with them (the same `LIBRARY_PATH` is needed when running an `alignc`-built program that links those libraries):
+`scripts/cargo.sh` locates LLVM 22 and supplies Homebrew library paths during the compiler build. For later `alignc` invocations, make the keg-only tools and native libraries available in your shell:
 ```sh
-export LLVM_SYS_221_PREFIX="$(brew --prefix llvm)"
-export LIBRARY_PATH="$(brew --prefix)/lib:$(brew --prefix openssl@3)/lib"
+export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix libpq)/bin:$PATH"
+export LIBRARY_PATH="$(brew --prefix libpq)/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+scripts/check-libpq-version.sh
 ```
 
 #### Build
 
 ```sh
-cargo build --release
-# The compiler binary will be at target/release/alignc
+scripts/cargo.sh build --release --workspace
+# Compiler: target/release/alignc; REPL: target/release/align-repl
 ```
 
 ## Hello World

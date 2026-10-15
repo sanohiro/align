@@ -1,6 +1,5 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, Move/effect classification, error policy, pitfalls, test
-anchors). Authored by the main loop (Fable).
+This directory records the per-area design of the `core` library: signatures,
+ownership and effect classification, error policy, pitfalls, and related tests.
 
 # core — soa / group_by / dict_encode
 

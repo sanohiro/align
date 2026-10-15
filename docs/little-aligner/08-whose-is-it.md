@@ -112,7 +112,7 @@ print(shout("align"))
 
 **Q14.** Whose is it, then — this very buffer, at this line?
 
-**A14.** Read the source: the last binding it moved into. Ownership in Align is not a runtime mystery; it is written down, and the compiler already checked your reading.
+**A14.** The last binding it moved into. Follow the assignments; the compiler rejects a later use of a moved value.
 
 ---
 
@@ -132,7 +132,7 @@ How many arrays now exist?
 
 **Q16.** May either view outlive `xs`?
 
-**A16.** No. A view is cheap because it owns nothing, and safe because the compiler remembers what it borrows. Move answers *who will free this?* A view answers *whose lifetime am I inside?* You need both answers to read memory correctly.
+**A16.** No. The compiler tracks what the view borrows and rejects uses beyond that lifetime. Move tells us who owns the storage; the view tells us who is borrowing it.
 
 ---
 

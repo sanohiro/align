@@ -66,7 +66,7 @@ fn main() -> i32 {
 
 ## Modules are files
 
-One file = one module; the `module` name must match the filename. `import` brings a sibling file in; everything is private unless marked `pub`; cross-module references are always qualified. No headers, no manifest, no search-path ritual.
+One file defines one module, and its `module` name must match the filename. `import` loads sibling modules. Declarations are private unless marked `pub`, and cross-module references are qualified.
 
 ```align
 // geom.align
@@ -98,4 +98,4 @@ The same `import` keyword enables built-in modules such as `std.fs` and `core.js
 
 ## Program shape
 
-A small program is one file. When it grows, the seams are data boundaries: the record types and the functions over them move to a module (`records.align`), the I/O edge stays in `main.align`, and `pub` marks the deliberate surface. Because references are qualified and visibility is explicit, a module's true interface is greppable: `pub` lines are the contract.
+A small program can fit in one file. As it grows, group related record types and functions in modules such as `records.align`, and keep application I/O in `main.align`. Use `pub` for declarations that importers need; those declarations identify the public interface.

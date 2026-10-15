@@ -42,7 +42,7 @@ The `i64` socket values here are identifiers for a model, not owned OS socket ha
 
 ## Transitions as Pure Functions
 
-In OOP, state transitions happen when you call a method that mutates internal fields (`conn.connect()`). In Align, a transition is a pure function that takes the current state and an event, and returns the *next* state.
+Here, a pure transition function takes the current state and an event and returns the next state. I/O stays outside the transition function.
 
 First, define the events that can happen:
 
@@ -86,7 +86,7 @@ fn next(state: ConnectionState, event: Event) -> ConnectionState {
 This is a **finite state machine**. Representing it as data and a transition function gives us:
 
 1. **Exhaustive cases:** `match` must cover every variant; the compiler rejects a missing arm. A wildcard explicitly handles any remaining cases.
-2. **Testable:** Testing this logic does not require spinning up sockets or mocking objects. You just call `next(state, event)` and assert the output.
+2. **Testable:** Call `next(state, event)` and check its result without opening a socket.
 3. **Data-Oriented:** We can store an array of thousands of `ConnectionState` in memory and update them in bulk using a pipeline: `states.map(fn s { next(s, ev) }).to_array()`.
 
 The transition logic can now be tested independently and applied to many states through the same pipeline.

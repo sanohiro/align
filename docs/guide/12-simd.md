@@ -115,11 +115,11 @@ fn fused(a: f64, b: f64, c: f64) -> f64 = float(contract) { a * b + c }
 
 ## `align(N)` — when the loads should be aligned
 
-`align(64) xs := [...]` over-aligns an array's storage; `align(64) CacheLine { ... }` over-aligns a struct (and pads its array stride to match). Vector loads at provably aligned offsets then use the wider alignment. It composes with `layout(C)` for FFI-shared buffers. This is a micro-optimization with a real but small payoff — measure first.
+`align(64) xs := [...]` over-aligns an array's storage; `align(64) CacheLine { ... }` over-aligns a struct (and pads its array stride to match). Vector loads at provably aligned offsets then use the wider alignment. It composes with `layout(C)` for FFI-shared buffers. Alignment can also increase padding and the working set. Measure its effect on the actual access pattern and target; neither a speedup nor a particular payoff is guaranteed.
 
 ## The two-tier rule
 
-- **Tier 1 (default): pipelines.** `xs.map(f).where(p).sum()`, soa columns, `group_by`. Width-agnostic — the compiler picks lane counts per target, and the same source can vectorize on AVX2, NEON, or a scalable ISA. This tier follows your data.
+- **Tier 1 (default): pipelines.** `xs.map(f).where(p).sum()`, soa columns, `group_by`. Source does not name a vector width. Eligible loops can vectorize for targets such as AVX2 or NEON; scalable ISAs remain a future target direction, not a current code-generation guarantee.
 - **Tier 2: `vecN`/`maskN`.** Use these for kernels such as dot products, FIR filters, or blending when you need to specify a fixed vector width and per-lane operations.
 
 > **Optimization:** Tier-1 vectorization is target- and profile-dependent, not a semantic guarantee or a fixed byte threshold. Loop legality and input shape also matter. Use `alignc explain-opt` for the decision and `emit-llvm --stage optimized` for the resulting vector width.

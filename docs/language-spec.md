@@ -755,8 +755,9 @@ A pipeline **materializes** either into a fresh owned `array<T>` (`.to_array()`)
 caller-provided `out`/`mut` slice (`.map_into(dst)` — the caller-storage counterpart). `map_into` is
 length-preserving (`map` / field-projection stages; `dst.len() == src.len()`, a mismatch aborts) and
 yields `()`; because the compiler proves `dst` is a distinct buffer from the source (the `out`
-no-alias rule), it emits the disjoint-buffer `noalias` so the fused write vectorizes with no runtime
-overlap check. An `out` parameter (`fn scale(src: slice<T>, out dst: slice<T>)`) is a writable output
+no-alias rule), it emits the disjoint-buffer `noalias` without a runtime overlap check.
+Vectorization still depends on the operations, target and profile.
+An `out` parameter (`fn scale(src: slice<T>, out dst: slice<T>)`) is a writable output
 buffer that must not alias any other argument — both a safety constraint and the no-alias hint.
 
 SIMD is two layers: the pipeline (`map`/`where`/`reduce`) is the width-agnostic main road — it never
@@ -794,8 +795,8 @@ provably aligned offset to an aligned load. `v[i]` reads lane `i` and `v[i] = x`
 compile-time-constant index in `0..N`, the write requiring a `mut` vector local. (`draft.md` §9.)
 
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
-layout, so a field-wise pipeline streams only the columns it touches (the cache lever that beats an
-AoS `Vec<Struct>`). Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one
+layout, so a field-wise pipeline reads contiguous values from the selected columns.
+Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one
 (`s: soa<User> := json.decode(d)?` counts the rows, allocates the columns, and fills them directly
 without an AoS intermediate or transpose), both arena-allocated. `json.decode`'s field contract is strict and
 exactly-once (a missing or duplicated declared field is an `Err`; undeclared keys are skipped),

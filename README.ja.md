@@ -26,36 +26,41 @@ brew install align
 curl -fsSL https://sanohiro.github.io/align/install.sh | sudo sh
 sudo apt install alignc
 ```
-インストールスクリプトが LLVM 22 と Align の apt リポジトリを設定し、`apt install alignc` でコンパイラとランタイムが導入されます。
+インストールスクリプトがパッケージリポジトリを設定し、`apt install alignc` でコンパイラとランタイムの依存関係が導入されます。
 
 ### ソースからのビルド
 
-コンパイラのビルドには **Rust 1.96 以上** と **LLVM 22**（Cコンパイラ/リンカーとして対応する **clang**）が必要です。
+ワークスペースのビルドには **Rust 1.96 以上**、**LLVM 22**、ネイティブ C ツールチェーンが必要です。計測付き PGO には、対応する **clang 22** とそのコンパイラランタイムも必要です。ネイティブライブラリには OpenSSL、zstd、SQLite、**libpq 17 以上**を使います。PostgreSQL サーバーは、データベースを使うアプリケーションや統合テストでのみ必要です。
 
 #### Linux (Ubuntu 24.04)
 
-公式リポジトリ (`apt.llvm.org`) から LLVM ツールチェーンをインストールします。`llvm-config-22` が `PATH` 上にある必要があります：
+リポジトリのルートから、CI と同じ署名付き LLVM・PostgreSQL パッケージリポジトリを使います。Ubuntu 24.04 標準の libpq 16 は、データベースのストリーム API には古すぎます。
 ```sh
-sudo apt install llvm-22 llvm-22-dev clang-22
+sudo apt install build-essential curl wget gnupg pkg-config
+scripts/ci-pgdg.sh
+ALIGN_APT_PACKAGES="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev" \
+  scripts/ci-apt-llvm.sh install --uncached
+scripts/check-libpq-version.sh
 ```
 
 #### macOS (Apple Silicon)
 
 Homebrew で依存関係をインストールします：
 ```sh
-brew install llvm openssl@3 zstd
+brew install llvm@22 openssl@3 libpq zstd
 ```
-現在 `llvm` formula は LLVM 22 を提供します。Homebrew の `llvm` が 22 より先に進んでいる場合は、バージョン固定の `llvm@22` formula を代わりにインストールしてください。Homebrew の LLVM は keg-only（`llvm-config` が `PATH` に載りません）なので、ビルドがそれを参照できるようにし、ランタイムのネイティブライブラリ（`zstd`、`openssl@3`）のリンカ検索パスを追加します。以下をシェルのプロファイルに追加するか、`cargo` / `alignc` の各コマンドの先頭に付けてください（`alignc` でビルドしたプログラムがこれらのライブラリをリンクして実行する際にも、同じ `LIBRARY_PATH` が必要です）：
+`scripts/cargo.sh` が LLVM 22 を見つけ、コンパイラのビルド中に Homebrew のライブラリ検索パスを設定します。その後 `alignc` を使うシェルでは、keg-only のツールとネイティブライブラリを参照できるようにします。
 ```sh
-export LLVM_SYS_221_PREFIX="$(brew --prefix llvm)"
-export LIBRARY_PATH="$(brew --prefix)/lib:$(brew --prefix openssl@3)/lib"
+export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix libpq)/bin:$PATH"
+export LIBRARY_PATH="$(brew --prefix libpq)/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+scripts/check-libpq-version.sh
 ```
 
 #### ビルド
 
 ```sh
-cargo build --release
-# コンパイラは target/release/alignc に生成されます
+scripts/cargo.sh build --release --workspace
+# コンパイラ: target/release/alignc、REPL: target/release/align-repl
 ```
 
 ## Hello World

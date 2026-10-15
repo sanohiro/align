@@ -23,14 +23,14 @@ fn main() -> i32 {
 }
 ```
 
-`null` / `alloc` / `free` / `load` / `store` / `offset` — that is the entire unsafe vocabulary. No pointer arithmetic operators, no casts-through-pointers dialect: six named operations you can grep for. (A `resource` type's own internal code adds a few representation-privilege verbs — `resource.from_raw`, `.into_raw`, `.view_from_raw` — usable only inside that type's `unsafe` code, never a bypass in ordinary `unsafe`.) `raw.null()` is the explicit native-ABI null sentinel; it does not add null to ordinary Align values. *Holding* a `raw` is safe (it's a Copy value; pass it around freely); only operating on one needs the block.
+The raw-pointer operations are `null`, `alloc`, `free`, `load`, `store` and `offset`. A `resource` type also has representation operations such as `resource.from_raw`, `.into_raw` and `.view_from_raw`, restricted to that type's privileged `unsafe` code. `raw.null()` supplies a native-ABI null sentinel. A `raw` is a Copy value that may be held and passed in safe code; operating on it requires `unsafe`.
 
 `load` and `store` admit primitive scalars, `raw` pointers, and eligible `layout(C)` structs. A
 native wrapper can therefore keep a C handle in a package-owned state block without casting the
 address to an integer: `raw.store(state, 0, handle)` and `handle: raw := raw.load(state, 0)`. The
 programmer remains responsible for the slot size, pointer validity, and effective type.
 
-What `unsafe` does **not** do: it is a marker, not a mode switch. Arena escape checks, move checking, bounds checks on ordinary types — all still apply inside. And purity inference (chapter [10](10-closures-and-parallelism.md)) marks any function containing `unsafe` as impure, so raw-memory code can never ride into `par_map`.
+Arena escape checks, move checking and bounds checks on ordinary types remain active inside `unsafe`. Purity inference (chapter [10](10-closures-and-parallelism.md)) classifies functions containing `unsafe` as impure, so they cannot be passed to `par_map`.
 
 ## `extern "C"` — declaring the outside world
 

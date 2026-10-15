@@ -212,7 +212,7 @@ as one mode, not as a mutable local declaration. The checking and return-provena
 provenance for every argument mode, including distinct Copy/Move aggregate holders, so a
 `BorrowMut` operand cannot invalidate a peer argument delivered to the same call.
 
-### Test declarations (designed 2026-08-30; implementation pending)
+### Test declarations (implemented 2026-08-31)
 
 ```ebnf
 test_decl = "test" string block
@@ -664,16 +664,21 @@ outside the current grammar.
 ## 8. Ambiguities and resolution
 
 ### struct literal vs block
-Allowing a bare struct literal at the `cond` position of `if cond { ... }` makes `Foo { ... }` collide with a block (the same problem as Rust). **Resolution**: at the scrutinee position of `if` / `match` / `while`, bare struct literals are forbidden; wrap in parentheses if needed.
+Allowing a bare struct literal at the `cond` position of `if cond { ... }` makes `Foo { ... }` collide with a block (the same problem as Rust). **Resolution**: at the scrutinee position of `if` / `match`, bare struct literals are forbidden; wrap in parentheses if needed.
 
 ```align
-if (Point{x:1,y:2}) == p { ... }
+Point { x: i64, y: i64 }
+fn is_origin(point: Point) -> bool = point.x == 0 && point.y == 0
+fn main() -> i32 {
+  if is_origin((Point { x: 0, y: 0 })) { return 0 }
+  return 1
+}
 ```
 
 ### generics `<` vs comparison
 Ambiguity between `a < b` at expression position and `f<T>(x)`. **Resolution policy**: at type positions (`: type`, `fn ret`, `type_decl`, etc.) `<>` is always generics. At expression positions there is **no type-argument syntax** — so `<` at expression position is unambiguously comparison, and no lookahead/backtrack is needed.
 
-**Settled (2026-06-22): no expression-position type-argument syntax (no turbofish).** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context (`u: User := json.decode(d)?`, flowing back through `?`). When neither supplies the type, that is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. This keeps "one way" (the binding annotation is the single place a type is written), avoids importing the `<>` parse ambiguity that pushed Go to `f[T](x)` and Rust to `::<>`, and is friendlier to generate. The one residual is a *schema-selector* builtin whose type appears in neither arguments nor result (`json.validate<T>`, `json.field_table<T>`); that narrow case stays open (and may fold into `decode`). This rule scales to general generics (before M4): a return-only type parameter is supplied by the binding annotation, never a turbofish.
+**Settled (2026-06-22): no expression-position type-argument syntax (no turbofish).** A call's type parameters are recovered by inference — from a value argument (`json.encode(u)`) or from the expected type propagated from context (`u: User := json.decode(d)?`, flowing back through `?`). When neither supplies the type, that is a hard error directing the user to annotate the binding; an explicit `f<T>(x)` / `f::<T>(x)` form is **not** adopted. This keeps "one way" (the binding annotation is the single place a type is written), avoids importing the `<>` parse ambiguity that pushed Go to `f[T](x)` and Rust to `::<>`, and is friendlier to generate. The schema-selector residual closed on 2026-07-18: `json.validate<T>` and `json.field_table<T>` were removed from the catalog. Validation uses decode-and-discard; the field table is compiler-internal. The shipped scanner uses `rows: json.scanner<Row> := json.scan(view)`, so its row type comes from the binding annotation as well. A return-only generic type parameter likewise comes from context, never a turbofish.
 
 ### type declaration vs struct literal
 A type declaration (`User { id: i64 }`) appears only at top-level item position. A struct literal (`User{ id: 1 }`) appears only at expression position. They are uniquely distinguished by where they occur.

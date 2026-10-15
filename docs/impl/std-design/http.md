@@ -1,6 +1,5 @@
-This directory holds Opus-implementable design specs for std modules beyond the roadmap's
-prose. Authored by the main loop (Fable); these are the source of truth for implementing each
-module.
+This directory records the detailed `std` module designs that supplement the roadmap.
+These specifications define the contract for each module's implementation.
 
 # std.http — implementation design (M11)
 
@@ -31,7 +30,7 @@ preserves presence. The private owner/view bool adds no ABI or allocation.
 The historical slices below describe the original nonempty-only rule. H1 and
 the S3 wire owner close the transition together.
 
-v1 proposal, Fable's settled shapes:
+v1 design signatures:
 
 ```text
 // Client
@@ -974,14 +973,12 @@ scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for l
     and a per-client-default / per-request-override `timeout(ns)` — the two things this note said were
     missing — are **IMPLEMENTED** (the G3-1 deferral is fully resolved on the client). The
     server-side escalation above remains its own post-v1 hardening item.
-  - **Sub-case — HEAD / 304 framing (inherited from Slice 1/2).** A `HEAD` response, or a `304 Not
-    Modified`, legitimately carries a `Content-Length` header **but no body**. The v1 read loop frames
-    purely by `Content-Length` (it does not special-case the request method or status), so it would
-    wait for body bytes that never arrive → the same indefinite block as above. v1's surface does not
-    expose `HEAD` conveniently (only `get`/`post`/`request`), but a caller-built `request` with method
-    `HEAD` hits this. **DESIGNED for align-llm Request 4 below; implementation pending.** The same
-    capability adds method/status-aware framing, informational-response advancement, and client-side
-    chunk de-framing without adding a second transport surface.
+  - **HEAD / 304 framing — RESOLVED by align-llm Request 4.** A `HEAD` response, or a `304 Not
+    Modified`, can carry a `Content-Length` header **but no body**. The original Slice-1/2 read loop
+    could wait for those absent body bytes. The implemented method/status-aware framing below
+    produces an empty body without a payload read, advances informational responses, and
+    de-frames chunked responses through the same transport surface. Its ledger owns exact header
+    validation and connection-reuse rules.
 - **~~`https://` rejection is coarse (DC-1, low).~~ RESOLVED by Slice 5.** `https://` no longer maps
   to `Error.Invalid` at all — it routes to the verified TLS path. A verification failure is now the
   distinct `Error.Denied`; a bad TLS transport is `Error.Code`; a protocol violation is

@@ -136,6 +136,36 @@ body だけが対応 bridge を同じ 3 引数で 1 回呼ぶ。compiler はそ�
 別位置、helper、変更 wrapper、private bridge の function value は package admission で拒否する。
 public wrapper 自体は通常の callable value のままである。
 
+正準の bridge と wrapper 宣言は次のとおり。
+
+```align
+fn inner_join_i64_bridge(
+  left: codec.i64_column,
+  right: codec.i64_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> = process.abort()
+
+fn inner_join_str_bridge(
+  left: codec.str_column,
+  right: codec.str_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> = process.abort()
+
+pub fn inner_join_i64(
+  left: codec.i64_column,
+  right: codec.i64_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> =
+  inner_join_i64_bridge(left, right, max_pairs)
+
+pub fn inner_join_str(
+  left: codec.str_column,
+  right: codec.str_column,
+  max_pairs: i64,
+) -> Result<array<RowPair>, JoinError> =
+  inner_join_str_bridge(left, right, max_pairs)
+```
+
 実装は次の 2 行を原子的に有効化した。
 
 | runtime 行 | symbol | ABI shape | Rust ABI |

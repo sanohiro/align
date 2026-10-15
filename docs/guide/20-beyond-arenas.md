@@ -4,7 +4,7 @@
 
 Chapters 5 and 8 introduced `arena` for data that shares a lifetime. If data lives for one phase, such as a web request, game frame, or compilation pass, allocate it in an arena and release it together when that phase ends.
 
-But what happens when data outlives a single phase, and its lifetime is unpredictable?
+Some values outlive a processing phase and are removed at different times. A pool can reuse storage for these values.
 
 Imagine a multiplayer game server. Players log in and out at random times. An `arena` per frame drops the player data too early. A server-long arena that allocates a new record on every login retains those allocations after logout. A fixed pool avoids that growth by reusing the same slots.
 
@@ -32,13 +32,13 @@ Returning an `i64` index alone cannot distinguish successive occupants of a slot
 2. Bob (Alice's friend) saves `target = 2` to heal her later.
 3. Alice disconnects. Slot 2 is now free.
 4. Charlie joins and is assigned the newly vacant `id = 2`.
-5. Bob casts his heal on `target = 2`. Charlie gets healed instead of Alice!
+5. Bob casts his heal on `target = 2`. Charlie receives the healing intended for Alice.
 
 This is a stale-handle form of the [ABA problem](https://en.wikipedia.org/wiki/ABA_problem): a saved index still points to the same slot, but the occupant has changed.
 
 ## Generational Indices
 
-To solve this, we don't just hand out an `i64` index. We hand out a ticket that includes both the index and a **generation counter**.
+Include both the slot index and a **generation counter** in the ticket given to callers:
 
 ```align
 Entity { index: i64, generation: i64 }

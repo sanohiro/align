@@ -43,6 +43,7 @@ Vendoring は、利用側のプロジェクトにパッケージのソースを�
 | 型付きの列の結合 | `pkg.frame` | [apps/frame/pkg](../../../apps/frame/pkg) |
 | トークン、パスワードハッシュ、セッショントークン | `pkg.auth` | [apps/auth/pkg](../../../apps/auth/pkg) |
 | RESP2 によるキー・値の操作 | `pkg.kv` | [apps/kv/pkg](../../../apps/kv/pkg) |
+| Unicode NFC 正規化 | `pkg.unicode` | [apps/unicode/pkg](../../../apps/unicode/pkg) |
 | SQLite と PostgreSQL | `pkg.db` | [apps/db/pkg](../../../apps/db/pkg) |
 
 これらのソースは、`alignc` のアーカイブ、Debian パッケージ、Homebrew formula には含まれません。新しく追加されたパッケージを試すときは、それに対応したコンパイラを使ってください。配布済みリリースがリポジトリの最新状態に追い付いていない場合があります。ルートファイルだけでなく、内部モジュールも一緒にコピーします。
@@ -229,6 +230,23 @@ fn create_session(
 ```
 
 `get` は所有権のある文字列を `Option` で返します。`set` は `Always` / `IfAbsent` / `IfPresent` の条件に従って設定したか、`delete` はキーが存在したかを返します。通信の失敗、サイズ超過、不正なレスポンスの後はクライアントを使えなくなり、以降の操作は `Closed` を返します。既定の接続先、認証、TLS、RESP3 の交渉、任意のコマンドを送る API、パイプライン、再試行、リダイレクト、プール、トランザクション、スクリプト、pub/sub は提供しません。公開の `pkg.kv` と非公開の実装 `pkg.kv.internal.resource` は一緒に配布します。上限とエラーの詳細は [`pkg.kv` の設計](../../impl/pkg-design/ja/kv.md) にあります。
+
+## `pkg.unicode`
+
+プロトコルやアプリケーションで Unicode の正準等価性が必要なら、明示的に正規化します。[apps/unicode/pkg](../../../apps/unicode/pkg) を取り込み、`nfc` を呼びます。
+
+```align
+import pkg.unicode
+
+fn main() -> Result<(), Error> {
+    normalized := pkg.unicode.nfc("é")?   // e followed by a combining acute accent
+    print(normalized == "é")              // true
+    print(pkg.unicode.version())           // 16.0.0
+    return Ok(())
+}
+```
+
+`nfc` は、空でない入力がすでに NFC でも、独立した所有 `string` を返します。作業領域と出力の確保は失敗し得るため `Result` を使い、入力や arena のライフタイムを保持しません。Unicode 16.0.0 の NFC であり、ロケールに依存しません。通常の文字列の等価性と順序は引き続きバイト単位で、暗黙の正規化はありません。他の正規化形式、書記素分割、case folding は対象外です。[Unicode の設計](../../impl/pkg-design/ja/unicode.md)を参照してください。
 
 ## `pkg.db`
 
