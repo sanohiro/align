@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 19;
+pub const FORMAT_VERSION: u32 = 20;
 
 const MAX_TYPE_DEPTH: u32 = 128;
 
@@ -225,8 +225,9 @@ fn write_mutable_retention(w: &mut Writer, summary: &align_sema::hir::MutableRet
         None => w.u8(0),
         Some(destinations) => {
             w.u8(1);
-            w.seq(destinations, |w, roots| {
-                w.seq(roots, |w, root| {
+            w.seq(destinations, |w, destination| {
+                w.bool(destination.may_mutate);
+                w.seq(&destination.roots, |w, root| {
                     w.u8(match root {
                         MutableRetentionRoot::Contained(_) => 0,
                         MutableRetentionRoot::Storage(_) => 1,
@@ -247,7 +248,8 @@ fn read_mutable_retention(
     let summary = match r.u8()? {
         0 => None,
         1 => Some(r.seq(|r| {
-            r.seq(|r| {
+            let may_mutate = r.bool()?;
+            let roots = r.seq(|r| {
                 let tag = r.u8()?;
                 match tag {
                     0 => Ok(MutableRetentionRoot::Contained(r.u32()?)),
@@ -257,7 +259,8 @@ fn read_mutable_retention(
                         tag,
                     }),
                 }
-            })
+            })?;
+            Ok(align_sema::hir::MutableRetentionDestination { may_mutate, roots })
         })?),
         tag => {
             return Err(DecodeError::BadTag {
@@ -1245,16 +1248,17 @@ mod tests {
 
     #[test]
     fn mutable_retention_has_independent_byte_goldens_and_rejects_malformed_records() {
-        use align_sema::hir::MutableRetentionRoot::{Contained, Storage};
+        use align_sema::hir::{MutableRetentionDestination as Destination, MutableRetentionRoot::{Contained, Storage}};
+        let row = |may_mutate, roots| Destination { may_mutate, roots };
         let mutable = IParam { mode: ParamMode::BorrowMut, ty: IType::Named { path: "str".into(), args: Vec::new() } };
         let value = IParam { mode: ParamMode::ByValue, ty: mutable.ty.clone() };
         let params = vec![mutable, value];
         let cases = [
             (None, vec![0], params.clone()),
             (Some(vec![]), vec![1, 0, 0, 0, 0], vec![]),
-            (Some(vec![vec![], vec![]]), vec![1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], params.clone()),
-            (Some(vec![vec![Contained(1)], vec![]]), vec![1, 2, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], params.clone()),
-            (Some(vec![vec![Storage(1)], vec![]]), vec![1, 2, 0, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0], params.clone()),
+            (Some(vec![row(false, vec![]), row(false, vec![])]), vec![1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], params.clone()),
+            (Some(vec![row(true, vec![Contained(1)]), row(false, vec![])]), vec![1, 2, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0], params.clone()),
+            (Some(vec![row(true, vec![Storage(1)]), row(false, vec![])]), vec![1, 2, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], params.clone()),
         ];
         for (record, literal, parameters) in cases {
             let mut writer = Writer::new();
@@ -1269,10 +1273,11 @@ mod tests {
         }
         for record in [
             Some(vec![]),
-            Some(vec![vec![Contained(2)], vec![]]),
-            Some(vec![vec![Contained(1), Contained(1)], vec![]]),
-            Some(vec![vec![Storage(1), Contained(0)], vec![]]),
-            Some(vec![vec![], vec![Contained(0)]]),
+            Some(vec![row(true, vec![Contained(2)]), row(false, vec![])]),
+            Some(vec![row(true, vec![Contained(1), Contained(1)]), row(false, vec![])]),
+            Some(vec![row(true, vec![Storage(1), Contained(0)]), row(false, vec![])]),
+            Some(vec![row(false, vec![]), row(false, vec![Contained(0)])]),
+            Some(vec![row(false, vec![]), row(true, vec![])]),
         ] {
             let mut writer = Writer::new();
             write_mutable_retention(&mut writer, &record);
@@ -1282,9 +1287,13 @@ mod tests {
             assert_eq!(read_mutable_retention(&mut Reader::new(&writer.buf), &params, false).map(|_| ()), expected);
         }
         assert!(matches!(read_mutable_retention(&mut Reader::new(&[2]), &params, false), Err(DecodeError::BadTag { what: "mutable-retention option", tag: 2 })));
-        let bad_root = [1, 2, 0, 0, 0, 1, 0, 0, 0, 2];
+        let bad_root = [1, 2, 0, 0, 0, 1, 1, 0, 0, 0, 2];
         assert!(matches!(read_mutable_retention(&mut Reader::new(&bad_root), &params, false), Err(DecodeError::BadTag { what: "mutable-retention root", tag: 2 })));
+        assert!(read_mutable_retention(&mut Reader::new(&[1, 2, 0, 0, 0, 2]), &params, false).is_err());
         assert!(read_mutable_retention(&mut Reader::new(&[1, 0, 0, 0, 0]), &[], true).is_err());
+        for mode in [ParamMode::ByValue, ParamMode::Borrow, ParamMode::Out] {
+            assert!(align_sema::hir::validate_mutable_retention(&Some(vec![row(true, vec![])]), &[mode], false).is_err());
+        }
     }
 
     #[test]
@@ -1519,7 +1528,7 @@ mod tests {
                 effect: Effect::Impure,
                 parallel_transfer_params: Vec::new(),
                 mutable_access: None,
-                mutable_retention: Some(vec![Vec::new()]),
+                mutable_retention: Some(vec![align_sema::hir::MutableRetentionDestination::default()]),
                 mutable_view_effect: Some(vec![Some(MutableViewEffect::default())]),
                 resource_hook_body: false,
                 body: IFnBody::Absent,

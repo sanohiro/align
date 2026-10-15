@@ -3201,7 +3201,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
-                mutable_retention: Some(vec![vec![]; 0]),
+                mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
                 mutable_view_effect: None,
                 locals: Vec::new(),
                 body,

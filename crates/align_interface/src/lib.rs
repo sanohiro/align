@@ -2956,7 +2956,7 @@ pub fn validate_for_import(
                 || function
                     .mutable_retention
                     .as_ref()
-                    .is_some_and(|roots| roots.iter().any(|root| !root.is_empty()))
+                    .is_some_and(|roots| roots.iter().any(|row| row.may_mutate || !row.roots.is_empty()))
                 || function
                     .drop_state_effects
                     .iter()

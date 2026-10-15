@@ -874,10 +874,12 @@ retention.” The memory-model consequences are:
   `borrow mut`, including unknown/non-retaining sources; an indexed
   `borrow mut` additionally validates and joins its possible backing contents,
   while `out` uses only the non-invalidating backing/observer join; and
-- same-program bodies and validated imported mutable-retention records provide exact roots;
-  imports without that record and indirect calls keep
-  the existing all-compatible-input fallback. Request 43/49 transports this
-  exact fact in interface format 10; function-value representation is unchanged.
+- same-program bodies, validated imports and uniquely resolved noncapturing function
+  values provide complete mutable-output records. Plan199 separates possible mutation
+  from retained roots, preserving unchanged borrowed siblings through a different-field
+  update. Only a proved unchanged flag suppresses the destination transition. Unknown,
+  multiple or captured targets keep all-input fallback. Format20 carries the independent
+  flag and roots; function-value representation is unchanged.
 
 Plan 80 extends that transport in interface format 17 with a separate direct
 Copy-view effect. Retained roots alone cannot say whether a mutable call rebound

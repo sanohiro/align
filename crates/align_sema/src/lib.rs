@@ -4768,7 +4768,7 @@ pub fn concrete_inline_body_externs(
         || function
             .mutable_retention
             .as_ref()
-            .is_some_and(|roots| roots.iter().any(|root| !root.is_empty()))
+            .is_some_and(|roots| roots.iter().any(|row| row.may_mutate || !row.roots.is_empty()))
         || ty_capture_is_move(
             function.ret,
             &program.structs,
@@ -12271,6 +12271,7 @@ fn run_body_analysis_passes(
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_self_contents: std::collections::HashMap::new(),
             walked_storage_facts: std::collections::HashMap::new(),
             walked_backing_facts: std::collections::HashMap::new(),
             pending_call_completions: std::collections::HashMap::new(),
@@ -12283,7 +12284,7 @@ fn run_body_analysis_passes(
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
             mutable_access_roots: BorrowRoots::new(),
-            borrow_mut_retention: vec![BorrowRoots::new(); f.params.len()],
+            borrow_mut_retention: vec![BorrowMutRetentionDestination::default(); f.params.len()],
             view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -14112,8 +14113,9 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
         .collect();
 
     // Process each function once, then revisit direct callers of a summary that grew. Concrete
-    // indirect callers are revisited when either their target set or a target's parallel-transfer
-    // summary changes. Call dependencies are collected by MoveCheck's exhaustive expression walk
+    // indirect callers are revisited when their target set or a target's retained-root,
+    // mutable-view, access or parallel-transfer summary changes. Call dependencies are collected
+    // by MoveCheck's exhaustive expression walk
     // on the first visit, so declaration order cannot lose a later summary refinement.
     let function_count = program.fns.len();
     let mut reverse_callers:
@@ -14122,7 +14124,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
     let mut queued = vec![true; function_count];
     let mut worklist: std::collections::VecDeque<usize> =
         (0..function_count).collect();
-    let indirect_view_callers = program
+    let indirect_effect_callers = program
         .fns
         .iter()
         .enumerate()
@@ -14158,15 +14160,16 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
         .map(|function| {
             (
                 function.name.clone(),
-                vec![BorrowRoots::new(); function.params.len()],
+                vec![BorrowMutRetentionDestination::default(); function.params.len()],
             )
         })
         .chain(program.imported_fns.iter().filter_map(|function| {
             if !function.producer_certified { return None; }
             hir::validate_mutable_retention(&function.mutable_retention, &function.param_modes, false).ok()?;
             let destinations = function.mutable_retention.as_ref()?;
-            Some((function.name.clone(), destinations.iter().map(|roots| {
-                roots.iter().map(|root| match *root {
+            Some((function.name.clone(), destinations.iter().map(|destination| BorrowMutRetentionDestination {
+                may_mutate: destination.may_mutate,
+                roots: destination.roots.iter().map(|root| match *root {
                     hir::MutableRetentionRoot::Contained(index) => BorrowRoot::Param(index),
                     hir::MutableRetentionRoot::Storage(index) => BorrowRoot::ParamStorage(index),
                 }).collect()
@@ -14256,6 +14259,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_self_contents: std::collections::HashMap::new(),
             walked_storage_facts: std::collections::HashMap::new(),
             walked_backing_facts: std::collections::HashMap::new(),
             pending_call_completions: std::collections::HashMap::new(),
@@ -14268,7 +14272,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             return_roots: BorrowRoots::new(),
                 parallel_transfer_roots: BorrowRoots::new(),
             mutable_access_roots: BorrowRoots::new(),
-            borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+            borrow_mut_retention: vec![BorrowMutRetentionDestination::default(); function.params.len()],
                 view_effect_exits: None,
                 non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -14339,8 +14343,8 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
                     }
                 }
             }
-            if view_changed || access_changed {
-                for &caller in &indirect_view_callers {
+            if retention_changed || view_changed || access_changed {
+                for &caller in &indirect_effect_callers {
                     if !queued[caller] {
                         queued[caller] = true;
                         worklist.push_back(caller);
@@ -14377,12 +14381,12 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             .cloned()
             .unwrap_or(hir::ReturnBorrowSummary::None);
         function.mutable_retention = named_borrow_mut_retention.get(&function.name)
-            .and_then(|destinations| destinations.iter().map(|roots| {
-                roots.iter().filter(|root| **root != BorrowRoot::ReadOnly).map(|root| match *root {
+            .and_then(|destinations| destinations.iter().map(|destination| {
+                destination.roots.iter().filter(|root| **root != BorrowRoot::ReadOnly).map(|root| match *root {
                     BorrowRoot::Param(index) => Some(hir::MutableRetentionRoot::Contained(index)),
                     BorrowRoot::ParamStorage(index) => Some(hir::MutableRetentionRoot::Storage(index)),
                     _ => None,
-                }).collect::<Option<Vec<_>>>().map(|mut roots| { roots.sort(); roots })
+                }).collect::<Option<Vec<_>>>().map(|mut roots| { roots.sort(); hir::MutableRetentionDestination { may_mutate: destination.may_mutate, roots } })
             }).collect::<Option<Vec<_>>>());
         function.mutable_view_effect = named_view_effect.get(&function.name).cloned().flatten();
         function.mutable_access = named_mutable_access.get(&function.name).cloned().flatten();
@@ -26587,11 +26591,18 @@ impl<'a> EscapeCheck<'a> {
                                         .collect::<Vec<_>>()
                                 })
                             {
+                                let summary = indirect_mutable_retention(
+                                    callee,
+                                    args.len(),
+                                    self.named_borrow_mut_retention,
+                                    self.callable_targets,
+                                    self.callable_target_ids,
+                                );
                                 self.record_mutable_call_modes(
                                     Self::expr_key(expression),
                                     args,
                                     &modes,
-                                    None,
+                                    summary.as_ref(),
                                     indirect_mutable_view_effect(
                                         callee,
                                         args.len(),
@@ -27422,7 +27433,7 @@ impl<'a> EscapeCheck<'a> {
             && let Some((root, true)) = destination_root
         {
             // A changed owned destination with no retained input can install a fresh heap buffer;
-            // the self-only no-mutation sentinel was removed before this action was recorded. The
+            // a proved unchanged destination was removed before this action was recorded. The
             // caller must therefore treat the post-call owner as at least possibly individual even
             // though the flattened retention summary has no source root to name.
             let lexical = self.mutable_root_storage_region(root, depth);
@@ -27510,7 +27521,21 @@ impl<'a> EscapeCheck<'a> {
             };
 
             let selected = Self::join_escape_value_facts(sources.iter().filter_map(|source| {
-                frozen.get(source.index()).and_then(Option::as_ref).cloned()
+                let value = frozen.get(source.index()).and_then(Option::as_ref)?.clone();
+                if matches!(source, BorrowMutRetentionSource::SelfContents(_)) {
+                    // The content-region snapshot is already independent of the owned allocation
+                    // lifetime. Keep its borrowed region/diagnostics without embedding displaced
+                    // owned headers as dependencies of their replacement generations.
+                    let snapshot = self.state.argument_snapshots.get(&(call, source.index()))?;
+                    Some(EscapeValueFact {
+                        non_storage: EscapeRegionFact::from_direct(snapshot.content_region),
+                        content_ended: value.content_ended,
+                        content_unknown: value.content_unknown,
+                        ..EscapeValueFact::default()
+                    })
+                } else {
+                    Some(value)
+                }
             }));
             if typed
                 .headers
@@ -27838,6 +27863,7 @@ impl<'a> EscapeCheck<'a> {
                             snapshot.retained_contained_region
                         }
                         BorrowMutRetentionSource::Storage(_) => snapshot.retained_storage_region,
+                        BorrowMutRetentionSource::SelfContents(_) => snapshot.content_region,
                     });
                     Some((index, region, captured.is_some()))
                 })
@@ -28097,7 +28123,13 @@ impl<'a> EscapeCheck<'a> {
             {
                 continue;
             }
-            let sources = borrow_mut_source_indices(summary, index, args.len());
+            if mode == ast::ParamMode::BorrowMut
+                && exact_borrow_mut_source_indices(summary, index, args.len()).is_some()
+                && summary.and_then(|rows| rows.get(index)).is_some_and(|row| !row.may_mutate)
+            {
+                continue;
+            }
+            let sources = mutable_call_source_indices(summary, index, args.len(), mode);
             destinations.push((index, mode, sources));
         }
         if !destinations.is_empty() {
@@ -30557,6 +30589,9 @@ struct MoveCheck<'a> {
     /// through. Parent formation reads these snapshots so a later eager sibling cannot rewrite an
     /// earlier runtime value's provenance in a product, residual aggregate, or call.
     walked_value_facts: std::collections::HashMap<usize, BorrowFact>,
+    /// Borrowed contents of completed mutable-call arguments, excluding owned lifetime
+    /// introductions at their typed occurrences. Exact Contained(self) uses only this snapshot.
+    walked_self_contents: std::collections::HashMap<usize, BorrowFact>,
     /// Storage roots captured when each borrow-capable expression completes. Mutable call actions
     /// consume these alongside `walked_value_facts`; consulting the live local state after a later
     /// eager argument ran would retarget an already-evaluated slice header.
@@ -30707,7 +30742,12 @@ type BorrowRoots = std::collections::BTreeSet<BorrowRoot>;
 /// records supply the same fact. Unavailable bodies retain the conservative fallback.
 /// The historical type name remains internal so
 /// the one summary path is extended rather than shadowed by an `out`-only fact.
-type BorrowMutRetentionSummary = Vec<BorrowRoots>;
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+struct BorrowMutRetentionDestination {
+    may_mutate: bool,
+    roots: BorrowRoots,
+}
+type BorrowMutRetentionSummary = Vec<BorrowMutRetentionDestination>;
 type BorrowMutRetentionMap =
     std::collections::HashMap<String, BorrowMutRetentionSummary>;
 type MutableAccessMap = std::collections::HashMap<String, hir::MutableAccessSummary>;
@@ -30846,16 +30886,47 @@ fn indirect_mutable_view_effect(
     combined.flatten()
 }
 
+/// Forward one complete callable output record, including its independent mutation authority.
+/// Multiple targets and captures needing environment substitution retain unavailable handling.
+fn indirect_mutable_retention(
+    callee: &Expr,
+    argument_count: usize,
+    named_retention: &BorrowMutRetentionMap,
+    callable_targets: &[CallableTargetSet],
+    callable_target_ids: &std::collections::HashMap<String, u32>,
+) -> Option<BorrowMutRetentionSummary> {
+    let Ty::Fn(id) = callee.ty else {
+        return None;
+    };
+    let targets = callable_targets.get(id as usize)?;
+    if targets.unavailable || targets.len() != 1 {
+        return None;
+    }
+    let target = targets.keys().next()?;
+    let name = callable_target_ids
+        .iter()
+        .find_map(|(name, id)| (id == target).then_some(name))?;
+    let summary = named_retention.get(name)?;
+    if summary.len() != argument_count {
+        return None;
+    }
+    for destination in 0..argument_count {
+        exact_borrow_mut_source_indices(Some(summary), destination, argument_count)?;
+    }
+    Some(summary.clone())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum BorrowMutRetentionSource {
     Contained(usize),
     Storage(usize),
+    SelfContents(usize),
 }
 
 impl BorrowMutRetentionSource {
     fn index(self) -> usize {
         match self {
-            Self::Contained(index) | Self::Storage(index) => index,
+            Self::Contained(index) | Self::Storage(index) | Self::SelfContents(index) => index,
         }
     }
 }
@@ -30865,8 +30936,10 @@ fn exact_borrow_mut_source_indices(
     destination: usize,
     argument_count: usize,
 ) -> Option<Vec<BorrowMutRetentionSource>> {
-    summary?
-        .get(destination)?
+    let summary = summary?;
+    if summary.len() != argument_count { return None; }
+    summary.get(destination)?
+        .roots
         .iter()
         .filter(|root| **root != BorrowRoot::ReadOnly)
         .map(|root| match *root {
@@ -30900,6 +30973,25 @@ fn borrow_mut_source_indices(
             })
             .collect()
     })
+}
+
+/// Only an exact Contained(self) output selects the old borrowed contents. Storage(self) may
+/// describe a newly formed self view and must retain full storage provenance.
+fn mutable_call_source_indices(
+    summary: Option<&BorrowMutRetentionSummary>, destination: usize,
+    argument_count: usize, mode: ast::ParamMode,
+) -> Vec<BorrowMutRetentionSource> {
+    if mode == ast::ParamMode::BorrowMut
+        && let Some(sources) = exact_borrow_mut_source_indices(summary, destination, argument_count)
+    {
+        sources.into_iter().map(|source| match source {
+            BorrowMutRetentionSource::Contained(index) if index == destination =>
+                BorrowMutRetentionSource::SelfContents(index),
+            other => other,
+        }).collect()
+    } else {
+        borrow_mut_source_indices(summary, destination, argument_count)
+    }
 }
 
 struct MoveCheckResult {
@@ -33583,11 +33675,9 @@ struct BorrowStateData {
     pipeline_headers: std::collections::HashMap<usize, ProjectedHeaderFact>,
     mutable_place_sources: std::collections::HashMap<usize, MutablePlaceSnapshot>,
     invalid_mutable_place_sources: std::collections::HashMap<usize, BorrowEnd>,
-    /// `borrow mut` parameters that still have at least one reaching path with no mutation. A
-    /// mutable-retention summary keeps that parameter's symbolic self roots only on such a path;
-    /// after an actual mutation an empty root set means a proven borrow-free replacement, not a
-    /// no-op call. Control joins union this may-unmodified fact.
-    unmodified_borrow_mut_params: std::collections::BTreeSet<u32>,
+    /// BorrowMut parameters possibly mutated on a reaching path. Join by union; returning exits
+    /// publish this independently of retained roots and of non-returning access observations.
+    modified_borrow_mut_params: std::collections::BTreeSet<u32>,
     /// Parameter identities whose view headers flowed into each current local header.
     view_flows: std::collections::HashMap<LocalId, std::collections::BTreeSet<u32>>,
     /// Path-sensitive effects; control joins union may facts and intersect must facts.
@@ -34012,10 +34102,16 @@ impl BorrowState {
     }
 
     fn resolve_headers(&self, headers: &ProjectedHeaderFact) -> MoveValueFact {
+        self.resolve_header_contents(headers, false, None)
+    }
+
+    fn resolve_header_contents(&self, headers: &ProjectedHeaderFact, retained: bool, self_parameter: Option<u32>) -> MoveValueFact {
         fn resolve(
             state: &BorrowState,
             headers: &ProjectedHeaderFact,
             visiting: &mut std::collections::BTreeSet<StorageGenerationRef>,
+            retained: bool,
+            self_parameter: Option<u32>,
         ) -> MoveValueFact {
             let mut result = MoveValueFact {
                 headers: headers.clone(),
@@ -34030,12 +34126,10 @@ impl BorrowState {
                 }
                 for reference in &leaf.generations {
                     let generation = &reference.generation;
-                    if !visiting.insert(reference.clone()) {
-                        continue;
-                    }
-                    if let Some(content) = state.storage.contents.entries.get(generation) {
+                    let entered = visiting.insert(reference.clone());
+                    if entered && let Some(content) = state.storage.contents.entries.get(generation) {
                         let selected = content.through_reference(reference, &reference.content_path);
-                        let nested = resolve(state, &selected.headers, visiting);
+                        let nested = resolve(state, &selected.headers, visiting, retained, self_parameter);
                         let mut resolved = selected.join(&nested);
                         // A slice retains every possible fixed backing slot, but those slots are
                         // not fields of its value type. Collapse at this known view boundary so
@@ -34058,19 +34152,55 @@ impl BorrowState {
                         }
                         result.non_storage.join_at(path, &resolved.non_storage);
                     }
-                    let owners = state.generation_lifetime_roots(generation);
+                    let mut owners = state.generation_lifetime_roots(generation);
+                    // The initial caller View generation denotes borrowed contents already in
+                    // the destination. A newly formed view into its Owned generation instead
+                    // remains Storage(self), even when both use the same parameter ordinal.
+                    if retained && leaf.known && leaf.fallback_roots.is_empty()
+                        && leaf.descriptor.is_some_and(|descriptor| descriptor.kind == StorageHeaderKind::View)
+                        && let Some(parameter) = self_parameter
+                        && matches!(generation, StorageGeneration::CallerStorage { parameter: source, .. } if *source == parameter)
+                        && state.storage.directory.entries.get(generation).and_then(|entry| entry.descriptor)
+                            .is_some_and(|descriptor| descriptor.kind == StorageHeaderKind::View)
+                        && owners.remove(&BorrowRoot::ParamStorage(parameter))
+                    {
+                        owners.insert(BorrowRoot::Param(parameter));
+                    }
+                    if retained && leaf.known && leaf.descriptor.is_some_and(|descriptor| {
+                        descriptor.kind.owns_storage() || descriptor.kind == StorageHeaderKind::InlineFixed
+                    }) {
+                        owners.retain(|root| root.ended_source().is_some());
+                    }
                     if !owners.is_empty() {
                         result
                             .non_storage
                             .join_at(path, &BorrowFact::from_direct(owners));
                     }
-                    visiting.remove(reference);
+                    if entered { visiting.remove(reference); }
                 }
             }
             result
         }
 
-        resolve(self, headers, &mut std::collections::BTreeSet::new())
+        resolve(self, headers, &mut std::collections::BTreeSet::new(), retained, self_parameter)
+    }
+
+    /// Rebuild header-managed paths from their authoritative contents instead of subtracting
+    /// matching identities from a flattened union. An independently borrowed occurrence of the
+    /// same generation still contributes its lifetime.
+    fn retained_contents(&self, legacy: BorrowFact, headers: &ProjectedHeaderFact) -> BorrowFact {
+        self.retained_parameter_contents(legacy, headers, None)
+    }
+
+    fn retained_parameter_contents(&self, mut legacy: BorrowFact, headers: &ProjectedHeaderFact, parameter: Option<u32>) -> BorrowFact {
+        let managed = headers.leaves.iter().filter(|(_, leaf)| leaf.known && leaf.descriptor.is_some())
+            .map(|(path, _)| path).collect::<Vec<_>>();
+        if managed.iter().any(|path| path.is_empty()) {
+            legacy = BorrowFact::default();
+        } else {
+            legacy.projected.retain(|path, _| !managed.iter().any(|header| path.starts_with(header)));
+        }
+        legacy.join(&self.resolve_header_contents(headers, true, parameter).non_storage)
     }
 
     /// Live roots that merely name the current release places of `headers`. These roots are
@@ -34740,8 +34870,8 @@ impl BorrowState {
                 _ => {}
             }
         }
-        out.unmodified_borrow_mut_params
-            .extend(b.unmodified_borrow_mut_params.iter().copied());
+        out.modified_borrow_mut_params
+            .extend(b.modified_borrow_mut_params.iter().copied());
         out.active_sum.retain(|local, active| {
             let Some(other) = b.active_sum.get(local) else {
                 return false;
@@ -35181,7 +35311,7 @@ impl<'a> MoveCheck<'a> {
                 if let Some(invalid) = self.borrows.invalid_value_sources.get_mut(key) {
                     invalid.retain(|root, _| !root.is_byte_validation());
                 }
-                for facts in [&mut self.walked_value_facts, &mut self.walked_storage_facts] {
+                for facts in [&mut self.walked_value_facts, &mut self.walked_storage_facts, &mut self.walked_self_contents] {
                     if let Some(fact) = facts.get_mut(key) {
                         fact.direct.retain(|root| !root.is_byte_validation());
                         for roots in fact.projected.values_mut() {
@@ -35202,6 +35332,7 @@ impl<'a> MoveCheck<'a> {
             for key in child_snapshots {
                 self.borrows.finish_value_observation(*key);
                 self.walked_value_facts.remove(key);
+                self.walked_self_contents.remove(key);
             }
         }
     }
@@ -35591,11 +35722,6 @@ impl<'a> MoveCheck<'a> {
                 .get(position)
                 .copied()
                 .unwrap_or(ast::ParamMode::ByValue);
-            if mode == ast::ParamMode::BorrowMut {
-                self.borrows
-                    .unmodified_borrow_mut_params
-                    .insert(position as u32);
-            }
             if self
                 .borrows
                 .view_effects
@@ -35968,25 +36094,15 @@ impl<'a> MoveCheck<'a> {
             // The storage directory is authoritative after a mutable transition. Reading the
             // legacy projected fact here would preserve the destination's pre-call roots after a
             // strong content clear, and would miss a Copy view rebound to another parameter.
-            let mut roots = self.borrows.summary_roots(self.local_borrow_fact(local).flatten());
-            if mode == ast::ParamMode::BorrowMut
-                && !self
-                    .borrows
-                    .unmodified_borrow_mut_params
-                    .contains(&(destination as u32))
-            {
-                roots.retain(|root| {
-                    !matches!(
-                        root,
-                        BorrowRoot::Param(source) | BorrowRoot::ParamStorage(source)
-                            if *source == destination as u32
-                    )
-                });
-            }
+            let legacy = self.borrows.facts.get(&local).cloned().unwrap_or_default();
+            let contents = self.borrows.retained_parameter_contents(legacy, &self.local_headers(local), Some(destination as u32));
+            let roots = self.borrows.summary_roots(contents.flatten());
             let Some(summary) = self.borrow_mut_retention.get_mut(destination) else {
                 continue;
             };
-            summary.extend(roots.into_iter().filter(|root| {
+            summary.may_mutate |= mode == ast::ParamMode::BorrowMut
+                && self.borrows.modified_borrow_mut_params.contains(&(destination as u32));
+            summary.roots.extend(roots.into_iter().filter(|root| {
                 matches!(root, BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_))
             }));
         }
@@ -36527,8 +36643,8 @@ impl<'a> MoveCheck<'a> {
         }
         for parameter in parameters {
             self.borrows
-                .unmodified_borrow_mut_params
-                .remove(&parameter);
+                .modified_borrow_mut_params
+                .insert(parameter);
         }
     }
 
@@ -36910,6 +37026,13 @@ impl<'a> MoveCheck<'a> {
             .iter()
             .map(|argument| self.completed_value_fact(argument))
             .collect::<Vec<_>>();
+        let self_argument_facts = args.iter().map(|argument| {
+            let key = Self::expr_key(argument);
+            self.walked_self_contents.get(&key).cloned().unwrap_or_else(|| {
+                // Missing completion cannot certify borrowed-content-only provenance.
+                self.completed_storage_fact(argument).join(&self.completed_value_fact(argument))
+            })
+        }).collect::<Vec<_>>();
         let whole_argument_facts = args
             .iter()
             .zip(&value_argument_facts)
@@ -36999,15 +37122,12 @@ impl<'a> MoveCheck<'a> {
                     .unwrap_or_default();
                 let exact_sources =
                     exact_borrow_mut_source_indices(summary, index, args.len());
-                let sources = borrow_mut_source_indices(summary, index, args.len());
-                // An exact summary containing only the destination's own contained/storage roots
-                // is the callee's no-mutation sentinel. Do not advance a caller generation for a
-                // helper that merely accepted `borrow mut` and returned.
+                let sources = mutable_call_source_indices(summary, index, args.len(), mode);
+                // Retained self roots are ordinary dependencies, never mutation authority.
+                // Only a complete exact record can prove the destination unchanged.
                 if mode == ast::ParamMode::BorrowMut
-                    && exact_sources.as_ref().is_some_and(|exact| {
-                        !exact.is_empty()
-                            && exact.iter().all(|source| source.index() == index)
-                    })
+                    && exact_sources.is_some()
+                    && summary.and_then(|rows| rows.get(index)).is_some_and(|row| !row.may_mutate)
                 {
                     return None;
                 }
@@ -37063,8 +37183,8 @@ impl<'a> MoveCheck<'a> {
         }
 
         for (index, mode, ..) in &destinations {
-            if *mode != ast::ParamMode::BorrowMut {
-                continue;
+            if *mode == ast::ParamMode::Out {
+                self.record_possible_mutation_roots(storage_argument_facts[*index].live_roots());
             }
             if let Some(place) = args
                 .get(*index)
@@ -37091,6 +37211,7 @@ impl<'a> MoveCheck<'a> {
                     &whole_argument_facts,
                     &element_argument_facts,
                     &storage_argument_facts,
+                    &self_argument_facts,
                     *index,
                     *mode,
                     sources,
@@ -37142,18 +37263,21 @@ impl<'a> MoveCheck<'a> {
                 &whole_argument_facts,
                 &element_argument_facts,
                 &storage_argument_facts,
+                &self_argument_facts,
                 *index,
                 *mode,
                 sources,
             );
             let mut incoming_headers = ProjectedHeaderFact::default();
             for source in sources {
-                if let Some(headers) = header_argument_facts.get(source.index()) {
+                if !matches!(source, BorrowMutRetentionSource::SelfContents(_))
+                    && let Some(headers) = header_argument_facts.get(source.index())
+                {
                     incoming_headers = incoming_headers.join(headers);
                 }
             }
             let mut incoming_content = MoveValueFact {
-                non_storage: incoming.clone(),
+                non_storage: self.normalize_borrow_fact(declared_ty, incoming.clone()),
                 headers: incoming_headers,
             };
 
@@ -37296,7 +37420,7 @@ impl<'a> MoveCheck<'a> {
                     header.path.clone(),
                     self.replace_projected_generation(place.root, &destination_path,
                         StorageHeaderDescriptor { ty: header.ty, kind: header.kind },
-                        generation, incoming_content.clone()),
+                        generation, incoming_content.project_path(&header.path)),
                 );
             }
             let mut destination = self.local_headers(place.root);
@@ -37411,6 +37535,7 @@ impl<'a> MoveCheck<'a> {
                     &whole_argument_facts,
                     &element_argument_facts,
                     &storage_argument_facts,
+                    &self_argument_facts,
                     index,
                     mode,
                     &sources,
@@ -37534,6 +37659,7 @@ impl<'a> MoveCheck<'a> {
             whole_argument_facts,
             element_argument_facts,
             storage_argument_facts,
+            &[], // View write roots never contain the output-only SelfContents discriminator.
             destination_index,
             ast::ParamMode::BorrowMut,
             &write_sources,
@@ -37651,11 +37777,13 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn mutable_retention_fact(
         &self,
         whole_argument_facts: &[BorrowFact],
         element_argument_facts: &[BorrowFact],
         storage_argument_facts: &[BorrowFact],
+        self_argument_facts: &[BorrowFact],
         destination: usize,
         mode: ast::ParamMode,
         sources: &[BorrowMutRetentionSource],
@@ -37670,6 +37798,7 @@ impl<'a> MoveCheck<'a> {
                 }
                 BorrowMutRetentionSource::Contained(index) => whole_argument_facts.get(index),
                 BorrowMutRetentionSource::Storage(index) => storage_argument_facts.get(index),
+                BorrowMutRetentionSource::SelfContents(index) => self_argument_facts.get(index),
             };
             let Some(source_fact) = source_fact else {
                 // A malformed exact fact must not become an empty, fail-open update.
@@ -38905,6 +39034,7 @@ impl<'a> MoveCheck<'a> {
 
     fn clear_value_snapshot(&mut self, key: usize) {
         self.walked_value_facts.remove(&key);
+        self.walked_self_contents.remove(&key);
         self.walked_storage_facts.remove(&key);
         self.walked_backing_facts.remove(&key);
         self.pending_call_completions.remove(&key);
@@ -40081,6 +40211,11 @@ impl<'a> MoveCheck<'a> {
         {
             self.borrows.begin_mutable_place_source(key, place);
         }
+        if self.mutable_call_argument_snapshots.contains(&key) {
+            let normalized = self.normalize_borrow_fact(expression.ty, fact.clone());
+            let contents = self.borrows.retained_contents(normalized, &self.completed_headers(expression));
+            self.walked_self_contents.insert(key, contents);
+        }
         self.walked_value_facts.insert(key, fact);
         self.walked_storage_facts.insert(key, storage);
         self.walked_backing_facts.insert(key, backing);
@@ -40777,6 +40912,25 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    fn record_possible_mutation_roots(&mut self, roots: BorrowRoots) {
+        for root in self.borrows.summary_roots(roots) {
+            let parameter = match root {
+                BorrowRoot::Param(parameter) | BorrowRoot::ParamStorage(parameter) => parameter,
+                _ => continue,
+            };
+            if self.f.param_modes.get(parameter as usize) == Some(&ast::ParamMode::BorrowMut) {
+                self.borrows.modified_borrow_mut_params.insert(parameter);
+            }
+        }
+    }
+
+    fn target_parameter_may_mutate(&self, target: &str, index: usize) -> bool {
+        self.named_param_modes.get(target).and_then(|modes| modes.get(index))
+            != Some(&ast::ParamMode::BorrowMut)
+            || self.named_borrow_mut_retention.get(target).and_then(|rows| rows.get(index))
+                .is_none_or(|row| row.may_mutate)
+    }
+
     fn record_mutable_access_roots(&mut self, roots: BorrowRoots) {
         let roots = self.borrows.expand_byte_validation_roots(roots);
         self.mutable_access_roots.extend(self.borrows.summary_roots(roots.clone()).into_iter().map(|root| match root {
@@ -40796,14 +40950,24 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn record_storage_access(&mut self, expression: &Expr) {
-        self.record_mutable_access_roots(self.access_storage_fact(expression).live_roots());
+        let roots = self.access_storage_fact(expression).live_roots();
+        self.record_possible_mutation_roots(roots.clone());
+        if let Some(place) = Self::mutable_actual_place(expression) {
+            self.mark_borrow_mut_modified(place.root);
+        }
+        self.record_mutable_access_roots(roots);
     }
 
     fn direct_mutable_access(&self, target: &str, arguments: &[Expr]) -> BorrowRoots {
+        self.direct_call_access(target, arguments, false)
+    }
+
+    fn direct_call_access(&self, target: &str, arguments: &[Expr], mutation: bool) -> BorrowRoots {
         if matches!(target, "print" | "hash64" | "hash128") { return BorrowRoots::new(); }
         let mut roots = BorrowRoots::new();
         let summary = self.named_mutable_access.get(target).and_then(Option::as_ref);
         for (index, argument) in arguments.iter().enumerate() {
+            if mutation && !self.target_parameter_may_mutate(target, index) { continue; }
             let contained = summary.is_none_or(|summary| summary.contains(&hir::MutableAccessRoot::Contained(index as u32)));
             let storage = summary.is_none_or(|summary| summary.contains(&hir::MutableAccessRoot::Storage(index as u32)))
                 || self.named_param_modes.get(target).and_then(|modes| modes.get(index))
@@ -40816,6 +40980,12 @@ impl<'a> MoveCheck<'a> {
 
     fn indirect_mutable_access_from_facts(
         &self, callee: &Expr, arguments: &[(BorrowFact, BorrowFact)],
+    ) -> BorrowRoots {
+        self.indirect_call_access(callee, arguments, false)
+    }
+
+    fn indirect_call_access(
+        &self, callee: &Expr, arguments: &[(BorrowFact, BorrowFact)], mutation: bool,
     ) -> BorrowRoots {
         let environment = self.completed_value_fact(callee);
         let environment_headers = self.completed_headers(callee);
@@ -40844,6 +41014,9 @@ impl<'a> MoveCheck<'a> {
                     hir::MutableAccessRoot::Contained(index) => (*index as usize, false),
                     hir::MutableAccessRoot::Storage(index) => (*index as usize, true),
                 };
+                if mutation && name.is_some_and(|name| !self.target_parameter_may_mutate(name, index)) {
+                    continue;
+                }
                 if let Some((value, backing)) = arguments.get(index) {
                     roots.extend(if storage { backing } else { value }.live_roots());
                 } else if let Ok(capture) = u32::try_from(index.saturating_sub(arguments.len())) {
@@ -40859,8 +41032,12 @@ impl<'a> MoveCheck<'a> {
         }
         // An explicit exclusive borrow is an access even when the inferred body never writes.
         if let Some(signature) = self.fn_types.get(id as usize) {
-            for ((mode, _), (_, storage)) in signature.params.iter().zip(arguments) {
-                if matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
+            for (index, ((mode, _), (_, storage))) in signature.params.iter().zip(arguments).enumerate() {
+                let may_mutate = !mutation || targets.keys().any(|target| {
+                    self.callable_target_ids.iter().find_map(|(name, id)| (id == target).then_some(name))
+                        .is_none_or(|name| self.target_parameter_may_mutate(name, index))
+                });
+                if may_mutate && matches!(mode, ast::ParamMode::BorrowMut | ast::ParamMode::Out) {
                     roots.extend(storage.live_roots());
                 }
             }
@@ -40922,6 +41099,7 @@ impl<'a> MoveCheck<'a> {
                     roots.extend(storage.live_roots());
                 }
             }
+            self.record_possible_mutation_roots(roots.clone());
             self.record_mutable_access_roots(roots);
         }
     }
@@ -40991,6 +41169,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn add_direct_parallel_transfer(&mut self, target: &str, arguments: &[Expr]) {
+        self.record_possible_mutation_roots(self.direct_call_access(target, arguments, true));
         self.record_mutable_access_roots(self.direct_mutable_access(target, arguments));
         let summary = self.named_parallel_transfer.get(target);
         let modes = self.named_param_modes.get(target);
@@ -41083,6 +41262,10 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn add_indirect_parallel_transfer(&mut self, callee: &Expr, arguments: &[Expr]) {
+        let facts = arguments.iter().map(|argument| (
+            self.completed_value_fact(argument), self.access_storage_fact(argument),
+        )).collect::<Vec<_>>();
+        self.record_possible_mutation_roots(self.indirect_call_access(callee, &facts, true));
         self.record_mutable_access_roots(self.indirect_mutable_access(callee, arguments));
         let signature = match callee.ty {
             Ty::Fn(id) => self.fn_types.get(id as usize),
@@ -42384,7 +42567,7 @@ impl<'a> MoveCheck<'a> {
         for fact in self.loop_value_facts.values_mut() {
             fact.rename_generations(renames);
         }
-        for fact in self.walked_value_facts.values_mut() {
+        for fact in self.walked_value_facts.values_mut().chain(self.walked_self_contents.values_mut()) {
             fact.rename_generations(renames);
         }
         for fact in self.walked_storage_facts.values_mut() {
@@ -42416,8 +42599,8 @@ impl<'a> MoveCheck<'a> {
         }
         rename_borrow_roots(&mut self.return_roots, renames);
         rename_borrow_roots(&mut self.parallel_transfer_roots, renames);
-        for roots in &mut self.borrow_mut_retention {
-            rename_borrow_roots(roots, renames);
+        for destination in &mut self.borrow_mut_retention {
+            rename_borrow_roots(&mut destination.roots, renames);
         }
         if let Some(cache) = self.borrow_fact_cache.get_mut() {
             for fact in cache.values_mut() {
@@ -46034,7 +46217,14 @@ impl<'a> MoveCheck<'a> {
                         self.callable_targets,
                         self.callable_target_ids,
                     );
-                    self.apply_mutable_call_effects(expression, args, &modes, None,
+                    let summary = indirect_mutable_retention(
+                        callee,
+                        args.len(),
+                        self.named_borrow_mut_retention,
+                        self.callable_targets,
+                        self.callable_target_ids,
+                    );
+                    self.apply_mutable_call_effects(expression, args, &modes, summary.as_ref(),
                         Some(&view_summary),
                         moved,
                     );
@@ -46109,6 +46299,7 @@ impl<'a> MoveCheck<'a> {
                     result_fact.project_exact(BorrowProjection::ResultErr),
                 )];
                 let access = self.indirect_mutable_access_from_facts(f, &arguments.iter().map(|(_, fact)| (fact.clone(), fact.clone())).collect::<Vec<_>>());
+                self.record_possible_mutation_roots(access.clone());
                 self.record_mutable_access_roots(access);
                 let roots = self
                     .indirect_parallel_transfer_fact_from_facts(f, &arguments)
@@ -49147,6 +49338,7 @@ impl<'a> MoveCheck<'a> {
                         result_fact.project_exact(BorrowProjection::ResultErr),
                     )];
                     let access = self.indirect_mutable_access_from_facts(f, &arguments.iter().map(|(_, fact)| (fact.clone(), fact.clone())).collect::<Vec<_>>());
+                    self.record_possible_mutation_roots(access.clone());
                     self.record_mutable_access_roots(access);
                     let roots = self
                         .indirect_parallel_transfer_fact_from_facts(f, &arguments)
@@ -77631,6 +77823,7 @@ mod tests {
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_self_contents: std::collections::HashMap::new(),
             walked_storage_facts: std::collections::HashMap::new(),
             walked_backing_facts: std::collections::HashMap::new(),
             pending_call_completions: std::collections::HashMap::new(),
@@ -77643,7 +77836,7 @@ mod tests {
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
             mutable_access_roots: BorrowRoots::new(),
-            borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+            borrow_mut_retention: vec![BorrowMutRetentionDestination::default(); function.params.len()],
             view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -78689,7 +78882,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
             state
                 .active_sum
                 .insert(1, [BorrowProjection::OptionSome].into());
-            state.unmodified_borrow_mut_params.insert(0);
+            state.modified_borrow_mut_params.insert(0);
             state
         }
 
@@ -81493,6 +81686,7 @@ fn main() -> i32 = 0
                     loop_value_facts: std::collections::HashMap::new(),
                     control_value_facts: std::collections::HashMap::new(),
                     walked_value_facts: std::collections::HashMap::new(),
+                    walked_self_contents: std::collections::HashMap::new(),
                     walked_storage_facts: std::collections::HashMap::new(),
                     walked_backing_facts: std::collections::HashMap::new(),
                     pending_call_completions: std::collections::HashMap::new(),
@@ -81505,7 +81699,7 @@ fn main() -> i32 = 0
                     return_roots: BorrowRoots::new(),
                     parallel_transfer_roots: BorrowRoots::new(),
             mutable_access_roots: BorrowRoots::new(),
-                    borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+                    borrow_mut_retention: vec![BorrowMutRetentionDestination::default(); function.params.len()],
                     view_effect_exits: None,
                     non_fallthrough: std::collections::HashSet::new(),
                     borrow_fact_cache: std::cell::RefCell::new(None),
@@ -86552,7 +86746,7 @@ fn main() {{
         let (program, diagnostics) = check(source);
         assert!(!diagnostics.has_errors());
         let function = program.fns.iter().find(|f| f.name == "put").unwrap();
-        assert_eq!(function.mutable_retention, Some(vec![vec![]]));
+        assert_eq!(function.mutable_retention, Some(vec![hir::MutableRetentionDestination { may_mutate: true, roots: vec![] }]));
         assert_eq!(function.return_borrow, hir::ReturnBorrowSummary::None);
         // A lifetime summary may name an aggregate containing unrelated constant text.
         // It must not claim that every result aliases that text's bytes.
@@ -86591,7 +86785,7 @@ fn main() {}
         assert!(!diagnostics.has_errors());
         let function = program.fns.iter().find(|function| function.name == "retain").unwrap();
         assert_eq!(function.mutable_retention,
-            Some(vec![vec![hir::MutableRetentionRoot::Storage(1)], vec![]]));
+            Some(vec![hir::MutableRetentionDestination { may_mutate: true, roots: vec![hir::MutableRetentionRoot::Storage(1)] }, hir::MutableRetentionDestination::default()]));
     }
 
     #[test]
@@ -87752,6 +87946,7 @@ fn main() -> i32 = 0
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_self_contents: std::collections::HashMap::new(),
             walked_storage_facts: std::collections::HashMap::new(),
             walked_backing_facts: std::collections::HashMap::new(),
             pending_call_completions: std::collections::HashMap::new(),
@@ -87764,7 +87959,7 @@ fn main() -> i32 = 0
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
             mutable_access_roots: BorrowRoots::new(),
-            borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+            borrow_mut_retention: vec![BorrowMutRetentionDestination::default(); function.params.len()],
             view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),
@@ -87948,10 +88143,127 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn mutable_retention_contents_preserve_borrowed_occurrences() {
+        let scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+        let generation = StorageGeneration::current(StorageOrigin::inline_place(3, &[]));
+        let owned = StorageHeaderDescriptor { ty: Ty::DynArray(scalar), kind: StorageHeaderKind::OwnedDynamic };
+        let view = StorageHeaderDescriptor { ty: Ty::Slice(scalar), kind: StorageHeaderKind::View };
+        let release = MoveReleasePlace::Local { local: 3, path: vec![] };
+        let owner = BorrowRoot::release(&generation, &release).unwrap();
+        let mut state = BorrowState::default();
+        state.storage.directory.entries.insert(generation.clone(), MoveGenerationEntry::new(&generation, Some(owned), [release].into()));
+        state.storage.contents.entries.insert(generation.clone(), MoveValueFact {
+            non_storage: BorrowFact::from_direct([BorrowRoot::Param(7)].into()),
+            headers: ProjectedHeaderFact::default(),
+        });
+        let header = |descriptor| ProjectedHeaderFact { leaves: [(vec![], StorageHeaderLeaf::known_typed(generation.clone(), descriptor))].into() };
+        let retained = state.retained_contents(BorrowFact::from_direct([owner.clone()].into()), &header(owned));
+        assert_eq!(retained.flatten(), [BorrowRoot::Param(7)].into());
+        let retained_view = state.retained_contents(BorrowFact::default(), &header(view));
+        assert!(retained_view.flatten().contains(&owner));
+        // A borrowed occurrence of the exact same generation inside owned contents is not the
+        // owner's lifetime introduction, including a graph cycle.
+        state.storage.contents.entries.get_mut(&generation).unwrap().headers = header(view);
+        assert!(state.retained_contents(BorrowFact::default(), &header(owned)).flatten().contains(&owner));
+        state.storage.contents.entries.get_mut(&generation).unwrap().headers = ProjectedHeaderFact::default();
+        let mut unknown = header(owned);
+        unknown.leaves.get_mut(&vec![]).unwrap().known = false;
+        assert!(state.retained_contents(BorrowFact::default(), &unknown).flatten().contains(&owner));
+        let fallback = BorrowRoot::ParamStorage(8);
+        let mut guarded = header(owned);
+        guarded.leaves.get_mut(&vec![]).unwrap().fallback_roots.insert(fallback.clone());
+        assert!(state.retained_contents(BorrowFact::default(), &guarded).flatten().contains(&fallback));
+        state.storage.directory.entries.get_mut(&generation).unwrap().ended = Some(BorrowEnd::Consumed);
+        assert!(state.retained_contents(BorrowFact::default(), &header(owned)).flatten().contains(&owner.ended(BorrowEnd::Consumed)));
+        for original_kind in [StorageHeaderKind::View, StorageHeaderKind::OwnedDynamic] {
+            for known in [false, true] {
+                let generation = StorageGeneration::caller_storage(0, &[BorrowProjection::StructField(0)]);
+                state.storage.directory.entries.insert(generation.clone(), MoveGenerationEntry::new(&generation,
+                    Some(StorageHeaderDescriptor { kind: original_kind, ..view }), Default::default()));
+                let mut leaf = StorageHeaderLeaf::known_typed(generation.clone(), view);
+                leaf.known = known;
+                let headers = ProjectedHeaderFact { leaves: [(vec![], leaf)].into() };
+                let roots = state.retained_parameter_contents(BorrowFact::default(), &headers, Some(0)).flatten();
+                let expected = if known && original_kind == StorageHeaderKind::View { BorrowRoot::Param(0) }
+                    else { BorrowRoot::ParamStorage(0) };
+                assert_eq!(roots, [expected].into(), "{original_kind:?}/{known}");
+            }
+        }
+    }
+
+    #[test]
+    fn indirect_mutable_retention_selects_only_one_complete_target() {
+        let callee = Expr {
+            kind: ExprKind::Local(0),
+            ty: Ty::Fn(0),
+            span: Span::new(0, 0, 0),
+        };
+        let targets = vec![CallableTargetSet {
+            targets: [(7, hir::ReturnBorrowSummary::None)].into(),
+            unavailable: false,
+        }];
+        let names = [("set".to_owned(), 7)].into();
+        let row = |may_mutate, roots| BorrowMutRetentionDestination { may_mutate, roots };
+        let summary: BorrowMutRetentionSummary = vec![
+            row(true, [BorrowRoot::Param(1), BorrowRoot::ParamStorage(0)].into()),
+            row(false, BorrowRoots::new()),
+        ];
+        let named: BorrowMutRetentionMap = [("set".to_owned(), summary.clone())].into();
+        assert_eq!(
+            indirect_mutable_retention(&callee, 2, &named, &targets, &names),
+            Some(summary),
+        );
+        // Mutation authority is independent of empty/self-retaining output roots.
+        for (may_mutate, roots) in [(false, BorrowRoots::new()), (true, BorrowRoots::new()),
+            (false, [BorrowRoot::Param(0)].into()), (true, [BorrowRoot::Param(0)].into())] {
+            let summary = vec![row(may_mutate, roots), row(false, BorrowRoots::new())];
+            let named = [("set".to_owned(), summary.clone())].into();
+            assert_eq!(
+                indirect_mutable_retention(&callee, 2, &named, &targets, &names),
+                Some(summary),
+            );
+        }
+        for case in [
+            "unavailable", "empty", "multiple", "missing-name", "missing-summary",
+            "capture-arity", "non-parameter-root", "out-of-range-root", "missing-type",
+            "non-callable",
+        ] {
+            let mut callee = callee.clone();
+            let mut targets = targets.clone();
+            let mut names = names.clone();
+            let mut named = named.clone();
+            match case {
+                "unavailable" => targets[0].unavailable = true,
+                "empty" => targets[0].clear(),
+                "multiple" => {
+                    targets[0].insert(8, hir::ReturnBorrowSummary::None);
+                    names.insert("replace".to_owned(), 8);
+                    // A no-op and a fresh replacement must never union into a false no-op.
+                    named.insert("set".to_owned(), vec![row(false, [BorrowRoot::Param(0)].into()), row(false, BorrowRoots::new())]);
+                    named.insert("replace".to_owned(), vec![row(true, BorrowRoots::new()), row(false, BorrowRoots::new())]);
+                }
+                "missing-name" => names.clear(),
+                "missing-summary" => named.clear(),
+                "capture-arity" => named.get_mut("set").unwrap().push(BorrowMutRetentionDestination::default()),
+                "non-parameter-root" => { named.get_mut("set").unwrap()[0].roots.insert(BorrowRoot::Local(0)); }
+                "out-of-range-root" => { named.get_mut("set").unwrap()[0].roots.insert(BorrowRoot::ParamStorage(2)); }
+                "missing-type" => targets.clear(),
+                "non-callable" => callee.ty = Ty::Bool,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                indirect_mutable_retention(&callee, 2, &named, &targets, &names),
+                None,
+                "{case} must preserve the unavailable fallback",
+            );
+        }
+    }
+
+    #[test]
     fn malformed_borrow_mut_retention_indices_fail_closed() {
         let mut valid_roots = BorrowRoots::new();
         valid_roots.insert(BorrowRoot::Param(1));
-        let valid = vec![valid_roots];
+        let valid = vec![BorrowMutRetentionDestination { may_mutate: true, roots: valid_roots }, BorrowMutRetentionDestination::default()];
         assert_eq!(
             exact_borrow_mut_source_indices(Some(&valid), 0, 2),
             Some(vec![BorrowMutRetentionSource::Contained(1)])
@@ -87959,7 +88271,7 @@ fn main() -> i32 = 0
 
         let mut storage_roots = BorrowRoots::new();
         storage_roots.insert(BorrowRoot::ParamStorage(1));
-        let storage = vec![storage_roots];
+        let storage = vec![BorrowMutRetentionDestination { may_mutate: true, roots: storage_roots }, BorrowMutRetentionDestination::default()];
         assert_eq!(
             exact_borrow_mut_source_indices(Some(&storage), 0, 2),
             Some(vec![BorrowMutRetentionSource::Storage(1)]),
@@ -87967,7 +88279,7 @@ fn main() -> i32 = 0
 
         let mut out_of_range_roots = BorrowRoots::new();
         out_of_range_roots.insert(BorrowRoot::Param(2));
-        let out_of_range = vec![out_of_range_roots];
+        let out_of_range = vec![BorrowMutRetentionDestination { may_mutate: true, roots: out_of_range_roots }, BorrowMutRetentionDestination::default()];
         assert_eq!(
             exact_borrow_mut_source_indices(Some(&out_of_range), 0, 2),
             None,
@@ -87976,13 +88288,13 @@ fn main() -> i32 = 0
 
         let mut non_parameter_roots = BorrowRoots::new();
         non_parameter_roots.insert(BorrowRoot::Local(0));
-        let non_parameter = vec![non_parameter_roots];
+        let non_parameter = vec![BorrowMutRetentionDestination { may_mutate: true, roots: non_parameter_roots }, BorrowMutRetentionDestination::default()];
         assert_eq!(
             exact_borrow_mut_source_indices(Some(&non_parameter), 0, 2),
             None,
             "a non-parameter root must not become a fail-open empty exact set",
         );
-        assert_eq!(exact_borrow_mut_source_indices(Some(&valid), 1, 2), None);
+        assert_eq!(exact_borrow_mut_source_indices(Some(&valid), 2, 2), None);
         assert_eq!(exact_borrow_mut_source_indices(None, 0, 2), None);
 
         assert_eq!(
@@ -88094,6 +88406,7 @@ fn main() -> i32 = 0
             loop_value_facts: std::collections::HashMap::new(),
             control_value_facts: std::collections::HashMap::new(),
             walked_value_facts: std::collections::HashMap::new(),
+            walked_self_contents: std::collections::HashMap::new(),
             walked_storage_facts: std::collections::HashMap::new(),
             walked_backing_facts: std::collections::HashMap::new(),
             pending_call_completions: std::collections::HashMap::new(),
@@ -88106,7 +88419,7 @@ fn main() -> i32 = 0
             return_roots: BorrowRoots::new(),
             parallel_transfer_roots: BorrowRoots::new(),
             mutable_access_roots: BorrowRoots::new(),
-            borrow_mut_retention: vec![BorrowRoots::new(); function.params.len()],
+            borrow_mut_retention: vec![BorrowMutRetentionDestination::default(); function.params.len()],
             view_effect_exits: None,
             non_fallthrough: std::collections::HashSet::new(),
             borrow_fact_cache: std::cell::RefCell::new(None),

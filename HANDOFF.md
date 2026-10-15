@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan199](docs/impl/199-indirect-mutable-outputs.md) separates mutable-output
+  dependencies from possible mutation, preserving borrowed siblings after another
+  field changes. Known noncapturing function values consume the same checked
+  records as direct calls. Interface20 certifies the complete fact; unknown or
+  multiple targets and partial Move-field calls retain their existing limits.
+
 - [Plan198](docs/impl/198-shared-match-field-origins.md) retains typed stable
   field origins through shared sum-payload matches for R130. Existing checked
   no-rebind effects preserve local view origins across repeated calls. Parent

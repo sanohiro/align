@@ -165,7 +165,7 @@ fn declaration_header_program() -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 1]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
         mutable_view_effect: Some(vec![None; 1]),
         locals: vec![
             hir::Local {
@@ -1913,7 +1913,7 @@ fn fn_type_header_program() -> hir::Program {
 fn summary_header_program() -> hir::Program {
     let mut program = declaration_header_program();
     program.fns[0].params = vec![0, 1];
-    program.fns[0].mutable_retention = Some(vec![vec![], vec![]]);
+    program.fns[0].mutable_retention = Some(vec![hir::MutableRetentionDestination::default(); 2]);
     program.fns[0].param_modes = vec![
         align_ast::ParamMode::ByValue,
         align_ast::ParamMode::ByValue,
@@ -1962,7 +1962,7 @@ fn main_header_program(params: Vec<Ty>, param_modes: Vec<align_ast::ParamMode>, 
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; params.len()]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); params.len()]),
         mutable_view_effect: Some(vec![None; params.len()]),
         locals: local_params,
         body: hir::Block {
@@ -2081,16 +2081,16 @@ fn malformed_hir_declaration_header_metadata_fails_closed() {
         ("import-retention-order", vec![vec![hir::MutableRetentionRoot::Storage(0), hir::MutableRetentionRoot::Contained(0)]]),
     ] {
         assert_one_header_mutation(label, &base, |program| {
-            program.imported_fns[0].mutable_retention = Some(roots);
+            program.imported_fns[0].mutable_retention = Some(roots.into_iter().map(|roots| hir::MutableRetentionDestination { may_mutate: false, roots }).collect());
         });
     }
     assert_one_header_mutation("import-retention-uncertified", &base, |program| {
         program.imported_fns[0].producer_certified = false;
-        program.imported_fns[0].mutable_retention = Some(vec![vec![]]);
+        program.imported_fns[0].mutable_retention = Some(vec![hir::MutableRetentionDestination::default()]);
     });
     assert_one_header_mutation("import-retention-nonmutable", &base, |program| {
         program.imported_fns[0].param_modes[0] = align_ast::ParamMode::Borrow;
-        program.imported_fns[0].mutable_retention = Some(vec![vec![hir::MutableRetentionRoot::Contained(0)]]);
+        program.imported_fns[0].mutable_retention = Some(vec![hir::MutableRetentionDestination { may_mutate: false, roots: vec![hir::MutableRetentionRoot::Contained(0)] }]);
     });
     assert_one_header_mutation("import-transfer-order", &base, |program| {
         program.imported_fns[0].parallel_transfer_params = vec![0, 0];
@@ -5097,7 +5097,7 @@ fn with_unary_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5187,7 +5187,7 @@ fn with_mixed_eager_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5218,7 +5218,7 @@ fn with_str_trim_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5322,7 +5322,7 @@ fn with_path_string_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5368,7 +5368,7 @@ fn with_reader_buffered_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5452,7 +5452,7 @@ fn with_bytes_str_cycle_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5551,7 +5551,7 @@ fn with_regex_string_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 1]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
         mutable_view_effect: Some(vec![None; 1]),
         locals: vec![hir::Local {
             id: 0,
@@ -5625,7 +5625,7 @@ fn with_template_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5669,7 +5669,7 @@ fn with_file_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5719,7 +5719,7 @@ fn with_array_builder_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![hir::MutableAccessRoot::Storage(0)]),
-        mutable_retention: Some(vec![vec![]; 1]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
         mutable_view_effect: Some(vec![None; 1]),
         locals: vec![hir::Local {
             id: 0,
@@ -5777,7 +5777,7 @@ fn with_process_command_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 1]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
         mutable_view_effect: Some(vec![None; 1]),
         locals: vec![hir::Local {
             id: 0,
@@ -5834,7 +5834,7 @@ fn with_http_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5904,7 +5904,7 @@ fn with_block_stmt_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -5982,7 +5982,7 @@ fn with_match_arm_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -6072,7 +6072,7 @@ fn with_if_branch_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -6173,7 +6173,7 @@ fn with_binary_match_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -6244,7 +6244,7 @@ fn with_conditional_operand_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -6316,7 +6316,7 @@ fn with_scoped_control_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -6382,7 +6382,7 @@ fn with_loop_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals: Vec::new(),
         body: hir::Block {
@@ -6458,7 +6458,7 @@ fn with_stage_body_depth(depth: usize) -> hir::Program {
         return_cleanup: hir::ReturnCleanupAbi::None,
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 1]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
         mutable_view_effect: Some(vec![None; 1]),
         locals: vec![hir::Local {
             id: 0,
@@ -7866,7 +7866,7 @@ fn body_test_named_function(
         return_cleanup: body_test_return_cleanup(ret),
         parallel_transfer: hir::ReturnBorrowSummary::None,
         mutable_access: Some(vec![]),
-        mutable_retention: Some(vec![vec![]; 0]),
+        mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
         mutable_view_effect: Some(vec![None; 0]),
         locals,
         body,
@@ -19092,14 +19092,19 @@ fn borrowed_handle_receiver_hir_rejects_forged_places() -> Result<(), &'static s
 }
 
 #[test]
-fn mutable_retention_replay_rejects_stale_local_facts() {
+fn mutable_retention_replay_rejects_stale_local_facts() -> Result<(), &'static str> {
     let base = checked_source_program("fn set(borrow mut dst: str, value: str) { dst = value }\nfn main() -> i32 = 0\n");
     assert!(align_sema::checked_hir_body_facts_are_valid(&base));
-    for replacement in [None, Some(vec![vec![], vec![]])] {
+    let mut wrong_flag = base.fns[0].mutable_retention.clone();
+    let destination = wrong_flag.as_mut().and_then(|rows| rows.first_mut()).ok_or("retention fixture row")?;
+    assert!(destination.may_mutate);
+    destination.may_mutate = false;
+    for replacement in [None, Some(vec![hir::MutableRetentionDestination::default(); 2]), wrong_flag] {
         let mut bad = base.clone();
         bad.fns[0].mutable_retention = replacement;
         assert_replay_rejects_without_mutating(bad, "mutable-retention facts must match the actual body");
     }
+    Ok(())
 }
 
 #[test]
@@ -20220,7 +20225,7 @@ fn native_output_hir_rejects_shared_mode_with_mutable_local_flag() -> Result<(),
         assert!(function.locals.get(usize::try_from(local).map_err(|_| "local index")?).ok_or("output local")?.is_mut);
         *function.param_modes.get_mut(buffer_parameter).ok_or("output mode")? = align_ast::ParamMode::Borrow;
         if let Some(summary) = &mut function.mutable_retention {
-            summary.get_mut(buffer_parameter).ok_or("output summary")?.clear();
+            *summary.get_mut(buffer_parameter).ok_or("output summary")? = hir::MutableRetentionDestination::default();
         }
         assert_body_entrypoints_empty(label, &malformed);
     }

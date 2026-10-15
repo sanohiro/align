@@ -277,9 +277,16 @@ impl MutableRetentionRoot {
     }
 }
 
-/// Exact body-analysis record, including the destination-self transition convention.
+/// Returning output dependencies, independent of authority to suppress a mutation transition.
+#[derive(Clone, Default, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MutableRetentionDestination {
+    /// Only BorrowMut rows may set this; false proves no mutation on returning paths.
+    pub may_mutate: bool,
+    pub roots: Vec<MutableRetentionRoot>,
+}
+
 /// `None` is unavailable; `Some` has one entry for every logical parameter.
-pub type MutableRetentionSummary = Option<Vec<Vec<MutableRetentionRoot>>>;
+pub type MutableRetentionSummary = Option<Vec<MutableRetentionDestination>>;
 
 /// Parameter-relative backing an invocation may modify or access exclusively. Storage and
 /// contained dependencies are distinct: changing a fresh array element does not modify a view
@@ -386,7 +393,8 @@ pub fn validate_mutable_retention(
     if destinations.len() != modes.len() {
         return Err("mutable-retention destination arity mismatch");
     }
-    for (roots, mode) in destinations.iter().zip(modes) {
+    for (destination, mode) in destinations.iter().zip(modes) {
+        let roots = &destination.roots;
         if roots
             .iter()
             .any(|root| usize::try_from(root.index()).map_or(true, |index| index >= modes.len()))
@@ -403,6 +411,9 @@ pub fn validate_mutable_retention(
             )
         {
             return Err("mutable-retention roots require a mutable destination");
+        }
+        if destination.may_mutate && *mode != align_ast::ParamMode::BorrowMut {
+            return Err("mutable-retention mutation flag requires borrow mut");
         }
     }
     if generic {

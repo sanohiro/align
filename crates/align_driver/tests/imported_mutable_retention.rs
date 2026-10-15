@@ -298,36 +298,6 @@ fn main() -> i32 {
     }
 }
 
-#[test]
-fn indirect_mutable_calls_keep_the_unavailable_summary_fallback() {
-    let helper = "module helper\npub fn ignore(borrow mut dst: str, ignored: str) {}\n";
-    let main = r#"module main
-import helper
-fn apply(borrow mut destination: str) {
-  call := helper.ignore
-  arena {
-    n := 42
-    short := template "short={n}"
-    call(destination, short)
-  }
-}
-fn main() -> i32 = 0
-"#;
-    let checked = diff_check_multi(
-        "indirect-retention-fallback",
-        &[("main.align", main), ("helper.align", helper)],
-        "main.align",
-    );
-    assert!(
-        checked.whole_errors && checked.per_unit_errors,
-        "whole: {}\nimported: {}",
-        checked.whole_diags,
-        checked.per_unit_diags
-    );
-    for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
-        assert!(diagnostics.contains("shorter-lived"), "{diagnostics}");
-    }
-}
 
 #[test]
 fn retained_local_views_reject_across_helper_boundaries() {
