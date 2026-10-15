@@ -22372,7 +22372,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Ty::Int(it) => ((it.signed as u64) << 16) | (it.bits / 8) as u64,
             Ty::Bool => (1 << 8) | 1,
             Ty::Float(ft) => (2 << 8) | (ft.bits / 8) as u64,
-            _ => unreachable!("json.decode scalar target is int/float/bool (sema-checked)"),
+            Ty::String => 0x810,
+            _ => return Err(self.err("unsupported JSON scalar decode target")),
         };
         let tag_v = self.ctx.i32_type().const_int(tag, false);
         let cs = self

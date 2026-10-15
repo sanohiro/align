@@ -7110,7 +7110,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             }
             Rvalue::JsonDecodeScalar { scalar, input, out } => {
                 if slot_ty != *scalar
-                    || !matches!(scalar, Ty::Int(_) | Ty::Float(_) | Ty::Bool)
+                    || !matches!(scalar, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::String)
                     || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
                 {
                     equation.invalid = true;
@@ -12519,6 +12519,38 @@ mod tests {
                     assert!(validate_partition_resource_rvalues(&malformed, definitions).is_err(), "{root}/{mutation}: partition");
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn producer_json_string_output() -> Result<(), Box<dyn std::error::Error>> {
+        let source = "import core.json\nfn decode(input:str)->Result<string,Error> = json.decode(input)\n";
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+        let base = crate::lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?;
+        let defined = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+        validate_mir_producers(&base)?;
+        validate_partition_resource_rvalues(&base, &defined)?;
+        for mutation in 0..5 {
+            let mut malformed = base.clone();
+            let function = malformed.fns.iter_mut().find(|f| f.name.as_str() == "decode").ok_or("decode fixture")?;
+            let operation = function.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| {
+                if let Stmt::Let(_, r @ Rvalue::JsonDecodeScalar { .. }) = s { Some(r) } else { None }
+            }).ok_or("string operation")?;
+            let Rvalue::JsonDecodeScalar { scalar: elem, input, out } = operation else { return Err("string fixture".into()); };
+            match mutation {
+                0 => *elem = Ty::Str,
+                1 => *elem = Ty::Bool,
+                2 => *out = u32::MAX,
+                3 => *input = Operand::Const(Const::Bool(true)),
+                _ => *function.slots.get_mut(usize::try_from(*out)?).ok_or("output slot")? = Ty::Bool,
+            }
+            assert!(validate_mir_producers(&malformed).is_err(), "mutation {mutation}");
+            assert!(validate_partition_resource_rvalues(&malformed, &defined).is_err(), "partition mutation {mutation}");
         }
         Ok(())
     }

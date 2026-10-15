@@ -1458,6 +1458,18 @@ validates tag, UTF-8, complete array and trailing input before publishing the
 spine; failure leaves the caller-zeroed output untouched and frees staged
 payloads. This adds no arena or input lifetime, descriptor or serialized field.
 
+## JSON owned-string scalar amendment (Plan203)
+
+A05's `JsonDecodeScalar` signature/effect/export inventory is unchanged. It
+admits the same exact tag domain as `JsonDecodeArray` above, including `0x810`
+for one independent owned 16-byte `{ptr,len}` string header. Validate tag,
+complete UTF-8, string token and trailing whitespace/EOF before publication.
+String failure leaves the caller-zeroed header untouched and frees unpublished
+payload bytes. Empty success is null/0 with no allocation; nonempty success
+transfers one exact decoded-byte allocation to string Drop. Numeric failure
+bytes remain unspecified and are ignored by the caller's status branch.
+No arena/input dependency or serialized record is added.
+
 ## AM-R02 mixed JSON provenance (Plan193)
 
 No native signature or RuntimeKey changes. `JsonOwnedDecode` now passes its checked

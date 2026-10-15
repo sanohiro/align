@@ -24,6 +24,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan203](docs/impl/203-json-owned-string-root.md) admits a standalone owned
+  `string` JSON decode root through the existing scalar decoder. Complete-root
+  validation precedes ownership publication; failure frees unpublished bytes.
+  Input/arena independence, ordinary Move/Drop and owner-bounded views remain
+  explicit. Borrowed `str` roots remain separate.
+
 - [Plan202](docs/impl/202-native-json-allocation-authority.md) certifies native
   JSON record/AoS/union heap spines independently of borrowed input/arena text.
   Existing mutable calls now accept those owners, and cleanup releases their
