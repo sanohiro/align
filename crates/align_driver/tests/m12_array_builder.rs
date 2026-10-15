@@ -511,7 +511,7 @@ fn record_builder_move_source_matrix() {
 }
 
 #[test]
-fn record_builder_source_use_after_push_and_borrowed_source_rejected() {
+fn record_builder_source_ownership_and_direct_field_transfer() {
     let moved = concat!(
         "Item { name: string }\n",
         "fn main() -> i32 {\n",
@@ -561,7 +561,12 @@ fn record_builder_source_use_after_push_and_borrowed_source_rejected() {
         "  return 0\n",
         "}\n",
     );
-    assert!(check_errs("ab-record-source-projection", projection));
+    // Plan192 transfers a complete direct owning field; a shared parent cannot transfer it.
+    assert!(!check_errs("ab-record-source-projection", projection));
+    let borrowed_projection = "Item { name: string }\nOuter { item: Item }\n\
+        fn retain(borrow outer: Outer) { mut b: array_builder<Item> := array_builder(); b.push(outer.item) }\n\
+        fn main() {}\n";
+    assert!(check_diagnostics("ab-record-borrowed-projection", borrowed_projection).contains("borrow"));
 
     let divergent = concat!(
         "Item { name: string }\n",

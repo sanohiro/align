@@ -215,6 +215,12 @@ fn main() -> i32 {
 
 #[test]
 fn existing_admission_and_view_lifetimes_stay_checked() {
+    // Whole Copy-array replacement is admitted by Plan170; bare value placement is unchanged.
+    let mut sources = SourceMap::new();
+    let checked = check(&mut sources, "fixed-literal-replacement",
+        "fn main() { mut values: [i64; 2] := [1, 2]; values = [3, 4] }");
+    assert!(!checked.diags.has_errors(), "{}",
+        align_driver::format_diagnostics(&sources, &checked.diags));
     for (label, source, expected) in [
         (
             "bare-return",
@@ -225,11 +231,6 @@ fn existing_admission_and_view_lifetimes_stay_checked() {
             "bare-branch",
             "fn main() { values := if true { [1, 2] } else { [3, 4] } }",
             "bare array literal",
-        ),
-        (
-            "replacement",
-            "fn main() { mut values: [i64; 2] := [1, 2]; values = [3, 4] }",
-            "whole-array reassignment",
         ),
         (
             "temporary-borrow",

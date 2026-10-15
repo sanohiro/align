@@ -300,7 +300,8 @@ fn fixed_array_ownership_rejects_copy_and_borrow_consumption() {
                             "fn bad(borrow value: Batch) { taken := value.values }\nfn main() {}"
                                 .into()
                         } else {
-                            format!("fn main() {{ value := {value}; taken := value.values }}")
+                            // Plan192 admits the direct transfer but consumes the parent field.
+                            format!("fn main() {{ value := {value}; taken := value.values; take(value) }}")
                         }
                     } else {
                         body

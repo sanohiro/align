@@ -232,8 +232,8 @@ fn r63_json_identity_matrix() {
     let width_edited = project.build(UnitReuse::Allowed);
     assert!(!hit(&width_edited, "lib") && !hit(&width_edited, "main"));
     let width_descriptor = &width_edited.units.iter().find(|unit| unit.unit == "lib").unwrap().summary.owned_json_graphs[0].envelope;
-    assert_ne!(width_descriptor, &cold_descriptor, "reachable float width participates in V3 identity");
-    assert_eq!(cold_descriptor[0], 3);
+    assert_ne!(width_descriptor, &cold_descriptor, "reachable float width participates in V4 identity");
+    assert_eq!(cold_descriptor[0], 4);
 
     project.write("lib.align", original);
     let reverted = project.build(UnitReuse::Allowed);

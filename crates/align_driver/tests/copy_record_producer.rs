@@ -227,7 +227,7 @@ fn copy_values_do_not_extend_views_or_source_authority() {
                     let text = align_driver::format_diagnostics(&sources, &diags);
                     assert!(diags.has_errors(), "accepted {name}/{per_unit}");
                     let expected = match name {
-                        "move" => text.contains("moving a nested struct field"),
+                        "move" => text.contains("cannot move a field out of borrowed parameter 'plan'"),
                         "shared" => text.contains("borrow"),
                         _ => text.contains("cannot return a view that borrows local storage"),
                     };

@@ -856,9 +856,10 @@ fn bound_else_fallback_matrix() {
 
 #[test]
 fn bound_else_fallback_rejections() {
+    // Plan190 admits tuple carriers; borrowed and moved fallback restrictions remain.
+    assert!(!check_errs("bound-else-tuple-carrier", "pub fn good(input: Option<(string, array<i64>)>) {}"));
     for (source, message) in [
         ("pub fn bad(borrow input: Option<string>, a: string) -> string = input else a", "borrow"),
-        ("pub fn bad(input: Option<(string, array<i64>)>) {}", "Option payload"),
         ("pub fn bad(input: Option<array<slice<i64>>>) {}", "Option payload"),
         ("pub fn bad(input: Option<string>) { a := \"a\".clone(); b := input else a; print(a) }", "moved"),
         ("pub fn bad(input: Option<string>, borrow a: string) -> string = input else a", "borrow"),

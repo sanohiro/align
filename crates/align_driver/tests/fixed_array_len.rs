@@ -325,7 +325,12 @@ pub fn exercise() {
 }
 
 #[test]
-fn fixed_length_preserves_array_formation_rejections() {
+fn fixed_length_preserves_array_formation_rules() {
+    // Plan164 admits owning string literals; placement and nested-array rules still apply.
+    assert!(!check_errs(
+        "fixed-len-owned-string.align",
+        "fn main() -> i32 = ([\"a\".clone()]).len() as i32\n",
+    ));
     for (receiver, message) in [
         ("[]", "empty array literal needs an expected element type"),
         ("{ [1,2]; xs := [3,4]; xs }", "an expression statement"),
@@ -335,7 +340,6 @@ fn fixed_length_preserves_array_formation_rejections() {
             "a `match` arm value",
         ),
         ("loop { break [1,2] }", "a `break` value"),
-        ("[\"a\".clone()]", "cannot be an element of a fixed array"),
         ("[[1,2],[3,4]]", "composite payloads are not supported"),
     ] {
         let source = format!("fn main() -> i32 = ({receiver}).len() as i32\n");

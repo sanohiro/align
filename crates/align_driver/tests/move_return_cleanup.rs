@@ -574,6 +574,21 @@ fn indirect_tagged_result_reads_the_tag_before_selected_payload() {
 
 #[test]
 fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
+    // Plan173 keeps each fresh component in its own owner until the aggregate commits.
+    // Resolve the owner from the field's stored value, independently of temporary slot numbering.
+    fn component_owner<'a>(function: &'a str, field: &str) -> &'a str {
+        let prefix = format!("{field} <- ");
+        let value = function.lines().find_map(|line| line.trim().strip_prefix(&prefix))
+            .expect("initialized component field");
+        function.lines().filter_map(|line| line.trim().split_once(" <- "))
+            .find_map(|(place, stored)|
+                (place.starts_with('_') && !place.contains('.') && stored == value).then_some(place))
+            .expect("fresh component cleanup owner")
+    }
+    fn cleanup_position(function: &str, field: &str) -> usize {
+        function.find(&format!("    drop {}\n", component_owner(function, field)))
+            .expect("fresh component cleanup")
+    }
     let mir = mir_text(FRESH_STRUCT_DESTINATION_SOURCE);
     for name in ["explicit_exit", "try_exit"] {
         let function = mir
@@ -581,8 +596,8 @@ fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
             .nth(1)
             .and_then(|body| body.split("\n}\n").next())
             .expect("fresh destination MIR function");
-        let second = function.find("drop_field _0.1").expect("second field cleanup");
-        let first = function.find("drop_field _0.0").expect("first field cleanup");
+        let second = cleanup_position(function, "_0.1");
+        let first = cleanup_position(function, "_0.0");
         assert!(
             second < first,
             "partial fields must be dropped in reverse source order:\n{function}"
@@ -614,7 +629,8 @@ fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
         .and_then(|body| body.split("\n}\n").next())
         .expect("hard trap MIR function");
     assert!(
-        !hard_trap.contains("drop_field"),
+        ["_1.0", "_1.1"].iter().all(|field|
+            !hard_trap.contains(&format!("    drop {}\n", component_owner(hard_trap, field)))),
         "a terminal hard-error edge must not gain successor cleanup:\n{hard_trap}"
     );
     let nested = mir
@@ -622,12 +638,8 @@ fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
         .nth(1)
         .and_then(|body| body.split("\n}\n").next())
         .expect("nested destination MIR function");
-    let array_drop = nested
-        .find("drop_field _0.1")
-        .expect("nested array cleanup");
-    let string_drop = nested
-        .find("drop_field _0.0.0")
-        .expect("nested string cleanup");
+    let array_drop = cleanup_position(nested, "_0.1");
+    let string_drop = cleanup_position(nested, "_0.0.0");
     assert!(
         array_drop < string_drop,
         "nested Move leaves must drop in reverse order:\n{nested}"
@@ -637,12 +649,8 @@ fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
         .nth(1)
         .and_then(|body| body.split("\n}\n").next())
         .expect("loop break destination MIR function");
-    let second = loop_exit
-        .find("drop_field _0.1")
-        .expect("loop break second field cleanup");
-    let first = loop_exit
-        .find("drop_field _0.0")
-        .expect("loop break first field cleanup");
+    let second = cleanup_position(loop_exit, "_0.1");
+    let first = cleanup_position(loop_exit, "_0.0");
     assert!(second < first, "loop break cleanup must be reverse order:\n{loop_exit}");
     let loop_field = mir
         .split("fn loop_field")
@@ -650,7 +658,8 @@ fn fresh_move_struct_destinations_cleanup_reached_partial_prefixes() {
         .and_then(|body| body.split("\n}\n").next())
         .expect("loop-valued field MIR function");
     assert!(
-        !loop_field.contains("drop_field"),
+        ["_0.0", "_0.1"].iter().all(|field|
+            !loop_field.contains(&format!("    drop {}\n", component_owner(loop_field, field)))),
         "breaking a loop used as a field must preserve the enclosing partial destination:\n{loop_field}"
     );
     if backend_available() {
