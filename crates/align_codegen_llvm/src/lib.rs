@@ -23085,7 +23085,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
         result_ty: Ty,
     ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let value = match rv {
-            Rvalue::CodecOpen { input, out } => {
+            Rvalue::CodecOpen { input, error_enum } => {
+                let Ty::Result(Scalar::CodecBatch, Scalar::Enum(actual_error)) = result_ty else {
+                    return Err(self.err("codec.open result is not Result<codec.batch, Error>"));
+                };
+                if actual_error != *error_enum {
+                    return Err(self.err("codec.open Error identity mismatch"));
+                }
                 let (pointer, length) = self.split_str(input)?;
                 let status = self.builder
                     .build_call(
@@ -23098,23 +23104,40 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .ok_or_else(|| self.err("codec_open_v1 must return i32"))?
                     .into_int_value();
-                let output = self.slots.get(out).copied()
-                    .ok_or_else(|| self.err("codec.open output slot is missing"))?;
                 let succeeded = self.builder.build_int_compare(
                     IntPredicate::EQ, status, self.ctx.i32_type().const_zero(), "codec.open.ok",
                 ).map_err(|error| self.err(error))?;
-                let publish = self.ctx.append_basic_block(self.func, "codec.open.publish");
+                let ok = self.ctx.append_basic_block(self.func, "codec.open.success");
+                let invalid = self.ctx.append_basic_block(self.func, "codec.open.invalid");
                 let join = self.ctx.append_basic_block(self.func, "codec.open.join");
-                self.builder.build_conditional_branch(succeeded, publish, join)
+                self.builder.build_conditional_branch(succeeded, ok, invalid)
                     .map_err(|error| self.err(error))?;
-                self.builder.position_at_end(publish);
+                let result_type = result_struct_type(self.ctx, Scalar::CodecBatch,
+                    Scalar::Enum(*error_enum), self.struct_types, self.enum_types, self.tagged_types);
+                let shape = self.result_union_shape(Scalar::CodecBatch, Scalar::Enum(*error_enum))?;
+                self.builder.position_at_end(ok);
                 let descriptor = self.operand(input)?;
-                self.builder.build_store(output, descriptor)
-                    .map_err(|error| self.err(error))?;
-                self.builder.build_unconditional_branch(join)
-                    .map_err(|error| self.err(error))?;
+                let success = self.build_union_from_values(result_type,
+                    self.ctx.i8_type().const_zero(), shape.variant(0)?, &[descriptor])?;
+                self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
+                let ok_end = self.builder.get_insert_block()
+                    .ok_or_else(|| self.err("codec.open success block is absent"))?;
+                self.builder.position_at_end(invalid);
+                let error_type = self.enum_types.get(*error_enum as usize).copied()
+                    .ok_or_else(|| self.err("codec.open Error enum is absent"))?;
+                let error = self.builder.build_insert_value(error_type.const_zero(),
+                    self.ctx.i32_type().const_int(align_sema::ERROR_VARIANT_INVALID as u64, false),
+                    0, "codec.open.error.invalid").map_err(|error| self.err(error))?.into_struct_value();
+                let failure = self.build_union_from_values(result_type,
+                    self.ctx.i8_type().const_int(1, false), shape.variant(1)?, &[error.into()])?;
+                self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
+                let invalid_end = self.builder.get_insert_block()
+                    .ok_or_else(|| self.err("codec.open invalid block is absent"))?;
                 self.builder.position_at_end(join);
-                status.into()
+                let result = self.builder.build_phi(result_type, "codec.open.result")
+                    .map_err(|error| self.err(error))?;
+                result.add_incoming(&[(&success, ok_end), (&failure, invalid_end)]);
+                result.as_basic_value()
             }
             Rvalue::CodecBatchRows(batch) => {
                 let (base, _) = self.codec_batch_parts(batch)?;

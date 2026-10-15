@@ -869,8 +869,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(index)
         ),
         Rvalue::XmlText { reader } => format!("xml_text({})", operand_str(reader)),
-        Rvalue::CodecOpen { input, out } => {
-            format!("codec_open({}, -> _{out})", operand_str(input))
+        Rvalue::CodecOpen { input, error_enum } => {
+            format!("codec_open({}, Error#{error_enum})", operand_str(input))
         }
         Rvalue::CodecBatchRows(batch) => format!("codec_batch_rows({})", operand_str(batch)),
         Rvalue::CodecBatchColumns(batch) => {

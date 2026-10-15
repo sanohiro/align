@@ -1696,12 +1696,6 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
-        Rvalue::CodecOpen { input, out } => {
-            contract.result = i32_ty;
-            contract.outputs = vec![(*out, Ty::CodecBatch)];
-            contract.operands = vec![(input, bytes, read)];
-            contract.access = XmlAccessProvenance::Shared;
-        }
         Rvalue::JsonDocCollect { kind, doc, arena, out } => {
             contract.outputs = vec![(*out, Ty::Slice(kind.element()))];
             contract.operands = vec![(doc, Ty::JsonDoc, read), (arena, Ty::ArenaHandle, read)];
@@ -1974,7 +1968,6 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::JsonDocKey { out, .. }
         | Rvalue::JsonDocCollect { out, .. }
         | Rvalue::BytesAsStr { out, .. }
-        | Rvalue::CodecOpen { out, .. }
         | Rvalue::FsReadFileView { out, .. }
         | Rvalue::FsReadBytesView { out, .. }
         | Rvalue::HttpRespHeader { out, .. }
@@ -2111,7 +2104,6 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::FsReadDir { path: input, .. }
         | Rvalue::DnsResolve { host: input, .. }
         | Rvalue::BytesAsStr { bytes: input, .. }
-        | Rvalue::CodecOpen { input, .. }
         | Rvalue::EnvGet { name: input, .. }
         | Rvalue::RegexCompile { pattern: input, .. }
         | Rvalue::TimeFormat { ns: input, .. }
@@ -2893,8 +2885,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
             let mut has_predecessor = false;
             for predecessor in &function.blocks {
                 let (condition, yes, no) = match &predecessor.term {
-                    Term::Goto(target) if *target == block => (None, block, block),
                     Term::Branch(condition, yes, no) if *yes == block || *no == block => (Some(condition), *yes, *no),
+                    other if crate::byte_ranges::successors(other).contains(&block) => (None, block, block),
                     _ => continue,
                 };
                 has_predecessor = true;
@@ -2902,8 +2894,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if yes != no
                     && let Some(Operand::Value(condition)) = condition
                     && function.value_tys.get(*condition as usize) == Some(&Ty::Bool)
-                    && predecessor.stmts.iter().any(|statement| matches!(statement, Stmt::Let(value, _) if value == condition))
+                    && self.graph.primary_definitions.get(*condition as usize) == Some(&1)
+                    && self.graph.auxiliary_definitions.get(*condition as usize) == Some(&0)
+                    && self.graph.duplicate_values.get(*condition as usize) == Some(&false)
                     && let Some(Some(predicate)) = self.graph.value_definitions.get(*condition as usize)
+                    && predecessor.stmts.iter().any(|statement| matches!(statement,
+                        Stmt::Let(value, actual) if value == condition && std::ptr::eq(actual, *predicate)))
                 {
                     let tested = match (predicate, selected) {
                         (Rvalue::OptionIsSome(value), XmlAccessPathSegment::OptionSome) if same_operand(value) => Some(1),
@@ -6284,6 +6280,23 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
+            Rvalue::CodecOpen { input, error_enum } => {
+                let bytes = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+                let whole = path.is_empty();
+                let ok = path.as_slice() == [XmlAccessPathSegment::ResultOk];
+                let err = path.as_slice() == [XmlAccessPathSegment::ResultErr];
+                if result_ty != Ty::Result(Scalar::CodecBatch, Scalar::Enum(error_enum))
+                    || !builtin_error_enum_is_exact(self.graph.program, error_enum)
+                    || !(whole || ok || err)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &input, bytes);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    // Only the complete Result is always present. A payload needs its tag guard.
+                    equation.absent = !whole;
+                }
+            }
             Rvalue::XmlParse {
                 input,
                 error_enum,
@@ -6732,7 +6745,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::LogLine(..)
             | Rvalue::LogLineBuilder(..)
             | Rvalue::LogFlush(..)
-            | Rvalue::CodecOpen { .. }
             | Rvalue::CodecBatchRows(..)
             | Rvalue::CodecBatchColumns(..)
             | Rvalue::CodecBatchKind(..)
@@ -9771,6 +9783,23 @@ fn validate_resource_rvalues_component(
                         program.resources.get(*resource as usize).is_some()
                             && operand_ty(function, owner) == Some(Ty::Resource(*resource))
                             && result == Ty::Raw
+                    }
+                    Rvalue::CodecOpen { .. } => OperandRequirement::READ
+                        .is_satisfied_by(xml_access(&Operand::Value(*value), result)),
+                    Rvalue::ResultUnwrapOk(input) | Rvalue::ResultUnwrapErr(input)
+                        if matches!(operand_ty(function, input), Some(Ty::Result(Scalar::CodecBatch, _))) =>
+                    {
+                        let selected = if matches!(rvalue, Rvalue::ResultUnwrapOk(_)) {
+                            XmlAccessPathSegment::ResultOk
+                        } else {
+                            XmlAccessPathSegment::ResultErr
+                        };
+                        // Scalar codec views are outside the protected-owner walk. Check even
+                        // discarded projections, including call/argument results with no tag fact.
+                        XmlAccessAnalyzer::new(&access_graph)
+                            .extraction_guard_matches(*value, input, &selected)
+                            && OperandRequirement::READ
+                                .is_satisfied_by(xml_access(&Operand::Value(*value), result))
                     }
                     Rvalue::XmlParse {
                         input,

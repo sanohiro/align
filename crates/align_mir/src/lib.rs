@@ -1955,11 +1955,12 @@ pub enum Rvalue {
     XmlText {
         reader: Operand,
     },
-    /// Validate a canonical `core.codec` envelope and publish its unchanged borrowed `{ptr,len}`
-    /// descriptor into `out` only on success. Yields i32 status; `out` has exact type `CodecBatch`.
+    /// Validate one canonical envelope and return `Result<CodecBatch, builtin Error>`.
+    /// Success borrows the unchanged input descriptor; failure is `Error.Invalid`.
+    /// The tagged result is indivisible: no conditional batch slot is exposed to MIR.
     CodecOpen {
         input: Operand,
-        out: Slot,
+        error_enum: u32,
     },
     CodecBatchRows(Operand),
     CodecBatchColumns(Operand),
@@ -21050,10 +21051,13 @@ fn lower_codec_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
         hir::ExprKind::CodecOpen { input } => {
             let input = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
-            let out = b.new_slot(Ty::CodecBatch);
-            let status = b.fresh_value(status_ty());
-            b.push(Stmt::Let(status, Rvalue::CodecOpen { input, out }));
-            emit_open_handle_result(b, status, out, Ty::CodecBatch, e.ty)
+            let Ty::Result(Scalar::CodecBatch, Scalar::Enum(error_enum)) = e.ty else {
+                b.terminate(Term::Unreachable);
+                return terminated_operand();
+            };
+            let result = b.fresh_value(e.ty);
+            b.push(Stmt::Let(result, Rvalue::CodecOpen { input, error_enum }));
+            Operand::Value(result)
         }
         hir::ExprKind::CodecBatchRows { batch } => {
             unary(b, batch, Rvalue::CodecBatchRows, e.ty)
@@ -21540,8 +21544,7 @@ fn emit_open_handle_result(
     let rslot = b.new_slot(result_ty);
     b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
 
-    // Ok: load the exact typed output and wrap it. The payload's type determines whether the
-    // unwrapped local owns cleanup or is only a borrowed view such as `CodecBatch`.
+    // Ok: load the handle pointer and wrap it (the unwrapped local owns it — `Drop` closes it).
     b.cur = ok_bb;
     let h = b.fresh_value(handle_ty);
     b.push(Stmt::Let(h, Rvalue::Load(out)));
@@ -21550,7 +21553,7 @@ fn emit_open_handle_result(
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
-    // Err: do not read the output slot or introduce a payload cleanup obligation; map the status.
+    // Err: the out slot was zeroed (null handle) → nothing to close; map the status.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     let ec = make_error_from_status(b, code, result_ty);
