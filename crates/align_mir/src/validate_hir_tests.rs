@@ -858,6 +858,44 @@ fn main() -> i32 = 0
 }
 
 #[test]
+fn codec_view_field_placement_matrix() -> Result<(), &'static str> {
+    for (name, scalar) in [
+        ("batch", Scalar::CodecBatch),
+        ("i64_column", Scalar::CodecI64Column),
+        ("f64_column", Scalar::CodecF64Column),
+        ("bool_column", Scalar::CodecBoolColumn),
+        ("str_column", Scalar::CodecStrColumn),
+    ] {
+        let source = format!(
+            "import core.codec\n\
+             Direct {{ value: codec.{name} }}\n\
+             Optional {{ value: Option<codec.{name}> }}\n\
+             Success {{ value: Result<codec.{name}, Error> }}\n\
+             Failure {{ value: Result<i64, codec.{name}> }}\n\
+             Nested {{ direct: Direct, value: Option<Result<codec.{name}, Error>> }}\n\
+             fn main() -> i32 = 0\n"
+        );
+        let program = checked_source_program(&source);
+        assert!(validate_hir::type_placement_metadata_is_valid(&program), "{name}");
+        assert!(body_core_metadata_is_valid(&program), "{name}");
+        for per_unit in [false, true] {
+            assert!(lower_program_checked(&program, per_unit, None).is_ok(), "{name}: {per_unit}");
+        }
+        let direct = program.structs.iter().position(|definition| definition.name == "Direct")
+            .ok_or("missing direct codec field")?;
+        for invalid_ty in [Ty::Slice(scalar), Ty::Array(scalar, 1)] {
+            let mut invalid = program.clone();
+            invalid.structs[direct].fields[0].ty = invalid_ty;
+            assert_placement_rejected(&format!("codec collection field {invalid_ty:?}"), &invalid);
+        }
+        let mut c_layout = program.clone();
+        c_layout.structs[direct].c_repr = true;
+        assert_placement_rejected(&format!("codec C field {name}"), &c_layout);
+    }
+    Ok(())
+}
+
+#[test]
 fn codec_hir_requires_exact_envelopes_discriminators_and_exclusive_encoder_places() {
     let source = r#"
 import core.codec
