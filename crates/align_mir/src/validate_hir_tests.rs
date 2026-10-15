@@ -858,7 +858,7 @@ fn main() -> i32 = 0
 }
 
 #[test]
-fn codec_view_field_placement_matrix() {
+fn codec_view_field_placement_matrix() -> Result<(), &'static str> {
     for (name, scalar) in [
         ("batch", Scalar::CodecBatch),
         ("i64_column", Scalar::CodecI64Column),
@@ -882,7 +882,7 @@ fn codec_view_field_placement_matrix() {
             assert!(lower_program_checked(&program, per_unit, None).is_ok(), "{name}: {per_unit}");
         }
         let direct = program.structs.iter().position(|definition| definition.name == "Direct")
-            .expect("direct codec field");
+            .ok_or("missing direct codec field")?;
         for invalid_ty in [Ty::Slice(scalar), Ty::Array(scalar, 1)] {
             let mut invalid = program.clone();
             invalid.structs[direct].fields[0].ty = invalid_ty;
@@ -892,6 +892,7 @@ fn codec_view_field_placement_matrix() {
         c_layout.structs[direct].c_repr = true;
         assert_placement_rejected(&format!("codec C field {name}"), &c_layout);
     }
+    Ok(())
 }
 
 #[test]
