@@ -4672,6 +4672,114 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
     }
 }
 
+fn independent_copy_numeric(ty: Ty) -> bool {
+    matches!(
+        ty,
+        Ty::Int(IntTy { bits: 8 | 16 | 32 | 64, .. })
+            | Ty::Float(FloatTy { bits: 32 | 64 })
+    )
+}
+
+fn independent_copy_vector(ty: Ty) -> Option<(Scalar, u32)> {
+    let Ty::Vec(element, lanes @ (2 | 4 | 8 | 16)) = ty else {
+        return None;
+    };
+    independent_copy_numeric(scalar_to_ty(element)).then_some((element, lanes))
+}
+
+fn independent_copy_leaf(ty: Ty) -> bool {
+    matches!(ty, Ty::Unit | Ty::Bool | Ty::Char | Ty::Rng)
+        || independent_copy_numeric(ty)
+        || matches!(ty, Ty::Array(element, _) if
+            matches!(element, Scalar::Unit | Scalar::Bool | Scalar::Char)
+                || independent_copy_numeric(scalar_to_ty(element)))
+        || independent_copy_vector(ty).is_some()
+        || matches!(ty, Ty::Mask(element, lanes)
+            if independent_copy_vector(Ty::Vec(element, lanes)).is_some())
+}
+
+/// Inline data can be copied out of readable storage without retaining its authority.
+/// Copy alone is insufficient: views and callable environments must keep their provenance.
+pub fn independent_copy_type(
+    root: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    if independent_copy_leaf(root) {
+        return true;
+    }
+    let mut pending = vec![(root, false)];
+    let mut active = HashSet::new();
+    let mut complete = HashSet::new();
+    while let Some((ty, exiting)) = pending.pop() {
+        if exiting {
+            active.remove(&ty);
+            complete.insert(ty);
+            continue;
+        }
+        if complete.contains(&ty) || independent_copy_leaf(ty) {
+            continue;
+        }
+        if !active.insert(ty) {
+            return false;
+        }
+        pending.push((ty, true));
+        match ty {
+            Ty::Struct(id) => {
+                let Some(record) = structs.get(id as usize) else { return false };
+                pending.extend(record.fields.iter().map(|field| (field.ty, false)));
+            }
+            Ty::Tuple(id) => {
+                let Some(tuple) = tuples.get(id as usize) else { return false };
+                pending.extend(tuple.elems.iter().map(|element| (scalar_to_ty(*element), false)));
+            }
+            Ty::Enum(id) => {
+                let Some(sum) = enums.get(id as usize) else { return false };
+                pending.extend(sum.variants.iter().flat_map(|variant|
+                    variant.payload.iter().map(|payload| (scalar_to_ty(*payload), false))));
+            }
+            // Inspect even zero-length elements and inactive payloads. Neither erases a type's
+            // borrow, callable or Move authority, and neither supplies a producer seed.
+            Ty::Array(element, _) | Ty::Option(element) => {
+                pending.push((scalar_to_ty(element), false));
+            }
+            Ty::StructArray(id, _) => pending.push((Ty::Struct(id), false)),
+            Ty::Result(ok, error) => {
+                pending.push((scalar_to_ty(ok), false));
+                pending.push((scalar_to_ty(error), false));
+            }
+            Ty::Tagged(id) => match tagged_types.get(id as usize) {
+                Some(hir::TaggedType::Option(payload)) => pending.push((scalar_to_ty(*payload), false)),
+                Some(hir::TaggedType::Result(ok, error)) => {
+                    pending.push((scalar_to_ty(*ok), false));
+                    pending.push((scalar_to_ty(*error), false));
+                }
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The immediate indexed-field read may copy only data independent of its parent storage.
+pub fn indexed_array_field_copy_element(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Ty> {
+    let element = match ty {
+        Ty::DynArray(element) => scalar_to_ty(element),
+        Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+        _ => return None,
+    };
+    independent_copy_type(element, structs, tuples, enums, tagged_types).then_some(element)
+}
+
 /// Ordinary owning array headers that support the scalar indexed-field length observation.
 pub fn indexed_array_field_has_length(ty: Ty) -> bool {
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos))
@@ -4682,6 +4790,7 @@ enum IndexedFieldUse {
     Value,
     SharedCall,
     Length,
+    CopyRead,
 }
 
 /// Whether an already-formed direct record field has a valid owning cleanup plan.
@@ -24976,6 +25085,15 @@ impl<'a> EscapeCheck<'a> {
                 }
                 _ => values.push(Region::Static),
             },
+            // This immediate read copies a closed independent-data graph. Even record results
+            // (conservatively region-bearing elsewhere) retain no parent allocation lifetime.
+            ExprKind::Index { recv, .. }
+                if matches!(recv.kind, ExprKind::ElemField { .. })
+                    && indexed_array_field_copy_element(recv.ty, self.structs, self.tuples,
+                        self.enums, self.tagged_types) == Some(expression.ty) =>
+            {
+                values.push(Region::Static);
+            }
             // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
@@ -45669,7 +45787,7 @@ impl<'a> MoveCheck<'a> {
         // The generic worklist discovers children before evaluating them, so keep this one on the
         // recursive path where the reservation encloses the child's complete evaluation.
         if matches!(expression.kind, ExprKind::BorrowedIndex { .. })
-            || matches!(&expression.kind, ExprKind::Len(inner)
+            || matches!(&expression.kind, ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. }
                 if indexed_array_field_has_length(inner.ty)
                     && matches!(inner.kind, ExprKind::ElemField { .. }))
         {
@@ -48900,7 +49018,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i) => {
                 move_expr!(self, i, moved, false, false)
             }
-            ExprKind::Len(inner) => {
+            ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. } => {
                 let selected_base = match &inner.kind {
                     ExprKind::ElemField { recv, .. }
                         if indexed_array_field_has_length(inner.ty) =>
@@ -48916,7 +49034,10 @@ impl<'a> MoveCheck<'a> {
                     self.borrows.begin_value_source(reservation, roots);
                     self.borrows.begin_value_headers(reservation, self.local_headers(place.root));
                     self.borrows.begin_mutable_place_source(reservation, place);
-                    let falls = self.expr(inner, moved, false, false);
+                    let mut falls = self.expr(inner, moved, false, false);
+                    if falls && let ExprKind::Index { index, .. } = &e.kind {
+                        falls = self.expr(index, moved, false, false);
+                    }
                     if falls {
                         self.validate_value_snapshot(reservation, reservation, e.span);
                     }
@@ -48924,6 +49045,9 @@ impl<'a> MoveCheck<'a> {
                     if !falls { return false; }
                 } else {
                     move_expr!(self, inner, moved, false, false);
+                    if let ExprKind::Index { index, .. } = &e.kind {
+                        move_expr!(self, index, moved, false, false);
+                    }
                 }
             }
             ExprKind::CloneIn { value, region } => {
@@ -48974,11 +49098,6 @@ impl<'a> MoveCheck<'a> {
                         self.reject_worker_region_requirement(&required, e.span);
                     }
                 }
-            }
-            // `recv[index]` borrows the receiver (reads an element) and reads the index.
-            ExprKind::Index { recv, index } => {
-                move_expr!(self, recv, moved, false, false);
-                move_expr!(self, index, moved, false, false);
             }
             ExprKind::ElemField {
                 recv, index, path, ..
@@ -64871,7 +64990,13 @@ impl<'a, 't> Checker<'a, 't> {
     /// array (whole-element load) and `str` byte indexing are deferred.
     fn check_index(&mut self, recv: &ast::Expr, index: &ast::Expr, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let r = self.check_expr(recv, None);
+        let r = if let Some((base, outer_index, fields)) = peel_index_field_chain(recv)
+            && !fields.is_empty()
+        {
+            self.check_index_field(base, outer_index, &fields, None, recv.span, IndexedFieldUse::CopyRead)
+        } else {
+            self.check_expr(recv, None)
+        };
         // `v[i]` on a vector reads lane `i`. The lane must be a **constant** literal in `0..N` (a SIMD
         // lane index is a fixed position; a dynamic lane would risk an out-of-range poison value). It
         // lowers to `extractelement`, reusing this `Index` node (MIR branches on the receiver type).
@@ -70310,7 +70435,7 @@ impl<'a, 't> Checker<'a, 't> {
             leaf_ty = Ty::Str;
         }
         // Other Move leaves are places only at an explicit shared call or immediate array-field
-        // length observation. Both reserve the source through their action; ordinary by-value
+        // length/independent-Copy observation. These reserve the source; ordinary by-value
         // reads still cannot identify which runtime element surrendered its owner.
         let length_observation = use_kind == IndexedFieldUse::Length
             && indexed_array_field_has_length(leaf_ty)
@@ -70321,7 +70446,11 @@ impl<'a, 't> Checker<'a, 't> {
                 Ty::Slice(Scalar::Struct(_)) | Ty::DynStructArray(_, Layout::Aos)
             ) || (matches!(r.ty, Ty::StructArray(..))
                 && matches!(index.kind, ast::ExprKind::Int(_))));
-        let admitted_move_field = indexed_move_borrow || length_observation
+        let copy_read = use_kind == IndexedFieldUse::CopyRead
+            && indexed_array_field_copy_element(leaf_ty, self.structs, self.tuples,
+                self.enums, self.tagged_types).is_some()
+            && self.borrowed_element_base(&r).is_some();
+        let admitted_move_field = indexed_move_borrow || length_observation || copy_read
             || matches!((r.ty, leaf_ty), (Ty::StructArray(..), Ty::Resource(_)));
         if !admitted_move_field
             && drop_plan(leaf_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()

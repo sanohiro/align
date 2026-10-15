@@ -486,6 +486,20 @@ or cleanup occurs, and the scalar may outlive the parent. This does not admit
 ordinary Move-field values, slice conversion, indexed writes or exclusive field
 borrows; shared calls retain their fixed-field literal-index restriction.
 
+`rows[row].path.values[index]` also reads an independent Copy element from such
+an ordinary dynamic scalar or AoS record array field. The result contains only
+closed inline data: numeric, bool, char, unit, RNG, valid numeric vector/mask
+leaves and records, tuples, fixed arrays or sum carriers containing those leaves.
+Every payload participates; views, pointers, callables, tasks and owners do not
+qualify. Existing collection formation rules still apply. The parent reservation
+covers both once-only indices: outer signed bounds precede the selected header,
+then the inner expression, inner signed bounds and element load. Outer failure
+suppresses the inner expression; termination at either index suppresses later
+actions. The copied value may outlive the parent without allocation or transfer.
+This adds no array-header value, slice, pipeline, write or exclusive-borrow
+permission. Shared calls and temporary/nested-index outer bases retain their
+existing restrictions. Plan205 owns the exact independent-data graph and proof.
+
 ### Loop
 
 `loop` is the one sequential-control construct: it repeats its block until a `break` executes.

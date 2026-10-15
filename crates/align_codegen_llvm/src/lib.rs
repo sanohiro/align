@@ -19186,18 +19186,33 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::SliceIndex(s, idx) => {
-                let source_ty = self.checked_operand_ty(s)?;
+                let source_ty = match s {
+                    Operand::BorrowedElementPlace(place) => place.element_ty,
+                    _ => self.checked_operand_ty(s)?,
+                };
                 if !slice_index_result_matches(self.program, source_ty, result_ty, false) {
                     return Err(self.err("slice-index physical source/result contract mismatch"));
                 }
                 let physical_ty = slice_index_physical_element(source_ty)
                     .ok_or_else(|| self.err("slice-index source is not pointer-backed"))?;
-                let agg = self.operand(s)?.into_struct_value();
-                let ptr = self
-                    .builder
-                    .build_extract_value(agg, 0, "ptr")
-                    .map_err(|e| self.err(e))?
-                    .into_pointer_value();
+                let ptr = if let Operand::BorrowedElementPlace(place) = s {
+                    if align_sema::indexed_array_field_copy_element(source_ty, &self.program.structs,
+                        &self.program.tuples, &self.program.enums, &self.program.tagged_types).is_none()
+                        || place.field_path.is_empty()
+                    {
+                        return Err(self.err("indexed array-field read requires independent Copy data"));
+                    }
+                    self.checked_indexed_field_inner_guard(s, idx)?;
+                    let field = self.borrowed_element_ptr(place)?;
+                    let data = self.builder.build_struct_gep(slice_struct_type(self.ctx), field,
+                        0, "borrow.element.array.data.field").map_err(|error| self.err(error))?;
+                    self.builder.build_load(self.ctx.ptr_type(AddressSpace::default()), data,
+                        "borrow.element.array.data").map_err(|error| self.err(error))?.into_pointer_value()
+                } else {
+                    let agg = self.operand(s)?.into_struct_value();
+                    self.builder.build_extract_value(agg, 0, "ptr")
+                        .map_err(|error| self.err(error))?.into_pointer_value()
+                };
                 let ty = self.llvm_type(physical_ty);
                 let index = self.operand(idx)?.into_int_value();
                 let ep = unsafe {
@@ -25383,6 +25398,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     && a.ty == b.ty
                     && a.cleanup == b.cleanup
             }
+            (Operand::BorrowedElementPlace(a), Operand::BorrowedElementPlace(b)) => {
+                Self::mir_operand_same(&Operand::BorrowedPlace(Box::new(a.base.clone())),
+                    &Operand::BorrowedPlace(Box::new(b.base.clone())))
+                    && Self::mir_operand_same(&a.index, &b.index)
+                    && a.element_ty == b.element_ty && a.field_path == b.field_path
+                    && a.guard.reservation == b.guard.reservation
+                    && Self::mir_operand_same(&a.guard.len, &b.guard.len)
+            }
             (
                 Operand::BorrowedFixedElementPlace(a),
                 Operand::BorrowedFixedElementPlace(b),
@@ -25652,10 +25675,34 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 return Err(self.err("borrowed element reservation does not precede its index evidence"));
             }
         }
+        let success = self.checked_signed_index_guard(source, &place.index, &place.guard.len, action)?;
+        self.checked_borrowed_element_root_preserved(
+            place,
+            action,
+            reservation_block,
+            reservation_statement,
+            success,
+        )?;
+        Ok(())
+    }
+
+    /// One canonical signed bounds rule for both levels of an indexed field read.
+    fn checked_signed_index_guard(
+        &self,
+        source: &align_mir::Block,
+        index: &Operand,
+        len: &Operand,
+        action: align_mir::BlockId,
+    ) -> Result<align_mir::BlockId, CodegenError> {
+        let signed_i64 = Ty::Int(IntTy { bits: 64, signed: true });
         let Term::Branch(Operand::Value(condition), failure, success) = &source.term else {
             return Err(self.err("borrowed element bounds guard has no canonical successful edge"));
         };
-        if !self.borrowed_element_validation.dominates(*success, action) {
+        // A success node may have another incoming edge. The canonical guard itself must
+        // dominate the action, otherwise reaching that node does not prove the bounds ran.
+        if !self.borrowed_element_validation.dominates(source.id, action)
+            || !self.borrowed_element_validation.dominates(*success, action)
+        {
             return Err(self.err("borrowed element bounds guard does not dominate its call action"));
         };
         let failure = self
@@ -25680,8 +25727,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         };
         if !matches!(failure.term, Term::Unreachable)
             || arguments.len() != 2
-            || !Self::mir_operand_same(&arguments[0], &place.index)
-            || !Self::mir_operand_same(&arguments[1], &place.guard.len)
+            || !Self::mir_operand_same(&arguments[0], index)
+            || !Self::mir_operand_same(&arguments[1], len)
         {
             return Err(self.err("borrowed element guard failure edge disagrees with its descriptor"));
         }
@@ -25696,29 +25743,51 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let zero = Operand::Const(Const::Int(0, signed_i64));
         let low_ok = matches!(
             self.unique_mir_value_def(*lo),
-            Some((block, _, Rvalue::Bin(BinOp::Lt, index, bound)))
+            Some((block, _, Rvalue::Bin(BinOp::Lt, candidate_index, bound)))
                 if block.id == source.id
-                    && Self::mir_operand_same(index, &place.index)
+                    && Self::mir_operand_same(candidate_index, index)
                     && Self::mir_operand_same(bound, &zero)
         );
         let high_ok = matches!(
             self.unique_mir_value_def(*hi),
-            Some((block, _, Rvalue::Bin(BinOp::Ge, index, len)))
+            Some((block, _, Rvalue::Bin(BinOp::Ge, candidate_index, candidate_len)))
                 if block.id == source.id
-                    && Self::mir_operand_same(index, &place.index)
-                    && Self::mir_operand_same(len, &place.guard.len)
+                    && Self::mir_operand_same(candidate_index, index)
+                    && Self::mir_operand_same(candidate_len, len)
         );
         if !low_ok || !high_ok {
             return Err(self.err("borrowed element guard comparisons disagree with its descriptor"));
         }
-        self.checked_borrowed_element_root_preserved(
-            place,
-            action,
-            reservation_block,
-            reservation_statement,
-            *success,
-        )?;
-        Ok(())
+        Ok(*success)
+    }
+
+    fn checked_indexed_field_inner_guard(
+        &self,
+        descriptor: &Operand,
+        index: &Operand,
+    ) -> Result<(), CodegenError> {
+        let action = self.current_mir_block
+            .ok_or_else(|| self.err("indexed field read has no action block"))?;
+        // The selected header is observed before the inner expression; its length may live in
+        // an earlier block when that expression branches. Only an identical descriptor qualifies.
+        for length_block in &self.f.blocks {
+            for statement in &length_block.stmts {
+                let Stmt::Let(value, Rvalue::SliceLen(source)) = statement else { continue };
+                if !Self::mir_operand_same(source, descriptor) { continue; }
+                let len = Operand::Value(*value);
+                if self.checked_operand_ty(&len)? != Ty::Int(IntTy { bits: 64, signed: true })
+                    || self.unique_mir_value_def(*value).is_none()
+                { continue; }
+                for guard in &self.f.blocks {
+                    if self.borrowed_element_validation.dominates(length_block.id, guard.id)
+                        && self.checked_signed_index_guard(guard, index, &len, action).is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(self.err("indexed array-field read lacks its exact inner bounds guard"))
     }
 
     fn borrowed_element_ptr(

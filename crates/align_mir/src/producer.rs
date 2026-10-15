@@ -1061,75 +1061,10 @@ fn xml_numeric_vector_shape(ty: Ty) -> Option<(Scalar, u32)> {
     xml_numeric_scalar_ty(scalar_to_ty(element)).then_some((element, lanes))
 }
 
-fn xml_plain_copy_leaf(ty: Ty) -> bool {
-    matches!(ty, Ty::Unit | Ty::Bool | Ty::Char | Ty::Rng)
-        || xml_numeric_scalar_ty(ty)
-        || matches!(ty, Ty::Array(element, _) if
-            matches!(element, Scalar::Unit | Scalar::Bool | Scalar::Char)
-                || xml_numeric_scalar_ty(scalar_to_ty(element)))
-        || xml_numeric_vector_shape(ty).is_some()
-        || matches!(ty, Ty::Mask(element, lanes)
-            if xml_numeric_vector_shape(Ty::Vec(element, lanes)).is_some())
-}
-
-/// Inline data can be copied out of readable storage without retaining its authority.
-/// Copy alone is insufficient: views and callable environments must keep their provenance.
+/// The source and producer use one closed independent-data graph (Plan182/205).
 fn xml_plain_copy_type(program: &Program, root: Ty) -> bool {
-    if xml_plain_copy_leaf(root) {
-        return true;
-    }
-    let mut pending = vec![(root, false)];
-    let mut active = HashSet::new();
-    let mut complete = HashSet::new();
-    while let Some((ty, exiting)) = pending.pop() {
-        if exiting {
-            active.remove(&ty);
-            complete.insert(ty);
-            continue;
-        }
-        if complete.contains(&ty) || xml_plain_copy_leaf(ty) {
-            continue;
-        }
-        if !active.insert(ty) {
-            return false;
-        }
-        pending.push((ty, true));
-        match ty {
-            Ty::Struct(id) => {
-                let Some(record) = program.structs.get(id as usize) else { return false };
-                pending.extend(record.fields.iter().map(|field| (field.ty, false)));
-            }
-            Ty::Tuple(id) => {
-                let Some(tuple) = program.tuples.get(id as usize) else { return false };
-                pending.extend(tuple.elems.iter().map(|element| (scalar_to_ty(*element), false)));
-            }
-            Ty::Enum(id) => {
-                let Some(sum) = program.enums.get(id as usize) else { return false };
-                pending.extend(sum.variants.iter().flat_map(|variant|
-                    variant.payload.iter().map(|payload| (scalar_to_ty(*payload), false))));
-            }
-            // Inspect even zero-length elements and inactive payloads. Neither erases a type's
-            // borrow, callable or Move authority, and neither supplies a producer seed.
-            Ty::Array(element, _) | Ty::Option(element) => {
-                pending.push((scalar_to_ty(element), false));
-            }
-            Ty::StructArray(id, _) => pending.push((Ty::Struct(id), false)),
-            Ty::Result(ok, error) => {
-                pending.push((scalar_to_ty(ok), false));
-                pending.push((scalar_to_ty(error), false));
-            }
-            Ty::Tagged(id) => match program.tagged_types.get(id as usize) {
-                Some(hir::TaggedType::Option(payload)) => pending.push((scalar_to_ty(*payload), false)),
-                Some(hir::TaggedType::Result(ok, error)) => {
-                    pending.push((scalar_to_ty(*ok), false));
-                    pending.push((scalar_to_ty(*error), false));
-                }
-                None => return false,
-            },
-            _ => return false,
-        }
-    }
-    true
+    align_sema::independent_copy_type(root, &program.structs, &program.tuples,
+        &program.enums, &program.tagged_types)
 }
 
 fn xml_option_payload(program: &Program, ty: Ty) -> Option<Ty> {
@@ -2719,6 +2654,44 @@ impl<'a> XmlAccessAnalyzer<'a> {
         Self::add_required_source(equation, source, OperandRequirement::READ);
     }
 
+    /// Authenticate the selected owning header without publishing it as an SSA owner/view.
+    fn check_indexed_array_field_read(
+        &mut self,
+        equation: &mut XmlAccessEquation,
+        place: &crate::BorrowedElementPlace,
+    ) {
+        let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        let mut selected_path = vec![XmlAccessPathSegment::Element];
+        selected_path.extend(place.field_path.iter().copied()
+            .map(XmlAccessPathSegment::StructField));
+        if place.field_path.is_empty()
+            || !align_sema::indexed_array_field_has_length(place.element_ty)
+            || !matches!(place.base.ty, Ty::StructArray(..)
+                | Ty::DynStructArray(_, Layout::Aos)
+                | Ty::Slice(Scalar::Struct(_)))
+            || xml_selected_ty(self.graph.program, place.base.ty, &selected_path)
+                != Some(place.element_ty)
+        {
+            equation.invalid = true;
+        } else {
+            self.check_operand(equation, &place.index, i64_ty);
+            // Inline storage records individual elements. Heap/slice storage is
+            // authenticated by its complete header; an empty inline array has no
+            // element producer and its independent bounds guard prevents the read.
+            let (expected, selected_path) = if matches!(place.base.ty,
+                Ty::StructArray(_, count) if count != 0)
+            {
+                (place.element_ty, selected_path)
+            } else {
+                (place.base.ty, Vec::new())
+            };
+            let source = self.read_source(equation,
+                &Operand::BorrowedPlace(Box::new(place.base.clone())),
+                expected, selected_path);
+            Self::add_required_source(equation, source, OperandRequirement::READ);
+        }
+    }
+
     fn check_whole_read_operand(
         &mut self,
         equation: &mut XmlAccessEquation,
@@ -4197,6 +4170,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     || xml_operand_base_ty(self.graph.function, &index) != Some(i64_ty)
                 {
                     equation.invalid = true;
+                    return equation;
+                }
+                if let Operand::BorrowedElementPlace(place) = &source {
+                    if slice_index_noalias
+                        || align_sema::indexed_array_field_copy_element(source_ty,
+                            &self.graph.program.structs, &self.graph.program.tuples,
+                            &self.graph.program.enums, &self.graph.program.tagged_types).is_none()
+                    {
+                        equation.invalid = true;
+                    } else {
+                        self.check_indexed_array_field_read(&mut equation, place);
+                        self.check_operand(&mut equation, &index, i64_ty);
+                        // Only an authenticated read of the closed independent-data graph loses
+                        // its parent dependency. Both guards/preservation are checked before LLVM.
+                        equation.seed = Some(XmlAccessProvenance::Owned);
+                    }
                     return equation;
                 }
                 self.check_whole_read_operand(&mut equation, &source, source_ty);
@@ -5906,35 +5895,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         return equation;
                     };
                     if let Operand::BorrowedElementPlace(place) = &input {
-                        let mut selected_path = vec![XmlAccessPathSegment::Element];
-                        selected_path.extend(place.field_path.iter().copied()
-                            .map(XmlAccessPathSegment::StructField));
-                        if place.field_path.is_empty()
-                            || !align_sema::indexed_array_field_has_length(place.element_ty)
-                            || !matches!(place.base.ty, Ty::StructArray(..)
-                                | Ty::DynStructArray(_, Layout::Aos)
-                                | Ty::Slice(Scalar::Struct(_)))
-                            || xml_selected_ty(self.graph.program, place.base.ty, &selected_path)
-                                != Some(place.element_ty)
-                        {
-                            equation.invalid = true;
-                        } else {
-                            self.check_operand(&mut equation, &place.index, i64_ty);
-                            // Inline storage records individual elements. Heap/slice storage is
-                            // authenticated by its complete header; an empty inline array has no
-                            // element producer and its independent bounds guard prevents the read.
-                            let (expected, selected_path) = if matches!(place.base.ty,
-                                Ty::StructArray(_, count) if count != 0)
-                            {
-                                (place.element_ty, selected_path)
-                            } else {
-                                (place.base.ty, Vec::new())
-                            };
-                            let source = self.read_source(&mut equation,
-                                &Operand::BorrowedPlace(Box::new(place.base.clone())),
-                                expected, selected_path);
-                            Self::add_required_source(&mut equation, source, OperandRequirement::READ);
-                        }
+                        self.check_indexed_array_field_read(&mut equation, place);
                     } else {
                         self.check_operand(&mut equation, &input, input_ty);
                     }
@@ -9580,10 +9541,12 @@ fn validate_resource_rvalues_component(
                 {
                     return Err(fail(function, &format!("native owner producer contract mismatch: {rvalue:?}")));
                 }
-                if matches!(rvalue, Rvalue::SliceLen(Operand::BorrowedElementPlace(_)))
-                    && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), i64_ty))
+                if matches!(rvalue, Rvalue::SliceLen(Operand::BorrowedElementPlace(_))
+                    | Rvalue::SliceIndex(Operand::BorrowedElementPlace(_), _)
+                    | Rvalue::SliceIndexNoalias { slice: Operand::BorrowedElementPlace(_), .. })
+                    && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
-                    return Err(fail(function, "indexed array-field length producer mismatch"));
+                    return Err(fail(function, "indexed array-field read producer mismatch"));
                 }
                 let protected_call_boundary = |args: &[Operand]| {
                     xml_owned_leaf_paths(program, result)

@@ -20833,3 +20833,59 @@ fn indexed_array_field_length_permission_stops_at_calls() -> Result<(), String> 
     assert_eq!(accepted, [false, false], "direct/indirect nested shared calls");
     Ok(())
 }
+
+
+#[test]
+fn indexed_array_field_copy_reads_hir_matrix() -> Result<(), String> {
+    let source = "R {ids:array<i64>}\nfn read(borrow rows:array<R>,i:i64,j:i64)->i64=rows[i].ids[j]\nfn main(){}";
+    let original = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&original));
+    for mutation in 0..10 {
+        let mut bad = original.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "read").ok_or("read function")?;
+        let expression = function.body.value.as_deref_mut().ok_or("read expression")?;
+        let hir::ExprKind::Index { recv, index } = &mut expression.kind else { return Err("index".into()) };
+        match mutation {
+            0 => expression.ty = Ty::Bool,
+            1 => index.ty = Ty::Bool,
+            2 => recv.ty = Ty::DynArray(Scalar::Bool),
+            3 => expression.kind = recv.kind.clone(),
+            _ => {
+                let hir::ExprKind::ElemField { recv: parent, index: outer, path, struct_id } = &mut recv.kind else { return Err("field".into()) };
+                match mutation {
+                    4 => path.clear(),
+                    5 => path.push(u32::MAX),
+                    6 => *struct_id = u32::MAX,
+                    7 => outer.ty = Ty::Bool,
+                    8 => parent.ty = Ty::Slice(Scalar::Bool),
+                    _ => outer.kind = hir::ExprKind::Local(u32::MAX),
+                }
+            }
+        }
+        assert!(!body_core_metadata_is_valid(&bad), "body mutation {mutation}");
+        for partition in [false, true] {
+            assert!(lower_program_checked(&bad, partition, None).is_err(), "lowering {mutation}/{partition}");
+        }
+    }
+    // An outer Index grants no permission to arguments nested inside its receiver call.
+    for indirect in [false, true] {
+        let (setup, target) = if indirect { ("callback:=values;", "callback") } else { ("", "values") };
+        let source = format!("R {{ids:array<i64>}}\nfn values(borrow ids:array<i64>)->array<i64> =[1,2].to_array()\nfn observed(borrow rows:[R;1],i:i64)->i64 {{{setup}return {target}(rows[0].ids)[0]}}\nfn main(){{}}");
+        let mut program = checked_source_program(&source);
+        assert!(body_core_metadata_is_valid(&program), "valid nested call/{indirect}");
+        let function = program.fns.iter_mut().find(|f| f.name == "observed").ok_or("observed")?;
+        let local = *function.params.get(1).ok_or("index parameter")?;
+        let expression = function.body.stmts.iter_mut().find_map(|stmt| {
+            if let hir::Stmt::Return(Some(value)) = stmt { Some(value) } else { None }
+        }).ok_or("observed return")?;
+        let hir::ExprKind::Index { recv, .. } = &mut expression.kind else { return Err("observed index".into()) };
+        let argument = match &mut recv.kind {
+            hir::ExprKind::Call { args, .. } | hir::ExprKind::CallFnValue { args, .. } => args.first_mut().ok_or("argument")?,
+            _ => return Err("receiver call".into()),
+        };
+        let hir::ExprKind::ElemField { index, .. } = &mut argument.kind else { return Err("argument field".into()) };
+        index.kind = hir::ExprKind::Local(local);
+        assert!(!body_core_metadata_is_valid(&program), "nested call permission leaked/{indirect}");
+    }
+    Ok(())
+}

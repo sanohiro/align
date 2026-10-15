@@ -3133,8 +3133,8 @@ pub struct BorrowedElementPlace {
     pub index: Operand,
     pub element_ty: Ty,
     /// Optional logical field path within the dynamic record element. An empty path denotes the
-    /// whole element; a non-empty path is emitted only for an explicit shared borrow, so a Move
-    /// field is addressed in place without loading or duplicating its owner.
+    /// whole element; a non-empty path serves an explicit shared borrow or an immediate array
+    /// length/independent-Copy read, without loading or duplicating the owning field header.
     pub field_path: Vec<u32>,
     /// Stable reservation identity plus the checked array length. Backends reconstruct the exact
     /// successful bounds edge after MIR rewrites and prove it dominates the call action before
@@ -13770,7 +13770,14 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         | Ty::DynSliceArray(_)
         | Ty::DynStructArray(..)
         | Ty::DynResponseArray => {
-            let sv = lower_borrowed_owned(b, recv);
+            let sv = if matches!(recv.kind, hir::ExprKind::ElemField { .. })
+                && align_sema::indexed_array_field_copy_element(recv.ty, &b.structs,
+                    &b.tuples, &b.enums, &b.tagged_types).is_some()
+            {
+                lower_borrowed_element_field(b, recv)
+            } else {
+                lower_borrowed_owned(b, recv)
+            };
             if !lowering_continues(b) {
                 return Operand::Const(Const::Unit);
             }
@@ -13807,7 +13814,11 @@ fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty
         }
     };
     let idx = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
-    emit_bounds_check(b, &idx, len);
+    if matches!(&src, Src::Slice(Operand::BorrowedElementPlace(_))) {
+        emit_signed_bounds_check(b, &idx, len);
+    } else {
+        emit_bounds_check(b, &idx, len);
+    }
     let v = b.fresh_value(elem_ty);
     let borrowed_src = match &src {
         Src::Slice(sv) => Some(sv.clone()),
