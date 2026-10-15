@@ -12,57 +12,103 @@ mod owned_fixture;
 #[cfg(unix)]
 fn codec_batch_result_survives_imported_generic_cache_replay() {
     owned_fixture::run("codec_batch_result_survives_imported_generic_cache_replay", |stage| {
-        let api = "module codec_api\nimport core.codec\n\
-            pub fn same(error: Error) -> Error = error\n\
-            pub fn rows_or_len(borrow result: Result<codec.batch, string>) -> i64 = match result { Ok(batch) => batch.rows(), Err(message) => message.len() }\n\
-            pub fn len_or_rows(borrow result: Result<string, codec.batch>) -> i64 = match result { Ok(message) => message.len(), Err(batch) => batch.rows() }\n\
-            pub fn open<T>(marker: T, input: slice<u8>, first: bool) -> Result<codec.batch, Error> {\n\
-              batch := codec.open(input).map_err(same)?\n\
-              return if first { Ok(batch) } else { loop { break Ok(batch) } }\n\
-            }\n";
-        let main = "module main\nimport core.codec\nimport codec_api\n\
-            fn main() -> Result<(), Error> {\n\
-              values := [7, 9]\n\
-              mut encoder := codec.encoder(2)?\n\
-              encoder.put_i64(\"id\", values)?\n\
-              owner := encoder.finish()\n\
-              batch := codec_api.open(0, owner.bytes(), true)?\n\
-              again := codec_api.open(false, owner.bytes(), false)?\n\
-              if batch.rows() != 2 || again.columns() != 1 { return Err(Error.Invalid) }\n\
-              batch_ok: Result<codec.batch, string> := Ok(batch)\n\
-              batch_err: Result<string, codec.batch> := Err(again)\n\
-              text_err: Result<codec.batch, string> := Err(\"bad\".clone())\n\
-              text_ok: Result<string, codec.batch> := Ok(\"bad\".clone())\n\
-              if codec_api.rows_or_len(batch_ok) != 2 || codec_api.len_or_rows(batch_err) != 2 { return Err(Error.Invalid) }\n\
-              if codec_api.rows_or_len(text_err) != 3 || codec_api.len_or_rows(text_ok) != 3 { return Err(Error.Invalid) }\n\
-              ids := again.i64s(0) else { return Err(Error.Invalid) }\n\
-              last := ids.at(1) else { return Err(Error.Invalid) }\n\
-              if last != 9 { return Err(Error.Invalid) }\n\
-              malformed := buffer.filled(8, 0 as u8)\n\
-              match codec_api.open(0, malformed.bytes(), false) {\n\
-                Ok(_) => { return Err(Error.Invalid) }\n\
-                Err(error) => { match error { Invalid => {}, _ => { return Err(Error.Invalid) } } }\n\
-              }\n\
-              return Ok(())\n\
-            }\n";
+        let api = r#"module codec_api
+import core.codec
+pub Views { batch: codec.batch, ints: codec.i64_column, floats: codec.f64_column, flags: codec.bool_column, texts: codec.str_column }
+pub Wrapped { values: Option<Views>, good: Result<codec.batch, string>, bad: Result<string, codec.batch> }
+pub fn same(error: Error) -> Error = error
+pub fn identity<T>(value: T) -> T = value
+pub fn rows_or_len(borrow result: Result<codec.batch, string>) -> i64 = match result { Ok(batch) => batch.rows(), Err(message) => message.len() }
+pub fn len_or_rows(borrow result: Result<string, codec.batch>) -> i64 = match result { Ok(message) => message.len(), Err(batch) => batch.rows() }
+pub fn open<T>(marker: T, input: slice<u8>, first: bool) -> Result<codec.batch, Error> {
+  batch := codec.open(input).map_err(same)?
+  return if first { Ok(batch) } else { loop { break Ok(batch) } }
+}
+pub fn hold<T>(marker: T, batch: codec.batch) -> Result<Views, Error> {
+  return Ok(Views {
+    batch: batch,
+    ints: batch.i64s(0) else { return Err(Error.Invalid) },
+    floats: batch.f64s(1) else { return Err(Error.Invalid) },
+    flags: batch.bools(2) else { return Err(Error.Invalid) },
+    texts: batch.strs(3) else { return Err(Error.Invalid) }
+  })
+}
+pub fn inspect(borrow holder: Wrapped, populated: bool) -> bool {
+  good := match holder.good { Ok(batch) => batch.rows(), Err(message) => message.len() }
+  bad := match holder.bad { Ok(message) => message.len(), Err(batch) => batch.rows() }
+  if !populated { return good == 3 && bad == 3 }
+  views := holder.values else { return false }
+  return good == 2 && bad == 2 && views.batch.columns() == 4
+    && (views.ints.at(1) else -1) == 9
+    && (views.floats.at(1) else -1.0) == 2.5
+    && (views.flags.at(1) else false)
+    && (views.texts.at(1) else "") == "second"
+}
+"#;
+        let main = r#"module main
+import core.codec
+import codec_api
+fn main() -> Result<(), Error> {
+  values := [7, 9]
+  floats := [1.5, 2.5]
+  flags := [false, true]
+  texts := ["first", "second"]
+  mut encoder := codec.encoder(2)?
+  encoder.put_i64("id", values)?
+  encoder.put_f64("float", floats)?
+  encoder.put_bool("flag", flags)?
+  encoder.put_str("text", texts)?
+  owner := encoder.finish()
+  batch := codec_api.open(0, owner.bytes(), true)?
+  again := codec_api.open(false, owner.bytes(), false)?
+  if batch.rows() != 2 || again.columns() != 4 { return Err(Error.Invalid) }
+  views := codec_api.hold(false, again)?
+  holder := codec_api.identity(codec_api.Wrapped { values: Some(views), good: Ok(batch), bad: Err(again) })
+  absent := codec_api.Wrapped { values: None, good: Err("bad".clone()), bad: Ok("bad".clone()) }
+  if !codec_api.inspect(holder, true) || !codec_api.inspect(absent, false) { return Err(Error.Invalid) }
+  batch_ok: Result<codec.batch, string> := Ok(batch)
+  batch_err: Result<string, codec.batch> := Err(again)
+  text_err: Result<codec.batch, string> := Err("bad".clone())
+  text_ok: Result<string, codec.batch> := Ok("bad".clone())
+  if codec_api.rows_or_len(batch_ok) != 2 || codec_api.len_or_rows(batch_err) != 2 { return Err(Error.Invalid) }
+  if codec_api.rows_or_len(text_err) != 3 || codec_api.len_or_rows(text_ok) != 3 { return Err(Error.Invalid) }
+  ids := again.i64s(0) else { return Err(Error.Invalid) }
+  last := ids.at(1) else { return Err(Error.Invalid) }
+  if last != 9 { return Err(Error.Invalid) }
+  malformed := buffer.filled(8, 0 as u8)
+  match codec_api.open(0, malformed.bytes(), false) {
+    Ok(_) => { return Err(Error.Invalid) }
+    Err(error) => { match error { Invalid => {}, _ => { return Err(Error.Invalid) } } }
+  }
+  return Ok(())
+}
+"#;
         std::fs::write(stage.join("codec_api.align"), api).unwrap();
         let entry = stage.join("main.align");
         std::fs::write(&entry, main).unwrap();
         let entry = entry.to_str().unwrap();
         let cache = align_driver::CacheContext::at(stage.join("cache"));
-        for round in 0..2 {
+        for round in 0..3 {
             let mut sources = SourceMap::new();
-            let mut built = align_driver::build_package(&mut sources, entry, main, &cache,
-                align_driver::UnitReuse::Allowed);
-            assert!(!built.diags.has_errors(), "{}",
-                align_driver::format_diagnostics(&sources, &built.diags));
-            assert_eq!(built.units.len(), 2);
-            assert!(built.units.iter().all(|unit|
-                unit.frontend.as_ref().unwrap().hit == (round == 1)));
+            let programs = if round == 0 {
+                let checked = check(&mut sources, entry, main);
+                assert!(!checked.diags.has_errors(), "{}",
+                    align_driver::format_diagnostics(&sources, &checked.diags));
+                vec![align_mir::lower_program_checked(&checked.hir, false, Some(&sources)).unwrap()]
+            } else {
+                let mut built = align_driver::build_package(&mut sources, entry, main, &cache,
+                    align_driver::UnitReuse::Allowed);
+                assert!(!built.diags.has_errors(), "{}",
+                    align_driver::format_diagnostics(&sources, &built.diags));
+                assert_eq!(built.units.len(), 2);
+                assert!(built.units.iter().all(|unit|
+                    unit.frontend.as_ref().unwrap().hit == (round == 2)));
+                (0..built.units.len()).map(|index| built.materialize(index).unwrap().clone())
+                    .collect::<Vec<_>>()
+            };
             let mut objects = Vec::new();
             let mut libraries = Vec::new();
-            for index in 0..built.units.len() {
-                let program = built.materialize(index).unwrap();
+            for (index, program) in programs.iter().enumerate() {
                 let object = stage.join(format!("codec-{round}-{index}.o"));
                 align_driver::emit_object_file(program, &object, BuildTarget::Baseline,
                     Profile::Release, &[], false).unwrap();
@@ -80,6 +126,62 @@ fn codec_batch_result_survives_imported_generic_cache_replay() {
                 "cache round {round}: {output:?}");
         }
     });
+}
+
+#[test]
+fn codec_view_field_lifetime_and_placement_refusals() {
+    let setup = "mut encoder := codec.encoder(1)?; encoder.put_i64(\"i\", [1])?; encoder.put_f64(\"f\", [1.0])?; encoder.put_bool(\"b\", [true])?; encoder.put_str(\"s\", [\"text\"])?; mut owner := encoder.finish(); mut alias := owner.bytes(); batch := codec.open(alias)?;";
+    for (kind, select, observe) in [
+        ("batch", "batch", "rows"),
+        ("i64_column", "batch.i64s(0) else { return Err(Error.Invalid) }", "len"),
+        ("f64_column", "batch.f64s(1) else { return Err(Error.Invalid) }", "len"),
+        ("bool_column", "batch.bools(2) else { return Err(Error.Invalid) }", "len"),
+        ("str_column", "batch.strs(3) else { return Err(Error.Invalid) }", "len"),
+    ] {
+        for (carrier, ty, value, access) in [
+            ("direct", format!("codec.{kind}"), "view", "holder.value"),
+            ("option", format!("Option<codec.{kind}>"), "Some(view)", "holder.value else { return Err(Error.Invalid) }"),
+            ("result", format!("Result<codec.{kind}, Error>"), "Ok(view)", "holder.value?"),
+        ] {
+            for action in ["live", "mutate", "replace", "escape"] {
+                let mutation = match action {
+                    "mutate" => "alias[16] = 255;",
+                    "replace" => "owner = buffer.filled(1, 0 as u8);",
+                    _ => "",
+                };
+                let (ret, finish) = if action == "escape" {
+                    ("Holder", "return Ok(holder)".to_string())
+                } else {
+                    ("i64", "return inspect(holder)".to_string())
+                };
+                let source = format!(
+                    "module main\nimport core.codec\nHolder {{ value: {ty} }}\n\
+                     fn inspect(holder: Holder) -> Result<i64, Error> {{ selected := {access}; return Ok(selected.{observe}()) }}\n\
+                     fn probe() -> Result<{ret}, Error> {{ {setup} view := {select}; holder := Holder {{ value: {value} }}; {mutation} {finish} }}\nfn main() {{}}\n"
+                );
+                let label = format!("codec-field-{kind}-{carrier}-{action}");
+                let checked = diff_check_multi(&label, &[("main.align", source.as_str())], "main.align");
+                for (errors, diagnostics) in [
+                    (checked.whole_errors, checked.whole_diags.as_str()),
+                    (checked.per_unit_errors, checked.per_unit_diags.as_str()),
+                ] {
+                    assert_eq!(errors, action != "live", "{label}: {diagnostics}");
+                    assert!(!diagnostics.contains("internal error"), "{label}: {diagnostics}");
+                    if action == "mutate" {
+                        assert!(diagnostics.contains("validated codec bytes were modified"), "{label}: {diagnostics}");
+                    }
+                }
+            }
+        }
+        for declaration in [
+            format!("Bad {{ values: array<codec.{kind}> }}"),
+            format!("extern \"C\" fn bad(value: codec.{kind})"),
+        ] {
+            let source = format!("module main\nimport core.codec\n{declaration}\nfn main() {{}}\n");
+            let checked = diff_check_multi("codec-field-forbidden-carriers", &[("main.align", source.as_str())], "main.align");
+            assert!(checked.whole_errors && checked.per_unit_errors, "{kind}: {declaration}");
+        }
+    }
 }
 
 #[test]

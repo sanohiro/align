@@ -1614,6 +1614,8 @@ impl<'a> PlacementValidator<'a> {
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
             Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Rng => true,
+            Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column
+            | Ty::CodecBoolColumn | Ty::CodecStrColumn => true,
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple|
                 tuple.elems.len() >= 2 && tuple.elems.iter().all(|&element|
                     self.tuple_element_ok(element) && self.field_scalar_ok(element, allow_param))),
