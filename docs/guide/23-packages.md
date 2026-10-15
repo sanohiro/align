@@ -61,6 +61,11 @@ These rules keep package internals private and the dependency direction one-way 
 
 ## `pkg.web`
 
+The current checkout has a [package/task-capture compatibility gap](../impl/pkg-design/web.md#status):
+importing the full package fails in `serve`, including for the one-worker example below.
+The examples describe the package API; running them needs that compatibility fix. This also affects
+`pkg.ws` applications that import the full web package.
+
 `pkg.web` is a zero-copy REST framework over `std.http`. A unary handler receives a Copy context made of request views, builds a response, and returns it. The framework retains the request handle, so it can turn an unmatched path into 404, a method mismatch into 405, and a handler error into 500.
 
 ```align
