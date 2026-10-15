@@ -38,8 +38,11 @@ sudo apt install alignc
 ```sh
 sudo apt install build-essential curl wget gnupg pkg-config
 scripts/ci-pgdg.sh
+align_deps_tmp="$(mktemp -d)"
+RUNNER_TEMP="$align_deps_tmp" \
 ALIGN_APT_PACKAGES="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev" \
   scripts/ci-apt-llvm.sh install --uncached
+rmdir "$align_deps_tmp"
 scripts/check-libpq-version.sh
 ```
 
