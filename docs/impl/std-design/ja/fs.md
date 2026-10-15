@@ -1,8 +1,8 @@
 このファイルは、下記の `std.fs` 拡張を実装するための設計である。公開契約台帳は
-[`../27-fs-exclusive-publication-plan.md`](../27-fs-exclusive-publication-plan.md) と
-[`../29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md) にある。Request 55 の single-link
-拡張は [`../34-fs-single-link-plan.md`](../34-fs-single-link-plan.md) が所有する。Request 56 の private
-temporary-directory lifecycle は [`../36-fs-private-temp-plan.md`](../36-fs-private-temp-plan.md) が所有する。
+[`../27-fs-exclusive-publication-plan.md`](../../27-fs-exclusive-publication-plan.md) と
+[`../29-fs-retained-root-plan.md`](../../29-fs-retained-root-plan.md) にある。Request 55 の single-link
+拡張は [`../34-fs-single-link-plan.md`](../../34-fs-single-link-plan.md) が所有する。Request 56 の private
+temporary-directory lifecycle は [`../36-fs-private-temp-plan.md`](../../36-fs-private-temp-plan.md) が所有する。
 
 # std.fs — 明示的な trusted filesystem 境界
 
@@ -437,23 +437,23 @@ owner evidence の境界は次のとおりである。
 保証は atomic no-replace と明示的な所有権であり throughput ではないため、benchmark は不要である。
 
 完全な closure matrix、acceptance table、review finding の処理は
-[`27-fs-exclusive-publication-plan.md`](../27-fs-exclusive-publication-plan.md) にある。
+[`27-fs-exclusive-publication-plan.md`](../../27-fs-exclusive-publication-plan.md) にある。
 
 Request 55 の確定契約と implementation closure matrix は
-[`34-fs-single-link-plan.md`](../34-fs-single-link-plan.md) にある。既存の A12 lowering と reader identity
+[`34-fs-single-link-plan.md`](../../34-fs-single-link-plan.md) にある。既存の A12 lowering と reader identity
 を再利用し、別 operation/runtime key と既存 stat record に対する descriptor-only link-count
 predicate を追加する。
 
 Request 56 は A08 owned-string constructor と A04 unit-result remover を 1 つずつ追加し、別々の
 HIR/MIR/runtime identity と完全な checked-HIR/whole/per-unit/export coverage を要求する。prefix、platform
 root、randomness、allocation-before-mutation、no-follow removal、race boundary、ownership の正確な matrix は
-[`36-fs-private-temp-plan.md`](../36-fs-private-temp-plan.md) にある。
+[`36-fs-private-temp-plan.md`](../../36-fs-private-temp-plan.md) にある。
 
 Request 18 も同じ cross-stage 規則を使う。`ReaderOpenBeneath` と `CreateExclusiveBeneath` の別 node、完全な
 visitor/validator/replay/MIR closure、正確な A12 runtime row と export parity、既存 handle Drop、
 whole/per-unit/cache parity、Linux/macOS descriptor-walk owner、および align-llm の実 consumer
 `c6d-request18-adoption` が必要である。完全な matrix は
-[`29-fs-retained-root-plan.md`](../29-fs-retained-root-plan.md) にある。新契約は throughput ではなく safety と
+[`29-fs-retained-root-plan.md`](../../29-fs-retained-root-plan.md) にある。新契約は throughput ではなく safety と
 ownership なので benchmark は不要である。
 
 ### 通常のディレクトリ作成と型の観測

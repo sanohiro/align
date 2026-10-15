@@ -1,5 +1,5 @@
-このディレクトリには、`core` ライブラリの各領域について、`../std-design/` と同等の粒度（シグネチャ、Move/effect の分類、エラー方針、落とし穴（Pitfalls）、テストアンカー）で記述された公式な設計ドキュメントを収めている。
-執筆はメインループ（Fable）が担当している。
+このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
+シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
 
 # core — array / slice / パイプライン
 
@@ -8,7 +8,7 @@
 ## Overview
 
 データ指向設計の中核（draft §7–§8）。3 つのコレクション形式と 1 つのデータ処理語彙からなる。
-以下のステージはすべて単一のカウント付きループへと融合（fuse）される。パイプラインはリダクション（reduction）または実体化（materialization）によって **必ず終端しなければならない**（パイプラインの途中状態を保持しようとするとコンパイルエラーになる。つまり、遅延評価（lazy）された値がスコープ外へエスケープすることは決してない）。このファイルではその表面仕様と構造のルールについて扱う。列指向（columnar）レイヤについては [soa-groupby.md](soa-groupby.md) を参照。
+合成可能な要素単位のステージは終端のループへ融合（fuse）される。`sort`、`partition` などの実体化する操作には、各操作で定めたストレージのコストが残る。chunk の直接 consumer は header 配列なしで view を導出できるが、保持する chunk 値は header 配列を実体化する。パイプラインはリダクション（reduction）または実体化（materialization）によって **必ず終端しなければならない**（パイプラインの途中状態を保持しようとするとコンパイルエラーになる。つまり、遅延評価（lazy）された値がスコープ外へエスケープすることは決してない）。このファイルではその表面仕様と構造のルールについて扱う。列指向（columnar）レイヤについては [soa-groupby.md](soa-groupby.md) を参照。
 
 ## 3 つのコレクション形
 
@@ -185,7 +185,15 @@ storage: field 'f' owns independent heap storage`。設計は
 - P2 — **どこでも init-first（初期値が先）**: 新しい fold 系の API（`reduce`、`scan`、将来の `fold_*` など）は seed（初期値）を先に取る。規約が混在すると、AI が誤ったコードを生成する原因になる。
 - P3 — `out` の no-alias チェックは、同じローカル変数の **サブスライス**（#302）と call-laundered なビュー（#328）の両方を考慮しなければならない — これらはどちらも実際に存在した soundness の穴だった。新しい書き込み可能なビューのインターフェースは、同じチェックを経由させる必要がある。
 - P4 — fixed-array のインデックスアクセスは、レシーバがリテラルまたは変数であることを要求する（MIR がスロットをアドレス指定するため）。失敗する式レシーバのケースに対して、配列を暗黙にコピーして「修正」するようなことはしてはならない。
-- P5 — 束縛されていない owned な一時値には 2026-07-15 以降、パスローカルな synthetic owner が存在し、ビューの生存期間やループの反復ごとの cleanup も追跡するようになった。`chunks(n)` は直接的な `.len()`、インデックスアクセス、パイプラインの consumer に渡す場合でも、依然としてヘッダの配列を実体化（materialize）する。この残存するコストについては、[audit 13 §8.2](../../13-string-array-allocation-short-input-audit.md#82-confirmed-p1--virtualize-chunks-for-direct-consumers) で追跡している。
+- P5 — 束縛されていない owned な一時値にはパスローカルな synthetic owner が存在し、view の寿命と
+  反復ごとの cleanup を追跡する。直接の `chunks(n).len()` と添字アクセスは件数または一つの
+  借用 view だけを計算する。直接の同期 pipeline はループ内で view を導出する。
+  選択された range-kernel `par_map` の直前にある stage-free な chunk source も、直接の整数
+  `par_map(...).sum()` を含め、range kernel 内で view を導出する。保持する値・境界を越える値・
+  並列の fallback 経路では header 配列を実体化する。元データの寿命と評価順序は変わらない。
+  [現在の plan record](../../09-explain-opt.md) は `virtual-count`、`virtual-index`、
+  `virtual-range-views`、`materialized-headers` を区別し、
+  [audit 13](../../13-string-array-allocation-short-input-audit.md) は最初の直接 count/index の実装を記録する。
 
 ## Test anchors
 

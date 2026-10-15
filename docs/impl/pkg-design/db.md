@@ -11,15 +11,17 @@ ordinary vendorable `pkg` subtrees.
 
 ## Status
 
-**DESIGN OF RECORD — query-centric SQL/database package.**
+**IMPLEMENTED through D14 — query-centric SQL/database package.** The capability
+ledger below remains the design of record; [the roadmap](../07-roadmap.md) records
+the completed dependency graph and the separate consumer-gated future work.
 
 Initial required drivers: **SQLite and PostgreSQL**.
 
-The semantic decisions and API shapes in this document are the contract. Implementation begins only
-after the general library-boundary prerequisites in
-[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) ship. Those
-features are required Align language/compiler work, not database-private builtins and not optional
-future cleanup.
+The semantic decisions and API shapes in this document are the contract. The general
+library-boundary prerequisites in
+[`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) shipped before
+the database implementation. Those features are shared Align language/compiler capabilities,
+not database-private builtins or optional cleanup.
 
 Normative words (`MUST`, `MUST NOT`, `SHOULD`, `MAY`) are intentional requirements.
 
@@ -908,7 +910,7 @@ pub fn run(
   parent := state.parent else return Ok(None)
   groups_out := groups.build()
   return Ok(Some(Output {
-    parent,
+    user: parent,
     groups: groups_out,
   }))
 }

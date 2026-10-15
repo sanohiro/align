@@ -7,6 +7,8 @@
 **A1.** Enough of it to learn how to read:
 
 ```align
+import core.json
+
 Record { score: i64, valid: bool }
 
 fn total(data: str) -> Result<i64, Error> {
@@ -29,7 +31,7 @@ Read it once. Do not hurry.
 
 **Q3.** Why begin with the answer? Surely the machinery is the interesting part.
 
-**A3.** Because an optimization that changes `40` is a bug, and a beautiful lifetime for the wrong result is still wrong. Meaning comes first. The other readings must preserve it.
+**A3.** Because the result must stay `40`. When we change storage or execution, we need that expected answer to check our work.
 
 ---
 
@@ -71,7 +73,7 @@ This is the **lifetime reading**. Do not merely find values; find their homes an
 
 **Q9.** What if the JSON is malformed?
 
-**A9.** `?` returns `Err` from `total`. On the way out, the arena still ends and its memory is reclaimed. Error flow and lifetime agree; the early door does not become a leak.
+**A9.** `?` returns `Err` from `total`. On the way out, the arena still ends and its memory is reclaimed. The early return still runs the cleanup.
 
 ---
 
@@ -83,7 +85,7 @@ This is the **lifetime reading**. Do not merely find values; find their homes an
 
 **Q11.** How can we tell that no filtered array was built?
 
-**A11.** There is no materializing ending between `where` and `sum`. If we wanted an array, we would have to say `.to_array()`. If we wanted a deep copy, we would have to say `.clone()`. Align makes those changes to the cost story pronounceable.
+**A11.** There is no materializing ending between `where` and `sum`. If we wanted an array, we would have to say `.to_array()`. If we wanted a deep copy, we would have to say `.clone()`. Those operations tell us where storage or copying is requested.
 
 ---
 
@@ -111,7 +113,7 @@ rows.where(.valid).score.to_array().sum()
 
 **Q15.** And where would `match` enter?
 
-**A15.** Where the data is one of many: inspect a detailed decode error, or process a sum-type field with several variants. `match` follows the shape of the value; `loop` follows the shape of control; a pipeline follows the flow of many values.
+**A15.** To inspect the `Error` variant returned by decoding and choose a policy for each case. This decoder returns the built-in categories, not a detailed parse message. `match` follows the shape of the value; `loop` follows the shape of control; a pipeline follows the flow of many values.
 
 ---
 
@@ -130,7 +132,7 @@ If one answer is foggy, you have found the part of the program you do not unders
 
 **Q17.** Why does Align make these four readings fit the same source?
 
-**A17.** Because its unusual rules were never separate tricks. A pipeline makes flow plain and work fusible. `soa` makes touched columns plain. Move and arenas make lifetimes plain. `?`, `.clone()`, and `.to_array()` make exits, copies, and allocations plain. The language asks the human, compiler, and hardware to read one honest story.
+**A17.** The same constructs carry information for each reading. Pipelines describe transformations that can fuse. `soa` identifies the columns in use. Move and arenas describe ownership and lifetime. `?`, `.clone()`, and `.to_array()` mark error propagation, copies, and array creation.
 
 ---
 
@@ -178,7 +180,7 @@ fn scores(data: str) -> Result<array<i64>, Error> {
 
 **Q21.** New requirement: “process blocks until EOF; within each block, total valid scores.” Which two control shapes appear?
 
-**A21.** A `loop` around the blocks and a pipeline inside each block. One problem may contain several shapes; mastery is giving each boundary its one fitting tool.
+**A21.** A `loop` around the blocks and a pipeline inside each block. One problem may need both control flow and a data pipeline.
 
 ---
 
@@ -190,13 +192,39 @@ fn scores(data: str) -> Result<array<i64>, Error> {
 
 **Q23.** New requirement: “twenty analyses reuse the same five columns.” Now?
 
-**A23.** `soa` in an arena. Decode once, keep the batch for the phase, and let the analyses stream columns. The same language offers both answers because the workloads are genuinely different.
+**A23.** `soa` in an arena. Decode once, keep the batch for the phase, and let the analyses stream columns. The repeated scans are the reason to keep the columns.
 
 ---
 
 **Q24.** When have you learned an Align feature?
 
 **A24.** Not when you can define it. When a new problem arrives and you can choose it, reject it, combine it with an older tool, and state its answer, lifetime, and cost before running the code.
+
+---
+
+**Q25.** The work reading predicts a faster program. Is that already a measurement?
+
+**A25.** No. First check equal results, including empty input and boundary cases. Build a baseline, then time the executable on representative data, several times:
+
+```text
+alignc build program.align --profile release --target-cpu baseline
+./program
+```
+
+Timing `alignc run` includes compilation. Record the compiler version, target CPU, input sizes, elapsed times, and memory use. Decide whether the question is kernel time or whole-program time; a faster scan can disappear inside a larger parsing cost. For file work, distinguish the first read from repeated reads with a warm page cache.
+
+---
+
+**Q26.** How do we check the claim “this pipeline vectorizes”?
+
+**A26.** Ask the optimizer about the same target:
+
+```text
+alignc explain-opt program.align --target-cpu baseline --verbose
+alignc emit-llvm program.align --stage optimized --profile release --target-cpu baseline
+```
+
+`explain-opt` reports an O2 analysis; it is not a timer or a report of which runtime worker path ran. Keep the result observable so dead-code elimination cannot remove the kernel. Inspect the relevant function, then measure. For a `fast` build, inspect optimized IR with `--profile fast` too: the O2 report does not establish what O3 emitted.
 
 ---
 

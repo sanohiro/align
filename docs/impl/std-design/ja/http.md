@@ -1,6 +1,5 @@
-このディレクトリには、ロードマップの本文ではカバーしきれない `std` モジュールについて、Opus がそのまま実装に
-着手できる粒度の設計仕様を収めている。執筆はメインループ (Fable) が担当しており、各モジュールを実装する際は
-これが信頼できる情報源（source of truth）となる。
+このディレクトリは、ロードマップを補う `std` モジュールの詳細な設計仕様をまとめる。
+各モジュールの実装は、この仕様に従う。
 
 # std.http — implementation design (M11)
 
@@ -29,7 +28,7 @@ replacement 後も設定済みを保持し、owner/view の private bool は ABI
 以下の過去 slice は従来の非空時のみ出す規則を記録している。
 H1 と S3 wire owner が同一機能で移行を閉じる。
 
-v1 案として、Fable が確定させた形式:
+v1 の設計シグネチャ:
 
 ```text
 // Client
@@ -942,14 +941,12 @@ I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは
     クライアント既定 / リクエスト単位上書きの `timeout(ns)` — 本注記が欠けていると言っていた 2 つ — は
     **実装済み**(G3-1 の先送りはクライアント側で完全に解決)。上記のサーバ側エスカレーションは引き続き
     独自の v1 後の堅牢化項目として残る。
-  - **サブケース — HEAD / 304 のフレーミング(スライス 1/2 から継承)。** `HEAD` レスポンスや
-    `304 Not Modified` は、正当に `Content-Length` ヘッダを持つが**ボディを持たない**。v1 の読み取り
-    ループは純粋に `Content-Length` でフレーミングする(リクエストメソッドやステータスで特別扱いしない)
-    ため、決して来ないボディバイトを待ち続ける → 上と同じ無期限ブロックになる。v1 の表面は `HEAD` を
-    手軽には出していない(`get`/`post`/`request` のみ)が、メソッド `HEAD` で組んだ `request` はこれに
-    当たる。**下記 align-llm Request 4 で設計済み、実装待ち。** 同じ capability が method/status-aware
-    framing、informational response の advancement、client-side chunk de-framing を、二つ目の transport
-    surface を増やさずに追加する。
+  - **HEAD / 304 のフレーミング — align-llm Request 4 で解決済み。** `HEAD` レスポンスや
+    `304 Not Modified` は、`Content-Length` ヘッダを持っていても**ボディを持たない**。
+    元のスライス 1/2 の読み取りループは、その存在しない body byte を待つ場合があった。
+    下記の実装済み method/status-aware framing は payload を読まず空の body を返し、
+    informational response を進め、同じ transport surface で chunked response を復元する。
+    正確な header validation と connection reuse の規則はその ledger に従う。
 - **~~`https://` の拒否が粗い(DC-1, low)。~~ スライス 5 で解消。** `https://` はもはや `Error.Invalid`
   に写らず、検証済み TLS 経路にルーティングされる。検証失敗は明確な `Error.Denied`、TLS トランスポート不良は
   `Error.Code`、プロトコル違反は `Error.Invalid`。(メッセージレスな `Error` enum はより広い別課題として残る

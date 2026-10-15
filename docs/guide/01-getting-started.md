@@ -24,13 +24,17 @@ The setup script adds both the signed Align repository and the official LLVM 22 
 
 ## Building the compiler
 
-You need **Rust 1.96+** and **LLVM 22**. On Debian/Ubuntu (via apt.llvm.org):
+You need **Rust 1.96+**, **LLVM 22**, a native C toolchain, and the development libraries for OpenSSL, zstd, SQLite and **libpq 17+**. Ubuntu 24.04's default libpq 16 is too old. Clone the repository first:
 
 ```text
-apt install llvm-22 llvm-22-dev clang-22 libclang-rt-22-dev libssl-dev zlib1g-dev libzstd-dev
 git clone https://github.com/sanohiro/align
 cd align
-cargo build
+```
+
+Follow the platform-specific [source setup](../../README.md#build-from-source), which configures the same LLVM/PostgreSQL repositories as CI on Ubuntu and the Homebrew paths on macOS. Then build both tools from the repository root:
+
+```text
+scripts/cargo.sh build --workspace
 ```
 
 The compiler is now at `./target/debug/alignc`. It is not on `PATH`; either call it by path or add an alias. (A `--release` build produces `./target/release/alignc` — the compiler itself runs faster, the generated code is the same.) `alignc` dynamically uses LLVM 22 and invokes `cc` to link the programs it builds, so installing the executable alone does not remove those native toolchain requirements.
@@ -108,11 +112,11 @@ object path; use `./` for an output filename beginning with `-`.
 `run` keeps its trailing program arguments; use `--` to pass tokens
 such as `--profile` to your program.
 
-The `db` group only concerns projects that use the `pkg.db` package (chapter [23](23-packages.md)). The everyday loop is `check` while editing, `run` to try it, and `test` to run the tests you have declared. Chapter [16](16-toolchain.md#tests-with-coretest) shows how to write them. `emit-llvm` is worth knowing early: Align's design promises that ordinary code lowers to tight machine code, and `emit-llvm` is how you check that promise yourself.
+The `db` group concerns projects that use `pkg.db` (chapter [23](23-packages.md)). Use `check` while editing, `run` to try a program, and `test` for declared tests; chapter [16](16-toolchain.md#tests-with-coretest) covers test declarations. `emit-llvm` lets you inspect the generated IR when investigating code generation or performance.
 
 ## Reading a compile error
 
-Align's compiler is strict — no null, exhaustive `match`, unhandled `Result` is an error, moved values can't be reused. The diagnostics tell you which rule fired and where. A first program trips over two of them most often:
+The compiler reports errors for non-exhaustive `match`, unhandled `Result`, and reuse of moved values. Diagnostics identify the rule and source location. These two examples show common errors:
 
 ```align
 fn main() -> i32 {

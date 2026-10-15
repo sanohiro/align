@@ -1,5 +1,5 @@
-このディレクトリには、`core` ライブラリの各領域について、`../std-design/` と同等の粒度（シグネチャ、Move/effect の分類、エラー方針、落とし穴（Pitfalls）、テストアンカー）で記述された公式な設計ドキュメントを収めている。
-執筆はメインループ（Fable）が担当している。
+このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
+シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
 
 # core — str / string / builder / template
 
@@ -8,7 +8,7 @@
 ## Overview
 
 テキスト処理（draft §12–§13） — 借用ビュー型、所有権を持つバッファ型、組み立て用の builder、そして 1 つの template 形式からなる。全体を通してバイト指向の UTF-8 として扱われる。検索系メソッドは memchr 系の SIMD スキャンレイヤの上に構築される（#310）。
-ここでの中心的な方針は **「すべての文字列のアロケーション（メモリ確保）先が明確であり、目に見える形になっていること」** である — arena、所有者（owner）、または builder のいずれかに属する。パイプラインのラムダ内での隠れたアロケーションはコンパイルエラーとなる。
+文字列の確保先は、arena、所有者（owner）、builder のいずれかとして明示する。パイプラインのラムダ内でも一時的な template をローカルに消費できるが、そのフレーム境界ビューを返すとコンパイルエラーとなる。
 
 ## Signatures and settled surface
 
@@ -28,7 +28,8 @@ s.clone()                  -> string     // deep copy; the arena-escape hatch
 a + b                      -> compile error; builder is the one concatenation path
 
 b := builder()  /  builder(cap)
-b.write(s: str|string)  /  b.write_int(i: i64)
+b.write(s: str|string)  /  b.write_int(i)  // 任意の整数型
+b.write_bool(v: bool)  /  b.write_char(c: char)  /  b.write_float(x: f32|f64)
 b.len()                    -> i64        // initialized UTF-8 byte count
 b.to_string()              -> string     // the finisher (there is no finish()/build())
 
@@ -100,10 +101,13 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 
 ## 仕様先行(未実装)
 
-- **`split`** および **`find_any`**（§18.1 カタログ） — 現状ディスパッチ用のアームはない。特に `split` は大きな課題（大物）である — その戻り値の型（ビューの `array<str>` — つまり region 付きビュー要素を持つ Move 配列）を実現するには、Move 要素コレクションに関する対応が必要になる。owned-copies による妥協的な形態でリリースしてはならない（「理想形で出すか、さもなくば defer（延期）する」）。現状では `find` / `rfind` と `s[a..b]` を組み合わせて手動で split 処理を構築する。
+- **`split`** および **`find_any`**（§18.1 カタログ） — 文字列メソッドとしての dispatch arm はない。
+  `array<str>` は既に使えるが、文字列の split メソッドは提供されていない。split の実装には、
+  separator・結果・寿命・allocation の正確な契約を定める必要がある。
+  現状では `find` / `rfind` と `s[a..b]` を組み合わせて手動で split 処理を構築する。
 - `s[i]` による直接のバイトアクセスはない — UTF-8 としての保証を外すことが呼び出し側で明確になるよう、`s.bytes()[i]` という明示的なバイトビューを使用する。
 - §13 / §18.1 の language template variant（`html`、`raw`、json-template など） — 現在は
-  plain な `template "…"` のみ。DESIGNED の `pkg.template` はこの syntax を変えず、default-escaped
+  plain な `template "…"` のみ。実装済みの `pkg.template` はこの syntax を変えず、default-escaped
   `write` と explicit `raw` を持つ opaque HTML builder を別に提供する。contextual language-template
   parsing は deferred のまま。
 
@@ -116,7 +120,7 @@ Pure（I/O なし）。*アロケーションの可視性* というルールは
 
 ## Test anchors
 
-`m5.rs`（find / rfind のペア、trim ファミリ、ゼロコピーの bytes ビュー、fuse を含む builder、template、エスケープ、UTF-8 のバイト長、print 型の網羅性チェックを含むメソッド）。`lambda.rs:271/280/287/294`（ラムダ内でのアロケーションの拒否 + ラムダ内での arena の許可）。`hash.rs`（ビューの受け入れ）。`fuzz_fmt.rs`（文字列を多用するソースの formatter 往復テスト）。例として `strings.align`、`template.align`。文字列連結の拒否は reducer、名前付き関数、ラムダの各コンテキストで一貫してカバーされている。SIMD スキャンの固定: #310 differential oracle。
+`m5.rs`（find / rfind のペア、trim ファミリ、ゼロコピーの bytes ビュー、fuse を含む builder、template、エスケープ、UTF-8 のバイト長、print 型の網羅性チェックを含むメソッド）。`lambda.rs`（template / JSON ビューの escape と文字列連結の拒否）。`template_ownership.rs::arena_free_template_can_be_consumed_inside_a_pipeline_lambda`（ローカルな消費と cleanup）。`hash.rs`（ビューの受け入れ）。`fuzz_fmt.rs`（文字列を多用するソースの formatter 往復テスト）。例として `strings.align`、`template.align`。文字列連結の拒否は reducer、名前付き関数、ラムダの各コンテキストで一貫してカバーされている。SIMD スキャンの固定: #310 differential oracle。
 
 ## バイト列の上書きと型付きビュー
 

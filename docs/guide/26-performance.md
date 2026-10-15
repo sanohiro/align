@@ -17,7 +17,29 @@ The second command runs the program; use your timing or profiling tool around th
 
 Use input loaded or generated at runtime. The small literal arrays in this guide explain behavior, but a compiler can calculate their results before the program runs. Consume the result, for example by printing a checksum after the timed computation. Compare equivalent results, repeat measurements, alternate the old and new versions, and report the spread as well as the chosen statistic. Include small, large, empty, and relevant skewed inputs; a change that wins on one size may lose on another.
 
-`release` uses O2 and is the default; `fast` uses O3. Try `fast` on the same workload rather than assuming its name promises a win. `--target-cpu native` targets the current machine; use it when that matches deployment. Keep `baseline` for the portable target, or select an explicit LLVM CPU supported by your deployment machines. Compare versions with the same target settings.
+Balance the order as `A,B` then `B,A`; always running A first can give B warmer
+input or different CPU clocks. Measure first-use latency separately from warmed
+throughput, including thread-pool initialization and file-cache warmth where
+relevant. More repetitions of the same order do not remove that bias. When a
+kernel takes less time than the timer can reliably resolve, time a batch of
+calls with runtime inputs and consumed results, then divide by the call count.
+
+Keep a compact record so another run answers the same question:
+
+```text
+source revision; alignc version; OS/CPU; exact build options
+input identity, size and distribution; expected checksum or float tolerance
+timed boundary; first-use or warmed state; sample count and execution order
+before/after absolute time; median and spread; ns/element or bytes/second
+peak memory; output size; allocation/copy evidence where measured
+```
+
+Use elapsed wall time for latency and throughput. Parallel CPU time can grow
+while wall time falls. Likewise, peak resident memory, live payload bytes and
+allocation count answer different questions; a reused allocation may still
+copy every byte. Name the metric instead of calling all three “memory use”.
+
+`release` uses O2 and is the default; `fast` uses O3. Compare them on the same workload. `--target-cpu native` targets the current machine; use it when that matches deployment. Keep `baseline` for the portable target, or select an explicit LLVM CPU supported by your deployment machines. Compare versions with the same target settings.
 
 ## Count passes before counting instructions
 
@@ -90,9 +112,33 @@ Choose the construction surface that matches the output:
 
 Reservation can reduce growth and copying; it does not eliminate the writes or every allocator call. Oversized reservations and large inline records can increase memory traffic. See [memory](05-memory.md) and [strings and text](07-strings-and-text.md) for ownership and bounds rules.
 
+For positional I/O, `file.pread_into(buffer, destination_offset, length,
+file_offset)` reads into reserved buffer storage without reallocating. The
+destination offset must be at most the initialized length, and the requested
+range must fit the capacity. Successful reads can extend the initialized length
+by the actual bytes written; they cannot leave an uninitialized hole. Handle
+short reads and EOF, and consume only the reported bytes. Use `buffer.filled`
+when random-write destinations must already be initialized. Keep text views
+within the buffer's borrow lifetime before refilling it; a file read boundary
+need not be a UTF-8 or record boundary.
+
+The [bounded CSV example](../../apps/csv/main.align) uses a reusable sequential
+read window and fallible reservations. It accumulates the admitted document
+before UTF-8 validation and decoding, so split characters and quoted records
+are handled across windows. Budget both the whole input and decoded columns;
+this example is bounded whole-document processing, not a streaming CSV decoder.
+
 ## Put the frequently scanned fields together
 
 Use `soa<T>` or separate columns when repeated passes read a few fields of many rows. A column scan can then read adjacent values without fetching every other field. Keep rows together when the common operation needs the whole row. Account for the conversion: doing `to_soa()` before every small operation can cost more than the scan saves. For suitable JSON workloads, decoding directly into SoA avoids a separate transpose.
+
+Estimate the working set in bytes, including inputs, outputs and scratch. A
+64-byte row with one hot 8-byte field exposes eight times as many row bytes as
+useful field bytes in a full scan; that is a layout comparison, not an eightfold
+speed guarantee. Sweep sizes below and above the relevant cache capacities.
+Also vary filter selectivity, key cardinality/skew and sortedness when those
+change the operation's work. Benchmark layout construction separately and
+include it in the end-to-end result unless the application actually reuses it.
 
 Use `zip` for same-index work across columns. Keep row order consistent and filter the paired values together. For repeated grouped reports, consider `dict_encode` to reuse string-key ids; use `group_by(...).agg(...)` when the supported source/key shape lets several aggregates share a pass. The current shape restrictions and examples are in [data-oriented design](11-data-oriented.md).
 
@@ -108,9 +154,17 @@ Reassociation and contraction can change rounding, signed-zero results, and NaN 
 
 ## Add parallelism after measuring sequential work
 
-`par_map(f)` returns the same ordered values as `map(f).to_array()` for an accepted Pure callable. Compare those two when the output is an array. If the output is only a scalar reduction, also compare with `map(f).sum()`: the sequential fused version avoids the intermediate array altogether.
+`par_map(f)` returns the same ordered values as `map(f).to_array()` for an accepted Pure callable. Compare those two when the output is an array. If the output is only a scalar reduction, also compare with `map(f).sum()`. A supported directly consumed integer `par_map(f).sum()` can use range partials instead of a full intermediate array; this also applies to supported chunk sources. Binding the mapped array first, adding stages, or summing floats can change that choice. Inspect `explain-opt`: `range-reduce`, `range-materialize` and `sequential-collect` describe different costs.
 
 Worker setup, scheduling, materialization, memory bandwidth, and work per element all affect the result. Small or cheap work can be faster sequentially. `explain-opt` shows whether the compiler selected a range plan or a sequential fallback; the runtime may still execute a range plan on the caller alone. It does not tell you which runtime path a particular input took. Parallel callbacks still have purity and capture restrictions; Move captures and region allocation capabilities cannot be sent to workers. Use `task_group` for separate tasks and keep their joins within the scope. [Closures and parallelism](10-closures-and-parallelism.md) covers both forms.
+
+Use `chunks(k)` when a callback naturally processes a batch, then measure several
+positive chunk sizes. Too little work per chunk increases scheduling cost; too
+few chunks leave workers idle, and uneven chunk costs make the slowest one
+dominate. The last chunk may be shorter. Explicitly summing float chunk totals
+changes the grouping relative to one strict sum, even if each chunk uses strict
+arithmetic. Check the numerical result as part of the experiment. `alignc -j`
+controls compilation workers; it is not a runtime parallelism setting.
 
 ## Inspect the code that answers your question
 
@@ -126,6 +180,29 @@ Look for fused traversals, remaining runtime calls, bounds checks, vector operat
 `explain-opt` reports per-unit choices and LLVM remarks with runtime LTO off. It does not report the final linked ThinLTO executable. A file with no `main` uses its own `pub` functions as inspection roots unless `--export` selects a narrower set. For final instruction selection, inspect the built binary with your platform's disassembler and profile that same artifact.
 
 Runtime LTO is already on by default for `release` and `fast`. Cross-unit `--thin-lto` is an explicit option for linked builds in those profiles; measure its runtime benefit and build cost. Instrumented PGO is a further option with a representative training workload, but currently cannot be combined with `--thin-lto`. Commands and restrictions are in [the toolchain chapter](16-toolchain.md#profiles-targets-and-whole-program-optimization).
+
+## Measure build speed separately
+
+For the edit loop, compare a cold build, an unchanged rebuild and a rebuild after
+one representative edit. Keep target/profile options fixed and use
+`--cache-stats` to see frontend and codegen reuse. A cache hit can still require
+linking. `build --watch` also retains process-local work between revisions;
+measure it separately from starting a new compiler each time.
+
+```text
+alignc build app.align --profile release --cache-stats -j 4
+alignc build app.align --profile release --cache-stats -j 4
+alignc build app.align --profile release --watch --cache-stats -j 4
+```
+
+The first command is cold only if reusable entries are absent from both the
+selected cache and any packaged fallback.
+Use a dedicated `ALIGNC_CACHE` directory for a cold-build experiment and remove
+it after all users of it have exited. `ALIGNC_CACHE=off` measures disabled caching,
+which also omits cache-publication work; label that experiment separately.
+On Linux, an installed `ld.lld` can reduce linking time (`ALIGNC_LINKER=lld`
+requires it). This changes link speed, not the generated program's optimization
+level. Compare `-j` values against both elapsed time and peak memory.
 
 ## Choose the next experiment from the evidence
 

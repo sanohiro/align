@@ -1,6 +1,5 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, Move/effect classification, error policy, pitfalls, test
-anchors). Authored by the main loop (Fable).
+This directory records the per-area design of the `core` library: signatures,
+ownership and effect classification, error policy, pitfalls, and related tests.
 
 # core — hash (+ scalar math)
 
@@ -23,6 +22,7 @@ hash128(data)  -> (u64, u64)     // .0 == hash64(data); .1 = decorrelated second
 x.abs()                          // signed int / float; identity on unsigned
 a.min(b) / a.max(b)              // pairwise; int = llvm.{s,u}min/max, float = NaN-propagating minimum/maximum
 x.sqrt() / .floor() / .ceil() / .round() / .trunc()   // float-only; round = ties away from zero
+x.exp() / .exp2() / .log() / .log2() / .log10()     // float-only; also lane-wise on float vectors
 b.pow(e)                         // float-only
 fma(a, b, c)                     // free builtin; float scalar or float vector; one rounding
 ```
@@ -46,14 +46,15 @@ unsigned `.abs()` is a defined identity, not an error.
 
 None — values in, values out.
 
-## Spec'd but not implemented
+## Availability and limits
 
 - **Not part of the contract:** hash output stability across *builds/versions* — wyhash with a
   fixed seed happens to be stable today, but §18.1 explicitly scopes it as "not a stable
   on-disk/wire format". Do not let tests or users pin exact hash values as API (the driver
   tests pin *properties*: determinism, lane equality, view acceptance).
-- Not DoS-resistant, not cryptographic — `std.crypto` (M11, designed in `../std-design/
-  crypto.md`) is the answer for security contexts; refuse "just use hash64" shortcuts there.
+- Not DoS-resistant, not cryptographic — the shipped
+  [`std.crypto`](../std-design/crypto.md) supplies the cryptographic operations; refuse
+  "just use hash64" shortcuts in security contexts.
 - Elementary `exp`/`exp2`/`log`/`log2`/`log10` shipped together under plan 75:
   direct LLVM scalar/vector intrinsics, no ULP or
   cross-target bit-identity promise, visibility of pre-instruction-selection

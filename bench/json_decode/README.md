@@ -1,7 +1,7 @@
-# `json_decode` — JSON decode-throughput duel (Align vs `serde_json`)
+# `json_decode` — JSON decode-throughput comparison (Align vs `serde_json`)
 
-The regression tracker for the **JSON parser rewrite** (recursive-descent → simdjson-style two-stage
-SIMD). Measures Align's `json.decode` against idiomatic Rust `serde_json` on a runtime-generated
+Tracks the indexed JSON decoder and retains the historical recursive-descent baseline.
+Measures Align's `json.decode` against idiomatic Rust `serde_json` on a runtime-generated
 array of 4-field records, both folding `where(.active).pay.sum()` so the time is parser-dominated.
 
 Two shapes (each with a matching serde baseline):
@@ -43,7 +43,7 @@ linked as a **cdylib** (dynamic, over the C-ABI). Standalone cargo project (own 
   1000000    51814 |   90.405   92.940     1.03x |   68.015   73.967     1.09x
 ```
 
-The current recursive-descent decoder is **parse-bound** and roughly ties `serde_json` (full ≈1.03×;
+The historical recursive-descent decoder was **parse-bound** and roughly tied `serde_json` (full ≈1.03×;
 proj ≈1.09×, a slight edge from skipping the two unused fields).
 
 ## After Mison speculation (2026-06-29, native, 1M rows)
@@ -57,13 +57,13 @@ proj ≈1.09×, a slight edge from skipping the two unused fields).
 
 The speculative decoder (lean `{ } [ ] :` decode-index + a Mison pattern: learn each declared field's
 colon ordinal from the first record, then per record jump to it and verify the key — no `find_field`
-— falling back on a structure miss) **wins the projection rail: `proj×` ≈1.09× → 1.16–1.65×**, while
+— falling back on a structure miss) **improved the measured projection ratio: `proj×` ≈1.09× → 1.16–1.65×**, while
 full-decode stays at parity (≈0.9–1.1×). It does *not* reach the `work/` probe's **~3.4–4.1×** (SIMD
 index + projecting two-stage, soa columns) — an autopsy pinned the remaining cost to the **walk**
 (index build + per-token `src[idx[k]]` gather + `rec_cols` + key scan-back + per-value parse), which
 the general decoder pays and the probe's inlined positional sum did not. The lean index was the
-autopsy's first fix (index build 47→18 ms vs the quote-heavy structural index). Run this before/after
-every parser change and watch the ratios; when a result disappoints, autopsy — don't guess (see
+investigation's first change (index build 47→18 ms vs the quote-heavy structural index). Run this before/after
+parser changes and inspect the component timings when a result needs explanation (see
 `bench/README.md` methodology).
 
 ## Historical profile finding (2026-06-29, native, 1M rows)

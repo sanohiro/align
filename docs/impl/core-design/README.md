@@ -1,6 +1,5 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, Move/effect classification, error policy, pitfalls, test
-anchors). Authored by the main loop (Fable).
+This directory records the per-area design of the `core` library: signatures,
+ownership and effect classification, error policy, pitfalls, and related tests.
 
 # core — library design docs
 
@@ -27,7 +26,7 @@ PR (same rule as std-design).
 - [option-result.md](option-result.md) — `Option<T>` / `Result<T, E>` / builtin `Error`: constructors, `?`, `else`, `map_err`, `main` exit mapping
 - [array-slice-pipeline.md](array-slice-pipeline.md) — `array<T>` / `slice<T>` / ranges / `out`, and the whole pipeline vocabulary + termination and fusion rules
 - [string.md](string.md) — `str` / `string` / `bytes` / `buffer` / `builder` / `template`: methods, concat policy, UTF-8 stance
-- [json.md](json.md) — `json.encode` / `json.encode_bounded` / `json.decode` (struct / array / soa targets), error policy, zero-copy views
+- [json.md](json.md) — `json.encode` / `json.encode_bounded` / `json.decode` (struct / array / soa targets), `json.doc`, streaming `json.scan`, error policy, zero-copy views
 - [soa-groupby.md](soa-groupby.md) — `soa<T>`, column ops, `group_by` aggregates, `.agg(...)`, `dict_encode`
 - [vec-mask.md](vec-mask.md) — `vecN<T>` / `maskN<T>`, lane ops, `load`/`store`, `select`/`dot`/`fma`/`sum_where`, `align(N)`
 - [arena-heap.md](arena-heap.md) — `arena {}` and `heap.new` / `box`: regions, escape, drop

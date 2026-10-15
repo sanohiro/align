@@ -1,5 +1,5 @@
-このディレクトリには、`core` ライブラリの各領域について、`../std-design/` と同等の粒度（シグネチャ、Move/effect の分類、エラー方針、落とし穴（Pitfalls）、テストアンカー）で記述された公式な設計ドキュメントを収めている。
-執筆はメインループ（Fable）が担当している。
+このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
+シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
 
 # core — Option / Result / Error
 
@@ -33,7 +33,7 @@ non-entry module は独自の `Error` を宣言でき、その場合 bare lookup
 
 ## Type & ownership classification
 
-`Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b は完了している。ひとつの再帰的なタグ付き `DropPlan` が有限かつ非再帰な Move payloadを受け入れ、tagged container自体をMoveとし、活性payloadだけをDropし、構築および owning-place の `match` / `else` / `?` でmove元を無効化する。admitted borrowed-place の `match` は既存の borrow ABI で活性payloadをその場で読み、source ownerを変更しない。この契約は [`26-borrowed-sum-projection-plan.md`](../26-borrowed-sum-projection-plan.md) が定める。recursive type、任意の新しいMove-element collection layout、L2のdynamic path-selected return cleanupは別の担当restrictionとして残る。新しいlibrary handleへcompiler-known exceptionを追加してはならない。
+`Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b は完了している。ひとつの再帰的なタグ付き `DropPlan` が有限かつ非再帰な Move payloadを受け入れ、tagged container自体をMoveとし、活性payloadだけをDropし、構築および owning-place の `match` / `else` / `?` でmove元を無効化する。admitted borrowed-place の `match` は既存の borrow ABI で活性payloadをその場で読み、source ownerを変更しない。この契約は [`26-borrowed-sum-projection-plan.md`](../../26-borrowed-sum-projection-plan.md) が定める。recursive type、任意の新しいMove-element collection layout、L2のdynamic path-selected return cleanupは別の担当restrictionとして残る。新しいlibrary handleへcompiler-known exceptionを追加してはならない。
 
 R82 の shared-carrier 対応は統合 provider branch に実装済みである。
 [Plan 56](../../56-r77-r83-composition-plan.md) は既存の再帰的 borrowed-payload grammar に

@@ -125,15 +125,20 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     c.flag_bool("verbose")
     c.flag_str("input", "input.json")
     c.flag_i64("count", 1)
+    c.flag_f64("ratio", 0.5)
 
     p := c.parse(args)?
     if p.get_bool("verbose") { print(p.get_str("input")) }
     print(p.get_i64("count"))
+    print(p.get_f64("ratio"))
+    print(p.occurrences("count"))   // 0 when only the default was used
     return Ok(())
 }
 ```
 
-`flag_bool` defaults to `false`; `flag_str` and `flag_i64` take explicit defaults. The accepted spelling is `--name value` (and `--name` for a bool). Unknown, duplicate, or malformed flags return `Error.Invalid`. After a successful parse, getters are total; asking for an undeclared name or the wrong type aborts as a programming error. `p.get_str` is a view into `p`, so clone it if the text must outlive the parsed handle.
+`flag_bool` defaults to `false`; `flag_str`, `flag_i64` and `flag_f64` take explicit defaults. Value flags accept both `--name value` and `--name=value`; a bool uses `--name`. Repeated flags use the last value. `occurrences(name)` counts explicit uses of any registered flag, including repeated bools and empty strings; an omitted flag counts zero. If a flag must be supplied exactly once, enforce that with an occurrence check after parsing.
+
+Unknown flags, missing values and malformed values return `Error.Invalid`. Float values use complete ASCII JSON-number syntax and must be finite: `-0.25` and `1e3` are accepted; `+1`, `01`, `NaN` and infinity are rejected. Registered float defaults must also be finite; application-specific ranges still need explicit checks. After a successful parse, getters are total; asking for an undeclared name or the wrong type aborts as a programming error. `p.get_str` is a view into `p`, so clone it if the text must outlive the parsed handle.
 
 Both the command and parsed result are Move handles. Bind them before calling methods; unnamed owning receivers are not yet supported. `c.usage()` returns generated usage text and remains available after either parse outcome. Register flags with ordinary function calls; no derive macros or attribute DSLs are needed.
 

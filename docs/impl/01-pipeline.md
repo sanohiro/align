@@ -93,7 +93,7 @@ executable
 - Structural performance lints run in sema; LLVM optimization remarks are exposed separately by `alignc explain-opt`.
 
 ### Codegen (`align_codegen_llvm`)
-- MIR → LLVM IR. Maps `vecN<T>`/`maskN<T>` to LLVM's vector type / select and emits vector instructions deterministically.
+- MIR → LLVM IR. Maps `vecN<T>`/`maskN<T>` to LLVM vector types and operations. LLVM's instruction selection is target-dependent and may use vector or scalar instructions; retained vector IR alone does not prove machine SIMD (`75-portable-math-plan.md`).
 - Arena allocation becomes runtime calls. Details in `05-backend-llvm.md`.
 - Package resources become generic producer-owned Drop-thunk calls. Generated Query bind/decode thunks and immutable
   descriptors lower from MIR/static artifacts without runtime reflection.
@@ -111,7 +111,8 @@ executable
   affect the producer implementation and link; only Params/Row/restriction/static semantics affect
   consumer interfaces.
 - Shipped subcommands: `check`, `check-per-unit`, `emit-interface`, `emit-mir`, `emit-llvm`,
-  `emit-obj`, `explain-opt`, `fmt`, `build`, `run`, `size`, and `cache clear`. Build controls include
+  `emit-obj`, `explain-opt`, `fmt`, `build`, `run`, `test`, `size`, `cache clear`, and
+  `db prepare/migrate/status/check/repair`. Build controls include
   profiles/target CPUs, `-j`, cache stats, runtime LTO, ThinLTO, instrumented PGO, and the explicit
   foreground `--watch` loop.
 - Build-performance item 6 implements function partitions for the explicit

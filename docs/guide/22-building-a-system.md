@@ -73,10 +73,10 @@ fn main() -> i32 {
 
 A real game would read elapsed time with `std.time` and window state through an FFI binding (Chapter 15); this example runs 600 fixed frames. The arena holds the columns for the whole run, and each system is a function called in the order shown. `physics` writes into the existing destination, so the position storage stays at two buffers regardless of the number of frames.
 
-## Why this scales
+## Properties of this design
 
-1. **Decoupling:** `physics` does not care about sprites. A render system does not care about velocities. You can add a `health` column tomorrow without touching the physics code.
-2. **Predictability:** Everything flows from top to bottom. There are no hidden `Update()` methods calling other methods implicitly.
+1. **Data dependencies:** `physics` receives position and velocity columns. Adding a separate `health` column does not require changing this function.
+2. **Execution order:** The loop calls each system explicitly, so their order is visible at the call site.
 3. **Performance:** Contiguous columns support sequential memory access and SIMD. Use `alignc explain-opt` or `alignc emit-llvm` to check whether `physics` vectorizes for your target.
 
 The arrays hold the state; each system applies a transformation. Adding a system means adding another function and choosing where to call it in the loop.

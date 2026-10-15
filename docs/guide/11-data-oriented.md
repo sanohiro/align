@@ -6,13 +6,13 @@ Memory layout affects how much data a processor must read. This chapter shows ho
 
 ## Array-of-structs vs structure-of-arrays
 
-A million particles, each with position and velocity. The obvious layout is an array of structs (AoS):
+Consider particles with position and velocity fields. An array of structs (AoS) stores each complete particle together:
 
 ```text
 [ {x0,y0,vx0,vy0}, {x1,y1,vx1,vy1}, ... ]
 ```
 
-To update just the `x` of every particle, the values you need are scattered every few words: you drag whole structs through cache to touch one field, and SIMD can't load the lanes contiguously. The structure-of-arrays (SoA) layout stores each field as its own dense column:
+A scan of only `x` steps across the other fields and may fetch bytes it does not use. Structure-of-arrays (SoA) stores each field in a contiguous column:
 
 ```text
 x:  [x0, x1, x2, ...]
@@ -47,7 +47,7 @@ fn main() -> i32 {
 }
 ```
 
-You still *think* in `User`; only the memory is columnar. `s.field` projects a column (an ordinary slice — the entire chapter [06](06-pipelines.md) vocabulary applies), `s[i]` gathers a row, `s.field[a..b]` windows a column. The columns live in an arena (`to_soa` must be called inside one): a batch layout with a batch lifetime, per chapter [05](05-memory.md).
+`soa<User>` retains the record type while storing its fields in separate columns. `s.field` projects a column as an ordinary slice (chapter [06](06-pipelines.md)); `s[i]` gathers a row; `s.field[a..b]` takes a slice of a column. Call `to_soa` inside an arena, which owns the column storage and bounds its lifetime (chapter [05](05-memory.md)).
 
 For a columnar scan such as `s.where(.active).score.sum()`, the columnar layout avoids fetching fields the scan does not use. Measure with your own data before choosing a layout.
 
@@ -141,4 +141,4 @@ This fragment continues the preceding `Row` example inside `main`: `.a` is the v
 
 ## The habit
 
-When data is processed in bulk — records walked repeatedly, a field or two at a time — reach for `soa<T>` at the point the data enters the program, and think in whole-column operations from there. The rule of thumb: **if a loop touches one or two fields of many rows, AoS is fighting you.** Keep AoS for data you touch whole and rarely (a config struct, one request), and let `emit-llvm` or a benchmark settle any argument — in Align the layout change is one line, so trying it is cheap.
+Consider `soa<T>` when repeated scans use only a few fields of each record. AoS can suit access to complete records. Include conversion cost and the number of later scans in your comparison, and use a representative benchmark to choose the layout. `emit-llvm` can help explain the generated access pattern.

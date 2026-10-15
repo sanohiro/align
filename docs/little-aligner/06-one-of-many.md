@@ -124,7 +124,7 @@ fn describe(p: Page) -> i64 = match p {
 }
 ```
 
-The impossible states — ready *and* failed, a size with no page — cannot be written. That is what sum types are *for*.
+This type cannot hold Ready and Failed at the same time, or attach a size to Loading.
 
 ---
 

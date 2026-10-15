@@ -57,10 +57,15 @@ protocol-neutral seam は `pkg.ws` より下に置く。`pkg.web` は `pkg.ws` �
 address、TLS、reader/writer、HTTP parser へ変換できない。
 
 ```align
+import pkg.web
 import pkg.web.types
 import pkg.ws
 
-fn chat(c: pkg.web.types.Ctx, connection: http_upgrade, protocol: string) -> Result<(), Error> {
+fn chat(
+  c: pkg.web.types.Ctx,
+  connection: http_upgrade,
+  protocol: string,
+) -> Result<(), Error> {
   mut ws := connection
   loop {
     message := pkg.ws.receive(ws, 1048576)?

@@ -8,15 +8,15 @@
 
 ---
 
-**Q2.** How many additions does the CPU perform?
+**Q2.** How many element additions are required?
 
 **A2.** Four. One for each pair. 
 
 ---
 
-**Q3.** Can we do it in one?
+**Q3.** Can SIMD express them as one vector operation?
 
-**A3.** Yes, if the CPU has wide registers. We can pack four `i32`s into a single `vec4<i32>` and add them with a single `+`.
+**A3.** Yes. We can pack four `i32`s into a `vec4<i32>` and add them with one `+`. The target, lane type, and width determine whether a vector operation becomes one or several machine instructions.
 
 ---
 
@@ -52,7 +52,7 @@ ones: vec4<i32> := [1, 1, 1, 1]
 safe_v2 := select(m, v2, ones)
 ans := v1 / safe_v2
 ```
-Where the mask is true, it picks the lane from `v2`; where false, from `ones` — so `safe_v2` is `[10, 1, 30, 40]`, and `ans` is `[0, 2, 0, 0]`. The second lane divides by the substituted `1`. Every denominator is now nonzero.
+Where the mask is true, it picks the lane from `v2`; where false, from `ones` — so `safe_v2` is `[10, 1, 30, 40]`, and `ans` is `[0, 2, 0, 0]`. The second lane divides by the substituted `1`. Every denominator is now nonzero. Signed overflow still wraps, as in scalar arithmetic: the minimum value divided by `-1` yields that minimum value, and its remainder is `0`.
 
 ---
 
@@ -165,7 +165,7 @@ select(m, w, zero)
 
 **Q21.** How should the rest of the program call a hand-vectorized kernel?
 
-**A21.** Through ordinary slices and values. Keep `vec4` inside a small function so the caller describes data, not one machine's register plan. An escape hatch is healthiest when it has a narrow door.
+**A21.** Through ordinary slices and values. Keep `vec4` inside a small function so callers can use it without depending on the vector width.
 
 ---
 

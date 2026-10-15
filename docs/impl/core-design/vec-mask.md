@@ -1,6 +1,5 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, Move/effect classification, error policy, pitfalls, test
-anchors). Authored by the main loop (Fable).
+This directory records the per-area design of the `core` library: signatures,
+ownership and effect classification, error policy, pitfalls, and related tests.
 
 # core — vecN / maskN / align(N)
 
@@ -9,7 +8,7 @@ anchors). Authored by the main loop (Fable).
 ## Overview
 
 The explicit fixed-width SIMD tier (draft §9). Policy first, because it shapes every API choice:
-the **pipeline is the width-agnostic main path** (auto-vectorized, scalable-ISA-ready); `vecN<T>`
+the **pipeline is the width-agnostic main path** (eligible for automatic vectorization and future scalable ISAs); `vecN<T>`
 / `maskN<T>` are the **fixed-width kernel escape hatch**. MIR carries vectorization-enabling
 *properties*, never a baked vector width — vector width is a permanent backend decision (settled,
 2026-07-02 internal review). Nothing in this area may leak a width assumption into the main path.
@@ -18,7 +17,7 @@ the **pipeline is the width-agnostic main path** (auto-vectorized, scalable-ISA-
 
 ```text
 v: vecN<T> := [a, b, ...]        // N ∈ {2,4,8,16}; T numeric; literal under annotation
-v + w, v - w, v * w, v / w, v % w    // lane-wise, one instruction each
+v + w, v - w, v * w, v / w, v % w    // lane-wise; target-dependent instruction selection
 v + s / s + v                        // scalar broadcasts (either side; literal or typed binding)
 v == w, v > w, v < w, ...        -> maskN<T>
 v[i]                             -> T            // lane read, constant index
@@ -26,6 +25,7 @@ v[i] = x                                          // lane write (mut binding)
 v.min() / v.max()                -> T            // horizontal reduce
 a.min(b) / a.max(b)              -> vecN<T>      // element-wise
 v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
+v.exp()/exp2()/log()/log2()/log10()             // per-lane float math; may scalarize
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
 select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
@@ -50,6 +50,13 @@ same lane count and lane bit width as the vectors it gates. That predicate is
 MIR producer validator alike, so no layer can disagree about a blend.
 
 `align(N)` is an attribute, not a type — it composes with `layout(C)` in either order.
+
+One vector operation does not promise one machine instruction: lane type, width and target
+determine whether LLVM selects vector instructions, multiple instructions or scalar code.
+The five elementary functions above reach LLVM as vector intrinsics. Use
+`emit-llvm --stage optimized` and `explain-opt` to inspect their disposition before instruction
+selection; retained vector IR without a provider can still scalarize later. Inspect the emitted
+object to establish final machine SIMD. [Plan 75](../75-portable-math-plan.md) owns this boundary.
 
 ## Effects
 

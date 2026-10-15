@@ -29,7 +29,7 @@ arena {
     ...
 }
 ```
-For a regular, non-empty file, this is an OS-level memory map (`mmap`). It avoids making a second user-space buffer up front; pages arrive through the OS page cache as they are touched. The view lives in the arena (chapter 8): a lifetime, stated up front. And the `?` is chapter 7: opening and validating a text file can fail, and Align will not let that stay invisible.
+For a regular, non-empty file, this uses an OS-level memory map (`mmap`), avoiding a second user-space input buffer. However, `read_file_view` validates the complete file as UTF-8 before returning, so it already scans the bytes and touches their pages. JSON parsing is another pass. The view is tied to the arena (chapter 8), and `?` handles opening or validation failures (chapter 7). Use a stable file: truncating it while mapped can terminate the process. Special files take a copying fallback; they do not have the same zero-copy cost.
 
 ---
 
@@ -101,13 +101,13 @@ fn main() -> Result<(), Error> {
 
 **Q11.** How much memory did this program churn through?
 
-**A11.** Much less churn than a row-object design, but not zero memory. The file mapping occupies address space and resident pages as it is touched. The decoded columns take space proportional to the rows. Grouping needs state and result columns proportional to the number of distinct users. What disappeared were the copied input buffer, millions of little row objects, and filtered intermediate arrays.
+**A11.** The mapping, decoded columns, and grouping state all use memory. The file mapping occupies address space and resident pages as it is touched. The decoded columns take space proportional to the rows. Grouping needs state and result columns proportional to the number of distinct users. This program avoids an owned input copy, per-record heap objects, and a filtered intermediate array.
 
 ---
 
 **Q12.** What happens when the `arena` block ends?
 
-**A12.** The mapped view is unmapped and the batch storage is released at the boundary. There is no tracing garbage collector searching for forgotten rows; the lifetime was the block we could point to from the start.
+**A12.** The mapped view is unmapped and the batch storage is released at the boundary. The block determines when that storage is released.
 
 ---
 
@@ -132,7 +132,7 @@ rows: json.scanner<Log> := json.scan(view)
 ok := rows.status.where(fn s { s == 200 }).count()?
 ```
 
-Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materialized. The reducer returns `Result` because malformed input may be discovered halfway through the stream.
+Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materialized. The reducer returns `Result` because malformed input may be discovered halfway through the stream. Scanner row schemas must be recursively Copy: owned strings and arrays are not admitted. A selected `str` must be unescaped; an escaped selected string returns an error even inside an arena, because the scanner has no arena allocation path.
 
 ---
 
@@ -144,7 +144,7 @@ Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materia
 
 **Q17.** Choose the input shape: a 20-gigabyte NDJSON file, one final count, no sorting, no grouping, no reuse.
 
-**A17.** Map it as a view and use `json.scan` into a fused reducer. The requested answer is bounded; a materialized batch is not.
+**A17.** Map it as a view and use `json.scan` into a fused reducer. The decoded working set is bounded instead of holding all rows. This streams decoding, not file reads: the mapping and the complete UTF-8 validation from Q4 remain. It is not an incremental network reader.
 
 ---
 
@@ -154,9 +154,9 @@ Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materia
 
 ---
 
-**Q19.** Same data, but the program needs one small record at a time and immediately sends it onward.
+**Q19.** Same data, but a fused reduction only needs each Copy record until its contribution has been added.
 
-**A19.** Prefer the scanner. SoA wins on repeated column work; it is not a badge to attach to every large file.
+**A19.** Prefer the scanner, within the schema limits from Q15. SoA helps with repeated column work; a large file alone does not justify keeping every decoded row.
 
 ---
 
@@ -168,7 +168,7 @@ Each row is decoded as it flows into the reducer; no `soa<Log>` batch is materia
 
 **Q21.** The scanner reports malformed JSON after nine million good rows. May it return the partial count as if nothing happened?
 
-**A21.** No. Its reducer returns `Result`; `?` passes the failure upward. Streaming saves materialization, not correctness. If an application wants partial answers, that policy needs an explicit interface and an explicit error decision.
+**A21.** No. Its reducer returns `Result`; `?` passes the failure upward. An application that needs a partial count must use an interface that reports both the partial result and the failure.
 
 ---
 

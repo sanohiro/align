@@ -1,5 +1,5 @@
-このディレクトリには、`core` ライブラリの各領域について、`../std-design/` と同等の粒度（シグネチャ、Move/effect の分類、エラー方針、落とし穴（Pitfalls）、テストアンカー）で記述された公式な設計ドキュメントを収めている。
-執筆はメインループ（Fable）が担当している。
+このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
+シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
 
 # core — hash (+ scalar math)
 
@@ -20,6 +20,7 @@ hash128(data)  -> (u64, u64)     // .0 == hash64(data); .1 = decorrelated second
 x.abs()                          // signed int / float; identity on unsigned
 a.min(b) / a.max(b)              // pairwise; int = llvm.{s,u}min/max, float = NaN-propagating minimum/maximum
 x.sqrt() / .floor() / .ceil() / .round() / .trunc()   // float-only; round = ties away from zero
+x.exp() / .exp2() / .log() / .log2() / .log10()     // float 専用; float vector にもレーン単位で適用
 b.pow(e)                         // float-only
 fma(a, b, c)                     // free builtin; float scalar or float vector; one rounding
 ```
@@ -40,10 +41,10 @@ Pure。ハッシュ結果は、与えられた入力に対して **1 つのビ�
 
 なし — 値が入力され、値が出力されるのみ。
 
-## 仕様先行(未実装)
+## 提供状況と制限
 
 - **契約には含まれない事項:** *ビルド間やバージョン間* でのハッシュ出力の安定性 — 固定シードを持つ wyhash は現状たまたま安定しているが、§18.1 ではこれを明示的に「オンディスクやワイヤーフォーマットとして安定したものではない」と定めている。テストやユーザー側で、特定の正確なハッシュ値を API の仕様として固定（pin）することを許してはならない（ドライバのテストで固定するのは、決定性、レーンの等価性、ビューの受理といった *プロパティ* のみである）。
-- DoS 耐性はなく、暗号用途でもない — セキュリティが要求される文脈での正解は `std.crypto`（M11、`../std-design/crypto.md` で設計済み）である。そのような場面で「手軽に hash64 で済ませる」という方法は拒否すること。
+- DoS 耐性はなく、暗号用途でもない — 実装済みの [`std.crypto`](../../std-design/crypto.md) が暗号操作を提供する。セキュリティが要求される場面で「手軽に hash64 で済ませる」という方法は拒否すること。
 - 初等関数 `exp`/`exp2`/`log`/`log2`/`log10` は plan 75 に従って一括して実装済み。LLVM の scalar/vector intrinsic へ直接 lower し、ULP または cross-target の bit 同一性は保証しない。命令選択前の scalarize は可視化し、provider のない retained IR には後段でも scalarize され得ると警告する。最終的な machine SIMD は object の検査で確認する。三角関数は引き続き未提供。
 - `core.bitset`（§18.1 に隣接する要素） — 未実装。ビット操作は整数演算子で行う。そのメモリレイアウトの問題は packed-bool な soa カラムと密接に関連しているため、一緒に決着させること。
 

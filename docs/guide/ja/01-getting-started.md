@@ -24,13 +24,17 @@ sudo apt install alignc
 
 ## コンパイラをビルドする
 
-必要なのは **Rust 1.96 以上**と **LLVM 22** です。Debian/Ubuntu なら次のようにします（apt.llvm.org 経由）。
+必要なのは **Rust 1.96 以上**、**LLVM 22**、ネイティブの C ツールチェーンと、OpenSSL・zstd・SQLite・**libpq 17 以上**の開発ライブラリです。Ubuntu 24.04 標準の libpq 16 では不足します。まずリポジトリを clone します。
 
 ```text
-apt install llvm-22 llvm-22-dev clang-22 libclang-rt-22-dev libssl-dev zlib1g-dev libzstd-dev
 git clone https://github.com/sanohiro/align
 cd align
-cargo build
+```
+
+プラットフォーム別の[ソースビルドの準備](../../../README.ja.md#ソースからのビルド)に従ってください。Ubuntu では CI と同じ LLVM/PostgreSQL リポジトリを設定し、macOS では Homebrew のパスを設定します。その後、リポジトリのルートで両方のツールをビルドします。
+
+```text
+scripts/cargo.sh build --workspace
 ```
 
 これでコンパイラは `./target/debug/alignc` に置かれます。`PATH` が通っていないため、フルパスで実行するかエイリアスを設定してください。（`--release` を付けてビルドすると `./target/release/alignc` が生成されます。コンパイラ自体の実行は速くなりますが、生成されるコードの性能は同じです。）なお、`alignc` は LLVM 22 を動的にリンクし、生成したプログラムのリンクには `cc` を呼び出すため、コンパイラの実行ファイルだけをコピーしてもネイティブツールチェーンへの依存は残ります。
@@ -108,7 +112,7 @@ alignc --version                          compiler version を表示
 
 ## コンパイルエラーを読む
 
-Align のコンパイラは厳格です。null は存在せず、`match` はすべてのケースを網羅する必要があり、処理されていない `Result` はエラーになります。また、ムーブされた値は再利用できません。診断メッセージは、どの規則に違反したのかを的確に教えてくれます。初めて書いたプログラムがコンパイルエラーになる場合、多くは次の2つのいずれかが原因です。
+コンパイラは、網羅されていない `match`、未処理の `Result`、move 後の値の再利用などをエラーとして報告します。診断には規則とソース位置が示されます。次の2つの例で確認します。
 
 ```align
 fn main() -> i32 {

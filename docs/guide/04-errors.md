@@ -2,7 +2,7 @@
 
 > 🌐 **English** · [Japanese](./ja/04-errors.md)
 
-Align has one error model. A computation that might not produce a value returns `Option<T>`; a computation that can *fail* returns `Result<T, E>`. There is no null, and there are no exceptions — an error is an ordinary value that travels back through `?`. This chapter is the whole model.
+A computation that may produce no value returns `Option<T>`; one that can fail returns `Result<T, E>`. Align has no null or exceptions. Errors are values, and `?` propagates them to the caller.
 
 ## `Option<T>` — maybe absent
 
@@ -26,7 +26,7 @@ fn main() -> i32 {
 
 `half_if_even(0)` returns `Some(0)`, while `half_if_even(7)` returns `None`. After `else 0`, both give the same number. Use `match` if the caller must distinguish an absent value from a present zero. The `?` operator described below applies only to `Result`; it does not unwrap `Option`.
 
-There is no null in the language, so there is no "forgot to check" — the type system won't give you a `T` until you've said what happens when there isn't one.
+To obtain a value from `Option<T>`, handle its `Some` and `None` cases with `match` or an `else` fallback.
 
 ## `Result<T, E>` — can fail
 
@@ -53,7 +53,7 @@ fn main() -> i32 {
 }
 ```
 
-`?` is the whole story of propagation: unwrap an `Ok`, or return the `Err` to the caller immediately. The happy path reads top to bottom; the error path is the cold edge, and the compiler literally lays it out as the cold branch. At the point where you finally *consume* a `Result`, you have two forms: `match` when the error's *content* matters, and `else` when it doesn't — `v := f() else fallback` takes the `Ok` value or deliberately discards the error for the fallback. Each intent has exactly one form: `?` propagates, `else` falls back, `match` inspects.
+`?` unwraps `Ok` or returns `Err` from the current function. Use `match` when the error content matters, or `else` for a fallback: `v := f() else fallback` takes the `Ok` value or discards the error and evaluates the fallback. These forms let you choose where an error is propagated or handled.
 
 ## Errors cannot be silently dropped
 
@@ -94,7 +94,7 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 }
 ```
 
-If an `Err` propagates out of `main`, the process exits non-zero — each `Error` category maps to a small fixed code (`NotFound` → 1, `Invalid` → 2, `Denied` → 3, `Timeout` → 4), and `Error.Code(c)` exits with `c`. `error(c)` is shorthand for constructing that carrier: `return Err(error(7))` exits with 7. No handler boilerplate at the top of `main`; the mapping is part of the language.
+If an `Err` propagates out of `main`, the process exits non-zero — each `Error` category maps to a small fixed code (`NotFound` → 1, `Invalid` → 2, `Denied` → 3, `Timeout` → 4), and `Error.Code(c)` exits with `c`. `error(c)` is shorthand for constructing that carrier: `return Err(error(7))` exits with 7. This exit-code mapping is part of the language.
 
 Programs receive command-line arguments through `main(args: array<str>)`; `args[1]` is the first user argument. This example requires one path argument and returns `Error.Invalid` for any other count. Checking before indexing prevents an out-of-bounds abort when no path was supplied. There is no global argument list or `env.args`.
 
@@ -135,7 +135,7 @@ fn main() -> i32 {
 }
 ```
 
-One rule keeps the model honest end to end: everything that can fail says so in its type, every failure is handled or visibly propagated, and nothing converts behind your back.
+
 
 ## The habit
 

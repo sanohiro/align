@@ -302,7 +302,7 @@ the element.
 
 ---
 
-## 3. Loop Fusion (Align's flagship)
+## 3. Loop Fusion
 
 The core of "writing it the normal way makes it easy for the compiler to optimize" (`draft.md` §1). Collapse a chain of `map`/`where`/`scan`/reduction into **one loop**, eliminating intermediate arrays.
 
@@ -561,11 +561,11 @@ They are Pure, allocation-free and do not introduce a runtime ABI call.
 - how far to push MIR toward SSA / handling of mut places
 ```
 
-Monomorphization is already settled: it happens before MIR construction (`03 §9`). A parallel
-reduction is a possible future feature, not an unimplemented branch of the current MIR.
-Borrow/resource/region/static-Query lowering is also settled but not yet implemented; its
-mandatory sequence and exhaustive-pass verification are in
-`17-library-boundary-prerequisites.md` §§8–10.
+Monomorphization is already settled: it happens before MIR construction (`03 §9`). The implemented
+`ParMapReduce` path in §6 handles directly consumed, stage-free integer `par_map(...).sum()`,
+including admitted chunk sources. A general parallel-reduction surface remains future work.
+Borrow/resource/region/static-Query lowering is implemented; its ownership boundaries and
+exhaustive-pass verification are recorded in `17-library-boundary-prerequisites.md` §§8–10.
 
 ## Move-element slices (plan 44)
 

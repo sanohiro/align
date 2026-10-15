@@ -1,6 +1,5 @@
-This directory holds Opus-implementable design specs for std modules beyond the roadmap's
-prose. Authored by the main loop (Fable); these are the source of truth for implementing each
-module.
+This directory records the detailed `std` module designs that supplement the roadmap.
+These specifications define the contract for each module's implementation.
 
 # std.net — implementation design (M11)
 
@@ -19,7 +18,7 @@ writer ABI and adds only private sink provenance so socket writes can suppress S
 
 ## Signatures
 
-v1 proposal — draft §18.2 lists members only; these are Fable's settled shapes:
+v1 design — draft §18.2 lists members only; the signatures below define their forms:
 
 ```text
 // TCP client
@@ -55,7 +54,7 @@ dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
     `Result<i64, Error>`, mirroring `reader.read` exactly (fill the caller's buffer, return the byte
     count). The ideal `datagram {n, peer}` return is **deferred**: a `Result` `Ok` payload is a single
     `Scalar` (there is no `Scalar::Tuple`), and the peer address is an owned `string`, so `{n, peer}`
-    would require synthesizing a builtin Move struct-with-owned-field aggregate — a magic special-case
+    would require synthesizing a builtin Move struct-with-owned-field aggregate — a library-specific compiler special case
     that "ideal form or defer" forbids. It waits for first-class builtin-struct returns. The socket
     already receives the peer at the syscall (`recvfrom`); v1 simply discards it (null `src_addr`).
 

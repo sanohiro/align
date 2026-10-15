@@ -1,6 +1,5 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, Move/effect classification, error policy, pitfalls, test
-anchors). Authored by the main loop (Fable).
+This directory records the per-area design of the `core` library: signatures,
+ownership and effect classification, error policy, pitfalls, and related tests.
 
 # core — array / slice / the pipeline
 
@@ -9,7 +8,9 @@ anchors). Authored by the main loop (Fable).
 ## Overview
 
 The data-oriented center (draft §7–§8): three collection forms and one processing vocabulary.
-Every stage below fuses into a single counted loop; a pipeline **must terminate** in a reduction
+Compatible element-wise stages fuse into a terminal loop; materializing operations such as
+`sort` and `partition` retain their documented storage costs. Direct chunk consumers can derive
+views without a header array; stored chunk values materialize it. A pipeline **must terminate** in a reduction
 or a materialization (a held middle is a compile error — no lazy value escapes). This file is the
 surface + shape rules; the columnar layer is [soa-groupby.md](soa-groupby.md).
 
@@ -227,10 +228,15 @@ input-vs-output scope; sources are allowed to alias one another and are never de
   route through the same check.
 - P4 — fixed-array indexing requires literal-or-variable receiver (MIR addresses the slot);
   don't "fix" a failing expression-receiver case by copying the array silently.
-- P5 — unbound owned temporaries have path-local synthetic owners as of 2026-07-15, including
-  view-retention and per-iteration loop cleanup. `chunks(n)` still materializes its header array
-  even for direct `.len()`, index, or pipeline consumers; that remaining cost is tracked in
-  [audit 13 §8.2](../13-string-array-allocation-short-input-audit.md#82-confirmed-p1--virtualize-chunks-for-direct-consumers).
+- P5 — unbound owned temporaries have path-local synthetic owners, including view retention and
+  per-iteration loop cleanup. Direct `chunks(n).len()` and indexing compute only the count or one
+  borrowed view. Direct synchronous pipelines derive views in their loop; an immediate, stage-free
+  chunk source of a selected range-kernel `par_map`, including direct integer `par_map(...).sum()`,
+  derives them in the range kernel. Stored/boundary values and parallel fallback paths still
+  materialize the header array. Source lifetime and evaluation order remain unchanged.
+  [The current plan records](../09-explain-opt.md) distinguish `virtual-count`, `virtual-index`,
+  `virtual-range-views` and `materialized-headers`; [audit 13](../13-string-array-allocation-short-input-audit.md)
+  records the original direct-count/index implementation.
 
 ## Test anchors
 

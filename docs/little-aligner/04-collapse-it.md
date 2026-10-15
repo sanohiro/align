@@ -166,6 +166,12 @@ No `to_array` in sight: `scan` already built the array (A9). Asking for one agai
 
 ---
 
+**Q22.** Do empty `min()` and `max()` return `None`?
+
+**A22.** No. They return their fold identities: `min()` yields the element type's largest integer or positive infinity for floats; `max()` yields its smallest integer or negative infinity. These are ordinary values, not an absence marker. If “no readings” needs a different answer, check for emptiness explicitly before using the extreme.
+
+---
+
 > **The Fourth Commandment**
 >
 > *Give `reduce` an initial value and a way to combine elements. When `sum` or `count` says what you need, use that name.*

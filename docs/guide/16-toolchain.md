@@ -154,7 +154,7 @@ lookup. This selects the driver only: its own linker/tool discovery, stripping,
 and size inspection still need their normal toolchain configuration. It does
 not authenticate executable bytes or prevent replacement after validation.
 
-By default, `alignc` links through the system C driver. On ELF targets it additionally asks the selected driver to run LLVM's `ld.lld`, which ships inside the LLVM toolchain `alignc` already requires, so nothing new needs installing. `ALIGNC_LINKER` pins the choice:
+By default, `alignc` links through the system C driver. On ELF targets it additionally asks the selected driver to run LLVM's `ld.lld` when available. Debian/Ubuntu distributes it separately as `lld-22`; installing `llvm-22-dev` alone does not supply it. `ALIGNC_LINKER` pins the choice:
 
 ```text
 ALIGNC_LINKER=lld       ELF: use ld.lld, or fail loudly if none is found
@@ -164,7 +164,7 @@ unset (default)         ELF: ld.lld when the toolchain ships one, else the syste
                         Mach-O: always the system linker
 ```
 
-Any other value is a hard error. Only link speed changes: the objects, the hygiene flags, the per-profile strip, and the optimization applied are identical either way, so this is not a `--profile` in disguise. macOS is unaffected — Apple's linker is already fast, and Mach-O never selects lld. A failed link names the linker that ran, and a failed lld link also names `ALIGNC_LINKER=system` as the escape hatch.
+Any other value is an error. This selects the linker; the input objects, hygiene flags, per-profile stripping and code-generation optimization stay the same. Mach-O uses the system linker. A link failure names the selected linker, and an lld failure also suggests `ALIGNC_LINKER=system`.
 
 ## The formatter
 
@@ -307,9 +307,7 @@ align> print(area(7))
 42
 ```
 
-`:time [N]` runs the already-built binary N times and reports min/median/max. It measures **your
-program**, not the compiler: compilation is not included, every sample includes process spawn, and
-the reported spawn floor is there to be subtracted.
+`:time [N]` runs the already-built binary N times and reports min/median/max. Compilation is excluded, but every sample includes process startup and the entire program, including I/O. Compare the reported spawn floor with the sample duration to recognize overhead-dominated measurements; it is a separate noisy measurement, not an exact correction to subtract. Use larger representative work or a repeated kernel harness for short operations (chapter [26](26-performance.md)).
 
 ```text
 align> :time 3

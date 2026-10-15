@@ -22,7 +22,7 @@ ys := xs.par_map(expensive)
 
 **Q2.** Does `par_map` need `.to_array()`?
 
-**A2.** No. It materializes an owned result array itself. Workers need places to put their answers, and the visible parallel boundary is also the visible materialization boundary.
+**A2.** No. Used as a value, it returns an owned result array. A direct supported integer `par_map(...).sum()` can instead use a range reduction without that full intermediate array. This optimization does not change the source-level result; inspect `explain-opt` before counting the generated storage.
 
 ---
 
@@ -69,7 +69,7 @@ ys := xs.par_map(fn x { x * factor })
 
 **Q9.** A million integers, and `f(x) = x + 1`. `par_map`?
 
-**A9.** Usually no. Sequential `map` fuses, vectorizes, and avoids worker dispatch and result materialization. Many elements do not by themselves make expensive work.
+**A9.** Start with sequential `map` and measure. It can fuse with later stages and may vectorize, without worker dispatch. If we need an array, both `map(...).to_array()` and `par_map(...)` materialize one. If we need only a sum, `map(...).sum()` avoids that result array; a supported direct integer parallel sum may avoid it too (Q2), while retaining scheduling costs. Compare the same requested answer: many elements do not by themselves make expensive work.
 
 ---
 
@@ -108,13 +108,13 @@ The three partial answers are `3`, `7`, and `11`; the final answer is `21`.
 
 **Q13.** If the chunks finish as third, first, second, may the final sum change?
 
-**A13.** Not for this integer sum. `par_map` restores result order, and the final reduction is sequential. More generally, never use hidden completion order as an input; if order matters, keep it in the data.
+**A13.** Not for this integer sum. Wrapping integer addition gives the same result when regrouped, and the compiler may use the direct range reduction from Q2. Floating-point addition is different: summing chunks and then their totals changes the parentheses from one strict sum over the original input, even when the chunk results stay in input order. Check numerical requirements before making that source change.
 
 ---
 
 **Q14.** Now the jobs are different: fetch a profile, load a model, and read a configuration. `par_map`?
 
-**A14.** No common element function is being mapped. These are a few heterogeneous tasks — use a `task_group`.
+**A14.** No common element function is being mapped. These are a few heterogeneous tasks — use a `task_group`. Unlike `par_map` callables, spawned tasks may perform I/O; they still cannot share mutable state.
 
 ---
 
@@ -156,9 +156,15 @@ task_group {
 
 ---
 
-**Q19.** Which words in Align mean “another thread runs this”?
+**Q19.** Which words explicitly request parallel scheduling?
 
-**A19.** `par_map` and `spawn`. Nothing else. If you cannot point to one of those words, the program did not secretly create parallel work.
+**A19.** `par_map` and `spawn`. They make the boundary visible; they do not promise a new thread per item or task. The runtime reuses workers, and a caller waiting for structured tasks can help execute queued work.
+
+---
+
+**Q20.** How large should each chunk be?
+
+**A20.** Measure several sizes against the sequential version on representative inputs. Too little work per chunk can cost more to schedule than to compute; too few chunks can leave workers idle. Include the short final chunk, output allocation when present, and the final reduction in the comparison. More workers cannot make memory bandwidth unlimited.
 
 ---
 

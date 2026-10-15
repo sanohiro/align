@@ -54,7 +54,7 @@ The example illustrates two rules:
 - **Integer overflow wraps.** It is defined two's-complement behavior — never undefined behavior, never a hidden trap. When you *want* a checked/saturating operation, the spec provides explicit `checked_*` / `saturating_*` / `wrapping_*` forms so the intent is visible in source.
 - **Narrowing is explicit and audited.** `as` truncation is defined behavior, and the compiler warns on potentially lossy `as` conversions unless it can prove the value fits, so silent truncation cannot hide.
 
-Division by zero (and `%` by zero) is a hard runtime error — the program aborts; it is never a silent wrong answer. Out-of-range literals (`x: i8 := 200`) are a compile error.
+Division by zero (and `%` by zero) is a hard runtime error — the program aborts. Signed minimum divided by `-1` wraps to that same minimum, and its remainder is zero, consistently with integer overflow. Out-of-range literals (`x: i8 := 200`) are a compile error.
 
 Floats follow IEEE 754: division by zero can produce infinity or NaN rather than aborting. Use `is_finite()`, `is_nan()`, and `is_infinite()` to classify a scalar float. `f32.to_bits()` returns `u32` and `f64.to_bits()` returns `u64`, preserving the encoding, including signed zero and NaN payloads; an `as` cast instead converts the numeric value. For floating-point math and explicit rounding permissions, see chapter [12](12-simd.md).
 
@@ -93,7 +93,7 @@ fn main() -> i32 {
 }
 ```
 
-Two body forms, nothing else: a block with `return`, or `= expr` for single-expression functions. Parameters are immutable values. Small values are copied; what happens with owning types is chapter [05](05-memory.md).
+Two body forms: a block, or `= expr` for a single expression. A non-Unit function must produce its declared value on every reachable path, through `return value` or a trailing expression. A Unit function may fall through or use bare `return`. Parameters are immutable values. Copy types are copied; what happens with owning types is chapter [05](05-memory.md).
 
 ## There is no `for`
 
@@ -111,7 +111,7 @@ n_read := loop {
 }
 ```
 
-There is no `continue` and no labeled break — skip-to-next is an `if` around the rest of the body, and a nested loop that wants a two-level exit is a function waiting to be extracted. Loop state lives in `mut` locals declared before the loop.
+There is no `continue` and no labeled break — skip-to-next is an `if` around the rest of the body, and extracting nested loops into a helper lets `return` exit both levels. Loop state lives in `mut` locals declared before the loop.
 
 **Pipelines handle data transformations; `loop` handles sequential control.** When you need to traverse a collection, look for a pipeline operation first. Recursion is available for recursive problems such as parsers and trees, but Align does not guarantee tail-call optimization: using recursion for iteration can keep growing the stack.
 
@@ -151,8 +151,8 @@ fn main() -> i32 {
 }
 ```
 
-The holes take full expressions. More on strings — including why there is a `builder` and when `+` is allowed — in chapter [07](07-strings-and-text.md).
+The holes take full expressions. Chapter [07](07-strings-and-text.md) explains `builder` and why string concatenation with `+` is rejected.
 
 ---
 
-That is the whole scalar core. Next: shaping data — structs, sum types, and `match`.
+The next chapter introduces structs, sum types and `match`.

@@ -50,7 +50,7 @@ fn main() -> Result<(), Error> {
 
 `json.decode<User>(...)` のような呼び出し形式は意図的に排除されています。Align では式の中で型引数を指定する構文をサポートしていないためです。変数への型注釈がパース対象の型を決定し、`?` 演算子と組み合わせることで自然なコードとして読み下せます。
 
-不正な JSON フォーマット、必須フィールドの欠落、型の不一致、範囲外の数値など、これらはすべて `Err` として返されます。プログラムがパニック（クラッシュ）を起こすことも、気づかないうちに誤った値として処理されることもありません。
+入力の文法エラー、フィールドの欠落、型の不一致、数値の範囲超過は `Err` を返します。
 
 ```align
 r: Result<User, Error> := json.decode("{\"id\": oops}")
@@ -90,6 +90,34 @@ fn main() -> Result<(), Error> {
 ```
 
 `soa<User>`（[11 章](11-data-oriented.md)）は、フィールドごとに連続した列を持ちます。デコーダは **JSON を読みながら列を構築する**ので、中間に構造体の配列を作ってから転置する必要がありません。エスケープのない文字列フィールドは入力テキストを借用し、選択されたエスケープ文字列は arena 内で一度だけデコードされます。列のライフタイムは arena と共通です。
+
+## 借用テキストと所有テキストを選ぶ
+
+デコード結果を入力より長く保持するなら、フィールドを `string` にします。所有レコードの配列や `array<string>` をルートとするデコードにも対応しています。
+
+```align
+import core.json
+
+User { name: string, age: i64 }
+
+fn load_users() -> Result<array<User>, Error> {
+    input := "[{\"name\":\"Ada\",\"age\":37}]".clone()
+    users: array<User> := json.decode(input)?
+    return Ok(users)
+}
+
+fn main() -> Result<(), Error> {
+    users := load_users()?
+    print(users[0].name)    // Ada — input has already been dropped
+    names: array<string> := json.decode("[\"Ada\",\"Lin\"]")?
+    print(names[1])         // Lin — indexing borrows str from names
+    return Ok(())
+}
+```
+
+デコーダーは、arena 内でも各所有文字列と配列本体を独立して確保し、通常の再帰的な Drop で解放します。完全に所有された結果は、入力やその arena のライフタイムを保持しません。借用テキストをデコードしてから、残すフィールドを1つずつ clone する必要がなくなります。
+
+対応済みの再帰的なレコード構造では、optional なテキストや配列を含めて `str` と `string` を混在できます。`string` はそれぞれのバイト列を所有します。エスケープのない `str` は入力を借用し、エスケープを含む `str` には明示的な外側の arena が必要です。arena がないと、選択されたエスケープ付き `str` のデコードは `Error.Code(1)` を返します。混在する結果は入力と外側の arena の両方に依存します。配列本体を所有していても、借用テキストを所有することにはなりません。どちらの形式も、エンコード結果は独立した所有文字列になります。対応する型とエラー規則の全体は [JSON の設計](../../impl/core-design/ja/json.md)を参照してください。
 
 ## JSON プログラムのかたち
 

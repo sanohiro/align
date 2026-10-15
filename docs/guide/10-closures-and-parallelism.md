@@ -42,9 +42,9 @@ fn main() -> i32 {
 
 Current limits (implementation in progress): a lambda bound to a value needs typed parameters, and returning a bare function value is still deferred. Function values can be stored in structs and homogeneous arrays/slices; named and non-capturing values are freely reusable, while escape analysis rejects a frame-capturing value that would outlive its environment.
 
-## Purity is inferred — and parallelism requires it
+## Purity is inferred — and `par_map` requires it
 
-The compiler infers, for every function, whether it is **Pure** (no I/O, no rng, no FFI, and no mutation of external state it does not own — updating a value passed as an explicit `borrow mut` parameter still counts as Pure, since the caller handed it over for exactly that). You never annotate it; you can't get it wrong. You only notice when it protects you:
+The compiler infers whether each function is **Pure**: no I/O, RNG, FFI or mutation of external state it does not own. Updating an explicit `borrow mut` parameter still counts as Pure. No purity annotation is written. This example fails because the callable passed to `par_map` performs I/O:
 
 ```align
 fn show(x: i64) -> i64 {
@@ -77,9 +77,9 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`par_map(f)` runs across a persistent worker-thread pool and returns an owned `array<R>`. For an accepted Pure callable, its values and result order match `map(f).to_array()`. This is the complete sequential equivalent: a bare `map(f)` is an unfinished pipeline. Worker completion order does not change the array order, but scheduling overhead and result allocation remain part of the parallel operation.
+`par_map(f)` produces an owned `array<R>`. For an accepted Pure callable, its values and result order match `map(f).to_array()`. This is the complete sequential equivalent: a bare `map(f)` is an unfinished pipeline. Supported range kernels choose between caller-only execution and a persistent worker pool at runtime. Worker completion order does not change the array order; materialization and scheduling still cost work. A supported direct integer `par_map(f).sum()` can instead select `range-reduce`, avoiding a full intermediate result array. Check the form with `explain-opt`; a range-kernel report does not prove workers actually ran.
 
-And you should: **`par_map` earns its keep only when `f` is expensive.** The range kernel still has setup and scheduling overhead, while sequential `map` fuses into a vectorized loop — for cheap arithmetic, plain `map().sum()` is typically *faster*. Measure before reaching for it. Direct-source `par_map` with Copy-capturing closures, supported scalar maps and filters, and supported field/projection forms use range kernels. Filtered forms may evaluate a Pure predicate again during count-and-fill processing. Unsupported forms fall back to sequential execution; Move captures remain rejected. Use `alignc explain-opt` to inspect the selected path.
+Measure `par_map` against the complete sequential equivalent. Input size, work per element, allocation, memory bandwidth and available workers all affect the result. Setup and scheduling can dominate short or cheap work; a fused sequential pipeline may vectorize and be faster. Direct-source `par_map` with Copy-capturing closures, supported scalar maps and filters, and supported field/projection forms use range kernels. Filtered forms may evaluate a Pure predicate again during count-and-fill processing. Unsupported forms fall back to sequential execution; Move captures remain rejected. Use `alignc explain-opt` to inspect the selected path and chapter [26](26-performance.md) for the measurement procedure.
 
 ## `task_group` — task parallelism
 
@@ -89,7 +89,7 @@ For heterogeneous work — do these three things at once, then combine:
 fn main() -> Result<(), Error> {
     base: i64 := 100
     task_group {
-        a := spawn(fn { base + 5 })     // runs on a real thread
+        a := spawn(fn { base + 5 })     // becomes eligible for worker execution
         b := spawn(fn { base * 2 })
         wait()                          // join everything spawned in this group
         print(a.get() + b.get())        // 305
@@ -98,12 +98,14 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`spawn(fn { ... })` starts a task and returns a handle; `wait()` joins all of them; `.get()` reads a result after the join. The block is the lifetime: tasks cannot outlive their `task_group`, structurally — no detached threads, no forgotten joins, because the scope won't let you write them.
+`spawn(fn { ... })` starts a task and returns a handle; `wait()` joins the group; `.get()` reads a result after a successful join. Tasks cannot outlive their `task_group`; leaving the scope, including an early exit, joins remaining tasks.
 
 The task is eligible to run before `spawn` returns, even when it is the only task. A busy worker
 pool can delay its start. A captured view shares its original bytes: keep that backing unchanged
 and alive until `wait`. Dropping or reassigning the task handle does not end this protection.
 Tasks may read shared views and modify storage they create themselves.
+
+Unlike `par_map`, spawned tasks may perform I/O and other impure work. `wait()` also helps execute its group's pending tasks, allowing nested groups to progress even when every worker is occupied. It cannot resolve a blocking cycle created by the program. Task results currently contain primitive Copy values, optionally through `Result`; returning an owned string or array from a task remains unsupported.
 
 Tasks that can fail return `Result`. Propagate a group failure with `wait()?`:
 
@@ -124,7 +126,7 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`wait()?` is the error boundary of the group: every task completes (no half-joined state), then the failure from the lowest spawn index propagates as an ordinary `Err`. Parallel error handling uses the same one operator as everything else.
+`wait()?` joins every task, then propagates the failure with the lowest spawn index as an ordinary `Err`. It uses the same propagation operator as sequential code.
 
 ## Which one, when
 
@@ -132,4 +134,4 @@ fn main() -> Result<(), Error> {
 - A few different jobs at once → `task_group`.
 - Everything else → sequential pipelines, which may use SIMD without additional worker threads (chapter [12](12-simd.md)).
 
-All of it visible in source: `par_map` and `spawn` are the only two words in the language that mean "another thread runs this."
+`par_map` and `spawn` mark explicit parallel work. Actual worker use depends on the operation and runtime scheduling.

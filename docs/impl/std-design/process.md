@@ -1,6 +1,5 @@
-This directory holds Opus-implementable design specs for std modules beyond the roadmap's
-prose. Authored by the main loop (Fable); these are the source of truth for implementing each
-module.
+This directory records the detailed `std` module designs that supplement the roadmap.
+These specifications define the contract for each module's implementation.
 
 # std.process — implementation design (M11)
 

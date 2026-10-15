@@ -23,7 +23,7 @@ fn main() -> i32 {
 }
 ```
 
-操作は `null`、`alloc`、`free`、`load`、`store`、`offset` の6つです。ポインタ演算子やポインタ経由のキャスト構文はなく、操作名で検索できます。`resource` 型の内部には `resource.from_raw`、`.into_raw`、`.view_from_raw` などの専用操作もありますが、その型自身の `unsafe` コードでしか使えません。`raw.null()` はネイティブ ABI に渡す明示的な null ポインタであり、通常の Align 値に null を追加するものではありません。
+raw ポインタの操作は `null`、`alloc`、`free`、`load`、`store`、`offset` です。`resource` 型には `resource.from_raw`、`.into_raw`、`.view_from_raw` などの内部表現操作もあり、その型の権限を持つ `unsafe` コードに限定されます。`raw.null()` はネイティブ ABI の null ポインタを作ります。
 
 `raw` 値を**保持して受け渡すこと**は安全です。`raw` は Copy 型なので、そのために `unsafe` は要りません。`raw.*` 操作を行うときにブロックが必要になります。
 

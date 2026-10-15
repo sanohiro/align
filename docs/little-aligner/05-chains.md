@@ -8,7 +8,7 @@
 scores.map(fn s { s + 5 }).where(fn s { s >= 60 }).count()
 ```
 
-**A1.** "Take the scores; add five to each; keep those at least sixty; count them." If you can read it, you can write it. That is the point of chains.
+**A1.** "Take the scores; add five to each; keep those at least sixty; count them." The stages follow the same order as the sentence.
 
 ---
 
@@ -48,7 +48,7 @@ xs.where(fn x { x > 0 }).map(fn x { x - 10 }).count()
 
 **Q6.** Does chaining `map` and `where` create a temporary array for each step?
 
-**A6.** No. `map` and `where` fuse with the ending: each element passes through the stages without an intermediate array. A chain ending in `sum` uses one loop. Materializing operations such as `scan`, `sort`, and `to_array` build an array; a later reduction reads that array in another pass. You can inspect the generated code with `alignc emit-llvm yourfile.align`.
+**A6.** No. `map` and `where` fuse with the ending: each element passes through the stages without an intermediate array. A chain ending in `sum` uses one loop. Materializing operations such as `scan`, `sort`, and `to_array` build an array; a later reduction reads that array in another pass. You can inspect the generated code with `alignc emit-llvm yourfile.align --stage optimized`.
 
 ---
 
@@ -86,7 +86,7 @@ print(active.sum())
 print(active.max())
 ```
 
-One visible allocation, two cheap reductions. (One day you'll want *many* aggregates over *groups* — that is chapter 10's `agg`.)
+One array allocation, then two reductions over it. Chapter 10's `agg` combines several aggregates per group.
 
 ---
 
@@ -112,7 +112,7 @@ fn double_into(src: slice<i64>, out dst: slice<i64>) {
 
 **A11.** The zero-allocation ending: results go into the slice `dst`, which must be the same length, and which the compiler proves doesn't overlap `src`. For the hot path that recycles buffers.
 
-`out` says that the caller provides the destination. The function writes into `dst` instead of allocating an array of its own. The destination for `map_into` is received through an `out` parameter like this one.
+`out` says that the caller provides the destination. The function writes into `dst` instead of allocating an array of its own. Here the destination for `map_into` is received through an `out` parameter. This ending preserves length: a preceding `where` is not supported, and a length mismatch stops the program. Use `to_array()` when filtering must produce a shorter array.
 
 ---
 

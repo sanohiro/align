@@ -1,6 +1,5 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, Move/effect classification, error policy, pitfalls, test
-anchors). Authored by the main loop (Fable).
+This directory records the per-area design of the `core` library: signatures,
+ownership and effect classification, error policy, pitfalls, and related tests.
 
 # core — json
 
@@ -494,7 +493,7 @@ the few boundaries that remain:
   `sum` / `count` / `reduce` / `any` / `all` / `min` / `max`; only materializing terminals stay out (by
   design — they would defeat streaming).
 
-  **J5 safety boundary — Request 6 design gate (implementation pending).** A scanner reuses one
+  **J5 safety boundary — Request 6 (implemented).** A scanner reuses one
   row slot for every input value and has no per-row arena or `Drop` transition. Therefore the row
   schema must be recursively **Copy**: `json.scan` accepts a row only when the canonical recursive
   `DropPlan` reports no `Drop` for the complete reachable struct, option, and union graph. This is a

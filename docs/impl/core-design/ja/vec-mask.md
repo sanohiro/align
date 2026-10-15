@@ -1,5 +1,5 @@
-このディレクトリには、`core` ライブラリの各領域について、`../std-design/` と同等の粒度（シグネチャ、Move/effect の分類、エラー方針、落とし穴（Pitfalls）、テストアンカー）で記述された公式な設計ドキュメントを収めている。
-執筆はメインループ（Fable）が担当している。
+このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
+シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
 
 # core — vecN / maskN / align(N)
 
@@ -7,13 +7,13 @@
 
 ## Overview
 
-明示的な固定幅 SIMD 層である（draft §9）。ここでの方針はすべての API 選択の基盤となるため、まずはその方針から述べる。**パイプライン処理こそが幅に依存しないメインパス**（自動でベクタライズされ、スケーラブルな ISA にも対応する）であり、`vecN<T>` / `maskN<T>` は **固定幅カーネルの escape hatch（避難口）** である。MIR が保持するのは vectorization を可能にするための *プロパティ* であり、ハードコードされたベクタ幅ではない — ベクタ幅は最終的にバックエンドが決定する事項である（決定済、2026-07-02 の内部レビュー）。この領域のいかなる実装も、ベクタ幅に関する仮定をメインパスへと漏らしてはならない。
+明示的な固定幅 SIMD 層である（draft §9）。ここでの方針はすべての API 選択の基盤となるため、まずはその方針から述べる。**パイプライン処理こそが幅に依存しないメインパス**（自動ベクタ化の対象であり、将来のスケーラブルな ISA にも幅を固定せず対応できる）であり、`vecN<T>` / `maskN<T>` は **固定幅カーネルの escape hatch（避難口）** である。MIR が保持するのは vectorization を可能にするための *プロパティ* であり、ハードコードされたベクタ幅ではない — ベクタ幅は最終的にバックエンドが決定する事項である（決定済、2026-07-02 の内部レビュー）。この領域のいかなる実装も、ベクタ幅に関する仮定をメインパスへと漏らしてはならない。
 
 ## Signatures (verified)
 
 ```text
 v: vecN<T> := [a, b, ...]        // N ∈ {2,4,8,16}; T numeric; literal under annotation
-v + w, v - w, v * w, v / w, v % w    // lane-wise, one instruction each
+v + w, v - w, v * w, v / w, v % w    // レーン単位; 命令選択はターゲット依存
 v + s / s + v                        // scalar broadcasts (either side; literal or typed binding)
 v == w, v > w, v < w, ...        -> maskN<T>
 v[i]                             -> T            // lane read, constant index
@@ -21,11 +21,12 @@ v[i] = x                                          // lane write (mut binding)
 v.min() / v.max()                -> T            // horizontal reduce
 a.min(b) / a.max(b)              -> vecN<T>      // element-wise
 v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
+v.exp()/exp2()/log()/log2()/log10()             // レーン単位の float math; scalarize され得る
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
 select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
                                                   // m: レーン数とレーン幅が一致する任意の mask
-v.sum_where(m)                   -> T            // masked reduction
+v.sum_where(m)                   -> T            // masked reduction; 同じ構造的 mask 規則
 
 s.load(i)                        -> vecN<T>      // N consecutive slice elems; bounds-checked
 s.store(i, v)                                     // through an out/mut slice; bounds-checked
@@ -36,7 +37,16 @@ align(N) Struct { ... }                           // over-align struct; stride p
 
 ## Type & ownership classification
 
-`vecN<T>` と `maskN<T>` は **Copy 可能なスカラークラスの値**（レジスタサイズの集約データ）である。自由に渡し、返し、格納することができる。move / drop / escape の経路には決して乗らない。`maskN<T>` は型として名前を指定できる（アノテーション、引数、戻り値など）。`align(N)` は型ではなく属性であり、`layout(C)` と組み合わせる場合どちらの順序でも合成可能である。
+`vecN<T>` と `maskN<T>` は **Copy 可能なスカラークラスの値**（レジスタサイズの集約データ）である。自由に渡し、返し、格納することができる。move / drop / escape の経路には決して乗らない。`maskN<T>` は型として名前を指定できる（アノテーション、引数、戻り値など）。mask の要素型は名前を付けるためのものであり、機械表現は `<N x i1>` である。`select` と `sum_where` は対象ベクタとレーン数・レーンのビット幅が一致する mask を受け取る。この判定は `align_sema::mask_gates_vector` に集約され、sema、checked-HIR record validator、MIR producer validator が共有する。
+
+`align(N)` は型ではなく属性であり、`layout(C)` と組み合わせる場合どちらの順序でも合成可能である。
+
+一つのベクタ演算が一つの機械命令になるとは限らない。LLVM の命令選択はレーン型・幅・
+ターゲットに依存し、ベクタ命令、複数命令、スカラーコードのいずれにもなり得る。
+上記の五つの初等関数は LLVM へ vector intrinsic として渡る。
+`emit-llvm --stage optimized` と `explain-opt` で命令選択前の状態を確認する。
+provider のない retained vector IR は後段でも scalarize され得るため、最終的な
+machine SIMD は出力 object の検査で確かめる。[Plan 75](../../75-portable-math-plan.md) がこの境界を定める。
 
 ## Effects
 

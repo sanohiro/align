@@ -1,6 +1,5 @@
-This directory holds Opus-implementable design specs for std modules beyond the roadmap's
-prose. Authored by the main loop (Fable); these are the source of truth for implementing each
-module.
+This directory records the detailed `std` module designs that supplement the roadmap.
+These specifications define the contract for each module's implementation.
 
 # std.crypto — implementation design (M11)
 
@@ -26,16 +25,15 @@ already-admitted secret material MUST be constant-time with respect to secret co
 (open-questions std.crypto — no secret-dependent wrapper branch or memory index; CMOV/bitwise
 only). Public lengths, algorithm identifiers, formats, allocation outcomes, and setup-validation
 results are outside that guarantee. In particular, key import/parser/provider-validation is a
-trusted setup operation, not an attacker-queryable timing oracle. This is the one domain where
-Align's branchless machinery is a CORRECTNESS requirement, not a perf choice.
+trusted setup operation, not an attacker-queryable timing oracle. Here, branchless execution
+is a correctness requirement.
 
-**Strategy**: **borrow the vetted engine**. AEAD (aes_gcm, chacha20_poly1305), hashes (sha256/512),
-KDF (hkdf, argon2id), hmac → FFI-wrap a constant-time-audited C library — inheriting its
-constant-time guarantees is far safer than self-hosting crypto and re-proving CT.
-`constant_time_equal` is the ONE trivial self-host (a branchless byte-diff-OR reduction — Align's
-`where`/mask machinery makes it natural and it's simple enough to audit). `crypto.random` → the OS
-CSPRNG (getrandom/getentropy — the rand.seed source, but here for key material, exposed as
-crypto-grade).
+**Strategy:** use an audited C library through FFI for AEAD (aes_gcm, chacha20_poly1305),
+hashes (sha256/512), KDF (hkdf, argon2id), and hmac. This keeps the primitive implementations
+and their constant-time analysis in the external library; the wrapper must preserve those
+properties. Only `constant_time_equal` is implemented locally, as a branchless byte-diff-OR
+reduction. `crypto.random` uses the OS CSPRNG (getrandom/getentropy, also used by `rand.seed`)
+for key material.
 
 **Engine: OpenSSL libcrypto (EVP), decided 2026-07-07** (recorded in `open-questions.md` Settled;
 supersedes this doc's original "libsodium recommended"). Rationale, converged from independent

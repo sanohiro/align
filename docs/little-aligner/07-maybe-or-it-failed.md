@@ -43,6 +43,8 @@ We will write `safe_head` ourselves in Q20.
 **Q7.** Here is a function that can fail, calling another that can fail:
 
 ```align
+import std.fs
+
 fn load(path: str) -> Result<i64, Error> {
     data := fs.read_file(path)?
     return Ok(data.len())
@@ -57,7 +59,7 @@ What is the `?` doing?
 
 **Q8.** So who eventually *handles* the error?
 
-**A8.** Whoever can. Each layer either passes it up (`?`) or sits down with a `match`. At the very top, `main() -> Result<(), Error>` turns an escaped `Err` into a non-zero exit code. The error travels as a value the whole way — no invisible unwinding, no catch-at-a-distance.
+**A8.** Whoever can. Each layer either passes it up (`?`) or sits down with a `match`. At the very top, `main() -> Result<(), Error>` maps an escaped `Err` to the exit status described in Q10. The error travels as a value through each caller. There is no exception unwinding.
 
 ---
 
@@ -73,7 +75,7 @@ fs.write_file("log.txt", "hi")
 
 **Q10.** What is in the built-in `Error`?
 
-**A10.** The categories the OS speaks — `NotFound`, `Invalid`, `Denied`, `Timeout` — and `Code(n)` for the rest, where `n` is an `i32`. Five arms, so `match` on it like any sum type and name all five (chapter 6 taught you how; `Error` is just a sum type with a badge). Let one escape `main` and it becomes the exit status: `1`, `2`, `3`, `4` in that order, and `Code(c)` exits `c`.
+**A10.** The categories the OS speaks — `NotFound`, `Invalid`, `Denied`, `Timeout` — and `Code(n)` for the rest, where `n` is an `i32`. Match these five variants just as we did in chapter 6. Let one escape `main` and it becomes the exit status: `1`, `2`, `3`, `4` in that order, and `Code(c)` exits `c`.
 
 ---
 
@@ -155,9 +157,9 @@ Only the parse result uses `else 0`. A file-reading error still returns to the c
 
 ---
 
-**Q19.** Why not write `fs.read_file(path) else ""` too?
+**Q19.** Why not write `fs.read_file(path) else "".clone()` too?
 
-**A19.** You may only if “unreadable file means empty input” is truly the application's policy. `else` is not a shorter `?`; it answers a different question. Choose by meaning, never by punctuation count.
+**A19.** You may if “unreadable file means empty input” is the application's policy. The fallback must be an owned `string`, matching the successful result; the literal `""` alone is a borrowed `str` and does not type-check. Chapter 8 explains `.clone()`. This choice also loses the distinction between an unreadable file and an empty one. `else` is not a shorter `?`; choose by meaning.
 
 ---
 

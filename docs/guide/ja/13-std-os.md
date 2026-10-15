@@ -14,6 +14,7 @@
 import std.fs
 
 pub fn main(args: array<str>) -> Result<(), Error> {
+    if args.len() != 2 { return Err(Error.Invalid) }
     fs.write_file(args[1], "hello, disk\n")?
     if fs.exists(args[1]) { print("written") }
     data := fs.read_file(args[1])?      // whole file → owned string
@@ -24,6 +25,12 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 ```
 
 `read_file`、`write_file`、`exists`、`remove`、`read_dir` は、ハンドルを管理せずに1回の呼び出しで使える API です。`write_file` は `str`、`builder`、`buffer` のバイト列を受け取ります。`read_dir` は名前の一覧を `array<string>` として返します。テキストの読み込みでは UTF-8 を検証し、不正なら `Error.Invalid` を返します。バイナリデータには後述のストリーミング API を使います。
+
+## 通常ファイルと位置指定の読み込み
+
+通常ファイルだけを受け付ける逐次読み込みの `reader` には `fs.open_regular(path)` を使います。オフセットを指定して読む場合は、`fs.open_ro_regular(path)` が `pread` と `len` を備えた通常の所有 `file` ハンドルを返します。どちらも Linux/macOS に対応し、シンボリックリンクを含む通常のパス解決を行い、開いたディスクリプタ自体を検査します。ディレクトリ、デバイス、FIFO は `Error.Invalid` になり、FIFO の書き手を待ちません。受け付けたディスクリプタを Drop まで保持するため、その後パス名が置き換わっても開いたハンドルの参照先は変わりません。
+
+`pread` は指定オフセットから呼び出し側の可変 buffer に読み込み、実際のバイト数を返します。EOF ではゼロです。読み取り専用のハンドルへの `pwrite` は `Error.Denied` になります。パスの閉じ込めや内容の固定を提供する操作ではありません。シンボリックリンクを拒否する必要がある場合は、後述の起点以下を開く操作を使います。[ファイルシステムの契約](../../impl/std-design/ja/fs.md)に詳細があります。
 
 ## 既存のファイルを置き換えずに公開する
 
@@ -54,7 +61,7 @@ fs.rename_no_replace(source: str, destination: str) -> Result<(), Error>
 
 ## シンボリックリンクをたどらずに通常ファイルを開く
 
-シンボリックリンクをたどる操作を拒否したい場合には、次の2つの関数を使います。
+シンボリックリンクをたどる操作を拒否したい場合には、次の関数を使います。
 
 ```text
 fs.open_beneath(root: str, relative: str) -> Result<reader, Error>
@@ -63,7 +70,7 @@ fs.create_exclusive_beneath(root: str, relative: str) -> Result<writer, Error>
 ```
 
 2番目の引数には、空でない相対パスを指定します。使えるパスの形式には制限があります。
-どちらの関数も、起点と相対パスの全体を検証してからディレクトリのファイルディスクリプタを
+これらの関数は、起点と相対パスの全体を検証してからディレクトリのファイルディスクリプタを
 保持して走査します。起点、途中のディレクトリ、末尾のいずれでもシンボリックリンクをたどりません。
 `open_beneath` は、開く前後で同じ通常ファイルであることを確認し、所有権を持つ `reader` を
 返します。この呼び出し自体はファイルの内容を読みません。`create_exclusive_beneath` は保持した

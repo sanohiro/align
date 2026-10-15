@@ -77,7 +77,7 @@ Still a `soa<User>` — you keep thinking in `User`; only the memory turned.
 
 **Q9.** May we still have alice back — the whole row?
 
-**A9.** `u := s[0]` gathers one `User` from the three columns. Costlier than a column read (three fetches instead of one) — the sideways layout charges for *rows* what it saved on *columns*.
+**A9.** `u := s[0]` gathers one `User` from the three columns. Reading the whole row means accessing all three columns, rather than just the age column.
 
 ---
 
@@ -93,15 +93,15 @@ Still a `soa<User>` — you keep thinking in `User`; only the memory turned.
 
 ---
 
-**Q12.** When does the sideways layout *lose*?
+**Q12.** When might AoS suit the work better?
 
-**A12.** When you touch whole rows, rarely and singly — a config record, one request. Gathering every field re-scatters what SoA gathered. Rows you handle whole: AoS. Columns you scan in bulk: SoA.
+**A12.** When you usually handle a whole record at a time — a config record, one request. AoS keeps its fields together. SoA is useful when the repeated work scans selected columns.
 
 ---
 
 **Q13.** The data arrives as JSON. Must we build rows first and turn them after?
 
-**A13.** No — decode *directly* sideways:
+**A13.** No — decode *directly* sideways. With `import core.json` at file scope, inside the arena:
 
 ```align
 s: soa<User> := json.decode(data)?
@@ -125,7 +125,7 @@ The parser fills columns as it reads, without an intermediate array of rows. Une
 
 **Q16.** Is `rows.to_soa()` free?
 
-**A16.** No. It allocates columns and transposes every row into them. The win comes afterward: several hot column scans repay that one visible conversion. Turning data sideways for one tiny whole-row operation would spend more than it saves.
+**A16.** No. It allocates columns and transposes every row into them. Repeated column scans may repay that conversion. For one small whole-row operation, the conversion adds work with little to gain.
 
 ---
 
@@ -170,7 +170,7 @@ Read the shape of it: `map(fn o { … })` is handed a whole **row**, so this pip
 
 **Q22.** Analyze only rows 100 through 199.
 
-**A22.** Slice the columns or the SoA window before reducing. A projected column is an ordinary slice:
+**A22.** Slice the projected columns before reducing. A projected column is an ordinary slice; slicing the complete SoA as `s[100..200]` is not supported:
 
 ```align
 s.price[100..200].sum()
@@ -182,7 +182,7 @@ The half-open range contains one hundred prices.
 
 **Q23.** You need one customer's entire record after finding its index. Is gathering one row a failure of SoA?
 
-**A23.** No. `s[i]` gathers it. A layout is chosen for the dominant work, not sworn as a religion. Occasional row gathers are the price paid for cheap repeated column scans.
+**A23.** No. `s[i]` gathers it. Choose the layout for the work you do most. Occasional row gathers can fit a program that mostly scans columns.
 
 ---
 

@@ -1,4 +1,5 @@
-このディレクトリには、ロードマップの本文ではカバーしきれない `std` モジュールについて、Opus がそのまま実装に着手できる粒度の設計仕様を収めている。執筆はメインループ（Fable）が担当しており、各モジュールの実装においてこれが信頼できる情報源（source of truth）となる。
+このディレクトリは、ロードマップを補う `std` モジュールの詳細な設計仕様をまとめる。
+各モジュールの実装は、この仕様に従う。
 
 # std.crypto — implementation design (M11)
 
@@ -17,9 +18,9 @@ SHA-1 を耐衝突性が必要な安全上の識別に採用しない。スト�
 
 ## Overview
 
-`crypto.random`、`sha256` / `sha512`、`blake3`、`hmac`、`hkdf`、`argon2id`、`aes_gcm`、`chacha20_poly1305`、`constant_time_equal`（draft §18.2）。**譲れない要件: admission 済み secret material を扱う cryptographic primitive path は、secret content に関してすべて constant-time でなければならない**（open-questions std.crypto — wrapper に secret-dependent branch/memory index を置かず、CMOV/bitwise のみ）。public length、algorithm identifier、format、allocation outcome、setup-validation result はこの保証外である。特に key import/parser/provider-validation は trusted setup operation であり、attacker-queryable timing oracle ではない。この領域は、Align の分岐なし機構がパフォーマンスのためだけでなく、**正しさの要件** そのものになる唯一の領域である。
+`crypto.random`、`sha256` / `sha512`、`blake3`、`hmac`、`hkdf`、`argon2id`、`aes_gcm`、`chacha20_poly1305`、`constant_time_equal`（draft §18.2）。**譲れない要件: admission 済み secret material を扱う cryptographic primitive path は、secret content に関してすべて constant-time でなければならない**（open-questions std.crypto — wrapper に secret-dependent branch/memory index を置かず、CMOV/bitwise のみ）。public length、algorithm identifier、format、allocation outcome、setup-validation result はこの保証外である。特に key import/parser/provider-validation は trusted setup operation であり、attacker-queryable timing oracle ではない。ここでは、分岐なしの実行は正しさの要件である。
 
-**戦略**: **検証済みの計算エンジンを外部から借りる**。AEAD（aes_gcm、chacha20_poly1305）、ハッシュ（sha256/512）、KDF（hkdf、argon2id）、hmac は、constant-time 性が監査済みの C ライブラリを FFI でラップする — 暗号処理を自前で実装して constant-time を証明し直すよりも、実績あるライブラリの constant-time 保証をそのまま継承するほうがはるかに安全だからである。自前実装するのは `constant_time_equal` ただ一つである（分岐なしのバイト単位の差分 OR 縮約であり、Align の `where` / mask 機構に素直に乗るうえ、容易に監査できるほど単純であるため）。`crypto.random` は OS の CSPRNG（getrandom / getentropy — `rand.seed` のソースと同じものだが、ここでは鍵材料向けの crypto グレードとして公開する）。
+**方針:** AEAD（aes_gcm、chacha20_poly1305）、ハッシュ（sha256/512）、KDF（hkdf、argon2id）、hmac は、監査済みの C ライブラリを FFI 経由で利用する。プリミティブの実装と constant-time 性の分析を外部ライブラリに集約し、ラッパーでもその性質を維持する。自前実装は、分岐なしでバイト差分を OR 縮約する `constant_time_equal` のみ。`crypto.random` は鍵材料の生成に OS の CSPRNG（`rand.seed` と同じ getrandom / getentropy）を使う。
 
 **エンジン: OpenSSL libcrypto(EVP)、2026-07-07 決定**（`open-questions.md` Settled に記録。本ドキュメント当初の「libsodium 推奨」を置き換える）。独立したセキュリティレビューと依存関係レビューが収束した根拠は次のとおり。libcrypto は必要なプリミティブを *すべて* ネイティブにカバーする — HKDF と Argon2id も `EVP_KDF` 経由で提供される — 単一の信頼境界（trust surface）に収まり、エンジンの混在も、自前 HKDF の統合による隙間（継ぎ目）も生じない。これらの機能の大部分は **OpenSSL ≥ 3.0** で動作する。Argon2id には **OpenSSL ≥ 3.2** で追加された `ARGON2ID` provider が必要であり、存在しない場合は `Error.Code` を返す。ドライバは使用した Crypto / TLS capability が必要とする場合に限り `-lcrypto` をリンクとして追加する。このモジュールでは `crypto.random` と `constant_time_equal` はリンクを要求しない。さらに AES-GCM はサポート対象環境において constant-time である（AES-NI / PCLMULQDQ のハードウェア経路、constant-time な vpaes フォールバック — x86-64 / aarch64 で T-table AES を使うことは決してない）。そのうえ、libsodium の `crypto_aead_aes256gcm_*` と異なり、ハードウェア要件によって API が制限（ゲート）されることがない。libsodium は抽象的には依然として優れたエンジンだが、システム全体の統合面（継ぎ目）で劣る（1.0.18 クラスのリリースには HKDF が無く、AES-GCM がハードウェアゲートされる）。**blake3 は決定記録付きで見送る**: これを提供するシステムの基本エンジンが無く（Debian に `libblake3-dev` は無い。OpenSSL にも BLAKE3 は無い）、自前実装は原則 P5 に反する。また、BLAKE2b を `blake3` という別名として扱うことは禁止されている（誤解を招く API となるため）。システムライブラリとして普及すれば再び候補になるか、あるいは `pkg` レイヤーでの提供対象となる。
 
