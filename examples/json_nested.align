@@ -1,13 +1,13 @@
-// Nested-struct JSON decode + encode (REST-gateway runway, Slice A). A struct field may itself be
-// a struct; `json.decode` recurses into the nested object and `json.encode` renders it back, so a
-// nested record round-trips byte-for-byte (declaration order). This is the shape an OpenAI-style
-// chat-completions response needs (`usage: Usage`, `choices[].message: Message`).
+// Nested-struct JSON decode + encode. A struct field may itself be a struct;
+// `json.decode` recurses into the nested object and `json.encode` renders fields in declaration
+// order. Whitespace, input field order and unknown keys are not preserved. This is the shape an
+// OpenAI-style chat-completions response needs (`usage: Usage`, `choices[].message: Message`).
 import core.json
 
 Usage { prompt_tokens: i64, completion_tokens: i64 }
 Message { role: str, content: str }
 Choice { index: i64, message: Message }
-// A single choice for brevity — array-of-struct fields (`choices: array<Choice>`) are Slice C.
+// A single choice for brevity; array-of-struct fields (`choices: array<Choice>`) are also supported.
 Response { id: str, model: str, choice: Choice, usage: Usage }
 
 fn parse(s: str) -> Result<Response, Error> {

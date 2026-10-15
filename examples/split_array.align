@@ -3,8 +3,8 @@
 // a and b into the returned tuple (their source slots are nulled), and the destructure transfers
 // ownership to `xs`/`ys`, which are freed at scope exit.
 //
-// An owned tuple is a temporary here: it is returned and destructured, but not bound to a
-// variable (`t := split()`) or passed as a parameter — those are a later slice.
+// This example destructures the returned tuple directly. A tuple may also be bound to a local
+// or passed as a parameter; tuple_field_move.align shows moving one field out of a bound tuple.
 fn split() -> (array<i64>, array<i64>) {
   a := [1, 2, 3].to_array()
   b := [10, 20].to_array()

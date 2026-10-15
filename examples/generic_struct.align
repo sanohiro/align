@@ -1,7 +1,7 @@
 // Generic structs (4c-5): a struct may take type parameters — `Pair<T>` — and is monomorphized
 // per concrete instantiation, just like a generic function. The type arguments are inferred from
 // the field values at the literal (no turbofish); `Pair<i32>` can also be written as a parameter
-// or annotation type. A field type must be Copy (a scalar or `str`) after substitution.
+// or annotation type. After substitution, fields follow the ordinary struct ownership rules.
 
 Pair<T> { a: T, b: T }
 

@@ -1,6 +1,6 @@
 // A written mask type (M6). A comparison `a > b` yields a `maskN<T>` — spelled like `vecN<T>`,
-// where the element matches the compared vectors. Naming the type lets a mask be a `let`
-// annotation, a function parameter, or a return type, so it can be threaded through code (here
+// where the element matches the compared vectors. The type can appear in a binding annotation,
+// a function parameter, or a return type, so a mask can be threaded through code (here
 // `blend` takes the mask and selects between two vectors lane-wise).
 
 fn blend(m: mask4<i32>, a: vec4<i32>, b: vec4<i32>) -> vec4<i32> = select(m, a, b)

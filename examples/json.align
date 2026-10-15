@@ -1,6 +1,6 @@
-// JSON encode (M5). `json.encode(s)` turns a flat struct into a JSON object `str`,
-// built with the runtime string builder. A struct may now hold `str` fields (which must
-// hold region-0 strings — literals / non-arena strings); str fields are JSON-escaped.
+// JSON encode. `json.encode(s)` borrows the source and returns `Result<string, Error>`.
+// The successful output owns its bytes independently of the source, including inside an arena.
+// Text fields are JSON-escaped; this example deliberately maps an encoding error to exit 1.
 import core.json
 
 User { id: i64, name: str, active: bool }

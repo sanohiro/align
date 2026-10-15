@@ -1,6 +1,6 @@
 // Fallible tasks + the wait()? error boundary (slice ④c). A task closure may return
-// Result<R, Error>; wait()? joins all and propagates the first failing task's error out of the
-// enclosing function. After wait()?, get() yields the Ok results (errors are already handled).
+// Result<R, Error>; wait()? joins all and propagates the lowest-spawn-index failure out of the
+// enclosing function, regardless of completion order. After wait()?, get() yields the Ok results.
 fn fetch(n: i64) -> Result<i64, Error> {
   if n < 0 { return Err(error(2)) }
   return Ok(n * 10)

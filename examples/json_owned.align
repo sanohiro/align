@@ -1,0 +1,26 @@
+// Owned JSON fields survive the input buffer: `string` owns its text, and `array<i64>` owns
+// its elements. Use `str` instead when the decoded text should borrow the input/explicit arena.
+import core.json
+
+Profile { name: string, scores: array<i64> }
+
+fn load_profile() -> Result<Profile, Error> {
+  input := "{\"name\":\"al\\u0069gn\",\"scores\":[10,20,12]}".clone()
+  profile: Profile := json.decode(input)?
+  // Returning moves the decoded owners; the local input is freed when this function exits.
+  return Ok(profile)
+}
+
+fn main() -> Result<(), Error> {
+  profile := load_profile()?
+  scores := profile.scores[..]
+  print(profile.name)         // align
+  print(scores.sum())         // 42; this slice borrows the decoded array
+
+  // Encoding borrows the record and returns an independent owned string. An exceeded byte cap
+  // returns Error.Invalid; `?` propagates it without publishing partial JSON.
+  encoded := json.encode_bounded(profile, 128)?
+  print(encoded)             // {"name":"align","scores":[10,20,12]}
+  print(profile.name)         // align; encoding did not consume the record
+  return Ok(())
+}

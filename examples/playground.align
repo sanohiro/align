@@ -9,8 +9,8 @@ User {
 fn process_users(users: slice<User>) -> f32 {
   // Completion test: try typing `users.` or test built-in functions like `where`
   total := users
-    .where(.active)
-    .score
+    .where(fn user { user.active })
+    .map(fn user { user.score })
     .sum()
 
   return total
@@ -26,5 +26,5 @@ fn main() -> i32 {
   // Format test: intentionally mess up indentation
   result := process_users([u1, u2])
 
-  return 0
+  return if result == 10.5 { 0 } else { 1 }
 }

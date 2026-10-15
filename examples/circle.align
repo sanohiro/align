@@ -1,5 +1,5 @@
-// Floating-point arithmetic. `print` is integer-only in M1, so the result is
-// observed through the exit code via a comparison.
+// Floating-point arithmetic. Compare the result and report it through the exit code:
+// 1 means the area lies between 12 and 13. `print` also accepts floating-point values.
 fn area(r: f64) -> f64 = r * r * 3.14159
 
 fn main() -> i32 {

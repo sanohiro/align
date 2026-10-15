@@ -1,5 +1,5 @@
 // The chunk-parallel pattern (draft.md §11): split an array into chunks, then `par_map` a
-// Pure function over each chunk. `process` takes a whole `slice<T>` chunk and reduces it; the
+// Pure function over each chunk. `chunk_sum` takes a whole `slice<T>` chunk and reduces it; the
 // per-chunk results are materialized into an `array<R>`, which a final reduction folds.
 // A direct chunks source is eligible for the generated whole-range kernel. This tiny sample stays
 // on the kernel's caller-only fast path; larger inputs schedule ranges across the worker pool.

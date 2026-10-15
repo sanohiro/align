@@ -1,6 +1,6 @@
-// JSON decode (M5). `json.decode(input)` parses a `str` into a struct, returning
-// Result<T, Error>. The target type T is inferred from the binding annotation through `?`
-// (`<T>` call syntax is future). M5 cut: a flat struct of int / bool fields.
+// JSON decode. `json.decode(input)` parses a `str`, returning Result<T, Error>.
+// The target type T is inferred from the binding annotation through `?`.
+// This example uses a flat struct of integer and boolean fields; json_nested.align shows nesting.
 import core.json
 
 User { id: i64, active: bool }
