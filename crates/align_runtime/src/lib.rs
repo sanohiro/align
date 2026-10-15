@@ -5823,6 +5823,12 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
     0
 }
 
+// Scalar roots and primitive-array roots share exactly this closed native target domain.
+fn json_scalar_tag_valid(tag: i32) -> bool {
+    matches!(tag, 1 | 2 | 4 | 8 | 0x10001 | 0x10002 | 0x10004 | 0x10008
+        | 0x101 | 0x204 | 0x208 | 0x810)
+}
+
 /// Decode one complete JSON array into an independent owned `{ptr,len}` (element count).
 /// Tags: int widths 1/2/4/8 with optional sign bit16, bool 0x101, floats 0x204/0x208,
 /// owned string 0x810. All other tags reject, including for an empty array.
@@ -5841,9 +5847,7 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     elem_tag: i32,
     out: *mut AlignStr,
 ) -> i32 {
-    if !matches!(elem_tag, 1 | 2 | 4 | 8 | 0x10001 | 0x10002 | 0x10004 | 0x10008
-        | 0x101 | 0x204 | 0x208 | 0x810)
-    {
+    if !json_scalar_tag_valid(elem_tag) {
         return 1;
     }
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
@@ -5941,32 +5945,42 @@ pub unsafe extern "C" fn align_rt_json_decode_array(
     0
 }
 
-/// Parse the WHOLE `input` as a single JSON scalar (number / bool) into the `out` scalar slot (JSON
-/// completeness T1b). `elem_tag` is the scalar encoding `(signed << 16) | (kind << 8) | byte-width`
-/// (kind 0 = int, 1 = bool, 2 = float; bit 16 = int sign) — the same tag a scalar *field* uses, so the
-/// shared per-scalar [`write_value`] applies the identical range / sign / float-width checks. Leading /
-/// trailing whitespace is allowed; any trailing non-whitespace is a decode error. Returns 0 on success,
-/// 1 on a malformed value, a type mismatch, or trailing garbage (leaving `out` as the caller-zeroed
-/// bytes). The value is copied out — the result borrows nothing from `input`.
+/// Parse one complete JSON int/float/bool/string. Tags are exactly int kind0 widths1/2/4/8
+/// with sign bit16 zero/one, bool0x101, float0x204/0x208, or owned string0x810. Returns 0 on
+/// success, 1 on invalid tag/UTF-8/value/trailing input. Results borrow neither input nor arena.
+/// String output is published only after EOF; failure leaves its header untouched and frees
+/// unpublished bytes. Numeric failure bytes are unspecified and must not be consumed.
 ///
 /// # Safety
-/// `input` must describe a valid byte range; `out` must point to `elem_tag`'s byte-width writable bytes.
+/// `input` must describe a valid byte range; `out` must be aligned and writable for the target
+/// scalar or 16-byte AlignStr. A successful nonempty string transfers one owned allocation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_json_decode_scalar(input: *const u8, input_len: i64, elem_tag: i32, out: *mut u8) -> i32 {
+    if !json_scalar_tag_valid(elem_tag) {
+        return 1;
+    }
     let src: &[u8] = unsafe { safe_slice(input, input_len) };
-    // A decoded value must not contain invalid UTF-8 (uniform with every other `json.decode` entry).
     if !validate_utf8(src) {
         return 1;
+    }
+    let mut p = JsonParser::new(src);
+    p.ws();
+    if elem_tag == 0x810 {
+        let Some(value) = p.owned_string_value() else { return 1; };
+        p.ws();
+        if p.pos != src.len() {
+            unsafe { align_rt_free(value.ptr.cast_mut()) };
+            return 1;
+        }
+        unsafe { out.cast::<AlignStr>().write(value) };
+        return 0;
     }
     let kind = (elem_tag >> 8) & 0xff;
     let width = (elem_tag & 0xff) as i64;
     let ed = JsonField { name_ptr: core::ptr::null(), name_len: 0, tag: elem_tag, offset: 0, sub: core::ptr::null(), opt_tag: -1 };
-    let mut p = JsonParser::new(src);
     let ok = (|| -> Option<()> {
-        p.ws();
         unsafe { write_value(&mut p, kind, width, &ed, out)? };
         p.ws();
-        // Trailing non-whitespace after the value is an error (a bare scalar decodes the whole input).
         (p.pos == src.len()).then_some(())
     })();
     if ok.is_none() { 1 } else { 0 }

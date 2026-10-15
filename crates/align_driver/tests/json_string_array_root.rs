@@ -1,4 +1,4 @@
-//! Voice V005: independent JSON string-array roots and canonical deep cleanup.
+//! Independent JSON owned-text roots and canonical cleanup (Plans183/203).
 #![cfg(unix)]
 #[path = "helpers/owned_fixture.rs"]
 mod owned_fixture;
@@ -131,15 +131,14 @@ fn execute(stage: &Path, programs: &[align_mir::Program], label: &str) {
     );
 }
 
-#[test]
-fn json_string_array_root_lifecycle_and_replay() {
-    owned_fixture::run("json_string_array_root_lifecycle_and_replay", |stage| {
-        std::fs::write(stage.join("model.align"), MODEL).unwrap();
+fn lifecycle_and_replay(name: &'static str, model: &str, main: &str) {
+    owned_fixture::run(name, |stage| {
+        std::fs::write(stage.join("model.align"), model).unwrap();
         let entry = stage.join("main.align");
-        std::fs::write(&entry, MAIN).unwrap();
+        std::fs::write(&entry, main).unwrap();
         let entry = entry.to_str().unwrap();
         let mut sources = SourceMap::new();
-        let checked = align_driver::check(&mut sources, entry, MAIN);
+        let checked = align_driver::check(&mut sources, entry, main);
         assert!(
             !checked.diags.has_errors(),
             "{}",
@@ -149,7 +148,7 @@ fn json_string_array_root_lifecycle_and_replay() {
             align_mir::lower_program_checked(&checked.hir, false, Some(&sources)).unwrap();
         execute(stage, &[program], "whole");
         let mut sources = SourceMap::new();
-        let built = align_driver::build_per_unit(&mut sources, entry, MAIN);
+        let built = align_driver::build_per_unit(&mut sources, entry, main);
         assert!(
             !built.diags.has_errors(),
             "{}",
@@ -170,7 +169,7 @@ fn json_string_array_root_lifecycle_and_replay() {
             let mut built = align_driver::build_package(
                 &mut sources,
                 entry,
-                MAIN,
+                main,
                 &cache,
                 align_driver::UnitReuse::Allowed,
             );
@@ -197,6 +196,11 @@ fn json_string_array_root_lifecycle_and_replay() {
 }
 
 #[test]
+fn json_string_array_root_lifecycle_and_replay() {
+    lifecycle_and_replay("json_string_array_root_lifecycle_and_replay", MODEL, MAIN);
+}
+
+#[test]
 fn json_string_array_root_rejects_invalid_source_and_view_escape() {
     owned_fixture::run(
         "json_string_array_root_rejects_invalid_source_and_view_escape",
@@ -219,7 +223,7 @@ fn json_string_array_root_rejects_invalid_source_and_view_escape() {
                     Some("not supported yet"),
                 ),
                 (
-                    "fn bad()->Result<string,Error> = json.decode(\"\\\"x\\\"\")",
+                    "fn bad()->Result<str,Error> = json.decode(\"\\\"x\\\"\")",
                     None,
                 ),
                 (
@@ -262,4 +266,136 @@ fn json_string_array_root_rejects_invalid_source_and_view_escape() {
             }
         },
     );
+}
+
+const STRING_MODEL: &str = r#"module model
+import core.json
+pub fn decode(input:str)->Result<string,Error> = json.decode(input)
+pub fn identity<T>(value:T)->T = value
+pub fn map(error:Error)->Error = error
+pub fn owned()->Result<string,Error> {
+  mut input:="\"plain\"".clone()
+  value:string:=json.decode(input)?
+  input="replaced".clone()
+  return Ok(value)
+}
+pub fn in_arena()->Result<string,Error> {
+  arena scratch {
+    text:="\"\\u304c\\u0000\"".clone_in(scratch)
+    value:string:=json.decode(text)?
+    return Ok(value)
+  }
+}
+pub fn controls(way:i64)->Result<string,Error> {
+  if way<0 {discard:=decode("\"lost\"")?;return Err(Error.Invalid)}
+  raw:=if way==0 {owned()} else {match way {1=>in_arena(),_=>loop {break owned()}}}
+  return identity(raw.map_err(map))
+}
+pub fn direct()->string = decode("\"direct\"") else {loop {}}
+pub fn early()->Result<string,Error> {
+  value:string:=json.decode({return Err(Error.Invalid); "\"never\""})?
+  return Ok(value)
+}
+pub fn once()->Result<string,Error> {
+  mut count:=0
+  value:string:=json.decode({count=count+1; "\"once\""})?
+  if count!=1 {return Err(Error.Invalid)}
+  return Ok(value)
+}
+"#;
+
+const STRING_MAIN: &str = r#"module main
+import model
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+fn equal(borrow value:string, expected:str)->bool = value[..]==expected
+fn exercise()->i32 {
+  mut way:=-1
+  loop {
+    if way==3 {break}
+    match model.controls(way) {
+      Ok(value)=>{
+        if way<0 {return 1}
+        if way==1 {
+          if value.len()!=4 || value[0..3]!="が" || value.bytes()[3]!=0 {return 2}
+        } else {if !equal(value,"plain") {return 3}}
+        if unsafe {align_rt_requested_live_bytes()}<=0 {return 4}
+      },
+      Err(error)=>{if way>=0 {return 5}}
+    }
+    way=way+1
+  }
+  mut value:=model.owned() else {return 6}
+  value=model.in_arena() else {return 7}
+  moved:=model.identity(value)
+  if moved.len()!=4 {return 8}
+  discarded:Result<string,Error>:=model.decode("\"discarded\"")
+  match model.decode("\"partial\" x") {
+    Ok(unexpected)=>{return 9},
+    Err(error)=>match error {Code(code)=>{if code!=1 {return 10}},_=>{return 11}}
+  }
+  match model.decode("false") {Ok(unexpected)=>{return 12},Err(error)=>{}}
+  match model.early() {Ok(unexpected)=>{return 13},Err(error)=>{}}
+  direct:=model.direct()
+  if !equal(direct,"direct") {return 14}
+  once:=model.once() else {return 15}
+  if !equal(once,"once") {return 16}
+  empty:=model.decode("\"\"") else {return 17}
+  if empty.len()!=0 {return 18}
+  fallback:=model.decode("invalid") else {"fallback".clone()}
+  if !equal(fallback,"fallback") {return 19}
+  if moved[0..3]!="が" || moved.bytes()[3]!=0 {return 20}
+  return 0
+}
+fn main()->i32 {
+  unsafe {align_rt_requested_live_reset()}
+  before:=unsafe {align_rt_alloc_count()}
+  free:=unsafe {align_rt_free_count()}
+  status:=exercise()
+  if status!=0 {return status}
+  count:=unsafe {align_rt_alloc_count()}-before
+  if count<=0 || unsafe {align_rt_free_count()}-free!=count || unsafe {align_rt_requested_live_bytes()}!=0 {
+    print(count);print(unsafe {align_rt_free_count()}-free);print(unsafe {align_rt_requested_live_bytes()});return 25
+  }
+  return 0
+}
+"#;
+
+#[test]
+fn json_string_root_lifecycle_and_replay() {
+    lifecycle_and_replay(
+        "json_string_root_lifecycle_and_replay",
+        STRING_MODEL,
+        STRING_MAIN,
+    );
+}
+
+#[test]
+fn json_string_root_refusals() {
+    owned_fixture::run("json_string_root_refusals", |stage| {
+        for (index, (body, expected)) in [
+            ("fn bad()->Result<str,Error> {value:string:=json.decode(\"\\\"x\\\"\")?;return Ok(value[..])}", "cannot return"),
+            ("fn bad()->Result<(),Error> {mut value:string:=json.decode(\"\\\"x\\\"\")?;view:=value[..];value=json.decode(\"\\\"next\\\"\")?;print(view);return Ok(())}", "invalidated borrow"),
+            ("fn bad()->Result<string,Error> = json.decode(missing())", "undefined function"),
+            ("fn bad()->Result<string,Error> = json.decode(17)", "str"),
+            ("fn bad()->Result<string,Error> = json.decode(\"\\\"x\\\"\",\"extra\")", "expects 1 argument"),
+            ("fn bad()->Result<char,Error> = json.decode(\"\\\"x\\\"\")", "not supported yet"),
+        ].iter().enumerate() {
+            let source=format!("import core.json\n{body}\nfn main() {{}}\n");
+            let entry=stage.join(format!("bad-{index}.align"));
+            std::fs::write(&entry,&source).unwrap();
+            for per_unit in [false,true] {
+                let mut sources=SourceMap::new();
+                let diags=if per_unit {
+                    align_driver::build_per_unit(&mut sources,entry.to_str().unwrap(),&source).diags
+                } else {
+                    align_driver::check(&mut sources,entry.to_str().unwrap(),&source).diags
+                };
+                let rendered=align_driver::format_diagnostics(&sources,&diags);
+                assert!(diags.has_errors() && rendered.contains(expected),"{index}/{per_unit}: {rendered}");
+            }
+        }
+    });
 }

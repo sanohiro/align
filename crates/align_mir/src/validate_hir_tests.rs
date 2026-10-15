@@ -19789,6 +19789,30 @@ fn json_array_root_checked_hir_requires_exact_source_and_element() {
 }
 
 #[test]
+fn json_string_decode_checked_hir() -> Result<(), Box<dyn std::error::Error>> {
+    let source = "import core.json\nfn decode(input:str)->Result<string,Error> {value:Result<string,Error>:=json.decode(input);return value}\n";
+    let base = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&base));
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..5 {
+        let mut malformed = base.clone();
+        let expression = body_first_let_init_mut(&mut malformed, "decode");
+        let hir::ExprKind::JsonDecodeScalar { scalar: elem, input } = &mut expression.kind else {
+            return Err("expected decoded-string fixture".into());
+        };
+        match mutation {
+            0 => *elem = Ty::Str,
+            1 => *elem = Ty::Char,
+            2 => *elem = Ty::Struct(u32::MAX),
+            3 => input.ty = Ty::String,
+            _ => expression.ty = Ty::String,
+        }
+        assert_body_entrypoints_empty("string-decode", &malformed);
+    }
+    Ok(())
+}
+
+#[test]
 fn json_string_array_decode_checked_hir() -> Result<(), Box<dyn std::error::Error>> {
     let source = "import core.json\nfn decode(input:str)->Result<array<string>,Error> {value:Result<array<string>,Error>:=json.decode(input);return value}\n";
     let base = checked_source_program(source);

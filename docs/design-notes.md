@@ -2188,6 +2188,16 @@ validation succeeds. Ownership-directed materialization remains explicit in
 introduced. Plan188 closes the separate owned-record AoS decoder; input-borrowing
 `array<str>` roots remain outside this capability.
 
+### JSON owned-string root decoding
+
+A standalone `string` has the same independent owner as each Plan183 array
+element. Plan203 admits it through the existing scalar decoder without an
+implicit wrapper, array spine or new ownership rule. Clean text is copied and
+escaped text is materialized into one owned payload; EOF validation precedes
+header publication and a failed trailing check releases the unpublished owner.
+This composes existing String/Result transfer and Drop while keeping borrowed
+`str` roots outside the admitted surface.
+
 ### JSON dynamic-array root composition (R87)
 
 A value already encodable as an array field retains that grammar at the root.

@@ -333,8 +333,18 @@ UTF-8, escapes or trailing input return `Error.Code(1)` and free every completed
 payload before exposing a result. Empty arrays allocate nothing; other arrays
 own one header spine and each nonempty string payload. Index views retain the
 array owner's lifetime. This reuses the existing type, Result and deep Drop;
-bare `string` and `array<str>` decoding remain separate.
-Plan183 owns the exact ABI, validation/publication order and cleanup matrix.
+`array<str>` decoding remains separate. Plan183 owns the array ABI and cleanup
+matrix; Plan203 supplies the standalone owned-string root below.
+
+**Owned string-root decoding.** The inferred target of `json.decode(input)` may
+be `string`. It accepts one complete UTF-8 JSON string, including existing
+escapes and escaped U+0000, with JSON whitespace before/after. Clean and escaped
+text both return independent owned bytes, even inside an arena. Empty output is
+null/0 with no allocation; nonempty output owns one exact decoded-byte allocation.
+Malformed UTF-8/strings, other JSON shapes and trailing input return
+`Error.Code(1)` without a partial result or retained allocation. The output may
+outlive input/arena; views of it retain its owner's lifetime. Bare `str` and
+`char` remain separate. Plan203 owns exact validation, publication and cleanup.
 
 **Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same
 existing element grammar as its JSON record field: supported integers, floats,

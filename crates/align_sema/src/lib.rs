@@ -32409,6 +32409,7 @@ fn native_storage_is_individual(kind: &ExprKind) -> bool {
         | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
         | ExprKind::JsonDecodeArray { .. } | ExprKind::JsonDecode { .. }
         | ExprKind::JsonDecodeStructArray { .. } | ExprKind::JsonDecodeUnion { .. }
+        | ExprKind::JsonDecodeScalar { .. }
         | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. })
 }
 
@@ -32520,10 +32521,9 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         ExprKind::ArrayBuilderBuild(_) => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::BuilderElement)
         }
-        // The runtime materializes a fresh `array<RowPair>` in Result::Ok and retains neither
-        // codec view. `RowPair` is scalar-only, so the generation starts without borrowed content;
-        // Result::Err carries no storage header.
-        ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
+        // These native outputs retain no borrowed content. Copy scalar targets have no
+        // storage headers; successful owners start fresh, and Result::Err carries no header.
+        ExprKind::JsonDecodeScalar { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -32588,7 +32588,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::Len(_)
         | ExprKind::Template(_)
         | ExprKind::JsonEncode { .. }
-        | ExprKind::StrParseI64 { .. } | ExprKind::JsonDecodeScalar { .. }
+        | ExprKind::StrParseI64 { .. }
         | ExprKind::JsonDoc { .. }
         | ExprKind::JsonDocKind { .. }
         | ExprKind::JsonDocGet { .. }
@@ -64018,14 +64018,12 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 };
             }
-            // A bare **scalar** target (JSON completeness T1b): parse the whole input as one JSON
-            // number / bool into an int / float / bool (`x: i64 := json.decode("42")?`). The value is
-            // `Copy` and copied out (not a view into the input), so the result is `Static` / returnable —
-            // no region tie. (`str` / `char` targets are deferred: a `str` would be an input-borrowing
-            // view; `char` has no JSON form.)
-            Some(Ty::Result(sc @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool), _)) => {
+            // Bare scalar roots copy numeric/bool values or independently own decoded string
+            // bytes. Neither retains the input or lexical arena; borrowed `str` remains separate.
+            Some(Ty::Result(sc @ (Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::String), _)) => {
                 let scalar = scalar_to_ty(sc);
                 let input = self.check_str_init(&args[0]);
+                if input.ty == Ty::Error { return err; }
                 return Expr {
                     kind: ExprKind::JsonDecodeScalar { scalar, input: Box::new(input) },
                     ty: Ty::Result(sc, Scalar::Enum(self.error_enum_id)),
@@ -64036,7 +64034,7 @@ impl<'a, 't> Checker<'a, 't> {
             // would be an input-borrowing view (a region-tracking follow-up), and `char` has no JSON form.
             Some(Ty::Result(sc @ (Scalar::Str | Scalar::Char), _)) => {
                 self.diags.error(
-                    format!("'json.decode' into a bare `{}` is not supported yet (int/float/bool scalar targets now; a `str` view target is a later slice)", scalar_name(sc)),
+                    format!("'json.decode' into a bare `{}` is not supported yet (int/float/bool/string scalar targets now; a `str` view target is a later slice)", scalar_name(sc)),
                     span,
                 );
                 return err;

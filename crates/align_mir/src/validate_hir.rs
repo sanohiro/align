@@ -6348,14 +6348,14 @@ impl<'a> BodyValidator<'a> {
     }
 
     fn json_array_target_ok(&self, ty: Ty) -> bool {
-        ty == Ty::String || self.json_scalar_target_ok(ty)
+        self.json_scalar_target_ok(ty)
     }
 
     fn json_scalar_target_ok(&self, ty: Ty) -> bool {
         match ty {
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
-            Ty::Bool => true,
+            Ty::Bool | Ty::String => true,
             _ => false,
         }
     }

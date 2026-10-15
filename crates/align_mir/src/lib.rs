@@ -1694,9 +1694,8 @@ pub enum Rvalue {
         input: Operand,
         out: Slot,
     },
-    /// `json.decode` into a bare **scalar** (JSON completeness T1b): parse the whole input as one JSON
-    /// number / bool and write it into the `out` scalar slot. Yields an `i32` status (0 = ok). `scalar`
-    /// is the target (int / float / bool); its kind/width/sign give the runtime scalar tag.
+    /// `json.decode` into int/float/bool/string: write an independent scalar/header to `out`.
+    /// Yields i32 status (0 = ok); kind/width/sign encode the exact runtime target tag.
     JsonDecodeScalar {
         scalar: Ty,
         input: Operand,
@@ -19550,10 +19549,8 @@ fn lower_str_parse_i64(
 }
 
 
-/// `json.decode(input)` into a bare **scalar** (JSON completeness T1b) → parse the whole input as one
-/// JSON number / bool into an out scalar slot via the runtime parser (status `i32`), then branch into
-/// `Ok(<scalar>)` / `Err(<code>)`. Mirrors [`lower_json_decode_array`]; the scalar is `Copy` (nothing
-/// to drop).
+/// Parse one independent scalar or owned string through an output slot and status, then form
+/// Ok/Err. Mirrors the owned array path: only success transfers output into the Result owner.
 fn lower_json_decode_scalar(
     b: &mut Builder,
     scalar: Ty,
