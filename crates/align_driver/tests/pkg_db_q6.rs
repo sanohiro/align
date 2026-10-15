@@ -1173,10 +1173,9 @@ fn main() -> i32 {
     }
 
     #[test]
-    fn indirect_storage_fallback() {
-        let indirect_storage_fallback = r#"State { values: slice<i64> }
-fn ignore(borrow mut state: State, borrow source: array<i64>) {
-}
+    fn indirect_storage_effects_follow_target_availability() {
+        let known = r#"State { values: slice<i64> }
+fn ignore(borrow mut state: State, borrow source: array<i64>) {}
 fn forward(borrow mut state: State) {
   source := [1, 2, 3].to_array()
   apply := ignore
@@ -1189,15 +1188,34 @@ fn main() -> i32 {
   return values.sum() as i32
 }
 "#;
-        let indirect_storage_diagnostics = check_diagnostics(
-            "pkg-db-q6-indirect-storage-fallback",
-            indirect_storage_fallback,
+        let retaining = known.replace(
+            "borrow source: array<i64>) {}",
+            "borrow source: array<i64>) { state.values = source[..] }",
         );
-        assert!(
-            indirect_storage_diagnostics
-                .contains("cannot retain a shorter-lived view through this mutable borrow"),
-            "an indirect call must conservatively retain owned argument storage:\n{indirect_storage_diagnostics}",
-        );
+        let unknown = known.replace(
+            "fn forward(borrow mut state: State) {",
+            "fn forward(borrow mut state: State, apply: fn(borrow mut State, borrow array<i64>) -> ()) {",
+        ).replace("  apply := ignore\n", "").replace("forward(state)", "forward(state, ignore)");
+        for (name, source, rejected) in [
+            ("known-empty", known, false),
+            ("known-retaining", retaining.as_str(), true),
+            ("unknown", unknown.as_str(), true),
+        ] {
+            for per_unit in [false, true] {
+                let mut sources = SourceMap::new();
+                let diagnostics = if per_unit {
+                    check_per_unit(&mut sources, name, source).diags
+                } else {
+                    check(&mut sources, name, source).diags
+                };
+                let rendered = align_driver::format_diagnostics(&sources, &diagnostics);
+                assert_eq!(diagnostics.has_errors(), rejected, "{name}/{per_unit}: {rendered}");
+                if rejected {
+                    assert!(rendered.contains("cannot retain a shorter-lived view through this mutable borrow"),
+                        "{name}/{per_unit}: {rendered}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1228,25 +1246,27 @@ fn main() -> i32 {
 
     #[test]
     fn indirect_all_argument_fallback() {
+        // An unknown callback keeps all-input fallback even when one caller passes a no-op.
+        // Do not use an `out` parameter here: function-value formation rejects it before
+        // mutable-output retention runs, making that an unrelated negative control.
         let indirect = r#"State { text: str }
-fn copy(borrow mut state: State, source: str, out: region) {
-  state.text = source.clone_in(out)
+fn ignore(borrow mut state: State, source: str) {}
+fn forward(apply: fn(borrow mut State, str) -> (), borrow mut state: State, source: str) {
+  apply(state, source)
 }
 fn main() -> i32 {
-  arena out {
-    mut owner := "source".clone()
-    source: str := owner
-    mut state := State { text: "" }
-    apply := copy
-    apply(state, source, out)
-    owner = "replaced".clone()
-    return state.text.len() as i32
-  }
+  mut owner := "source".clone()
+  source: str := owner
+  mut state := State { text: "" }
+  forward(ignore, state, source)
+  owner = "replaced".clone()
+  return state.text.len() as i32
 }
 "#;
+        let diagnostics = check_diagnostics("pkg-db-q6-indirect-retention-fallback", indirect);
         assert!(
-            check_errs("pkg-db-q6-indirect-retention-fallback", indirect),
-            "an indirect call must retain the conservative all-argument fallback",
+            diagnostics.contains("use of invalidated borrow 'state'"),
+            "an unknown indirect call must retain all argument dependencies:\n{diagnostics}",
         );
     }
 
