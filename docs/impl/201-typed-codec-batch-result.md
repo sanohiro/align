@@ -37,7 +37,8 @@ seed from another native producer. An unconditional producer sweep authenticates
 discarded operation and checks the readable source. The same sweep demands the
 existing producer equation and explicit `extraction_guard_matches` proof for
 every `ResultUnwrapOk`/`ResultUnwrapErr` whose
-operand is `Result<CodecBatch, _>`, even when the extracted value is discarded,
+canonical success or error payload resolves to `CodecBatch` through `xml_result_payload`,
+including both direct `Ty::Result` and table-backed `Ty::Tagged` forms, even when the extracted value is discarded,
 returned directly or used only by scalar codec accessors. This closes the gap
 left by demand-driven protected-owner walks, which do not include CodecBatch.
 Call summaries and parameter provenance do not establish which Result arm is
@@ -47,8 +48,22 @@ CFG successor kind; non-Branch edges never refine the allowed tag set. A tag
 predicate must have exactly one primary definition, no auxiliary definition,
 no duplicate value record, and the selected definition must be the actual
 predecessor statement. Duplicate predicates cannot borrow another definition
-as evidence. Ordinary
-aggregate type checks remain unchanged. Invalid input/value/enum/result IDs
+as evidence.
+
+Guard identity follows the operand's semantics. SSA Value/Arg operands name an
+immutable descriptor. A `BorrowedPlace` names a typed slot/path/cleanup tuple,
+so identical shape alone is insufficient: the observed place must also remain
+unchanged between the tag test and extraction on every reaching path. Reuse the
+existing backward tag-guard walk and add a read-only observation window for
+place operands. Reads and pure scalar/tag computations preserve the observation;
+stores, nulling, Drop, calls and unclassified operations end it. At the matching
+predicate inspect only following statements; on intermediate blocks inspect all
+statements and at the extraction inspect its preceding statements. Perform each interval check
+before visited-state reuse; a prefix/suffix cannot certify a full block on a
+loop path. This covers
+ordinary borrowed mixed Copy/Move sums without treating mutable memory like SSA.
+Other borrowed element operand forms retain their existing fail-closed matching
+boundary. Ordinary aggregate type checks remain unchanged. Invalid input/value/enum/result IDs
 must be rejected before LLVM or interface publication.
 
 Generic native-output equations certify slots without proving that a successful
@@ -61,6 +76,7 @@ and uses the existing tagged-extraction proof.
 | Axis | Implementation and acceptance |
 | --- | --- |
 | Type formation and validation | Keep checked HIR and nominal `CodecBatch` types unchanged. `CodecOpen` producer validation checks exact byte input, builtin Error identity and Result type. `producer::codec_tests` covers malformed input/result/enum identity, unreadable input, duplicated operation/extraction/predicate definitions and discarded operations. Unguarded, reversed, unrelated, bypassed and same-successor Result extraction must fail for both payload arms, including unused extraction, direct batch returns, scalar accessors, helper-call results and Result parameters. The composed tagged/resource gates still reject a raw slice placed directly in a batch Result. |
+| Canonical type and operand families | Resolve both semantic payloads through the existing Result/Tagged authority. Owner tests cross direct/table-backed representation with local/imported/argument producers and both extraction arms. Shared `Result<CodecBatch, string>` and `Result<string, CodecBatch>` matching owns borrowed-place acceptance, with exact path identity. Record-held codec Result source shapes already fail checked-HIR placement on the baseline; that separate formation defect is outside this repair. Borrowed-place mutation, different slot/path/type/cleanup and observation-window controls own exact identity and freshness. SSA uses retain their existing snapshot semantics. Unsupported dynamic/fixed-element matching is not newly admitted. |
 | Construction and errors | `lower_codec_expr` emits one complete typed Result producer. LLVM constructs only the selected tagged payload after validation, with no conditional output slot. `core_codec` golden, invalid-envelope and alignment owners exercise success and failure. |
 | Source lifetime, move-in/out, replacement, Drop | No new owner or cleanup bit. Shared native output facts name the original input. Existing `core_codec` source expiry, validated-byte mutation, reopening and detached-copy controls retain their verdicts; encoder/buffer cleanup remains unchanged. |
 | Control flow | Existing `core_codec` owners cover `?`, `else`, `match`, returned Result and generic/imported helpers. MIR structural owners assert there is no separately addressable conditional output or status; LLVM branch/phi inspection and runtime invalid-input owners prove both result arms initialize their active payload. Reuse local observation matrices for if/loop joins and early exits; add a focused typed-construction owner only where existing tests do not assert the corrected MIR relation. `map_err` uses the ordinary Result route and introduces no codec-specific behavior. |

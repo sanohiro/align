@@ -2867,19 +2867,30 @@ impl<'a> XmlAccessAnalyzer<'a> {
             _ => return false,
         };
         let function = self.graph.function;
-        let Some(block) = function.blocks.iter().find(|block| block.stmts.iter().any(
-            |statement| matches!(statement, Stmt::Let(value, _) if *value == result)
-        )) else { return false; };
-        let same_operand = |candidate: &Operand| matches!((candidate, operand),
-            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b);
+        let Some((block, position)) = function.blocks.iter().find_map(|block| {
+            block.stmts.iter().position(|statement| matches!(statement,
+                Stmt::Let(value, _) if *value == result)).map(|position| (block, position))
+        }) else { return false; };
+        let same_operand = |candidate: &Operand| match (candidate, operand) {
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) => a == b,
+            (Operand::BorrowedPlace(a), Operand::BorrowedPlace(b)) =>
+                a.slot == b.slot && a.path == b.path && a.ty == b.ty && a.cleanup == b.cleanup,
+            _ => false,
+        };
+        // A place observes memory again at extraction; unlike SSA, equal identity is not a
+        // snapshot. Keep the observation live only across this closed read-only instruction set.
+        let preserves_observation = |statements: &[Stmt]| {
+            !matches!(operand, Operand::BorrowedPlace(_)) || statements.iter().all(|statement| {
+                matches!(statement, Stmt::Let(_, Rvalue::Use(_) | Rvalue::Load(_)
+                    | Rvalue::Un(..) | Rvalue::Bin(..) | Rvalue::Select { .. }
+                    | Rvalue::OptionIsSome(_) | Rvalue::ResultIsOk(_) | Rvalue::EnumTagEq { .. }))
+            })
+        };
+        if !preserves_observation(&block.stmts[..position]) { return false; }
         let mut pending = vec![(block.id, (0..count).collect::<Vec<_>>() )];
         let mut visited = HashSet::new();
         let mut proved = false;
         while let Some((block, allowed)) = pending.pop() {
-            if allowed.iter().all(|tag| *tag == selected_tag) {
-                proved = true;
-                continue;
-            }
             if block == function.entry { return false; }
             if !visited.insert((block, allowed.clone())) { continue; }
             let mut has_predecessor = false;
@@ -2891,6 +2902,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 };
                 has_predecessor = true;
                 let mut allowed = allowed.clone();
+                let mut observed_after = 0;
                 if yes != no
                     && let Some(Operand::Value(condition)) = condition
                     && function.value_tys.get(*condition as usize) == Some(&Ty::Bool)
@@ -2898,7 +2910,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     && self.graph.auxiliary_definitions.get(*condition as usize) == Some(&0)
                     && self.graph.duplicate_values.get(*condition as usize) == Some(&false)
                     && let Some(Some(predicate)) = self.graph.value_definitions.get(*condition as usize)
-                    && predecessor.stmts.iter().any(|statement| matches!(statement,
+                    && let Some(predicate_position) = predecessor.stmts.iter().position(|statement| matches!(statement,
                         Stmt::Let(value, actual) if value == condition && std::ptr::eq(actual, *predicate)))
                 {
                     let tested = match (predicate, selected) {
@@ -2910,9 +2922,18 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     };
                     if let Some(tested) = tested {
                         allowed.retain(|tag| (*tag == tested) == (yes == block));
+                        observed_after = predicate_position + 1;
                     }
                 }
-                pending.push((predecessor.id, allowed));
+                if allowed.iter().all(|tag| *tag == selected_tag) {
+                    if !preserves_observation(&predecessor.stmts[observed_after..]) { return false; }
+                    proved = true;
+                } else {
+                    // Check this complete interval before visited-state reuse. The extraction
+                    // prefix and a predicate suffix must never stand in for a loop's full block.
+                    if !preserves_observation(&predecessor.stmts) { return false; }
+                    pending.push((predecessor.id, allowed));
+                }
             }
             if !has_predecessor { return false; }
         }
@@ -9787,7 +9808,8 @@ fn validate_resource_rvalues_component(
                     Rvalue::CodecOpen { .. } => OperandRequirement::READ
                         .is_satisfied_by(xml_access(&Operand::Value(*value), result)),
                     Rvalue::ResultUnwrapOk(input) | Rvalue::ResultUnwrapErr(input)
-                        if matches!(operand_ty(function, input), Some(Ty::Result(Scalar::CodecBatch, _))) =>
+                        if operand_ty(function, input).is_some_and(|ty| [true, false].into_iter()
+                            .any(|ok| xml_result_payload(program, ty, ok) == Some(Ty::CodecBatch))) =>
                     {
                         let selected = if matches!(rvalue, Rvalue::ResultUnwrapOk(_)) {
                             XmlAccessPathSegment::ResultOk

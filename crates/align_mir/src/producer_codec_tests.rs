@@ -16,6 +16,10 @@ fn program() -> Result<Program, Box<dyn std::error::Error>> {
         pub fn helper_error(input: slice<u8>, prior: Error) -> Error = match open(input) { Ok(_) => prior, Err(failure) => failure }\n\
         pub fn parameter_error(result: Result<codec.batch, Error>, prior: Error) -> Error = match result { Ok(_) => prior, Err(failure) => failure }\n\
         fn main() {}\n";
+    lower(source)
+}
+
+fn lower(source: &str) -> Result<Program, Box<dyn std::error::Error>> {
     let mut diagnostics = align_diag::Diagnostics::new();
     let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
     let ast = align_parser::parse_file(tokens, &mut diagnostics);
@@ -221,6 +225,11 @@ fn codec_payload_extraction_requires_the_exact_unique_tag_guard() -> TestResult 
     let baseline = program()?;
     for (mode, baseline) in [
         ("local", baseline.clone()),
+        ("tagged-local", table_backed(baseline.clone())?),
+        (
+            "tagged-imported",
+            table_backed(imported(baseline.clone())?)?,
+        ),
         ("imported", imported(baseline)?),
     ] {
         validate(&baseline, true, mode);
@@ -334,6 +343,275 @@ fn codec_payload_extraction_requires_the_exact_unique_tag_guard() -> TestResult 
                     _ => return Err("axis".into()),
                 }
                 validate(&bad, false, &format!("{mode}/{name}/{axis}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn table_backed(mut program: Program) -> Result<Program, Box<dyn std::error::Error>> {
+    let Ty::Result(ok, error) = program
+        .fns
+        .iter()
+        .find(|f| f.name.as_str() == "open")
+        .map(|f| f.ret)
+        .or_else(|| {
+            program
+                .imported_fns
+                .iter()
+                .find(|f| f.name.as_str() == "open")
+                .map(|f| f.ret)
+        })
+        .ok_or("open result")?
+    else {
+        return Err("Result".into());
+    };
+    let id = u32::try_from(program.tagged_types.len())?;
+    program
+        .tagged_types
+        .push(hir::TaggedType::Result(ok, error));
+    for declaration in &mut program.imported_fns {
+        if declaration.name.as_str() == "open" {
+            declaration.ret = Ty::Tagged(id);
+        }
+    }
+    for function in &mut program.fns {
+        if function.name.as_str() == "open" {
+            function.ret = Ty::Tagged(id);
+            for block in &mut function.blocks {
+                if let Term::Return(Some(input)) = &block.term {
+                    let value = u32::try_from(function.value_tys.len())?;
+                    function.value_tys.push(Ty::Tagged(id));
+                    block
+                        .stmts
+                        .push(Stmt::Let(value, Rvalue::Use(input.clone())));
+                    block.term = Term::Return(Some(Operand::Value(value)));
+                }
+            }
+        }
+        if matches!(
+            function.name.as_str(),
+            "helper" | "parameter" | "helper_error" | "parameter_error"
+        ) {
+            for ty in function.slots.iter_mut().chain(&mut function.value_tys) {
+                if *ty == Ty::Result(ok, error) {
+                    *ty = Ty::Tagged(id);
+                }
+            }
+        }
+    }
+    Ok(program)
+}
+
+#[test]
+fn codec_borrowed_mixed_result_keeps_shared_matching() -> TestResult {
+    let program = lower(
+        "import core.codec\n\
+        pub fn inspect(borrow result: Result<codec.batch, string>) -> i64 = match result { Ok(batch) => batch.rows(), Err(message) => message.len() }\n\
+        fn main() {}\n",
+    )?;
+    validate(&program, true, "borrowed mixed Result");
+    Ok(())
+}
+
+#[test]
+fn codec_borrowed_guards_authenticate_identity_and_observation_windows() -> TestResult {
+    let baseline = lower(
+        "import core.codec\n\
+        fn noop() {}\n\
+        pub fn ok(borrow result: Result<codec.batch, string>, borrow other: Result<codec.batch, string>) -> i64 = match result { Ok(batch) => batch.rows(), Err(message) => message.len() }\n\
+        pub fn err(borrow result: Result<string, codec.batch>, borrow other: Result<string, codec.batch>) -> i64 = match result { Ok(message) => message.len(), Err(batch) => batch.rows() }\n\
+        fn main() {}\n",
+    )?;
+    let noop = baseline
+        .fns
+        .iter()
+        .find(|f| f.name.as_str() == "noop")
+        .ok_or("noop")?
+        .name
+        .clone();
+    for tagged in [false, true] {
+        let mut baseline = baseline.clone();
+        if tagged {
+            for function in &mut baseline.fns {
+                if !matches!(function.name.as_str(), "ok" | "err") {
+                    continue;
+                }
+                let original = *function.slots.first().ok_or("parameter")?;
+                let Ty::Result(ok, err) = original else {
+                    return Err("result")?;
+                };
+                let id = u32::try_from(baseline.tagged_types.len())?;
+                baseline.tagged_types.push(hir::TaggedType::Result(ok, err));
+                for ty in function.slots.iter_mut().chain(&mut function.value_tys) {
+                    if *ty == original {
+                        *ty = Ty::Tagged(id);
+                    }
+                }
+                for statement in function.blocks.iter_mut().flat_map(|b| &mut b.stmts) {
+                    if let Stmt::Let(
+                        _,
+                        Rvalue::ResultIsOk(Operand::BorrowedPlace(place))
+                        | Rvalue::ResultUnwrapOk(Operand::BorrowedPlace(place))
+                        | Rvalue::ResultUnwrapErr(Operand::BorrowedPlace(place)),
+                    ) = statement
+                    {
+                        if place.ty == original {
+                            place.ty = Ty::Tagged(id);
+                        }
+                    }
+                }
+            }
+        }
+        validate(&baseline, true, "mixed borrowed baseline");
+        for name in ["ok", "err"] {
+            for axis in [
+                "read-prefix",
+                "read-suffix",
+                "read-middle",
+                "write-prefix",
+                "write-suffix",
+                "write-middle",
+                "call-prefix",
+                "call-suffix",
+                "call-middle",
+                "write-before",
+                "write-after",
+                "different-slot",
+                "different-path",
+                "different-type",
+                "different-cleanup",
+                "loop-write",
+                "diamond-write",
+            ] {
+                let mut bad = baseline.clone();
+                let function = bad
+                    .fns
+                    .iter_mut()
+                    .find(|f| f.name.as_str() == name)
+                    .ok_or("function")?;
+                let (use_block, use_position) = function
+                    .blocks
+                    .iter()
+                    .find_map(|b| {
+                        b.stmts
+                            .iter()
+                            .position(|s| {
+                                matches!(
+                                    s,
+                                    Stmt::Let(
+                                        _,
+                                        Rvalue::ResultUnwrapOk(_) | Rvalue::ResultUnwrapErr(_)
+                                    )
+                                )
+                            })
+                            .map(|p| (b.id, p))
+                    })
+                    .ok_or("use")?;
+                let (guard_block, guard_position) = function
+                    .blocks
+                    .iter()
+                    .find_map(|b| {
+                        b.stmts
+                            .iter()
+                            .position(|s| matches!(s, Stmt::Let(_, Rvalue::ResultIsOk(_))))
+                            .map(|p| (b.id, p))
+                    })
+                    .ok_or("guard")?;
+                let slot = u32::try_from(function.slots.len())?;
+                function.slots.push(Ty::Bool);
+                let value = u32::try_from(function.value_tys.len())?;
+                function.value_tys.push(if axis.starts_with("call-") {
+                    Ty::Unit
+                } else {
+                    Ty::Bool
+                });
+                let statement = if axis.starts_with("read-") {
+                    Stmt::Let(value, Rvalue::Use(Operand::Const(Const::Bool(true))))
+                } else if axis.starts_with("call-") {
+                    Stmt::Let(
+                        value,
+                        Rvalue::Call(DirectCall::Program(noop.clone()), vec![]),
+                    )
+                } else {
+                    Stmt::Store(slot, Operand::Const(Const::Bool(true)))
+                };
+                if axis.starts_with("different-") {
+                    let Stmt::Let(_, Rvalue::ResultIsOk(Operand::BorrowedPlace(place))) =
+                        &mut function.blocks[guard_block as usize].stmts[guard_position]
+                    else {
+                        return Err("borrowed guard".into());
+                    };
+                    match axis {
+                        "different-slot" => place.slot = *function.params.get(1).ok_or("other")?,
+                        "different-path" => place.path.push(hir::BorrowedPathSegment::ResultOk),
+                        "different-type" => place.ty = Ty::Str,
+                        "different-cleanup" => place.cleanup = Some(slot),
+                        _ => return Err("identity axis".into()),
+                    }
+                } else if axis.ends_with("-middle") || axis == "diamond-write" {
+                    let bridge = u32::try_from(function.blocks.len())?;
+                    let Term::Branch(_, yes, no) = &mut function.blocks[guard_block as usize].term
+                    else {
+                        return Err("branch".into());
+                    };
+                    if name == "ok" {
+                        *yes = bridge;
+                    } else {
+                        *no = bridge;
+                    }
+                    if axis == "diamond-write" {
+                        function.blocks.push(Block {
+                            id: bridge,
+                            stmts: vec![],
+                            stmt_lines: vec![],
+                            term: Term::Branch(
+                                Operand::Const(Const::Bool(true)),
+                                bridge + 1,
+                                bridge + 2,
+                            ),
+                        });
+                        function.blocks.push(Block {
+                            id: bridge + 1,
+                            stmts: vec![],
+                            stmt_lines: vec![],
+                            term: Term::Goto(use_block),
+                        });
+                        function.blocks.push(Block {
+                            id: bridge + 2,
+                            stmts: vec![statement],
+                            stmt_lines: vec![(0, 0)],
+                            term: Term::Goto(use_block),
+                        });
+                    } else {
+                        function.blocks.push(Block {
+                            id: bridge,
+                            stmts: vec![statement],
+                            stmt_lines: vec![(0, 0)],
+                            term: Term::Goto(use_block),
+                        });
+                    }
+                } else {
+                    let (block, position) = if axis.ends_with("-suffix") {
+                        (guard_block, guard_position + 1)
+                    } else if axis == "write-before" {
+                        (guard_block, guard_position)
+                    } else if axis == "write-after" || axis == "loop-write" {
+                        (use_block, use_position + 1)
+                    } else {
+                        (use_block, use_position)
+                    };
+                    let block = function.blocks.get_mut(block as usize).ok_or("block")?;
+                    block.stmt_lines.resize(block.stmts.len(), (0, 0));
+                    block.stmts.insert(position, statement);
+                    block.stmt_lines.insert(position, (0, 0));
+                    if axis == "loop-write" {
+                        block.term = Term::Goto(use_block);
+                    }
+                }
+                let accepted =
+                    axis.starts_with("read-") || matches!(axis, "write-before" | "write-after");
+                validate(&bad, accepted, &format!("tagged={tagged}/{name}/{axis}"));
             }
         }
     }

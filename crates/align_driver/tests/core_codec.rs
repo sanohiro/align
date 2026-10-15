@@ -14,6 +14,8 @@ fn codec_batch_result_survives_imported_generic_cache_replay() {
     owned_fixture::run("codec_batch_result_survives_imported_generic_cache_replay", |stage| {
         let api = "module codec_api\nimport core.codec\n\
             pub fn same(error: Error) -> Error = error\n\
+            pub fn rows_or_len(borrow result: Result<codec.batch, string>) -> i64 = match result { Ok(batch) => batch.rows(), Err(message) => message.len() }\n\
+            pub fn len_or_rows(borrow result: Result<string, codec.batch>) -> i64 = match result { Ok(message) => message.len(), Err(batch) => batch.rows() }\n\
             pub fn open<T>(marker: T, input: slice<u8>, first: bool) -> Result<codec.batch, Error> {\n\
               batch := codec.open(input).map_err(same)?\n\
               return if first { Ok(batch) } else { loop { break Ok(batch) } }\n\
@@ -27,6 +29,12 @@ fn codec_batch_result_survives_imported_generic_cache_replay() {
               batch := codec_api.open(0, owner.bytes(), true)?\n\
               again := codec_api.open(false, owner.bytes(), false)?\n\
               if batch.rows() != 2 || again.columns() != 1 { return Err(Error.Invalid) }\n\
+              batch_ok: Result<codec.batch, string> := Ok(batch)\n\
+              batch_err: Result<string, codec.batch> := Err(again)\n\
+              text_err: Result<codec.batch, string> := Err(\"bad\".clone())\n\
+              text_ok: Result<string, codec.batch> := Ok(\"bad\".clone())\n\
+              if codec_api.rows_or_len(batch_ok) != 2 || codec_api.len_or_rows(batch_err) != 2 { return Err(Error.Invalid) }\n\
+              if codec_api.rows_or_len(text_err) != 3 || codec_api.len_or_rows(text_ok) != 3 { return Err(Error.Invalid) }\n\
               ids := again.i64s(0) else { return Err(Error.Invalid) }\n\
               last := ids.at(1) else { return Err(Error.Invalid) }\n\
               if last != 9 { return Err(Error.Invalid) }\n\
