@@ -1221,9 +1221,7 @@ fn composed_leaf_exposure_covers_generics_returns_and_has_bounded_growth() {
 #[test]
 fn composed_reader_per_unit_and_thin_cache_bind_private_body_edits() {
     if !backend_available() { return; }
-    let dir = std::env::temp_dir().join(format!("align-composed-cache-{}", std::process::id()));
-    std::fs::create_dir(&dir).expect("exclusively acquire cache owner directory");
-    let project = Proj { dir, entry: "main.align".into() };
+    let project = Proj::new("composed-cache", &[], "main.align");
     let library = "module scan\nfn read(borrow src: slice<u8>, off: i64) -> u32 = src.u32_le(off) + 0\npub fn sum(borrow src: slice<u8>) -> u32 { mut total: u32 := 0; n := src.len() / 4; mut i := 0; loop { if i >= n { break }; total = total + read(src, i * 4); i = i + 1 }; return total }\n";
     let main = "import scan\nfn main() { mut b := buffer(4); b.put_u32_le(7); bytes := b.bytes(); print(scan.sum(bytes)) }\n";
     project.write("scan.align", library);

@@ -220,10 +220,8 @@ fn composed_sampler_native_cpu_controls_preserve_scalar_policy_without_byte_trap
         assert_eq!(function.lines().filter(|line| line.contains("load ptr, ptr %0,")).count(), 1, "{cpu}: {function}");
         assert!(!function.contains("@align_rt_range_fail"), "{cpu}: logits loop retains a trap");
         assert!(function.contains("@align_rt_bounds_fail"), "{cpu}: candidate bounds remain");
-        let dir = std::env::temp_dir().join(format!("align-composed-isa-{}-{cpu}", std::process::id()));
-        std::fs::create_dir(&dir).expect("exclusively acquire object directory");
-        let guard = Proj { dir, entry: String::new() };
-        let obj = guard.dir.join("sampler.o");
+        let stage = align_driver::ArtifactStage::temp("align-composed-isa").expect("acquire object stage");
+        let obj = stage.path().join("sampler.o");
         emit_object_file(&mir, &obj, target, Profile::Release, &["select".into()], false).expect("sampler object");
         let mut command = std::process::Command::new("objdump");
         if cfg!(target_os = "macos") { command.arg("--macho"); }

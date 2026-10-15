@@ -446,29 +446,12 @@ pub fn inspect() -> i32 {
     Ok(())
 }
 
-// Acquire one private directory atomically; Proj's Drop owns only that acquired directory.
-fn composition_project(name: &str) -> std::io::Result<Proj> {
-    loop {
-        let dir = std::env::temp_dir().join(format!(
-            "align-composition-{name}-{}-{}",
-            std::process::id(),
-            thin_nonce()
-        ));
-        match std::fs::create_dir(&dir) {
-            Ok(()) => {
-                let mut project = Proj {
-                    dir,
-                    entry: "main.align".to_string(),
-                };
-                // The retained-directory API rejects symlink components, including macOS
-                // temporary-root aliases. Keep cleanup armed if canonicalization fails.
-                project.dir = std::fs::canonicalize(&project.dir)?;
-                return Ok(project);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
+// ArtifactStage canonicalizes the root before acquiring it, including macOS temp aliases.
+fn composition_project(_name: &str) -> std::io::Result<Proj> {
+    Ok(Proj::from_stage(
+        align_driver::ArtifactStage::temp("align-composition")?,
+        "main.align",
+    ))
 }
 
 fn run_composition_mode(
