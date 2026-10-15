@@ -6,6 +6,12 @@ A hands-on introduction to writing Align. Start at [00](00-why-align.md) and rea
 
 **[The Little Aligner](../little-aligner/README.md)** practices pipelines, data layout, and ownership through short questions and answers, in the tradition of *The Little Schemer*. You can start with either book and consult the other when you want a different explanation or more practice.
 
+## Build something or find an API
+
+- [Build a CSV-to-JSON CLI](practical-cli.md) — project setup, modules, errors, tests, and an executable
+- [Find an API by task](api-by-task.md) — choose an operation, then open its example and contract
+- [Runnable examples](../../examples/README.md) — short programs to check and run independently
+
 ## Reading and running the examples
 
 Some examples are complete programs; others are fragments that use declarations introduced nearby. Type and function declarations belong at file scope, and executable statements go inside `main`. Explicitly marked errors show what the compiler rejects; they are exercises in reading diagnostics. Features still awaiting implementation are marked separately.
