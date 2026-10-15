@@ -27,8 +27,10 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 - [Plan199](docs/impl/199-indirect-mutable-outputs.md) separates mutable-output
   dependencies from possible mutation, preserving borrowed siblings after another
   field changes. Known noncapturing function values consume the same checked
-  records as direct calls. Interface20 certifies the complete fact; unknown or
-  multiple targets and partial Move-field calls retain their existing limits.
+  records as direct calls. R126's archived real borrowed-session loop now passes
+  whole/per-unit checking and object emission; consumer lifecycle and GPU
+  qualification remain external. Interface20 certifies the complete fact; unknown
+  or multiple targets and partial Move-field calls retain their existing limits.
 
 - [Plan198](docs/impl/198-shared-match-field-origins.md) retains typed stable
   field origins through shared sum-payload matches for R130. Existing checked
@@ -188,18 +190,17 @@ implementation: qualify each real-use requirement and its safety strategy
 independently. Keep parked source and evidence archived outside the active
 worktree; their adoption is not a prerequisite for independent work.
 
-- Request126's borrowed-session loop refusal and Request28's indexed/view builder
-  readers require their own provenance closure; the shipped binary-write effect
-  producer does not resume K1.
+- Request28's indexed/view builder readers still require their own provenance
+  closure; the shipped scalar length and mutable-output capabilities do not
+  resume K1.
 - [Plan196](docs/impl/196-indexed-array-field-length.md) implements R137's scalar
   `rows[index].ids.len()` observation across stable fixed/dynamic AoS and slice
   bases. The parent remains owned, checked bounds precede the read, and the i64
   result retains no borrow. Wider indexed Move-field views and their Plan61
   authority prerequisite remain unselected; consumer adoption is external.
-- Function-value whole-record exclusive calls retain the existing conservative
-  mutable-output fallback: even supported whole-field replacement can invalidate
-  later destination use. Precise indirect mutable-output summaries are separate
-  from Plan194's direct/imported field-store capability.
+- Unknown, multiple-target and capturing function-value mutable outputs retain
+  conservative handling. Plan199 closes the uniquely resolved noncapturing case;
+  it does not infer projected origins or admit partial exclusive Move fields.
 - Request142's exclusive matched owned payload is a separate ownership
   capability. It requires its own complete projection/alias/cleanup design;
   existing shared and owning matches do not imply exclusive admission.

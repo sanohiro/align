@@ -17,7 +17,8 @@ pub use align_driver::{
 };
 pub use align_span::SourceMap;
 
-use std::path::PathBuf;
+use align_driver::ArtifactStage;
+use std::path::{Component, Path, PathBuf};
 
 /// Whether a C compiler (`cc`) is available — the FFI by-value-struct tests compile a small C helper
 /// (the by-value struct callee) and link it against the Align object. Skip those tests where `cc`
@@ -85,29 +86,11 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let a_obj = dir.join(format!("align-ffic-{pid}-{name}.o"));
-    let c_src_path = dir.join(format!("align-ffic-{pid}-{name}.c"));
-    let c_obj = dir.join(format!("align-ffic-{pid}-{name}-helper.o"));
-    let exe = dir.join(format!(
-        "align-ffic-{pid}-{name}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    struct Cleanup(Vec<PathBuf>);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            for p in &self.0 {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
-    let _guard = Cleanup(vec![
-        a_obj.clone(),
-        c_src_path.clone(),
-        c_obj.clone(),
-        exe.clone(),
-    ]);
+    let stage = ArtifactStage::temp("align-ffic").expect("acquire C fixture stage");
+    let a_obj = stage.path().join("input.o");
+    let c_src_path = stage.path().join("helper.c");
+    let c_obj = stage.path().join("helper.o");
+    let exe = stage.path().join(format!("program{}", std::env::consts::EXE_SUFFIX));
     emit_object_file(
         &mir,
         &a_obj,
@@ -128,20 +111,6 @@ pub fn build_and_run_with_c(name: &str, align_src: &str, c_src: &str) -> std::pr
     assert!(cc_status.success(), "compiling the C helper failed");
     link_objects(&align_driver::CDriver::default(), &[&a_obj, &c_obj], &exe, &mir.link_libs, Profile::Release).expect("link");
     std::process::Command::new(&exe).output().expect("run")
-}
-
-/// Removes a test's temporary object + executable on scope exit — including on a panic (an
-/// `assert_eq!` failure), so a failing test does not leak files into the temp directory.
-struct TempArtifacts {
-    obj: PathBuf,
-    exe: PathBuf,
-}
-
-impl Drop for TempArtifacts {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.obj);
-        let _ = std::fs::remove_file(&self.exe);
-    }
 }
 
 /// Compile `src` to a native executable, run it, and return its `Output`. Asserts the program
@@ -197,7 +166,7 @@ pub fn build_and_run_args_with_env(
             );
             let mir = lower_to_mir(&checked.hir);
             let arg_refs: Vec<&str> = prog_args.iter().map(String::as_str).collect();
-            emit_link_run(&mir, &name, &arg_refs, &envs)
+            emit_link_run(&mir, &arg_refs, &envs)
         })
         .expect("spawn build thread");
     match handle.join() {
@@ -211,23 +180,12 @@ pub fn build_and_run_args_with_env(
 #[inline(never)]
 fn emit_link_run(
     mir: &align_driver::MirProgram,
-    name: &str,
     prog_args: &[&str],
     envs: &[(String, String)],
 ) -> std::process::Output {
-    let dir = std::env::temp_dir();
-    // Include the process id so two concurrent test-suite runs on one machine (e.g. parallel CI)
-    // don't collide on these temp paths.
-    let pid = std::process::id();
-    let obj = dir.join(format!("align-test-{pid}-{name}.o"));
-    let exe = dir.join(format!(
-        "align-test-{pid}-{name}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
-    let _artifacts = TempArtifacts {
-        obj: obj.clone(),
-        exe: exe.clone(),
-    };
+    let stage = ArtifactStage::temp("align-test").expect("acquire executable stage");
+    let obj = stage.path().join("input.o");
+    let exe = stage.path().join(format!("program{}", std::env::consts::EXE_SUFFIX));
     emit_object_file(
         mir,
         &obj,
@@ -251,7 +209,7 @@ fn emit_link_run(
 /// long-running server the test drives as a client on another thread.
 pub struct BuiltExe {
     pub exe: PathBuf,
-    _artifacts: TempArtifacts,
+    _stage: ArtifactStage,
 }
 
 /// Compile `src` to a native executable and return its path (without running it). Unlike
@@ -267,13 +225,9 @@ pub fn build_exe(name: &str, src: &str) -> BuiltExe {
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    let dir = std::env::temp_dir();
-    let pid = std::process::id();
-    let obj = dir.join(format!("align-test-{pid}-{name}.o"));
-    let exe = dir.join(format!(
-        "align-test-{pid}-{name}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let stage = ArtifactStage::temp("align-test").expect("acquire executable stage");
+    let obj = stage.path().join("input.o");
+    let exe = stage.path().join(format!("program{}", std::env::consts::EXE_SUFFIX));
     emit_object_file(
         &mir,
         &obj,
@@ -285,8 +239,8 @@ pub fn build_exe(name: &str, src: &str) -> BuiltExe {
     .expect("codegen");
     link_executable(&align_driver::CDriver::default(), &obj, &exe, &mir.link_libs, Profile::Release).expect("link");
     BuiltExe {
-        exe: exe.clone(),
-        _artifacts: TempArtifacts { obj, exe },
+        exe,
+        _stage: stage,
     }
 }
 
@@ -387,30 +341,38 @@ pub fn check_diagnostics(name: &str, src: &str) -> String {
 /// to the entry file, so the modules must be real files in one directory.
 struct TempProject {
     dir: PathBuf,
+    _stage: ArtifactStage,
+}
+
+/// Fixture names are relative source paths, never authority to leave the acquired root.
+fn fixture_path(root: &Path, name: &str) -> PathBuf {
+    let relative = Path::new(name);
+    assert!(
+        relative.components().any(|part| matches!(part, Component::Normal(_)))
+            && relative.components().all(|part| matches!(part, Component::Normal(_) | Component::CurDir)),
+        "fixture path must be a nonempty relative path without parent components: {name:?}"
+    );
+    root.join(relative)
 }
 
 impl TempProject {
-    fn new(name: &str, files: &[(&str, &str)]) -> TempProject {
-        let dir = std::env::temp_dir().join(format!("align-mtest-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir temp project");
+    fn new(_name: &str, files: &[(&str, &str)]) -> TempProject {
+        let stage = ArtifactStage::temp("align-mtest").expect("acquire module stage");
+        let project = TempProject {
+            dir: stage.path().to_path_buf(),
+            _stage: stage,
+        };
         for (fname, src) in files {
-            let path = dir.join(fname);
+            let path = fixture_path(&project.dir, fname);
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("mkdir module subdir");
             }
             std::fs::write(path, src).expect("write module file");
         }
-        TempProject { dir }
+        project
     }
     fn entry(&self, entry: &str) -> PathBuf {
-        self.dir.join(entry)
-    }
-}
-
-impl Drop for TempProject {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        fixture_path(&self.dir, entry)
     }
 }
 
@@ -460,12 +422,8 @@ pub fn build_and_run_multi_args_with_env(
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    let pid = std::process::id();
-    let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
-    let exe = proj.dir.join(format!(
-        "align-mtest-{pid}-{name}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let obj = proj.dir.join("input.o");
+    let exe = proj.dir.join(format!("program{}", std::env::consts::EXE_SUFFIX));
     emit_object_file(
         &mir,
         &obj,
@@ -519,12 +477,8 @@ pub fn build_and_run_multi_with_static_descriptors_args_with_env(
     );
     let mir = lower_to_mir_with_static_descriptors(&checked, &mut sm, &proj.dir)
         .expect("install static descriptor data");
-    let pid = std::process::id();
-    let obj = proj.dir.join(format!("align-mtest-{pid}-{name}.o"));
-    let exe = proj.dir.join(format!(
-        "align-mtest-{pid}-{name}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let obj = proj.dir.join("input.o");
+    let exe = proj.dir.join(format!("program{}", std::env::consts::EXE_SUFFIX));
     emit_object_file(
         &mir,
         &obj,
@@ -564,19 +518,13 @@ pub fn build_and_run_multi_with_c(
         "unexpected per-unit errors:\n{}",
         align_driver::format_diagnostics(&sm, &walk.diags)
     );
-    let pid = std::process::id();
-    let c_path = proj.dir.join(format!("align-mtest-{pid}-{name}.c"));
-    let c_obj = proj.dir.join(format!("align-mtest-{pid}-{name}-fixture.o"));
-    let exe = proj.dir.join(format!(
-        "align-mtest-{pid}-{name}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let c_path = proj.dir.join("fixture.c");
+    let c_obj = proj.dir.join("fixture.o");
+    let exe = proj.dir.join(format!("program{}", std::env::consts::EXE_SUFFIX));
     let mut objects = Vec::with_capacity(walk.units.len() + 1);
     let mut link_libs = Vec::new();
     for (index, unit) in walk.units.iter().enumerate() {
-        let object = proj
-            .dir
-            .join(format!("align-mtest-{pid}-{name}-unit{index}.o"));
+        let object = proj.dir.join(format!("unit{index}.o"));
         emit_object_file(
             &unit.mir,
             &object,
@@ -669,12 +617,8 @@ pub fn build_exe_multi(name: &str, files: &[(&str, &str)], entry: &str) -> Built
         align_driver::format_diagnostics(&sm, &checked.diags)
     );
     let mir = lower_to_mir(&checked.hir);
-    let pid = std::process::id();
-    let obj = proj.dir.join(format!("align-mexe-{pid}-{name}.o"));
-    let exe = proj.dir.join(format!(
-        "align-mexe-{pid}-{name}{}",
-        std::env::consts::EXE_SUFFIX
-    ));
+    let obj = proj.dir.join("input.o");
+    let exe = proj.dir.join(format!("program{}", std::env::consts::EXE_SUFFIX));
     emit_object_file(
         &mir,
         &obj,
@@ -908,7 +852,6 @@ pub fn check_multi_diagnostics(name: &str, files: &[(&str, &str)], entry: &str) 
 // live in one place instead of being copied per test file.
 // ================================================================================================
 
-use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -1042,26 +985,27 @@ pub fn dag_files(cver: &str) -> Vec<(&'static str, String)> {
 pub struct Proj {
     pub dir: PathBuf,
     pub entry: String,
+    _stage: ArtifactStage,
 }
 
 impl Proj {
     /// A project from explicit `(name, source)` files, with `entry` the entry unit's filename.
-    pub fn new(tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
-        let dir = std::env::temp_dir().join(format!(
-            "align-thin-{}-{tag}-{}",
-            std::process::id(),
-            thin_nonce()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir project");
-        let proj = Proj {
-            dir,
-            entry: entry.to_string(),
-        };
+    pub fn new(_tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
+        let stage = ArtifactStage::temp("align-thin").expect("acquire project stage");
+        let proj = Self::from_stage(stage, entry);
         for (name, src) in files {
             proj.write(name, src);
         }
         proj
+    }
+    /// Transfer an already acquired stage; no constructor accepts an unowned path.
+    pub fn from_stage(stage: ArtifactStage, entry: &str) -> Proj {
+        fixture_path(stage.path(), entry);
+        Proj {
+            dir: stage.path().to_path_buf(),
+            entry: entry.to_string(),
+            _stage: stage,
+        }
     }
     /// The standard 4-unit DAG with the given `c` body; entry = `main.align`.
     pub fn dag(tag: &str, cver: &str) -> Proj {
@@ -1070,7 +1014,7 @@ impl Proj {
         Proj::new(tag, &refs, "main.align")
     }
     pub fn write(&self, name: &str, src: &str) {
-        std::fs::write(self.dir.join(name), src).expect("write source");
+        std::fs::write(fixture_path(&self.dir, name), src).expect("write source");
     }
     /// An ENABLED cache under `<dir>/cache`.
     pub fn cache(&self) -> CacheContext {
@@ -1078,12 +1022,6 @@ impl Proj {
     }
     pub fn cache_root(&self) -> PathBuf {
         self.dir.join("cache")
-    }
-}
-
-impl Drop for Proj {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1100,7 +1038,7 @@ pub struct ThinBuilt {
 
 /// Build `proj`'s program the ThinLTO way (all three phases) with `cache` + `jobs` workers.
 pub fn thin_build(proj: &Proj, cache: &CacheContext, jobs: usize) -> ThinBuilt {
-    let entry = proj.dir.join(&proj.entry);
+    let entry = fixture_path(&proj.dir, &proj.entry);
     let entry_src = std::fs::read_to_string(&entry).expect("read entry");
     let mut sm = SourceMap::new();
     let walk = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);

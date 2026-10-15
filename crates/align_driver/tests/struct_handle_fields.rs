@@ -162,17 +162,7 @@ fn all_field_kinds_coexist_and_drop_cleanly() {
 }
 
 fn handle_project(tag: &str, source: &str) -> Proj {
-    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir =
-        std::env::temp_dir().join(format!("align-handle-{}-{tag}-{nonce}", std::process::id()));
-    std::fs::create_dir(&dir).expect("exclusively create fixture directory");
-    let project = Proj {
-        dir,
-        entry: "main.align".to_owned(),
-    };
-    project.write("main.align", source);
-    project
+    Proj::new(tag, &[("main.align", source)], "main.align")
 }
 
 fn handle_command(

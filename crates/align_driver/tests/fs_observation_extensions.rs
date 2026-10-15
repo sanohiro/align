@@ -109,26 +109,10 @@ fn observation_input_domains() {
 }
 
 fn private_project(tag: &str, files: &[(&str, &str)], entry: &str) -> Proj {
-    use std::os::unix::fs::DirBuilderExt;
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let time = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("fixture clock")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "align-retained-private-{}-{time}-{nonce}-{tag}",
-        std::process::id()
-    ));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .expect("acquire private fixture");
-    let mut project = Proj {
-        dir,
-        entry: entry.to_string(),
-    };
-    project.dir = std::fs::canonicalize(&project.dir).expect("canonicalize acquired fixture");
+    use std::os::unix::fs::PermissionsExt;
+    let project = Proj::new(tag, &[], entry);
+    std::fs::set_permissions(&project.dir, std::fs::Permissions::from_mode(0o700))
+        .expect("private fixture permissions");
     for (name, source) in files {
         project.write(name, source);
     }

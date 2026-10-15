@@ -782,31 +782,7 @@ fn process_status_owned_composition() {
 }
 
 fn status_project(files: &[(&str, &str)]) -> Proj {
-    for attempt in 0..100 {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "align-status-{}-{nonce}-{attempt}",
-            std::process::id()
-        ));
-        match std::fs::create_dir(&dir) {
-            Ok(()) => {
-                let project = Proj {
-                    dir,
-                    entry: "main.align".to_owned(),
-                };
-                for (name, source) in files {
-                    project.write(name, source);
-                }
-                return project;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => panic!("create status project: {error}"),
-        }
-    }
-    panic!("could not exclusively create status project");
+    Proj::new("status", files, "main.align")
 }
 
 struct StatusChild(Option<std::process::Child>);

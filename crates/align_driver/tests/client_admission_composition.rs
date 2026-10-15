@@ -376,18 +376,11 @@ fn regular_reader_requires_import_and_exact_path_type() {
 }
 
 fn private_fixture() -> Proj {
-    use std::os::unix::fs::DirBuilderExt;
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("align-admission-{}-{nonce}", std::process::id()));
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .expect("acquire private fixture");
-    Proj {
-        dir,
-        entry: "main.align".to_string(),
-    }
+    use std::os::unix::fs::PermissionsExt;
+    let project = Proj::new("admission", &[], "main.align");
+    std::fs::set_permissions(&project.dir, std::fs::Permissions::from_mode(0o700))
+        .expect("private fixture permissions");
+    project
 }
 
 #[test]
