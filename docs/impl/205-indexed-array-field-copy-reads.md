@@ -84,3 +84,11 @@ helpers return both scalar and Copy-record data through whole/per-unit and
 cold/hit/type-edit/restore builds. The shared fixture harness is used by the
 length and Copy-read targets; its change also requires the existing local
 PostgreSQL service gate under the repository's fail-closed shared-helper rule.
+
+The independent code review found a missing control-flow obligation shared by
+both guards: a success node may have a bypass predecessor. The shared guard
+validator now requires the canonical guard block itself to dominate the action,
+in addition to its success node. Retained-Branch bypass twins for both levels,
+with used and discarded results, are accepted by the reviewed pre-fix compiler
+and rejected after this correction. The full matrix has 27 mutations in both
+result-use states; no representation or public boundary changes for the fix.

@@ -25698,7 +25698,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let Term::Branch(Operand::Value(condition), failure, success) = &source.term else {
             return Err(self.err("borrowed element bounds guard has no canonical successful edge"));
         };
-        if !self.borrowed_element_validation.dominates(*success, action) {
+        // A success node may have another incoming edge. The canonical guard itself must
+        // dominate the action, otherwise reaching that node does not prove the bounds ran.
+        if !self.borrowed_element_validation.dominates(source.id, action)
+            || !self.borrowed_element_validation.dominates(*success, action)
+        {
             return Err(self.err("borrowed element bounds guard does not dominate its call action"));
         };
         let failure = self

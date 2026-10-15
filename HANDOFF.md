@@ -2,13 +2,13 @@
 
 ## Current work direction
 
-The owner requests continuous planned feature and improvement work: finish each
-capability through PR and merge, then continue until asked to stop. The current
-instruction was reaffirmed on 2026-10-14. It supersedes earlier one-batch stops.
-Reconcile all three external request registers first, validate each request
-against real consumer evidence and Align's design, and reassess deferred
-requests after the current delivery. Implement coherent capabilities; retain a
-reasoned deferral when the required design conflicts with Align's invariants.
+The owner's latest instruction (2026-10-15) is to finish the indexed array-field
+Copy-read capability through PR and merge, then stop this implementation batch.
+Do not start another capability without a new request. For later request-driven
+work, reconcile all three external request registers first and validate each
+request against real consumer evidence and Align's design. Consumer adoption
+remains external; retain a reasoned deferral when the required design conflicts
+with Align's invariants.
 
 Prioritize existing std/library usability, useful bounded transport/library
 composition, then measured execution/storage/startup improvements. Complex
@@ -23,6 +23,13 @@ Align v0.9.0 is released; Requests138–141 are included. The workspace version 
 not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI state.
 
 ## Recent completed capabilities
+
+- [Plan205](docs/impl/205-indexed-array-field-copy-reads.md) admits
+  `rows[row].values[index]` for independent Copy elements of existing owning
+  array fields. Both indices retain signed bounds and the complete parent
+  reservation; scalar and Copy-record results outlive the parent without a
+  header/view escape or allocation. General views and existing whole fixed
+  Move-record call/replacement restrictions remain separate.
 
 - [Plan203](docs/impl/203-json-owned-string-root.md) admits a standalone owned
   `string` JSON decode root through the existing scalar decoder. Complete-root

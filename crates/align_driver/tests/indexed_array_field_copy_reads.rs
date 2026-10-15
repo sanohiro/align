@@ -334,8 +334,9 @@ fn producer_and_bounds() {
             signed: true,
         });
         let zero = Operand::Const(Const::Int(0, i64_ty));
+        let mut accepted = Vec::new();
         for unused in [false, true] {
-            for mutation in 0..25 {
+            for mutation in 0..27 {
                 let mut bad = original.clone();
                 let function = bad
                     .fns
@@ -530,7 +531,7 @@ fn producer_and_bounds() {
                         };
                         guard.term = Term::Branch(condition, success, failure);
                     }
-                    _ => {
+                    24 => {
                         // Same physical array/element types, but a different selected header.
                         if let Stmt::Let(
                             _,
@@ -540,6 +541,72 @@ fn producer_and_bounds() {
                             place.field_path[0] = 1;
                         }
                     }
+                    _ => {
+                        // Keep the canonical Branch and its comparisons, but reach its success
+                        // without executing that guard. Length/index SSA still dominate their
+                        // real uses, so LLVM verification is not the owner of this rejection.
+                        let guard_index = function
+                            .blocks
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, block)| {
+                                matches!(block.term, Term::Branch(..)).then_some(i)
+                            })
+                            .nth(mutation - 25)
+                            .unwrap();
+                        let split = function.blocks[guard_index]
+                            .stmts
+                            .iter()
+                            .position(|stmt| {
+                                if mutation == 25 {
+                                    matches!(
+                                        stmt,
+                                        Stmt::Let(_, Rvalue::SliceLen(Operand::BorrowedPlace(_)))
+                                    )
+                                } else {
+                                    matches!(
+                                        stmt,
+                                        Stmt::Let(_, Rvalue::Bin(align_ast::BinOp::Lt, _, _))
+                                    )
+                                }
+                            })
+                            .unwrap();
+                        let mut guard = function.blocks[guard_index].clone();
+                        guard.stmts = function.blocks[guard_index].stmts.split_off(split);
+                        let Term::Branch(_, _, success) = guard.term else {
+                            unreachable!()
+                        };
+                        function.blocks[guard_index].term = Term::Unreachable;
+                        let inserted = u32::try_from(guard_index + 1).unwrap();
+                        function.blocks.insert(guard_index + 1, guard);
+                        let shift = |target: &mut u32| {
+                            if *target >= inserted {
+                                *target += 1;
+                            }
+                        };
+                        for (id, block) in function.blocks.iter_mut().enumerate() {
+                            block.id = u32::try_from(id).unwrap();
+                            match &mut block.term {
+                                Term::Goto(target) => shift(target),
+                                Term::Branch(_, failure, success) => {
+                                    shift(failure);
+                                    shift(success);
+                                }
+                                _ => {}
+                            }
+                        }
+                        for edge in &mut function.exceptional_edges {
+                            if edge.block == u32::try_from(guard_index).unwrap() {
+                                edge.block = inserted;
+                            } else {
+                                shift(&mut edge.block);
+                            }
+                        }
+                        let mut success = success;
+                        shift(&mut success);
+                        function.blocks[guard_index].term =
+                            Term::Branch(Operand::Const(Const::Bool(false)), inserted, success);
+                    }
                 }
                 if unused {
                     for block in &mut function.blocks {
@@ -548,11 +615,11 @@ fn producer_and_bounds() {
                         }
                     }
                 }
-                assert!(
-                    llvm(&bad).is_err(),
-                    "MIR mutation {mutation}, unused={unused}"
-                );
+                if llvm(&bad).is_ok() {
+                    accepted.push((mutation, unused));
+                }
             }
         }
+        assert!(accepted.is_empty(), "accepted malformed MIR: {accepted:?}");
     });
 }
