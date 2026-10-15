@@ -1696,6 +1696,12 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::CodecOpen { input, out } => {
+            contract.result = i32_ty;
+            contract.outputs = vec![(*out, Ty::CodecBatch)];
+            contract.operands = vec![(input, bytes, read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
         Rvalue::JsonDocCollect { kind, doc, arena, out } => {
             contract.outputs = vec![(*out, Ty::Slice(kind.element()))];
             contract.operands = vec![(doc, Ty::JsonDoc, read), (arena, Ty::ArenaHandle, read)];
@@ -1968,6 +1974,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::JsonDocKey { out, .. }
         | Rvalue::JsonDocCollect { out, .. }
         | Rvalue::BytesAsStr { out, .. }
+        | Rvalue::CodecOpen { out, .. }
         | Rvalue::FsReadFileView { out, .. }
         | Rvalue::FsReadBytesView { out, .. }
         | Rvalue::HttpRespHeader { out, .. }
@@ -2104,6 +2111,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::FsReadDir { path: input, .. }
         | Rvalue::DnsResolve { host: input, .. }
         | Rvalue::BytesAsStr { bytes: input, .. }
+        | Rvalue::CodecOpen { input, .. }
         | Rvalue::EnvGet { name: input, .. }
         | Rvalue::RegexCompile { pattern: input, .. }
         | Rvalue::TimeFormat { ns: input, .. }
@@ -6724,7 +6732,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::LogLine(..)
             | Rvalue::LogLineBuilder(..)
             | Rvalue::LogFlush(..)
-            | Rvalue::CodecOpen(..)
+            | Rvalue::CodecOpen { .. }
             | Rvalue::CodecBatchRows(..)
             | Rvalue::CodecBatchColumns(..)
             | Rvalue::CodecBatchKind(..)
@@ -12334,6 +12342,10 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
 #[cfg(test)]
 #[path = "producer_borrow_call_tests.rs"]
 mod borrow_call_tests;
+
+#[cfg(test)]
+#[path = "producer_codec_tests.rs"]
+mod codec_tests;
 
 #[cfg(test)]
 #[path = "producer_copy_tests.rs"]

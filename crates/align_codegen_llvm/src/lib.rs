@@ -16784,7 +16784,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::XmlText { .. } => {
                 return self.gen_xml_rvalue(rv, result_ty)
             }
-            Rvalue::CodecOpen(_)
+            Rvalue::CodecOpen { .. }
             | Rvalue::CodecBatchRows(_)
             | Rvalue::CodecBatchColumns(_)
             | Rvalue::CodecBatchName(..)
@@ -23085,9 +23085,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
         result_ty: Ty,
     ) -> Result<Option<BasicValueEnum<'c>>, CodegenError> {
         let value = match rv {
-            Rvalue::CodecOpen(input) => {
+            Rvalue::CodecOpen { input, out } => {
                 let (pointer, length) = self.split_str(input)?;
-                self.builder
+                let status = self.builder
                     .build_call(
                         self.runtime(RuntimeKey::CodecOpenV1),
                         &[pointer.into(), length.into()],
@@ -23097,6 +23097,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .try_as_basic_value()
                     .basic()
                     .ok_or_else(|| self.err("codec_open_v1 must return i32"))?
+                    .into_int_value();
+                let output = self.slots.get(out).copied()
+                    .ok_or_else(|| self.err("codec.open output slot is missing"))?;
+                let succeeded = self.builder.build_int_compare(
+                    IntPredicate::EQ, status, self.ctx.i32_type().const_zero(), "codec.open.ok",
+                ).map_err(|error| self.err(error))?;
+                let publish = self.ctx.append_basic_block(self.func, "codec.open.publish");
+                let join = self.ctx.append_basic_block(self.func, "codec.open.join");
+                self.builder.build_conditional_branch(succeeded, publish, join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(publish);
+                let descriptor = self.operand(input)?;
+                self.builder.build_store(output, descriptor)
+                    .map_err(|error| self.err(error))?;
+                self.builder.build_unconditional_branch(join)
+                    .map_err(|error| self.err(error))?;
+                self.builder.position_at_end(join);
+                status.into()
             }
             Rvalue::CodecBatchRows(batch) => {
                 let (base, _) = self.codec_batch_parts(batch)?;
