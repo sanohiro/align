@@ -83,6 +83,12 @@ view. It reuses the existing reserved, bounds-checked element place and reads
 only its length. General view-return and mutable-retention authority remain on
 the separate Plan61 track; a scalar observation needs neither a second borrow
 model nor a new lifetime summary.
+[Plan205](impl/205-indexed-array-field-copy-reads.md) extends the same reserved
+place to `rows[row].values[index]` when the selected element belongs to the
+closed independent-Copy graph. Both bounds and the complete parent lifetime
+remain explicit compiler obligations. A copied record containing no view or
+owner needs no retained-view permission; ordinary array-header reads remain
+excluded. The source checker and producer share one type authority.
 
 The [R77–R83 composition batch](impl/56-r77-r83-composition-plan.md) separates
 initialized reads, ownership, storage generations and contained-view lifetimes.

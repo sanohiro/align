@@ -85,3 +85,9 @@ array fields. The owners use admitted fixed storage for arena/text-array cases.
 The existing whole-fixed-Move-record call producer restriction is separate from
 checking the admitted borrowed function body; this capability does not widen
 whole-place calls. No consumer code or compiler pin changes are required here.
+
+Plan205 subsequently admits one further immediate consumer: independent Copy
+index reads through the selected ordinary array field, with both bounds and the
+same complete parent reservation. Its shared closed-data classifier excludes
+views and owners. The general field-header/view/write exclusions above remain;
+Plan205 owns the additional Index context and exact two-guard proof.
