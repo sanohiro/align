@@ -2,6 +2,221 @@
 use super::*;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+#[test]
+fn arena_decoder_buffer_authority() -> TestResult {
+    for (declaration, ty) in [
+        ("R {values:array<i64>,text:str}", "R"),
+        ("R {values:array<str>,text:str}", "R"),
+        ("Inner {values:array<i64>} R {inner:Inner,text:str}", "R"),
+        ("R {values:array<i64>,text:str}", "array<R>"),
+        ("R {value:i64,text:str}", "soa<R>"),
+        (
+            "R {values:array<i64>,text:str} Choice { Row(R), Number(i64) }",
+            "Choice",
+        ),
+    ] {
+        let source = format!(
+            "import core.json\n{declaration}\nfn change(borrow mut value:{ty}){{}}\nfn probe(input:str)->Result<(),Error>{{arena {{mut value:{ty}:=json.decode(input)?;change(value);change(value)}};return Ok(())}}\nfn main(){{}}"
+        );
+        let program = lower(&source)?;
+        validate(&program, true, ty);
+    }
+    Ok(())
+}
+
+const ARENA_DECODE: &str = r#"
+import core.json
+R {values:array<i64>,tags:array<str>,text:str}
+fn change(borrow mut value:R){}
+fn probe(borrow shared:R,input:str)->Result<(),Error>{
+ arena {mut value:R:=json.decode(input)?;change(value)}
+ return Ok(())
+}
+fn main(){}
+"#;
+
+#[test]
+fn arena_decoder_buffer_malformed() -> TestResult {
+    for soa in [false, true] {
+        let source = if soa {
+            ARENA_DECODE
+                .replace(
+                    "R {values:array<i64>,tags:array<str>,text:str}",
+                    "R {value:i64,text:str}",
+                )
+                .replace("value:R", "value:soa<R>")
+                .replace("shared:R", "shared:soa<R>")
+        } else {
+            ARENA_DECODE.into()
+        };
+        let base = lower(&source)?;
+        validate(&base, true, "decoder base");
+        for mutation in 0..8 {
+            let mut bad = base.clone();
+            let f = bad
+                .fns
+                .iter_mut()
+                .find(|f| f.name.as_str() == "probe")
+                .ok_or("probe")?;
+            let (block, statement, value, output) = f
+                .blocks
+                .iter()
+                .enumerate()
+                .find_map(|(b, body)| {
+                    body.stmts
+                        .iter()
+                        .enumerate()
+                        .find_map(|(s, node)| match node {
+                            Stmt::Let(
+                                value,
+                                Rvalue::JsonDecode { out, .. } | Rvalue::JsonDecodeSoa { out, .. },
+                            ) => Some((b, s, *value, *out)),
+                            _ => None,
+                        })
+                })
+                .ok_or("decoder")?;
+            match mutation {
+                0..=3 => {
+                    let Stmt::Let(_, producer) = &mut f.blocks[block].stmts[statement] else {
+                        return Err("decoder shape".into());
+                    };
+                    match producer {
+                        Rvalue::JsonDecode {
+                            struct_id,
+                            input,
+                            out,
+                            arena,
+                        } => match mutation {
+                            0 => *input = Operand::Const(Const::Bool(true)),
+                            1 => *arena = Some(Operand::Const(Const::Bool(true))),
+                            2 => *out = u32::MAX,
+                            _ => *struct_id = u32::MAX,
+                        },
+                        Rvalue::JsonDecodeSoa {
+                            struct_id,
+                            input,
+                            out,
+                            arena,
+                        } => match mutation {
+                            0 => *input = Operand::Const(Const::Bool(true)),
+                            1 => *arena = Operand::Const(Const::Bool(true)),
+                            2 => *out = u32::MAX,
+                            _ => *struct_id = u32::MAX,
+                        },
+                        _ => return Err("decoder shape".into()),
+                    }
+                }
+                4 => f.value_tys[value as usize] = Ty::Bool,
+                5 => {
+                    f.blocks[block].stmts.remove(statement);
+                }
+                6 => {
+                    let duplicate = f.blocks[block].stmts[statement].clone();
+                    f.blocks[block].stmts.insert(statement, duplicate);
+                }
+                _ => {
+                    // A fresh native writer cannot upgrade a competing shared header.
+                    f.blocks[block]
+                        .stmts
+                        .insert(statement + 1, Stmt::Store(output, Operand::Arg(0)));
+                }
+            }
+            // SoA is a Copy view; assigning another readable view transfers no owner.
+            validate(
+                &bad,
+                soa && mutation == 7,
+                &format!("decoder soa={soa}/mutation={mutation}"),
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn arena_decoder_buffer_and_payload_are_distinct() -> TestResult {
+    let program = lower(ARENA_DECODE)?;
+    let function = program
+        .fns
+        .iter()
+        .find(|f| f.name.as_str() == "probe")
+        .ok_or("probe")?;
+    let mut definitions = vec![None; function.value_tys.len()];
+    let mut counts = vec![0; function.value_tys.len()];
+    let mut stores = XmlSlotStores {
+        roots: vec![Vec::new(); function.slots.len()],
+        fields: vec![Vec::new(); function.slots.len()],
+        elements: vec![Vec::new(); function.slots.len()],
+        element_fields: vec![Vec::new(); function.slots.len()],
+        constant_elements: vec![Vec::new(); function.slots.len()],
+        producers: vec![Vec::new(); function.slots.len()],
+    };
+    let mut output = None;
+    for stmt in function.blocks.iter().flat_map(|b| &b.stmts) {
+        match stmt {
+            Stmt::Let(value, rvalue) => {
+                definitions[*value as usize] = Some(rvalue);
+                counts[*value as usize] += 1;
+                if let Rvalue::JsonDecode { out, .. } = rvalue {
+                    output = Some(*out);
+                    stores.producers[*out as usize].push((*value, rvalue));
+                }
+            }
+            Stmt::Store(slot, value) => stores.roots[*slot as usize].push(value),
+            _ => {}
+        }
+    }
+    let graph = ValidatedProducerGraph {
+        function,
+        program: &program,
+        local_contracts: &HashSet::new(),
+        value_definitions: &definitions,
+        auxiliary_value_definitions: &vec![None; counts.len()],
+        duplicate_values: &vec![false; counts.len()],
+        slot_stores: &stores,
+        primary_definitions: &counts,
+        auxiliary_definitions: &vec![0; counts.len()],
+    };
+    let output = output.ok_or("output")?;
+    for field in 0..3 {
+        let path = vec![XmlAccessPathSegment::StructField(field)];
+        let ty =
+            xml_selected_ty(&program, function.slots[output as usize], &path).ok_or("field")?;
+        let payload = xml_slot_path_access(&graph, output, ty, path.clone());
+        assert_eq!(
+            payload,
+            XmlProducerState::Present(if field < 2 {
+                XmlAccessProvenance::Owned
+            } else {
+                XmlAccessProvenance::Shared
+            })
+        );
+        let mut analyzer = XmlAccessAnalyzer::new(&graph);
+        let source = analyzer.buffer_node(XmlAccessNode::Slot(output, path));
+        assert_eq!(
+            analyzer.build(source, None),
+            if field < 2 {
+                XmlProducerState::Present(XmlAccessProvenance::Owned)
+            } else {
+                XmlProducerState::Invalid
+            }
+        );
+    }
+    assert_eq!(
+        xml_slot_path_access(
+            &graph,
+            output,
+            Ty::Str,
+            vec![
+                XmlAccessPathSegment::StructField(1),
+                XmlAccessPathSegment::Element
+            ]
+        ),
+        XmlProducerState::Present(XmlAccessProvenance::Shared)
+    );
+    Ok(())
+}
+
 fn lower(source: &str) -> TestResult<Program> {
     let mut diagnostics = align_diag::Diagnostics::new();
     let tokens = align_lexer::tokenize(0, source, &mut diagnostics);

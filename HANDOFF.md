@@ -24,6 +24,13 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan202](docs/impl/202-native-json-allocation-authority.md) certifies native
+  JSON record/AoS/union heap spines independently of borrowed input/arena text.
+  Existing mutable calls now accept those owners, and cleanup releases their
+  buffers inside arenas. Recursive union error cleanup follows the selected arm
+  and clears failed payloads before outer cleanup; borrowed lifetimes and
+  JSON/CSV SoA arena ownership remain unchanged.
+
 - [Plan199](docs/impl/199-indirect-mutable-outputs.md) separates mutable-output
   dependencies from possible mutation, preserving borrowed siblings after another
   field changes. Known noncapturing function values consume the same checked
@@ -41,13 +48,13 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 - [Plan197](docs/impl/197-fixed-text-array-borrows.md) certifies local fixed
   str-array shared/exclusive borrows through complete Copy construction and
   separate text/header authority. Input text lifetimes and sole cleanup remain;
-  Move-element/record roots and native arena decoder proofs stay separate.
+  Move-element/record roots stay separate; Plan202 closes native JSON decoder proofs.
 
 - [Plan195](docs/impl/195-mutable-borrow-storage-authority.md) separates readable
   borrowed-call contents from complete recursive owner and buffer authority.
   Typed arena dynamic arrays and fixed str-array record fields now execute
   through existing whole-place mutable calls. Plan197 closes named fixed str-array
-  roots; native arena-decoder outputs retain separate producer limits.
+  roots; Plan202 closes native JSON arena-decoder allocation authority.
 
 - [Plan194](docs/impl/194-dynamic-array-field-writes.md) admits indexed writes to
   owned scalar-array record fields for media AM-R01 and LLM R147/R46. Exact selected

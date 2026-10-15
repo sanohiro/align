@@ -1953,11 +1953,9 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         Rvalue::ProcessLive { out, .. } => out.iter().map(|slot|(*slot,Owned)).collect(),
         Rvalue::ChildWait { out, .. } => vec![(*out, Owned)],
         Rvalue::FsTree { output, .. } => fs_tree_output_slots(*output).into_iter().map(|slot| (slot, Owned)).collect(),
-        Rvalue::JsonDecode { out, arena, .. }
-        | Rvalue::JsonDecodeStructArray { out, arena, .. }
-        | Rvalue::JsonDecodeUnion { out, arena, .. } => {
-            vec![(*out, if arena.is_some() { Shared } else { Owned })]
-        }
+        Rvalue::JsonDecode { out, .. }
+        | Rvalue::JsonDecodeStructArray { out, .. }
+        | Rvalue::JsonDecodeUnion { out, .. } => owned(*out),
         Rvalue::JsonDecodeSoa { out, .. } | Rvalue::CsvDecode { out, .. } => {
             vec![(*out, Shared)]
         }
@@ -7072,14 +7070,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if let Some(arena) = arena {
                     self.check_operand(equation, arena, Ty::ArenaHandle);
                 }
-                (
-                    *out,
-                    if arena.is_some() {
-                        XmlAccessProvenance::Shared
-                    } else {
-                        XmlAccessProvenance::Owned
-                    },
-                )
+                (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::JsonOwnedDecode { root_kind, plan, input, out, arena } => {
                 let canonical = align_sema::owned_json_graph_plan_v4(
@@ -7153,14 +7144,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if let Some(arena) = arena {
                     self.check_operand(equation, arena, Ty::ArenaHandle);
                 }
-                (
-                    *out,
-                    if arena.is_some() {
-                        XmlAccessProvenance::Shared
-                    } else {
-                        XmlAccessProvenance::Owned
-                    },
-                )
+                (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::JsonDecodeSoa {
                 struct_id,
@@ -7239,14 +7223,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if let Some(arena) = arena {
                     self.check_operand(equation, arena, Ty::ArenaHandle);
                 }
-                (
-                    *out,
-                    if arena.is_some() {
-                        XmlAccessProvenance::Shared
-                    } else {
-                        XmlAccessProvenance::Owned
-                    },
-                )
+                (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::JsonScanNext {
                 scanner,
@@ -7416,7 +7393,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
         } else {
             // The output slot owns its record/array, while an exact Str projection borrows
             // input or arena text. Never promote that text to exclusive storage authority.
-            let selected_access = if matches!(rvalue, Rvalue::JsonOwnedDecode { .. })
+            let selected_access = if matches!(rvalue, Rvalue::JsonOwnedDecode { .. }
+                | Rvalue::JsonDecode { .. } | Rvalue::JsonDecodeStructArray { .. }
+                | Rvalue::JsonDecodeUnion { .. })
                 && selected_ty == Ty::Str
             {
                 XmlAccessProvenance::Shared

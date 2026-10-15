@@ -67,8 +67,9 @@ Borrowed element/fixed-element descriptors retain their existing stable-place,
 bounds and field authentication. They gain no new exclusive source admission.
 This capability admits complete fixed str-array record fields; Plan197
 subsequently closes named fixed str-array roots through Copy construction. Native
-arena decoder outputs retain their existing producer authority;
-only the typed allocation-pointer/header path gains arena buffer authority here.
+arena decoder outputs retain their existing producer authority in this slice;
+Plan202 subsequently certifies their individual heap spines and borrowed text.
+Only the typed allocation-pointer/header path gains arena buffer authority here.
 
 One call validator serves all four direct/indirect and cleanup/no-cleanup MIR
 forms, local and imported contracts, whole-program and per-unit publication,

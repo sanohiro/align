@@ -4256,7 +4256,8 @@ pub struct JsonSubTable {
 /// `Str`(0) / `Number`(1) / `Bool`(2) / `Object`(3) / `Array`(4), an O(1) dispatch on the first
 /// structural byte. `arms` is one [`JsonField`] per variant describing its single payload (the `tag`
 /// packs the payload kind/width/sign exactly as a struct field; `offset` is the payload's byte offset
-/// **within the enum** `{ i32 tag, payloads… }`; `sub` is the object payload's sub-schema; `opt_tag`
+/// **within the enum** `{ i32 tag, shared payload storage }`; variant payloads may overlap.
+/// `sub` is the object payload's sub-schema; `opt_tag`
 /// is unused, `-1`). `class_to_arm[c]` maps a shape class `c` (0..5) to its arm index, or `-1` if the
 /// union has no variant of that shape; `enum_tags[arm]` is the enum tag value (variant index) to
 /// store. `store_size` is the enum's byte size (for the payload bounds check). Sema guarantees the
@@ -4408,12 +4409,22 @@ unsafe fn decode_union_value(p: &mut JsonParser, u: &JsonUnion, base: *mut u8) -
     if off.checked_add(w)? > store {
         return None;
     }
-    let dst = unsafe { base.add(off) };
-    unsafe { write_value(p, kind, width, d, dst)? };
-    // Set the enum tag (`i32` at offset 0) to the selected variant's index. `enum_tags` is parallel to
-    // `arms` (both `n_arms` long), so bound it identically rather than trusting an unchecked `add`.
+    // Resolve the tag before payload construction: after publishing an owner there must be no
+    // fallible descriptor lookup that bypasses its cleanup.
     let enum_tags = unsafe { core::slice::from_raw_parts(u.enum_tags, arms.len()) };
     let tag_val = *enum_tags.get(arm_idx as usize)?;
+    let dst = unsafe { base.add(off) };
+    if unsafe { write_value(p, kind, width, d, dst) }.is_none() {
+        // A partial record can contain scalar/text bytes even after its own buffers were freed.
+        // Clean the selected descriptor, never the still-unpublished tag, then clear the entire
+        // union so an enclosing cleanup cannot interpret those bytes as another arm's owner.
+        unsafe {
+            drop_decoded_owned(base, core::slice::from_ref(d), None);
+            core::ptr::write_bytes(base, 0, store);
+        }
+        return None;
+    }
+    // Publish the enum tag (`i32` at offset 0) only after the complete payload is live.
     let tag_bytes = tag_val.to_le_bytes();
     unsafe { std::ptr::copy_nonoverlapping(tag_bytes.as_ptr(), base, 4) };
     Some(())
@@ -4443,17 +4454,14 @@ pub unsafe extern "C" fn align_rt_json_decode_union(
     }
     let u = unsafe { &*union_desc };
     let mut p = JsonParser { src, pos: 0, arena };
-    // `decode_union_value` is atomic: on failure it allocates nothing that survives (an
-    // `array<Struct>` arm builds into a local `Vec` freed on the early return; the owned buffer is
-    // materialized only after the value fully parses). So a decode failure needs no cleanup.
+    // Failed payload construction releases its partial owners and clears the union storage.
     if unsafe { decode_union_value(&mut p, u, out) }.is_none() {
         return 1;
     }
     p.ws();
     if p.pos != src.len() {
-        // Trailing garbage AFTER a successful decode: the value is a live enum, so an owned
-        // `array<Struct>` (kind-5) payload is now materialized in `out` — free it before returning the
-        // decode `Err`, else it leaks (the Align side has no bound value to drop on the error path).
+        // A complete payload may own buffers directly or through nested records. The Align side
+        // has no bound value to drop on the error path.
         unsafe { drop_decoded_union(out, u) };
         return 1;
     }
@@ -4462,9 +4470,8 @@ pub unsafe extern "C" fn align_rt_json_decode_union(
 
 /// Free the owned payload of a decoded union value on an error path (trailing garbage after a
 /// successful `decode_union_value`). The union analogue of [`drop_decoded_owned`]: read the enum tag,
-/// find the matching arm, and if it is a kind-5 owned `array<Struct>` free its `{ptr,len}` buffer and
-/// null the slot (idempotent). Every other arm is non-owned (scalar / `str` view / plain-data object),
-/// so there is nothing else to free.
+/// find the matching arm, and recursively release its owners through the same descriptor cleanup
+/// as record fields. Every released slot is nulled, so outer cleanup may safely repeat this pass.
 ///
 /// # Safety
 /// `base` must point at a decoded enum of `u.store_size` bytes; `u` must be a valid [`JsonUnion`].
@@ -4478,14 +4485,7 @@ unsafe fn drop_decoded_union(base: *mut u8, u: &JsonUnion) {
         if enum_tags[i] != tag {
             continue;
         }
-        if (d.tag >> 8) & 0xff == 5 && d.offset >= 0 {
-            let off = d.offset as usize;
-            let mut pb = [0u8; 8];
-            unsafe { core::ptr::copy_nonoverlapping(base.add(off), pb.as_mut_ptr(), 8) };
-            let ptr = usize::from_le_bytes(pb) as *mut u8;
-            unsafe { align_rt_free(ptr) };
-            unsafe { core::ptr::write_bytes(base.add(off), 0, 8) };
-        }
+        unsafe { drop_decoded_owned(base, core::slice::from_ref(d), None) };
         return;
     }
 }
@@ -54325,6 +54325,8 @@ mod json_array_root_tests;
 
 #[cfg(test)]
 mod json_record_array_grammar_tests;
+#[cfg(all(test, feature = "alloc-count"))]
+mod json_union_cleanup_tests;
 
 #[cfg(all(test, feature = "alloc-count"))]
 mod json_owned_record_array_tests;

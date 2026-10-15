@@ -22131,9 +22131,25 @@ impl<'a> EscapeCheck<'a> {
                 // Fully owned graphs copy every text leaf and retain neither input nor arena.
                 ExprKind::JsonOwnedDecode { .. }
                 | ExprKind::JsonDecodeArray { .. } => EscapeValueFact::default(),
-                ExprKind::JsonDecode { input, .. }
-                | ExprKind::JsonDecodeStructArray { input, .. }
-                | ExprKind::JsonDecodeUnion { input, .. } => self.completed_escape_value(input),
+                ExprKind::JsonDecode { input, struct_id }
+                | ExprKind::JsonDecodeStructArray { input, struct_id } => {
+                    let mut content = self.completed_escape_value(input);
+                    if self.struct_has_str(*struct_id) {
+                        content.non_storage = content.non_storage.join(
+                            &EscapeRegionFact::from_direct(self.allocation_region(expression)),
+                        );
+                    }
+                    content
+                }
+                ExprKind::JsonDecodeUnion { input, enum_id } => {
+                    let mut content = self.completed_escape_value(input);
+                    if self.tracks_region(Ty::Enum(*enum_id)) {
+                        content.non_storage = content.non_storage.join(
+                            &EscapeRegionFact::from_direct(self.allocation_region(expression)),
+                        );
+                    }
+                    content
+                }
                 _ => EscapeValueFact::default(),
             },
             StorageContentInitializer::JsonDocCollection => match &expression.kind {
@@ -32391,7 +32407,8 @@ fn storage_header_descriptors_compatible(
 fn native_storage_is_individual(kind: &ExprKind) -> bool {
     matches!(kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
         | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
-        | ExprKind::JsonDecodeArray { .. }
+        | ExprKind::JsonDecodeArray { .. } | ExprKind::JsonDecode { .. }
+        | ExprKind::JsonDecodeStructArray { .. } | ExprKind::JsonDecodeUnion { .. }
         | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. })
 }
 

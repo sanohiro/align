@@ -159,6 +159,7 @@ fn exercise()->Result<(),Error>{
  }
  return Ok(())
 }
+
 fn main()->i32 {
  before:=unsafe {align_rt_alloc_count()};freed:=unsafe {align_rt_free_count()}
  live:=unsafe {align_rt_requested_live_bytes()}
@@ -166,5 +167,238 @@ fn main()->i32 {
  if unsafe {align_rt_alloc_count()}-before!=unsafe {align_rt_free_count()}-freed || unsafe {align_rt_requested_live_bytes()}!=live {return 2}
  return 0
 }"#, "control").unwrap();
+    });
+}
+
+#[test]
+fn arena_decoded_storage() {
+    owned_fixture::run("arena_decoded_storage", |stage| {
+        std::fs::write(
+            stage.join("decoded.align"),
+            r#"module decoded
+pub Row {values:array<i64>,tags:array<str>,text:str}
+pub fn change(borrow mut row:Row) {
+ if row.values.len()>0 {row.values[0]=7}
+ if row.tags.len()>0 {row.tags[0]="new"}
+ row.text="changed"
+}
+pub fn forward(borrow mut row:Row){change(row);change(row)}
+pub fn inspect<T>(borrow mut value:T){}
+"#,
+        )
+        .unwrap();
+        execute(stage, r#"
+import core.json
+import decoded
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+fn fail()->Result<i64,Error> = Err(Error.Invalid)
+fn mapper(e:Error)->Error=e
+fn exercise(bad:bool)->Result<(),Error>{
+ input:="{\"values\":[1,2],\"tags\":[\"old\",\"\\u0061\"],\"text\":\"old\"}".clone()
+ arena outer {
+  mut row:decoded.Row:=json.decode(input)?
+  if unsafe {align_rt_requested_live_bytes()}<=0 {return Err(Error.Invalid)}
+  before:=unsafe {align_rt_alloc_count()};freed:=unsafe {align_rt_free_count()}
+  decoded.forward(row)
+  decoded.inspect(row)
+  mut n:=0
+  loop {if n==3 {break};decoded.change(row);n=n+1}
+  if row.values[0]!=7 || row.values[1]!=2 || row.tags[0]!="new" || row.tags[1]!="a" || row.text!="changed" {return Err(Error.Invalid)}
+  if unsafe {align_rt_alloc_count()}!=before || unsafe {align_rt_free_count()}!=freed {return Err(Error.Invalid)}
+  mut empty:decoded.Row:=json.decode("{\"values\":[],\"tags\":[],\"text\":\"empty\"}")?
+  decoded.forward(empty)
+  if empty.values.len()!=0 || empty.tags.len()!=0 || empty.text!="changed" {return Err(Error.Invalid)}
+  if bad {unused:=fail().map_err(mapper)?}
+  row=json.decode(input)?
+  mut moved:=row
+  decoded.forward(moved)
+  if moved.values[0]!=7 || moved.tags[1]!="a" {return Err(Error.Invalid)}
+  malformed:Result<decoded.Row,Error>:=json.decode("{\"values\":[1],\"tags\":[\"ok\",false],\"text\":\"bad\"}")
+  match malformed {Ok(_)=>{return Err(Error.Invalid)},Err(_)=>{}}
+ }
+ return Ok(())
+}
+fn main()->i32 {
+ unsafe {align_rt_requested_live_reset()}
+ before:=unsafe {align_rt_alloc_count()};freed:=unsafe {align_rt_free_count()}
+ live:=unsafe {align_rt_requested_live_bytes()}
+ match exercise(false){Err(_)=>{return 1},Ok(_)=>{}}
+ match exercise(true){Ok(_)=>{return 2},Err(_)=>{}}
+ if unsafe {align_rt_alloc_count()}-before!=unsafe {align_rt_free_count()}-freed || unsafe {align_rt_requested_live_bytes()}!=live {print(unsafe {align_rt_alloc_count()}-before);print(unsafe {align_rt_free_count()}-freed);print(live);print(unsafe {align_rt_requested_live_bytes()});return 3}
+ return 0
+}"#, "arena-decoded").unwrap();
+    });
+}
+
+#[test]
+fn arena_decoded_shapes() {
+    owned_fixture::run("arena_decoded_shapes", |stage| {
+        let package = stage.join("pkg/csv/internal");
+        std::fs::create_dir_all(&package).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/csv/pkg");
+        std::fs::copy(root.join("csv.align"), stage.join("pkg/csv.align")).unwrap();
+        std::fs::copy(
+            root.join("csv/internal/descriptor.align"),
+            package.join("descriptor.align"),
+        )
+        .unwrap();
+        execute(stage, r#"
+import core.json
+import pkg.csv
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+Inner {values:array<i64>}
+Row {inner:Inner,text:str}
+Cell {value:i64,text:str}
+Choice {Record(Row),Number(i64)}
+fn nested(borrow mut row:Row){row.inner.values[0]=9}
+fn rows(borrow mut values:array<Row>){}
+fn columns(borrow mut values:soa<Cell>){}
+fn choice(borrow mut value:Choice){}
+fn exercise()->Result<(),Error>{
+ arena {
+  mut row:Row:=json.decode("{\"inner\":{\"values\":[1]},\"text\":\"live\"}")?
+  nested(row)
+  if row.inner.values[0]!=9 || row.text!="live" {return Err(Error.Invalid)}
+  mut list:array<Row>:=json.decode("[{\"inner\":{\"values\":[2]},\"text\":\"live\"}]")?
+  rows(list)
+  if list.len()!=1 || list[0].text!="live" {return Err(Error.Invalid)}
+  mut table:soa<Cell>:=json.decode("[{\"value\":3,\"text\":\"live\"}]")?
+  columns(table)
+  if table.value[0]!=3 || table.text[0]!="live" {return Err(Error.Invalid)}
+  mut tagged:Choice:=json.decode("{\"inner\":{\"values\":[4]},\"text\":\"live\"}")?
+  choice(tagged)
+  if unsafe {align_rt_requested_live_bytes()}<=0 {return Err(Error.Invalid)}
+ }
+ return Ok(())
+}
+fn main()->i32 {
+ unsafe {align_rt_requested_live_reset()}
+ before:=unsafe {align_rt_alloc_count()};freed:=unsafe {align_rt_free_count()}
+ match exercise(){Ok(_)=>{},Err(_)=>{return 1}}
+ arena out {
+  options:=pkg.csv.DecodeOptions {header:pkg.csv.Header.Absent,line_ending:pkg.csv.LineEnding.Lf,max_rows:2}
+  result:Result<soa<Cell>,pkg.csv.Error>:=pkg.csv.decode("5,live",out,options)
+  mut table:=result else {return 2}
+  columns(table)
+  if table.value[0]!=5 || table.text[0]!="live" {return 3}
+ }
+ if unsafe {align_rt_alloc_count()}-before!=unsafe {align_rt_free_count()}-freed || unsafe {align_rt_requested_live_bytes()}!=0 {return 4}
+ return 0
+}"#, "arena-decoded-shapes").unwrap();
+    });
+}
+
+#[test]
+fn arena_decoder_borrowed_text_keeps_its_lifetime() {
+    owned_fixture::run("arena_decoder_borrowed_text_keeps_its_lifetime", |stage| {
+        for (declaration, ty, json) in [
+            (
+                "R {values:array<i64>,text:str}",
+                "R",
+                r#"{"values":[1],"text":"escaped\\u0061"}"#,
+            ),
+            (
+                "R {values:array<i64>,text:str}",
+                "array<R>",
+                r#"[{"values":[1],"text":"escaped\\u0061"}]"#,
+            ),
+            (
+                "R {values:array<i64>,text:str} Choice {One(R),Number(i64)}",
+                "Choice",
+                r#"{"values":[1],"text":"escaped\\u0061"}"#,
+            ),
+        ] {
+            let literal = format!("\"{}\"", json.replace('\\', "\\\\").replace('"', "\\\""));
+            for body in [
+                format!(
+                    "fn escaped()->Result<{ty},Error>{{arena {{value:{ty}:=json.decode({literal})?;return Ok(value)}}}}"
+                ),
+                format!(
+                    "fn invalidated()->Result<(),Error>{{mut input:={literal}.clone();arena {{value:{ty}:=json.decode(input)?;input=\"other\".clone();observe(value)}};return Ok(())}}"
+                ),
+            ] {
+                let source = format!(
+                    "import core.json\n{declaration}\nfn observe(borrow value:{ty}){{}}\n{body}\nfn main(){{}}"
+                );
+                let path = stage.join("lifetime.align");
+                std::fs::write(&path, &source).unwrap();
+                for per_unit in [false, true] {
+                    let mut sources = SourceMap::new();
+                    let diagnostics = if per_unit {
+                        align_driver::build_per_unit(&mut sources, path.to_str().unwrap(), &source)
+                            .diags
+                    } else {
+                        align_driver::check(&mut sources, path.to_str().unwrap(), &source).diags
+                    };
+                    let rendered = align_driver::format_diagnostics(&sources, &diagnostics);
+                    assert!(
+                        diagnostics.has_errors(),
+                        "{ty}/per-unit={per_unit}: {source}"
+                    );
+                    assert!(
+                        rendered.contains("arena")
+                            || rendered.contains("outlive")
+                            || rendered.contains("invalidat")
+                            || rendered.contains("borrow"),
+                        "{rendered}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn arena_union_error_cleanup() {
+    owned_fixture::run("arena_union_error_cleanup", |stage| {
+        let base = r#"
+import core.json
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_requested_live_peak()->i64
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+Part {value:i64}
+Row {text:str,values:array<i64>,required:i64}
+Choice {Many(array<Part>),One(Row)}
+Outer {choice:Choice,tail:i64}
+fn exercise()->Result<(),Error>{
+ arena {
+  partial:Result<Outer,Error>:=json.decode("{\"choice\":{\"text\":\"borrowed\"}}")
+  match partial {Ok(_)=>{return Err(Error.Invalid)},Err(_)=>{}}
+  trailing:Result<Choice,Error>:=json.decode("{\"text\":\"borrowed\",\"values\":[1],\"required\":2} trailing")
+  match trailing {Ok(_)=>{return Err(Error.Invalid)},Err(_)=>{}}
+  sibling:Result<Outer,Error>:=json.decode("{\"choice\":{\"text\":\"borrowed\",\"values\":[1],\"required\":2}}")
+  match sibling {Ok(_)=>{return Err(Error.Invalid)},Err(_)=>{}}
+  rows:Result<array<Outer>,Error>:=json.decode("[{\"choice\":{\"text\":\"borrowed\",\"values\":[1],\"required\":2},\"tail\":3},{\"choice\":{\"text\":\"borrowed\",\"values\":[1]}}]")
+  match rows {Ok(_)=>{return Err(Error.Invalid)},Err(_)=>{}}
+ }
+ return Ok(())
+}
+fn main()->i32 {
+ unsafe {align_rt_requested_live_reset()}
+ before:=unsafe {align_rt_alloc_count()};freed:=unsafe {align_rt_free_count()}
+ match exercise(){Ok(_)=>{},Err(_)=>{return 1}}
+ if unsafe {align_rt_requested_live_peak()}<=0 {return 2}
+ if unsafe {align_rt_requested_live_bytes()}!=0 || unsafe {align_rt_alloc_count()}-before!=unsafe {align_rt_free_count()}-freed {return 3}
+ return 0
+}"#;
+        for record_first in [false, true] {
+            let source = if record_first {
+                base.replace(
+                    "Choice {Many(array<Part>),One(Row)}",
+                    "Choice {One(Row),Many(array<Part>)}",
+                )
+            } else {
+                base.into()
+            };
+            execute(stage, &source, &format!("union-errors-{record_first}")).unwrap();
+        }
     });
 }
