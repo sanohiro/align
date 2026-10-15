@@ -4,6 +4,84 @@
 mod common;
 use common::*;
 
+#[cfg(unix)]
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
+
+#[test]
+#[cfg(unix)]
+fn codec_batch_result_survives_imported_generic_cache_replay() {
+    owned_fixture::run("codec_batch_result_survives_imported_generic_cache_replay", |stage| {
+        let api = "module codec_api\nimport core.codec\n\
+            pub fn same(error: Error) -> Error = error\n\
+            pub fn rows_or_len(borrow result: Result<codec.batch, string>) -> i64 = match result { Ok(batch) => batch.rows(), Err(message) => message.len() }\n\
+            pub fn len_or_rows(borrow result: Result<string, codec.batch>) -> i64 = match result { Ok(message) => message.len(), Err(batch) => batch.rows() }\n\
+            pub fn open<T>(marker: T, input: slice<u8>, first: bool) -> Result<codec.batch, Error> {\n\
+              batch := codec.open(input).map_err(same)?\n\
+              return if first { Ok(batch) } else { loop { break Ok(batch) } }\n\
+            }\n";
+        let main = "module main\nimport core.codec\nimport codec_api\n\
+            fn main() -> Result<(), Error> {\n\
+              values := [7, 9]\n\
+              mut encoder := codec.encoder(2)?\n\
+              encoder.put_i64(\"id\", values)?\n\
+              owner := encoder.finish()\n\
+              batch := codec_api.open(0, owner.bytes(), true)?\n\
+              again := codec_api.open(false, owner.bytes(), false)?\n\
+              if batch.rows() != 2 || again.columns() != 1 { return Err(Error.Invalid) }\n\
+              batch_ok: Result<codec.batch, string> := Ok(batch)\n\
+              batch_err: Result<string, codec.batch> := Err(again)\n\
+              text_err: Result<codec.batch, string> := Err(\"bad\".clone())\n\
+              text_ok: Result<string, codec.batch> := Ok(\"bad\".clone())\n\
+              if codec_api.rows_or_len(batch_ok) != 2 || codec_api.len_or_rows(batch_err) != 2 { return Err(Error.Invalid) }\n\
+              if codec_api.rows_or_len(text_err) != 3 || codec_api.len_or_rows(text_ok) != 3 { return Err(Error.Invalid) }\n\
+              ids := again.i64s(0) else { return Err(Error.Invalid) }\n\
+              last := ids.at(1) else { return Err(Error.Invalid) }\n\
+              if last != 9 { return Err(Error.Invalid) }\n\
+              malformed := buffer.filled(8, 0 as u8)\n\
+              match codec_api.open(0, malformed.bytes(), false) {\n\
+                Ok(_) => { return Err(Error.Invalid) }\n\
+                Err(error) => { match error { Invalid => {}, _ => { return Err(Error.Invalid) } } }\n\
+              }\n\
+              return Ok(())\n\
+            }\n";
+        std::fs::write(stage.join("codec_api.align"), api).unwrap();
+        let entry = stage.join("main.align");
+        std::fs::write(&entry, main).unwrap();
+        let entry = entry.to_str().unwrap();
+        let cache = align_driver::CacheContext::at(stage.join("cache"));
+        for round in 0..2 {
+            let mut sources = SourceMap::new();
+            let mut built = align_driver::build_package(&mut sources, entry, main, &cache,
+                align_driver::UnitReuse::Allowed);
+            assert!(!built.diags.has_errors(), "{}",
+                align_driver::format_diagnostics(&sources, &built.diags));
+            assert_eq!(built.units.len(), 2);
+            assert!(built.units.iter().all(|unit|
+                unit.frontend.as_ref().unwrap().hit == (round == 1)));
+            let mut objects = Vec::new();
+            let mut libraries = Vec::new();
+            for index in 0..built.units.len() {
+                let program = built.materialize(index).unwrap();
+                let object = stage.join(format!("codec-{round}-{index}.o"));
+                align_driver::emit_object_file(program, &object, BuildTarget::Baseline,
+                    Profile::Release, &[], false).unwrap();
+                objects.push(object);
+                for library in &program.link_libs {
+                    if !libraries.contains(library) { libraries.push(library.clone()); }
+                }
+            }
+            let binary = stage.join(format!("codec-{round}"));
+            align_driver::link_objects(&align_driver::CDriver::default(),
+                &objects.iter().map(|p| p.as_path()).collect::<Vec<_>>(), &binary,
+                &libraries, Profile::Release).unwrap();
+            let output = std::process::Command::new(binary).output().unwrap();
+            assert!(output.status.success() && output.stdout.is_empty() && output.stderr.is_empty(),
+                "cache round {round}: {output:?}");
+        }
+    });
+}
+
 #[test]
 fn validated_codec_observation_whole_unit_parity() {
     for imported in [false, true] {

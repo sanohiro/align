@@ -2867,35 +2867,51 @@ impl<'a> XmlAccessAnalyzer<'a> {
             _ => return false,
         };
         let function = self.graph.function;
-        let Some(block) = function.blocks.iter().find(|block| block.stmts.iter().any(
-            |statement| matches!(statement, Stmt::Let(value, _) if *value == result)
-        )) else { return false; };
-        let same_operand = |candidate: &Operand| matches!((candidate, operand),
-            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b);
+        let Some((block, position)) = function.blocks.iter().find_map(|block| {
+            block.stmts.iter().position(|statement| matches!(statement,
+                Stmt::Let(value, _) if *value == result)).map(|position| (block, position))
+        }) else { return false; };
+        let same_operand = |candidate: &Operand| match (candidate, operand) {
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) => a == b,
+            (Operand::BorrowedPlace(a), Operand::BorrowedPlace(b)) =>
+                a.slot == b.slot && a.path == b.path && a.ty == b.ty && a.cleanup == b.cleanup,
+            _ => false,
+        };
+        // A place observes memory again at extraction; unlike SSA, equal identity is not a
+        // snapshot. Keep the observation live only across this closed read-only instruction set.
+        let preserves_observation = |statements: &[Stmt]| {
+            !matches!(operand, Operand::BorrowedPlace(_)) || statements.iter().all(|statement| {
+                matches!(statement, Stmt::Let(_, Rvalue::Use(_) | Rvalue::Load(_)
+                    | Rvalue::Un(..) | Rvalue::Bin(..) | Rvalue::Select { .. }
+                    | Rvalue::OptionIsSome(_) | Rvalue::ResultIsOk(_) | Rvalue::EnumTagEq { .. }))
+            })
+        };
+        if !preserves_observation(&block.stmts[..position]) { return false; }
         let mut pending = vec![(block.id, (0..count).collect::<Vec<_>>() )];
         let mut visited = HashSet::new();
         let mut proved = false;
         while let Some((block, allowed)) = pending.pop() {
-            if allowed.iter().all(|tag| *tag == selected_tag) {
-                proved = true;
-                continue;
-            }
             if block == function.entry { return false; }
             if !visited.insert((block, allowed.clone())) { continue; }
             let mut has_predecessor = false;
             for predecessor in &function.blocks {
                 let (condition, yes, no) = match &predecessor.term {
-                    Term::Goto(target) if *target == block => (None, block, block),
                     Term::Branch(condition, yes, no) if *yes == block || *no == block => (Some(condition), *yes, *no),
+                    other if crate::byte_ranges::successors(other).contains(&block) => (None, block, block),
                     _ => continue,
                 };
                 has_predecessor = true;
                 let mut allowed = allowed.clone();
+                let mut observed_after = 0;
                 if yes != no
                     && let Some(Operand::Value(condition)) = condition
                     && function.value_tys.get(*condition as usize) == Some(&Ty::Bool)
-                    && predecessor.stmts.iter().any(|statement| matches!(statement, Stmt::Let(value, _) if value == condition))
+                    && self.graph.primary_definitions.get(*condition as usize) == Some(&1)
+                    && self.graph.auxiliary_definitions.get(*condition as usize) == Some(&0)
+                    && self.graph.duplicate_values.get(*condition as usize) == Some(&false)
                     && let Some(Some(predicate)) = self.graph.value_definitions.get(*condition as usize)
+                    && let Some(predicate_position) = predecessor.stmts.iter().position(|statement| matches!(statement,
+                        Stmt::Let(value, actual) if value == condition && std::ptr::eq(actual, *predicate)))
                 {
                     let tested = match (predicate, selected) {
                         (Rvalue::OptionIsSome(value), XmlAccessPathSegment::OptionSome) if same_operand(value) => Some(1),
@@ -2906,9 +2922,18 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     };
                     if let Some(tested) = tested {
                         allowed.retain(|tag| (*tag == tested) == (yes == block));
+                        observed_after = predicate_position + 1;
                     }
                 }
-                pending.push((predecessor.id, allowed));
+                if allowed.iter().all(|tag| *tag == selected_tag) {
+                    if !preserves_observation(&predecessor.stmts[observed_after..]) { return false; }
+                    proved = true;
+                } else {
+                    // Check this complete interval before visited-state reuse. The extraction
+                    // prefix and a predicate suffix must never stand in for a loop's full block.
+                    if !preserves_observation(&predecessor.stmts) { return false; }
+                    pending.push((predecessor.id, allowed));
+                }
             }
             if !has_predecessor { return false; }
         }
@@ -6276,6 +6301,23 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.seed = Some(XmlAccessProvenance::Owned);
                 }
             }
+            Rvalue::CodecOpen { input, error_enum } => {
+                let bytes = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+                let whole = path.is_empty();
+                let ok = path.as_slice() == [XmlAccessPathSegment::ResultOk];
+                let err = path.as_slice() == [XmlAccessPathSegment::ResultErr];
+                if result_ty != Ty::Result(Scalar::CodecBatch, Scalar::Enum(error_enum))
+                    || !builtin_error_enum_is_exact(self.graph.program, error_enum)
+                    || !(whole || ok || err)
+                {
+                    equation.invalid = true;
+                } else {
+                    self.check_operand(&mut equation, &input, bytes);
+                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    // Only the complete Result is always present. A payload needs its tag guard.
+                    equation.absent = !whole;
+                }
+            }
             Rvalue::XmlParse {
                 input,
                 error_enum,
@@ -6724,7 +6766,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::LogLine(..)
             | Rvalue::LogLineBuilder(..)
             | Rvalue::LogFlush(..)
-            | Rvalue::CodecOpen(..)
             | Rvalue::CodecBatchRows(..)
             | Rvalue::CodecBatchColumns(..)
             | Rvalue::CodecBatchKind(..)
@@ -9764,6 +9805,24 @@ fn validate_resource_rvalues_component(
                             && operand_ty(function, owner) == Some(Ty::Resource(*resource))
                             && result == Ty::Raw
                     }
+                    Rvalue::CodecOpen { .. } => OperandRequirement::READ
+                        .is_satisfied_by(xml_access(&Operand::Value(*value), result)),
+                    Rvalue::ResultUnwrapOk(input) | Rvalue::ResultUnwrapErr(input)
+                        if operand_ty(function, input).is_some_and(|ty| [true, false].into_iter()
+                            .any(|ok| xml_result_payload(program, ty, ok) == Some(Ty::CodecBatch))) =>
+                    {
+                        let selected = if matches!(rvalue, Rvalue::ResultUnwrapOk(_)) {
+                            XmlAccessPathSegment::ResultOk
+                        } else {
+                            XmlAccessPathSegment::ResultErr
+                        };
+                        // Scalar codec views are outside the protected-owner walk. Check even
+                        // discarded projections, including call/argument results with no tag fact.
+                        XmlAccessAnalyzer::new(&access_graph)
+                            .extraction_guard_matches(*value, input, &selected)
+                            && OperandRequirement::READ
+                                .is_satisfied_by(xml_access(&Operand::Value(*value), result))
+                    }
                     Rvalue::XmlParse {
                         input,
                         error_enum,
@@ -12334,6 +12393,10 @@ pub fn direct_runtime_key_is_valid(key: RuntimeKey, args: &[Ty], ret: Ty, progra
 #[cfg(test)]
 #[path = "producer_borrow_call_tests.rs"]
 mod borrow_call_tests;
+
+#[cfg(test)]
+#[path = "producer_codec_tests.rs"]
+mod codec_tests;
 
 #[cfg(test)]
 #[path = "producer_copy_tests.rs"]

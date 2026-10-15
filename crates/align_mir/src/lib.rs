@@ -1955,9 +1955,13 @@ pub enum Rvalue {
     XmlText {
         reader: Operand,
     },
-    /// Validate a canonical `core.codec` envelope. The successful batch value is the unchanged
-    /// input `{ptr,len}` and is wrapped by MIR only after this status is zero.
-    CodecOpen(Operand),
+    /// Validate one canonical envelope and return `Result<CodecBatch, builtin Error>`.
+    /// Success borrows the unchanged input descriptor; failure is `Error.Invalid`.
+    /// The tagged result is indivisible: no conditional batch slot is exposed to MIR.
+    CodecOpen {
+        input: Operand,
+        error_enum: u32,
+    },
     CodecBatchRows(Operand),
     CodecBatchColumns(Operand),
     CodecBatchName(Operand, Operand),
@@ -21047,9 +21051,13 @@ fn lower_codec_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
     match &e.kind {
         hir::ExprKind::CodecOpen { input } => {
             let input = lower_required!(b, lower_expr(b, input), Operand::Const(Const::Unit));
-            let status = b.fresh_value(status_ty());
-            b.push(Stmt::Let(status, Rvalue::CodecOpen(input.clone())));
-            lower_status_value_result(b, status, input, e.ty)
+            let Ty::Result(Scalar::CodecBatch, Scalar::Enum(error_enum)) = e.ty else {
+                b.terminate(Term::Unreachable);
+                return terminated_operand();
+            };
+            let result = b.fresh_value(e.ty);
+            b.push(Stmt::Let(result, Rvalue::CodecOpen { input, error_enum }));
+            Operand::Value(result)
         }
         hir::ExprKind::CodecBatchRows { batch } => {
             unary(b, batch, Rvalue::CodecBatchRows, e.ty)
