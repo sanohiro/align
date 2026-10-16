@@ -12586,8 +12586,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // Copy Result family with explicit checked-HIR validation and no retained storage.
         // BufferTryNew adds one explicit fallible owned-buffer construction family.
         // UnicodeNfc adds the canonical owned-string normalization producer.
+        // ArraySortCmp adds the explicit two-input comparison terminal.
         variants,
-        358,
+        359,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
