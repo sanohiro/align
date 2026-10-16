@@ -492,3 +492,27 @@ controls stay within 6.8 ms and straight fixed-array controls within 2.9 ms.
 The 512-value Result-match per-unit median increases 6.7 ms. This is a small
 local improvement in generation-heavy checking, with no uniform-speedup,
 near-linear, runtime-resource or consumer-time claim.
+
+## Item 28 result (2026-10-17)
+
+The same host/profile compares merged
+`2ff4de63d1808767706631040237fbf5f361357e` with direct existential queries
+for empty/singleton generation-observer sets. Larger sets keep ordered iteration;
+the predicates and all rename operations remain unchanged. Both binaries use
+`DYLD_SHARED_REGION=private`; no builds/tests overlap measurement. Both corpora
+use `--llvm-parity`. [Full samples and hashes](results-singleton-scans-macos.json)
+retain all 30 cells and a separate five-sample replication of the large loops.
+
+| 512-value fixed-array loop | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| check | 0.729 s | 0.697 s | 1.05x |
+| check-per-unit | 1.460 s | 1.385 s | 1.05x |
+| check, separate replication | 0.728 s | 0.695 s | 1.05x |
+| check-per-unit, separate replication | 1.456 s | 1.380 s | 1.05x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four distinct
+rejected controls agree. Every 16-value control stays within 0.4 ms, numeric
+controls within 12.4 ms and straight fixed-array controls within 2.6 ms. The
+512-value Result-match per-unit median increases 12.3 ms. The compiler binary
+grows by 112 bytes. This is a local checking-time improvement, without a uniform
+speedup, near-linear scaling, runtime-resource or consumer-time claim.
