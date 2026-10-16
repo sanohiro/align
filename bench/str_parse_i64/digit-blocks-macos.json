@@ -1,0 +1,166 @@
+{
+  "base": "e8e4b2d3ea7421888cbf78da44f46f1547d8e466",
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "protocol": "Two complete per-group ABBA passes, all 392 samples retained; no concurrent builds/tests.",
+  "baseline": {
+    "crates/align_runtime/src/lib.rs": "60626b8e47f7a9616106fa5fd8e866fc2834ef4d63469b070bffa1eeb9ea1dea",
+    "bench/str_parse_i64/main.c": "b2161b4e6c57aceb0ac3a623906a666d4b5676cbf6b306ec98dee08c14aedf5e",
+    "target/release/libalign_runtime.a": "508116bf516e3eb6756743c117bb316d40b6d295b9f107066c3cbdbe5a801201",
+    ".git/align-decimal-digit-blocks/baseline": "9f9a5383b13cebb95bb58f9db5eb0cb1e191b86afb8d07851b92f30e2d2a6f0c",
+    "binary_bytes": 33816
+  },
+  "candidate": {
+    "crates/align_runtime/src/lib.rs": "4047096a6ae75e3f8a25be2807edee2c897936db5c381988aa409d30c0bef6f2",
+    "bench/str_parse_i64/main.c": "b2161b4e6c57aceb0ac3a623906a666d4b5676cbf6b306ec98dee08c14aedf5e",
+    "target/release/libalign_runtime.a": "8d29cd5a0f711d4bc56827f157074558603d3451b9109cc62bcbc1992adb10cb",
+    ".git/align-decimal-digit-blocks/candidate": "97c03539933fb50354254ad50cef0e367bb31910ebe2a485c875e1ecff2a9266",
+    "binary_bytes": 33816
+  },
+  "medians": [
+    {
+      "group": 0,
+      "baseline": 7.887,
+      "candidate": 6.746,
+      "percent": -14.466844173957139,
+      "delta": -1.1409999999999991
+    },
+    {
+      "group": 1,
+      "baseline": 8.016,
+      "candidate": 6.891,
+      "percent": -14.034431137724546,
+      "delta": -1.125
+    },
+    {
+      "group": 2,
+      "baseline": 7.9885,
+      "candidate": 6.8235,
+      "percent": -14.583463729110601,
+      "delta": -1.165
+    },
+    {
+      "group": 3,
+      "baseline": 25.941000000000003,
+      "candidate": 26.004,
+      "percent": 0.24285879495777873,
+      "delta": 0.06299999999999883
+    },
+    {
+      "group": 4,
+      "baseline": 28.087,
+      "candidate": 27.17,
+      "percent": -3.2648556271584694,
+      "delta": -0.916999999999998
+    },
+    {
+      "group": 5,
+      "baseline": 4.775,
+      "candidate": 4.6715,
+      "percent": -2.1675392670157168,
+      "delta": -0.10350000000000037
+    },
+    {
+      "group": 6,
+      "baseline": 22.1475,
+      "candidate": 21.084,
+      "percent": -4.801896376566206,
+      "delta": -1.0635000000000012
+    }
+  ],
+  "per_pass_medians": [
+    {
+      "repetition": 0,
+      "group": 0,
+      "baseline": 7.891,
+      "candidate": 6.7455
+    },
+    {
+      "repetition": 1,
+      "group": 0,
+      "baseline": 7.887,
+      "candidate": 6.746
+    },
+    {
+      "repetition": 0,
+      "group": 1,
+      "baseline": 8.0145,
+      "candidate": 6.886
+    },
+    {
+      "repetition": 1,
+      "group": 1,
+      "baseline": 8.019,
+      "candidate": 6.8934999999999995
+    },
+    {
+      "repetition": 0,
+      "group": 2,
+      "baseline": 7.995,
+      "candidate": 6.828
+    },
+    {
+      "repetition": 1,
+      "group": 2,
+      "baseline": 7.985,
+      "candidate": 6.82
+    },
+    {
+      "repetition": 0,
+      "group": 3,
+      "baseline": 25.9325,
+      "candidate": 26.0065
+    },
+    {
+      "repetition": 1,
+      "group": 3,
+      "baseline": 25.942500000000003,
+      "candidate": 26.004
+    },
+    {
+      "repetition": 0,
+      "group": 4,
+      "baseline": 28.087,
+      "candidate": 27.166
+    },
+    {
+      "repetition": 1,
+      "group": 4,
+      "baseline": 28.0845,
+      "candidate": 27.176499999999997
+    },
+    {
+      "repetition": 0,
+      "group": 5,
+      "baseline": 4.774,
+      "candidate": 4.6705000000000005
+    },
+    {
+      "repetition": 1,
+      "group": 5,
+      "baseline": 4.7755,
+      "candidate": 4.6745
+    },
+    {
+      "repetition": 0,
+      "group": 6,
+      "baseline": 22.151,
+      "candidate": 21.014499999999998
+    },
+    {
+      "repetition": 1,
+      "group": 6,
+      "baseline": 22.1455,
+      "candidate": 21.0865
+    }
+  ],
+  "build_logs": {
+    "baseline": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.21s\nbaseline built\n",
+    "candidate": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.05s\ncandidate built\n"
+  },
+  "toolchain": {
+    "rust": "rustc 1.96.1 (31fca3adb 2026-06-26) (Homebrew)",
+    "cc": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+  },
+  "admission": "At least 10% gain in one short-valid group; no group regresses by both more than 5% and 0.5 ns.",
+  "orchestration_note": "The initial supervisor parser expected seven CSV records rather than a header plus seven records. Fixed header handling and resumed from the retained completed baseline pass0/group0/slot0 output; no probe sample discarded or repeated."
+}

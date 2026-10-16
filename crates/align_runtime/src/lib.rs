@@ -15408,6 +15408,20 @@ pub unsafe extern "C" fn align_rt_str_parse_i64(data: *const u8, len: i64, out: 
         // Every decimal prefix is at most 10^18 - 1, below i64::MAX. The
         // optional sign is already removed, so neither accumulation nor
         // applying a negative sign can overflow in this length-bounded path.
+        if digits.len() >= 8 {
+            let mut groups = digits.chunks_exact(4);
+            for group in &mut groups {
+                let a = group[0].wrapping_sub(b'0');
+                let b = group[1].wrapping_sub(b'0');
+                let c = group[2].wrapping_sub(b'0');
+                let d = group[3].wrapping_sub(b'0');
+                if a > 9 || b > 9 || c > 9 || d > 9 { return AL_INVALID; }
+                let block = i64::from(a) * 1000 + i64::from(b) * 100
+                    + i64::from(c) * 10 + i64::from(d);
+                value = value * 10_000 + block;
+            }
+            digits = groups.remainder();
+        }
         for &byte in digits {
             if !byte.is_ascii_digit() { return AL_INVALID; }
             value = value * 10 + i64::from(byte - b'0');
@@ -28921,6 +28935,7 @@ mod tests {
         let before = global_alloc_count();
         for text in [
             b"42".as_slice(), b"-9223372036854775808", b"bad", b"9223372036854775808",
+            b"999999999999999999", b"-999999999999999999",
             b"000000000000000000000000000000000000000042",
             b"00000000000000000000000000000000000000000x",
         ] {
