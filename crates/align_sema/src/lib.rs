@@ -81157,9 +81157,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // HTTP timeout setters borrow an existing owner and return unit/Error.
         // OsMemory observes only Copy counts and retains no storage.
         // UnicodeNfc constructs a fresh owned string without retaining input storage.
+        // ArraySortCmp shares the fresh pipeline-element policy with the other sort terminals.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 358,
+            variants, 359,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
