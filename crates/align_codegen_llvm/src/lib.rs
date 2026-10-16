@@ -40937,6 +40937,28 @@ fn main() -> i32 = 0
         let sf = attr_group_of(&out, "align_rt_str_find");
         assert!(!sf.contains("memory("), "str_find (memchr dispatch cache) must not claim a memory effect:\n{sf}");
 
+        // PathExt's memrchr2 also reaches the x86 dispatch cache. Base/Dir remain
+        // scalar argument-only readers. All three return an input subview, so
+        // readonly remains valid but captures(none) would misdescribe the result.
+        for (sym, argument_only) in [
+            ("align_rt_path_base", true),
+            ("align_rt_path_dir", true),
+            ("align_rt_path_ext", false),
+        ] {
+            let attrs = attr_group_of(&out, sym);
+            assert_eq!(attrs.contains("memory("), argument_only, "{sym}:\n{attrs}");
+            if argument_only {
+                assert!(attrs.contains("memory(argmem: read)"), "{sym}:\n{attrs}");
+            }
+            for flag in ["nounwind", "willreturn", "nofree", "nosync"] {
+                assert!(attrs.contains(flag), "{sym} must carry {flag}:\n{attrs}");
+            }
+            assert!(
+                out.contains(&format!("declare {{ ptr, i64 }} @{sym}(ptr readonly, i64)")),
+                "{sym} must retain readonly without captures(none) on its returned input:\n{out}"
+            );
+        }
+
         // (3b) The hoisted repeated-needle plan (doc-13 §6.6). LIKE the one-shot `str_find`,
         // `str_finder_find` keeps the pure-finite flags + `readonly captures(none)` on BOTH pointers
         // (the plan at param 0, the haystack at param 1) but WITHHOLDS `memory(...)`: a one-byte

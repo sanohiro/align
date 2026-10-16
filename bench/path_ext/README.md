@@ -33,6 +33,12 @@ dot-or-slash once through the existing `memchr` dependency. Empty, root and
 dotfile behavior and input-bounded views remain unchanged. Base and dir remain
 unchanged operation controls.
 
+The compiler classifies ext through the existing `DispatchCache` effect model
+because the x86 `memchr` dispatcher accesses a global cache. It withholds the
+function's `memory(...)` attribute while retaining its readonly, escaping input
+view. This direct C fixture measures native producers without Align caller
+attributes; the effect-metadata correction leaves those native bytes unchanged.
+
 Both arms use actual non-test release runtime builds with the same C bytes and
 flags on Apple M1 macOS arm64. Qualification compiled the fixture from scratch;
 the checked-in C file is byte-identical to that copy. Two complete per-cell ABBA
