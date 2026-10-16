@@ -63,3 +63,48 @@ runtime archives and linked executables. Initial baseline qualification and
 the checked-in runner reproduction are separate from the paired samples.
 An earlier cumulative-month-table candidate was rejected for repeatable January
 costs; none of its samples enters this comparison. Linux timing remains unmeasured.
+
+## RFC1123 name dispatch, 2026-10-17
+
+Baseline `4a6d26cc5ee9e3a32c3a664fbde73dcf97b55dab` includes the calendar
+arithmetic above. This separate comparison changes only RFC1123 name lookup:
+exact byte-pattern dispatch replaces the weekday/month table scans. The same
+147 golden records, native calls and compiler flags are retained. Both actual
+release producers were recompiled before linking; no builds or tests overlap
+the paired runs. Two complete per-cell ABBA passes retain all 1,120 sample rows
+(28 per arm and cell), with no discarded or selectively repeated cells.
+
+[rfc1123-dispatch-macos.csv](rfc1123-dispatch-macos.csv) owns every sample;
+[rfc1123-dispatch-macos.json](rfc1123-dispatch-macos.json) records producer
+identities, host/toolchain, protocol and medians. These results are separate
+from the preceding calendar comparison and are not pooled with it.
+
+| Kind | Group | Baseline ns | Candidate ns | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 0 | 14.562 | 14.994 | +2.97% |
+| 0 | 1 | 14.899 | 14.892 | -0.05% |
+| 0 | 2 | 20.145 | 20.215 | +0.34% |
+| 0 | 3 | 12.346 | 12.253 | -0.76% |
+| 1 | 0 | 18.297 | 18.315 | +0.10% |
+| 1 | 1 | 18.847 | 18.949 | +0.54% |
+| 1 | 2 | 19.764 | 20.073 | +1.57% |
+| 1 | 3 | 11.579 | 11.512 | -0.58% |
+| 2 | 0 | 20.190 | 17.414 | -13.75% |
+| 2 | 1 | 47.145 | 17.290 | -63.33% |
+| 2 | 2 | 43.277 | 17.901 | -58.64% |
+| 2 | 3 | 24.401 | 13.739 | -43.70% |
+| 3 | 0 | 12.700 | 12.687 | -0.11% |
+| 3 | 1 | 12.909 | 12.886 | -0.18% |
+| 3 | 2 | 13.094 | 13.082 | -0.09% |
+| 3 | 3 | 9.186 | 8.693 | -5.37% |
+| 4 | 0 | 9.021 | 8.971 | -0.55% |
+| 4 | 1 | 9.168 | 9.245 | +0.84% |
+| 4 | 2 | 9.445 | 9.584 | +1.46% |
+| 4 | 3 | 7.819 | 7.838 | +0.23% |
+
+All four RFC1123 groups improve by 13.7–63.3%. Other formats are controls:
+the largest observed increase is RFC3339 January, +0.433 ns (3.0%), and no
+uniform improvement is claimed. Both complete passes reproduce the January
+cost and the RFC1123 improvement. The bounded subnanosecond control cost is
+accepted alongside the 2.8–29.9 ns RFC1123 reductions. No Linux or application
+throughput conclusion follows.
