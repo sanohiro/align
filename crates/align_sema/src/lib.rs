@@ -18933,8 +18933,8 @@ impl EscapeValueFact {
             may_individual: _,
         } = self;
         headers.leaves.values().any(|leaf| {
-            leaf.generations.iter().any(|reference| renames.changes(&reference.generation))
-                || leaf.fallback_roots.iter().any(|root| root.generation_changes(renames))
+            storage_set_any(&leaf.generations, |reference| renames.changes(&reference.generation))
+                || storage_set_any(&leaf.fallback_roots, |root| root.generation_changes(renames))
         })
     }
 
@@ -31740,11 +31740,7 @@ impl StorageHeaderLeaf {
     }
 
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
-        if self
-            .generations
-            .iter()
-            .any(|reference| renames.changes(&reference.generation))
-        {
+        if storage_set_any(&self.generations, |reference| renames.changes(&reference.generation)) {
             self.generations = std::mem::take(&mut self.generations)
                 .into_iter()
                 .map(|generation| generation.rename_generation(renames))
@@ -33244,8 +33240,20 @@ struct BorrowFact {
     projected: std::collections::BTreeMap<Vec<BorrowProjection>, BorrowRoots>,
 }
 
+// Avoid iterator setup for the common empty and singleton observer sets.
+fn storage_set_any<T: Ord>(
+    entries: &std::collections::BTreeSet<T>,
+    predicate: impl FnMut(&T) -> bool,
+) -> bool {
+    match entries.len() {
+        0 => false,
+        1 => entries.first().is_some_and(predicate),
+        _ => entries.iter().any(predicate),
+    }
+}
+
 fn rename_borrow_roots(roots: &mut BorrowRoots, renames: &StorageGenerationRenames) {
-    if !roots.iter().any(|root| root.generation_changes(renames)) {
+    if !storage_set_any(roots, |root| root.generation_changes(renames)) {
         return;
     }
     *roots = std::mem::take(roots)
@@ -33629,11 +33637,7 @@ impl ByteValidationBacking {
     }
 
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
-        if self
-            .generations
-            .iter()
-            .any(|generation| renames.changes(generation))
-        {
+        if storage_set_any(&self.generations, |generation| renames.changes(generation)) {
             self.generations = self
                 .generations
                 .iter()
