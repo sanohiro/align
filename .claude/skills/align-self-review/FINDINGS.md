@@ -681,3 +681,9 @@ passed. Fixture output and compiler-inventory corrections are not review events.
 | PR | Reviewed candidate | Priority | Root-cause key | Finding and closure |
 |---|---|---|---|---|
 | #1362 | plan210 initial strategy | P1 | `public-surface-completeness` | The proposed text-builder byte view promised helper-return read-only authority without a serialized permission fact. Existing return summaries deliberately erase ReadOnly; compile-only direct/returned and typed-view witnesses distinguish the gap. The revised assessment withdraws the complete capability behind the existing interprocedural prerequisite, with no partial pointer producer or K1 adoption. This is a plan finding, not a shipped regression. |
+
+PR #1378 local preflight qualification (not a review event): the raw nominal
+comparison tripwire caught a redundant comparison between two result classifiers
+fed the same final element. Preserve the exact stored element discriminator and
+check ordinary formation separately; do not widen equality or the tripwire's
+allowlist. The named ratchet and final capability owners passed after that fix.

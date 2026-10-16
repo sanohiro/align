@@ -2353,7 +2353,10 @@ using the complete graph classification shared with Copy producer/builder reads.
 Copy alone is insufficient: a view or callable field can carry access authority.
 Excluding those graphs allows complete AoS copies and ordinary two-record calls
 without a new ownership or interprocedural permission model. No aggregate order
-or key extraction is inferred; direct/key sorting retains its existing domain.
+or key extraction is inferred. Plan221 admits the same independent records to
+`sort_by_key`, retaining exactly-once key evaluation and the existing key owner
+column. Both result-fact analyses exclude key-only captures while preserving
+source/stage contents and call-time reservations. Direct sort still needs scalar Ord.
 
 Plan 134 completes the previously deferred owned-string key path. Sorting keeps
 comparison headers separate from an unsorted ownership column. The key call's

@@ -202,6 +202,9 @@ short-circuit. Inferred effects restrict transformations rather than source acce
 `region` capability from every staged and terminal worker capture, including through a
 nested function-value environment.
 
+Plan221 admits the same independent Copy records as comparator sorting to
+`sort_by_key`; complete AoS elements use the existing key and merge columns.
+Key-only captures remain call-live without becoming result contents.
 `sort_by_key` is stable and permits an Impure key callable. The implementation decorates in input
 order and calls the key exactly N times before reordering; the source contract now makes that
 behavior normative. Comparisons consume the recorded keys and never re-evaluate the callable.
