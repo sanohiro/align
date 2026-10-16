@@ -6,6 +6,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(unix)]
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
+
 /// A temp source file that removes itself on drop (survives an assertion panic).
 struct TempFile(PathBuf);
 
@@ -52,6 +56,48 @@ const FP_SUM: &str = "fn add(a: f64, b: f64) -> f64 = a + b\n\
        print(run(s))\n  \
        return Ok(())\n\
      }\n";
+
+#[cfg(unix)]
+#[test]
+fn dependent_memory_loop_does_not_suggest_independent_output() {
+    if !align_driver::backend_available() {
+        return;
+    }
+    owned_fixture::run("dependent_memory_loop_does_not_suggest_independent_output", |root| {
+        let source = root.join("dependent.align");
+        std::fs::write(&source, r#"
+fn identity(x: i64) -> i64 = x
+fn run(borrow mut xs: array<i64>, count: i64) {
+    mut i := 1
+    loop {
+        if i >= count { break }
+        xs[i] = xs[i - 1] + 1
+        i = i + 1
+    }
+}
+fn main(args: array<str>) -> Result<(), Error> {
+    mut xs := [1, 0, 0, 0, 0, 0, 0, 0].map(identity).to_array()
+    run(xs, args.len())
+    print(xs[7])
+    return Ok(())
+}
+"#).unwrap();
+        for verbose in [false, true] {
+            let mut command = alignc();
+            command.arg("explain-opt").arg(&source);
+            if verbose {
+                command.arg("--verbose");
+            }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert!(report.lines().any(|line| line.starts_with("dependent.align:7:")
+                && line.contains("not vectorized")
+                && line.contains("safe ordering for the loop's memory operations")), "{report}");
+            assert!(!report.contains("distinct `out`") && !report.contains("don't overlap"), "{report}");
+        }
+    });
+}
 
 /// A vectorizing pipeline → the success summary reflects it, no miss line, exit 0.
 #[test]

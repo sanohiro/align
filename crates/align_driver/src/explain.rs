@@ -52,9 +52,10 @@ pub enum Verdict {
 pub enum ReasonCode {
     /// The optimizer succeeded — no decline reason.
     None,
-    MayAlias,
+    MemoryDependence,
+    UnknownArrayBounds,
     CostModel,
-    CallNoVectorForm,
+    CallNotVectorizable,
     ReductionNotRecognized,
     FpReorder,
     UnknownTripCount,
@@ -349,50 +350,66 @@ fn is_runtime(message: &str) -> bool {
 /// (no fabricated cause).
 fn vectorize_miss_reason(reason: &str) -> (ReasonCode, String) {
     // FP reassociation (an ordered floating-point reduction). Empirically observed.
-    if reason.contains("reorder floating-point") {
+    if reason == "cannot prove it is safe to reorder floating-point operations" {
         return (
             ReasonCode::FpReorder,
             "not vectorized — reordering floating-point operations could change the result, so the \
-             compiler won't parallelize this reduction by default. Use an integer reduction, or \
-             accept the scalar loop here."
+             compiler preserves their ordering."
                 .to_string(),
         );
     }
     // A loop-carried value that is not a recognized reduction (e.g. a running `scan`). Observed.
-    if reason.contains("could not be identified as reduction") || reason.contains("reduction") {
+    if reason == "value that could not be identified as reduction is used outside the loop" {
         return (
             ReasonCode::ReductionNotRecognized,
-            "not vectorized — a value carried between iterations wasn't recognized as a reduction, \
-             so the iterations can't run in parallel. If it's a sum/product/min/max, use `reduce` \
-             with a recognized combiner (`+`, `*`, `min`, `max`); a genuine running scan can't be \
-             widened."
+            "not vectorized — a value used outside the loop wasn't recognized as a reduction."
                 .to_string(),
         );
     }
-    // Aliasing — the vectorizer can't prove two pointers don't overlap.
-    if reason.contains("cannot identify array bounds")
-        || reason.contains("do not alias")
-        || reason.contains("memory operations")
-        || reason.contains("Unknown data dependence")
-    {
+    // Access-bound discovery and memory dependence are different failures.
+    // Neither justifies an aliasing diagnosis or a semantics-changing rewrite
+    // into an independent output array (an in-place recurrence needs its writes).
+    if reason == "cannot identify array bounds" {
         return (
-            ReasonCode::MayAlias,
-            "not vectorized — the compiler can't prove the pipeline's source and destination don't \
-             overlap. Write the result into a distinct `out` array."
+            ReasonCode::UnknownArrayBounds,
+            "not vectorized — the compiler couldn't identify the bounds of the loop's memory accesses."
                 .to_string(),
         );
     }
-    // A call with no vector form (e.g. a non-vectorizable math function).
-    if reason.contains("call") {
+    // Dependency remarks may append a newline and the exact conflicting
+    // access. Classify their complete first line and retain all detail in
+    // OptRecord; words in that appended evidence must not select another cause.
+    let first_line = reason.split_once('\n').map_or(reason, |(line, _)| line);
+    if matches!(first_line,
+        "cannot prove it is safe to reorder memory operations"
+        | "unsafe dependent memory operations in loop."
+        | "unsafe dependent memory operations in loop. Use #pragma clang loop distribute(enable) to allow loop distribution to attempt to isolate the offending operations into a separate loop"
+        | "Unknown data dependence."
+    ) {
         return (
-            ReasonCode::CallNoVectorForm,
-            "not vectorized — the pipeline calls a function with no vector form, so the loop can't \
-             be widened. Use a vectorizable operation, or accept the scalar loop here."
+            ReasonCode::MemoryDependence,
+            "not vectorized — the compiler couldn't establish safe ordering for the loop's memory operations."
+                .to_string(),
+        );
+    }
+    // LLVM establishes that this call was not vectorizable, not that no
+    // vector implementation exists. Clang flags are not Align remedies.
+    if matches!(reason,
+        "call instruction cannot be vectorized"
+        | "library call cannot be vectorized. Try compiling with -fno-math-errno, -ffast-math, or similar flags"
+    ) {
+        return (
+            ReasonCode::CallNotVectorizable,
+            "not vectorized — a function call in the loop could not be vectorized."
                 .to_string(),
         );
     }
     // Unknown trip count.
-    if reason.contains("number of loop iterations") || reason.contains("loop count") {
+    if matches!(reason,
+        "could not determine number of loop iterations"
+        | "unable to calculate the loop count due to complex control flow"
+        | "could not safely create a loop count expression"
+    ) {
         return (
             ReasonCode::UnknownTripCount,
             "not vectorized — the compiler couldn't determine the iteration count, so it couldn't \
@@ -401,7 +418,7 @@ fn vectorize_miss_reason(reason: &str) -> (ReasonCode, String) {
         );
     }
     // Cost model — vague by nature; say only that (never upgrade it into a concrete cause).
-    if reason.contains("not beneficial") || reason.contains("cost") {
+    if reason == "the cost-model indicates that vectorization is not beneficial" {
         return (
             ReasonCode::CostModel,
             "not vectorized — the compiler's cost model found no benefit from vectorizing this loop."
@@ -1096,7 +1113,64 @@ mod tests {
         ]);
         let rec = &rep.records[0];
         assert_eq!(rec.reason, ReasonCode::ReductionNotRecognized);
-        assert!(rec.message.contains("reduce"));
+        assert!(rec.message.contains("reduction"));
+    }
+
+    #[test]
+    fn vectorization_blockers_do_not_invent_causes_or_remedies() {
+        use ReasonCode::{CallNotVectorizable, MemoryDependence, UnknownArrayBounds, UnknownTripCount};
+        let memory = "the compiler couldn't establish safe ordering for the loop's memory operations";
+        let call = "a function call in the loop could not be vectorized";
+        let trip = "the compiler couldn't determine the iteration count, so it couldn't widen the loop";
+        let cases = [
+            ("cannot identify array bounds", UnknownArrayBounds, "the compiler couldn't identify the bounds of the loop's memory accesses"),
+            ("cannot prove it is safe to reorder memory operations", MemoryDependence, memory),
+            ("unsafe dependent memory operations in loop.", MemoryDependence, memory),
+            ("unsafe dependent memory operations in loop. Use #pragma clang loop distribute(enable) to allow loop distribution to attempt to isolate the offending operations into a separate loop", MemoryDependence, memory),
+            ("unsafe dependent memory operations in loop. Use #pragma clang loop distribute(enable) to allow loop distribution to attempt to isolate the offending operations into a separate loop\nBackward loop carried data dependence. Memory location is the same as accessed at memory.align:6:17", MemoryDependence, memory),
+            ("unsafe dependent memory operations in loop.\nConflicting call or reduction", MemoryDependence, memory),
+            ("Unknown data dependence.", MemoryDependence, memory),
+            ("call instruction cannot be vectorized", CallNotVectorizable, call),
+            ("library call cannot be vectorized. Try compiling with -fno-math-errno, -ffast-math, or similar flags", CallNotVectorizable, call),
+            ("could not determine number of loop iterations", UnknownTripCount, trip),
+            ("unable to calculate the loop count due to complex control flow", UnknownTripCount, trip),
+            ("could not safely create a loop count expression", UnknownTripCount, trip),
+        ];
+        for (reason, code, explanation) in cases {
+            let raw = format!("memory.align:6:17: loop not vectorized: {reason}");
+            let report = Report::build(&[raw.clone()]);
+            assert_eq!(report.records.len(), 1, "{raw}");
+            let record = &report.records[0];
+            assert_eq!(record.reason, code, "{raw}");
+            assert_eq!((&*record.file, record.line, record.col), ("memory.align", 6, 17));
+            assert_eq!(record.llvm_detail, raw);
+            let expected = format!("memory.align:6:17: not vectorized — {explanation}.");
+            for verbose in [false, true] {
+                let output = report.render(verbose);
+                assert_eq!(output.lines().filter(|line| *line == expected).count(), 1, "{output}");
+                assert!(!output.contains("distinct `out`") && !output.contains("no vector form"), "{output}");
+            }
+        }
+
+        for reason in [
+            "Cannot vectorize early exit loop with reductions or recurrences",
+            "Scalable vectorization not supported for the reduction operations found in this loop.",
+            "unsupported instruction near a call",
+            "unknown memory operations restriction",
+            "unknown cost restriction",
+            "unknown loop count restriction",
+            "unknown reason mentioning reorder floating-point",
+            "unknown reason mentioning pointers do not alias",
+            "cannot identify array bounds: unknown extension",
+        ] {
+            let raw = format!("unknown.align:2:3: loop not vectorized: {reason}");
+            let report = Report::build(&[raw.clone()]);
+            assert_eq!(report.records.len(), 1, "{raw}");
+            let record = &report.records[0];
+            assert_eq!(record.reason, ReasonCode::Unspecified, "{raw}");
+            assert_eq!(record.llvm_detail, raw);
+            assert_eq!(record.message, format!("not vectorized — the compiler declined to widen this loop ({reason})."));
+        }
     }
 
     #[test]

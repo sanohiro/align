@@ -135,26 +135,27 @@ diagnostic voice (`file:line:col: message`, lowercase, terse, backticked code, r
   message patterns of the pinned LLVM 19 — contained in one module, re-verified at the LLVM
   upgrade. The ideal structured keying (`(pass, RemarkName)`, version-stable) needs the C++
   shim — deferred with record. Each table row carries our own stable `reason_code`
-  (`MayAlias | CostModel | CallNoVectorForm | ReductionNotRecognized | TooLargeToInline |
-  Recursive | UnknownTripCount | Unspecified`), so the human text and the future JSON never
-  depend on LLVM prose.
+  (`MemoryDependence | UnknownArrayBounds | CostModel | CallNotVectorizable |
+  ReductionNotRecognized | FpReorder | UnknownTripCount | Unspecified`), so the human
+  text and the future JSON never depend on LLVM prose.
 - **Honesty rule (load-bearing):** the message asserts only what the remark justifies. Concrete
-  mappable cause (aliasing / no-vector-form / unrecognized reduction / inline cost) → cause +
-  concrete Align remedy. Vague cause (`cost model`) → say only that; **never** upgrade a
+  mappable cause → that cause, with an Align remedy only when the remark justifies it.
+  Vague cause (`cost model`) → say only that; **never** upgrade a
   cost-model decline into an aliasing story; no fabricated suggestions. LLVM22's
   standalone vectorization-profitability refusal uses the same CostModel diagnostic
   as its prefixed refusal; interleaving and SLP refusals are separate observations
-  ([Plan211](211-vectorization-cost-diagnostics.md)).
+  ([Plan211](211-vectorization-cost-diagnostics.md)). Known LLVM22 memory-ordering,
+  access-bound and call refusals remain distinct; they imply neither aliasing nor
+  absence of a vector implementation. Unknown reasons use the neutral diagnostic,
+  even when they contain a recognized keyword
+  ([Plan212](212-vectorization-blocker-diagnostics.md)).
 - Example renderings (the voice to match):
 
 ```text
-app.align:42:9: not vectorized — the pipeline's source and destination may be the same array;
-  the compiler can't prove they don't overlap. Write the result into a distinct `out` array.
+app.align:42:9: not vectorized — the compiler couldn't establish safe ordering for the loop's memory operations.
 app.align:71:9: not vectorized — the compiler's cost model found no benefit from vectorizing this loop.
-app.align:80:9: not vectorized — the pipeline calls a function with no vector form (`sin`), so
-  the loop can't be widened. Use a vectorizable operation, or accept the scalar loop here.
-app.align:95:9: not vectorized — the combine here wasn't recognized as associative, so its
-  iterations can't run in parallel. Use `reduce` with a recognized combiner (`+`, `*`, `min`, `max`).
+app.align:80:9: not vectorized — a function call in the loop could not be vectorized.
+app.align:95:9: not vectorized — a value used outside the loop wasn't recognized as a reduction.
 ```
 
 ### Anchoring policy (Nothing-hidden applies to our own leaks)

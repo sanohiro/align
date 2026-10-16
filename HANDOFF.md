@@ -2,10 +2,11 @@
 
 ## Current work direction
 
-The owner's latest instruction (2026-10-16) is to process outstanding requests,
-including unstarted requests, completing PR and merge for each capability before
-starting the next. Stop after that request pass; do not continue into planned
-work. Reconcile all three external request registers first and validate each
+The owner's latest instruction (2026-10-16) is to continue implementation,
+completing PR and merge for each capability before starting the next, until the
+owner asks to stop. The preceding outstanding-request pass is complete;
+independently qualified planned work may now continue. Reconcile all three
+external request registers before request-driven work and validate each
 request against real consumer evidence and Align's design. Consumer adoption
 remains external; retain a reasoned deferral when the required design conflicts
 with Align's invariants.
