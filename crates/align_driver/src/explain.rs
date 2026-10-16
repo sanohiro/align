@@ -292,7 +292,13 @@ fn classify(raw: &RawRemark) -> Class {
 
     // loop-vectorize, MISSED. The specific analysis remark (`loop not vectorized: <reason>`) carries
     // the actionable cause; the bare `loop not vectorized` decline is a redundant duplicate → bucket.
-    if let Some(reason_text) = m.strip_prefix("loop not vectorized: ") {
+    // LLVM 22 emits its profitability refusal without the usual reason prefix.
+    // Match that complete message: interleaving and SLP profitability remarks
+    // do not establish that loop vectorization was declined.
+    let miss_reason = m.strip_prefix("loop not vectorized: ").or_else(|| {
+        (m == "the cost-model indicates that vectorization is not beneficial").then_some(m)
+    });
+    if let Some(reason_text) = miss_reason {
         let (reason, message) = vectorize_miss_reason(reason_text);
         return Class::Record(OptRecord {
             kind: Kind::NotVectorized,
@@ -398,8 +404,7 @@ fn vectorize_miss_reason(reason: &str) -> (ReasonCode, String) {
     if reason.contains("not beneficial") || reason.contains("cost") {
         return (
             ReasonCode::CostModel,
-            "not vectorized — the compiler judged it not worthwhile here (short pipeline or cheap \
-             per-element work); nothing to change in the source."
+            "not vectorized — the compiler's cost model found no benefit from vectorizing this loop."
                 .to_string(),
         );
     }
@@ -1038,6 +1043,50 @@ mod tests {
         // The default view surfaces it as a `file:line:col:` line.
         let out = rep.render(false);
         assert!(out.contains("probe.align:1:33:"), "actionable line missing:\n{out}");
+    }
+
+    #[test]
+    fn vectorization_cost_refusals_are_actionable_without_invented_causes() {
+        for reason in [
+            "the cost-model indicates that vectorization is not beneficial",
+            "loop not vectorized: the cost-model indicates that vectorization is not beneficial",
+        ] {
+            let raw = format!("cost.align:5:7: {reason}");
+            let report = Report::build(&[raw.clone()]);
+            assert_eq!(report.not_vectorized(), 1, "{raw}");
+            assert_eq!(report.bucket_total(), 0, "{raw}");
+            let record = &report.records[0];
+            assert_eq!(record.reason, ReasonCode::CostModel);
+            assert_eq!(record.pass, "loop-vectorize");
+            assert_eq!(record.llvm_detail, raw);
+            let diagnostic = "cost.align:5:7: not vectorized — the compiler's cost model found no benefit from vectorizing this loop.";
+            for verbose in [false, true] {
+                let output = report.render(verbose);
+                assert_eq!(output.lines().filter(|line| *line == diagnostic).count(), 1, "{output}");
+                assert!(!output.contains("short pipeline") && !output.contains("nothing to change"));
+                assert!(!output.contains("overlap") && !output.contains("floating-point"));
+            }
+        }
+
+        for reason in [
+            "the cost-model indicates that interleaving is not beneficial",
+            "SLP vectorization was possible but not beneficial with cost 1 >= 0",
+            "the cost-model indicates that vectorization is not beneficial: unknown extension",
+        ] {
+            let raw = format!("cost.align:5:7: {reason}");
+            let report = Report::build(&[raw.clone()]);
+            assert!(report.records.is_empty(), "{raw}");
+            assert!(!report.render(false).contains("not vectorized"));
+            assert!(report.render(true).contains(&raw));
+        }
+
+        for location in ["<unknown>:0:0", "cost.align:0:7"] {
+            let report = Report::build(&[format!(
+                "{location}: the cost-model indicates that vectorization is not beneficial",
+            )]);
+            assert!(report.records.is_empty());
+            assert_eq!(report.internal.len(), 1);
+        }
     }
 
     #[test]

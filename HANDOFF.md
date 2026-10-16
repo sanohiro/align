@@ -24,6 +24,13 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan211](docs/impl/211-vectorization-cost-diagnostics.md) makes LLVM22's
+  standalone vectorization-profitability refusal visible in ordinary
+  `explain-opt` output for Request116. The diagnostic retains the source
+  location and reports only the cost decision; interleaving and SLP observations
+  remain distinct. This closes the observed reporting gap, not the umbrella's
+  entire corpus or consumer performance qualification.
+
 - [Plan209](docs/impl/209-builder-copy-reads.md) adds independent Copy indexed
   reads from unfinished typed builders for LLM Request28's numeric columns.
   Reads preserve initialized bounds and owner reservations while copied values
