@@ -6112,6 +6112,11 @@ fn callable_preflight(
                             result: canonical_metadata(CanonicalTy::from_program(*r, program))?,
                         });
                     }
+                    Rvalue::HeapAlloc(..)
+                        if matches!(function.value_tys.get(*value as usize), Some(Ty::Task(_))) =>
+                    {
+                        return Err(CodegenError::Lowering("task result requires spawn producer".into()));
+                    }
                     Rvalue::BoxGet(task)
                         if matches!(preflight_operand_ty(function, task), Some(Ty::Task(_))) =>
                     {
@@ -14806,9 +14811,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 }
             }
             Rvalue::HeapAlloc(handle, init) => {
-                // A `box<T>` (heap.new) or a `Task<R>` (spawn) — both a boxed scalar in an arena.
-                let (Ty::Box(s) | Ty::Task(s)) = result_ty else {
-                    return Err(self.err("heap allocation result is not a box or task"));
+                // `box<T>` (heap.new); task result slots are owned by SpawnTask.
+                let Ty::Box(s) = result_ty else {
+                    return Err(self.err("heap allocation result is not a box"));
                 };
                 let i64t = self.ctx.i64_type();
                 let bytes = scalar_bytes(s);
@@ -37829,20 +37834,21 @@ fn main() -> i32 = 0
         let valid = mir(source);
         let text = emit_llvm_ir(&valid, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap_or_else(|error| panic!("{error}"));
         assert!(text.lines().any(|line| line.contains("@align_rt_tg_alloc(") && line.contains("i64 32, i64 32")), "explicit result alignment: {text}");
-        for mutation in 0..6 {
+        for mutation in 0..7 {
             let mut invalid = valid.clone();
             let mut changed = false;
             for function in &mut invalid.fns {
                 for block in &mut function.blocks {
                     for statement in &mut block.stmts {
                         let Stmt::Let(value, request) = statement else { continue };
-                        if let Rvalue::SpawnTask { r, fallible, capture_tys, closure, .. } = request {
+                        if let Rvalue::SpawnTask { tg, r, fallible, capture_tys, closure } = request {
                             match mutation {
                                 0 => *r = Ty::Str,
                                 1 => function.value_tys[*value as usize] = Ty::Task(Scalar::Bool),
                                 2 => *fallible = true,
                                 3 => capture_tys.push(Ty::Bool),
                                 4 => *closure = Operand::Const(Const::Unit),
+                                6 => *request = Rvalue::HeapAlloc(tg.clone(), Operand::Const(Const::Unit)),
                                 _ => continue,
                             }
                             changed = true;
@@ -37857,10 +37863,10 @@ fn main() -> i32 = 0
             let declarations = callable_declarations(&invalid).unwrap_or_else(|error| panic!("{error}"));
             let error = callable_preflight(&invalid, &[], declarations, ModuleScope::Whole)
                 .err().unwrap_or_else(|| panic!("forged task metadata must reject before LLVM"));
-            assert!(error.to_string().contains(if mutation == 5 {
-                "task get payload metadata invalid"
-            } else {
-                "spawn result/callable metadata invalid"
+            assert!(error.to_string().contains(match mutation {
+                5 => "task get payload metadata invalid",
+                6 => "task result requires spawn producer",
+                _ => "spawn result/callable metadata invalid",
             }), "{mutation}: {error}");
         }
     }

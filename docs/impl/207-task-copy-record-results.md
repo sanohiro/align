@@ -67,7 +67,12 @@ result graphs and unsuccessful/stale/inner wait authority in both modes.
 `hir_body_validator_task_record_results` owns formation and expression corruption,
 including constructor-free Task locals whose record graph is independently
 changed to an excluded leaf or cycle. `task_record_result_metadata_and_alignment`
-pins explicit allocation alignment and six malformed callable/slot/load cases.
+pins explicit allocation alignment and seven malformed callable/slot/load cases,
+including a legacy HeapAlloc substituted for SpawnTask. Only SpawnTask may
+produce a task result slot; the scalar box allocation path rejects Task metadata
+before LLVM emission. This closes the independent code review's malformed-MIR
+panic finding without changing ordinary box allocation. The sibling BoxClone
+path already requires Box and cannot produce a Task.
 The existing independent graph, task_group, task_progress and non-Send malformed
 MIR owners retain neighboring type, capture, scheduler and cleanup guarantees.
 The unchanged media reproducer passes whole/per-unit checking. No consumer
