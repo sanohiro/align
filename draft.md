@@ -1459,6 +1459,19 @@ values are passed as ordinary arguments — so it fuses into the same loop and a
 (Consistent with *Nothing hidden*: a lambda that escaped and outlived its captures would need a
 visible heap environment; the in-loop case never does.)
 
+`source.scan(init, f) -> array<A>` materializes the running state after each
+surviving element, in source order; `init: A` is evaluated once and never emitted,
+and `f: (A, E) -> A` runs once per survivor. Input E may be an existing Copy
+record. Alongside existing Copy scalar/sum accumulators, A may be an already-formed
+independent Copy record without explicit `align(N)`: its complete inline graph,
+including every variant and zero-length field, must contain no views, callables,
+pointers, resources or Move values. Record results use canonical AoS storage;
+root tuple accumulators remain unsupported. Source and captures remain live
+through the call. Independent result elements retain none of their borrows;
+borrowed outputs retain their lifetimes, and every result keeps its ordinary
+heap or explicit-arena allocation lifetime. No hidden clone or element move is
+introduced. Detailed domain and closure: Plan223.
+
 Pipeline construction follows written order. The receiver/source is evaluated first. Each stage
 then snapshots its captured Copy values once at that stage's written position. A terminal evaluates
 its explicit arguments next; therefore `reduce(init, fn ...)` and `scan(init, fn ...)` snapshot

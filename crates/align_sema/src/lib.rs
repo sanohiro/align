@@ -448,24 +448,22 @@ pub fn str_clone_body_ty(ty: Ty) -> bool {
     matches!(ty, Ty::Str | Ty::String)
 }
 
-/// The materialized element scalar of a `scan` accumulator, or `None` when the accumulator cannot
-/// be materialized into an `array<A>`.
-///
-/// This is the single producer authority for the `scan` output-element rule. `check_array_scan`
-/// admits an accumulator through it, and the checked-HIR body validator asks the same function
-/// instead of re-deriving the rule: the validator's own `scalar_to_prim` spelling of "materializable"
-/// rejected `()` and every sum-type accumulator that sema accepts, so a checked `scan` lowered to
-/// the fail-closed empty program (`docs/impl/19-hir-validation-ledger.md`, delegation matrix row
-/// `scan-accumulator`).
-///
-/// A struct accumulator is excluded because the fused buffer/`PtrStore` path has no struct-element
-/// support; every other `ty_to_scalar` scalar materializes. Move admission is a separate rule and
-/// stays with the caller (`reject_move_pipeline_call_arg`), which needs the diagnostic span.
-pub fn scan_accumulator_scalar(acc: Ty) -> Option<Scalar> {
-    if matches!(acc, Ty::Struct(_) | Ty::Tuple(_)) {
-        return None;
+/// Single producer authority for the materialized result of `scan`.
+/// Keep the existing Unit/sum/scalar domain; Copy admission is a separate call rule.
+/// Records use the same complete independent graph and natural AoS storage as callback sorting.
+/// The checked-HIR validator delegates here rather than narrowing the scalar domain independently.
+pub fn scan_accumulator_result(
+    acc: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Ty> {
+    match acc {
+        Ty::Struct(_) => independent_record_array_result(acc, structs, tuples, enums, tagged_types),
+        Ty::Tuple(_) => None,
+        _ => ty_to_scalar(acc).map(Ty::DynArray),
     }
-    ty_to_scalar(acc)
 }
 
 /// Memory layout of a struct array — a property of the array *type*, so AoS-vs-SoA is decided
@@ -4791,16 +4789,44 @@ pub fn copy_sort_result(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> Option<Ty> {
-    if let Ty::Struct(id) = elem {
-        if structs.get(id as usize)?.align.is_some()
-            || !independent_copy_type(elem, structs, tuples, enums, tagged_types)
-        {
-            return None;
-        }
-        return Some(Ty::DynStructArray(id, Layout::Aos));
+    if matches!(elem, Ty::Struct(_)) {
+        return independent_record_array_result(elem, structs, tuples, enums, tagged_types);
     }
     let scalar = ty_to_scalar(elem)?;
     (scalar_to_prim(scalar).is_some() || scalar == Scalar::Str).then_some(Ty::DynArray(scalar))
+}
+
+fn independent_record_array_result(
+    elem: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Ty> {
+    let Ty::Struct(id) = elem else { return None };
+    (structs.get(id as usize)?.align.is_none()
+        && independent_copy_type(elem, structs, tuples, enums, tagged_types))
+        .then_some(Ty::DynStructArray(id, Layout::Aos))
+}
+
+/// This proof concerns stored elements only, never the fresh result header or its generation.
+/// Derive the element from the actual canonical result and check the producer's stored equation.
+fn independent_scan_contents(
+    expression: &Expr,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    let ExprKind::ArrayScan { elem: stored, .. } = &expression.kind else { return false };
+    let element = match expression.ty {
+        Ty::DynArray(scalar) => scalar_to_ty(scalar),
+        Ty::DynStructArray(id, Layout::Aos) => Ty::Struct(id),
+        _ => return false,
+    };
+    element == *stored
+        && scan_accumulator_result(element, structs, tuples, enums, tagged_types) == Some(expression.ty)
+        && independent_copy_type(element, structs, tuples, enums, tagged_types)
 }
 
 /// Copy reads do not widen builder formation. A descriptor must already be constructible in
@@ -22298,6 +22324,9 @@ impl<'a> EscapeCheck<'a> {
             },
             StorageContentInitializer::PipelineElement
             | StorageContentInitializer::PartitionElement => {
+                if independent_scan_contents(expression, self.structs, self.tuples, self.enums, self.tagged_types) {
+                    return EscapeValueFact::default();
+                }
                 let mut facts = Vec::new();
                 if let Some(source) = self.pipeline_storage_source(expression) {
                     facts.push(self.pipeline_escape_element_value(
@@ -25029,6 +25058,10 @@ impl<'a> EscapeCheck<'a> {
                     self.allocation_region(expression),
                     children,
                 );
+            }
+            ExprKind::ArrayScan { .. }
+                if independent_scan_contents(expression, self.structs, self.tuples, self.enums, self.tagged_types) => {
+                values.push(self.allocation_region(expression));
             }
             ExprKind::ArrayReduce {
                 source,
@@ -39268,12 +39301,13 @@ impl<'a> MoveCheck<'a> {
             }
             return fact;
         }
-        if let Some(stages) = pipeline_stages(&e.kind) {
+        let independent_contents = independent_scan_contents(e, self.structs, self.tuples, self.enums, self.tagged_types);
+        if !independent_contents && let Some(stages) = pipeline_stages(&e.kind) {
             for capture in stage_capture_exprs(stages) {
                 fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
         }
-        if !matches!(e.kind, ExprKind::Closure { .. } | ExprKind::ArraySortBy { .. } | ExprKind::ArraySortCmp { .. }) {
+        if !independent_contents && !matches!(e.kind, ExprKind::Closure { .. } | ExprKind::ArraySortBy { .. } | ExprKind::ArraySortCmp { .. }) {
             for capture in node_captures(&e.kind) {
                 fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
@@ -41661,6 +41695,8 @@ impl<'a> MoveCheck<'a> {
                     result
                 }
             }
+            ExprKind::ArrayScan { .. }
+                if independent_scan_contents(e, self.structs, self.tuples, self.enums, self.tagged_types) => BorrowFact::default(),
             ExprKind::ArrayScan { source, stages, func, captures, init, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, stages);
                 self.pipeline_accumulator_fact(func, captures, init, &element).flatten_lifetimes()
@@ -42324,6 +42360,8 @@ impl<'a> MoveCheck<'a> {
                 roots.extend(self.borrow_sources(init));
                 roots
             }
+            ExprKind::ArrayScan { .. }
+                if independent_scan_contents(e, self.structs, self.tuples, self.enums, self.tagged_types) => BorrowRoots::default(),
             ExprKind::ArrayScan { source, init, .. } => {
                 // Every stored scan element is a callback result (the initial value is never
                 // emitted). Preserve lifetime dependencies without guessing returned bytes.
@@ -62644,37 +62682,17 @@ impl<'a, 't> Checker<'a, 't> {
         let acc_ty = named_sig
             .as_ref()
             .map_or_else(|| self.finalize(init.ty), |sig| sig.ret);
-        // A failed initial value leaves `acc_ty == Ty::Error`; bail before the scalar check so it
-        // doesn't cascade into a confusing "accumulator must be a scalar" diagnostic (matching reduce).
+        // A failed initial value leaves `acc_ty == Ty::Error`; bail before the materialization check so it
+        // doesn't cascade into a confusing "accumulator must be materializable" diagnostic (matching reduce).
         if acc_ty == Ty::Error {
-            return err;
-        }
-        // A struct element must be projected to a scalar first (the fused loop has no scalar
-        // value loaded for a struct array, like `map`/`to_array`).
-        if matches!(elem, Ty::Struct(_)) {
-            self.diags.error(
-                "'scan' over struct elements is not supported yet (project a field first)".to_string(),
-                span,
-            );
             return err;
         }
         if self.reject_move_pipeline_call_arg(elem, "scan", "element", span) {
             return err;
         }
-        // The accumulator (output element) must materialize into `array<A>`. `ty_to_scalar` accepts
-        // `Ty::Struct` (a valid Option/Result payload), but the buffer/PtrStore path has no
-        // struct-element support, so structs are rejected. `scan_accumulator_scalar` is the single
-        // authority for that rule; the checked-HIR body validator asks the same function.
-        if matches!(acc_ty, Ty::Struct(_)) {
+        let Some(result_ty) = scan_accumulator_result(acc_ty, self.structs, self.tuples, self.enums, self.tagged_types) else {
             self.diags.error(
-                "'scan' accumulator must be a primitive scalar (struct accumulators are not supported yet)".to_string(),
-                span,
-            );
-            return err;
-        }
-        let Some(scalar) = scan_accumulator_scalar(acc_ty) else {
-            self.diags.error(
-                format!("'scan' accumulator must be a scalar to materialize, got {}", ty_name(acc_ty)),
+                format!("'scan' accumulator must be a materializable Copy scalar or an independent Copy record without align(N), got {}", ty_name(acc_ty)),
                 span,
             );
             return err;
@@ -62688,7 +62706,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         Expr {
             kind: ExprKind::ArrayScan { source: Box::new(source), stages, func, captures, init: Box::new(init), elem: acc_ty },
-            ty: Ty::DynArray(scalar),
+            ty: result_ty,
             span,
         }
     }
@@ -92122,17 +92140,17 @@ fn exit_branch(flag: bool) -> i64 {
     }
 
     #[test]
-    fn scan_over_struct_element_rejected_not_panicked() {
-        // A struct element (no field projection) must be rejected in sema, not panic in MIR.
+    fn scan_over_copy_struct_element_checks() {
+        // Complete Copy records are ordinary by-value callback inputs.
         let (_p, d) = check("Point { x: i32, y: i32 }\nfn addx(acc: i32, p: Point) -> i32 = acc + p.x\nfn main() -> i32 {\n  return [Point { x: 1, y: 2 }].scan(0, addx).sum()\n}\n");
-        assert!(d.has_errors(), "scan over struct elements must error (project a field first)");
+        assert!(!d.has_errors(), "scan over Copy struct elements must check: {d:?}");
     }
 
     #[test]
-    fn scan_struct_accumulator_rejected() {
-        // A struct accumulator (ty_to_scalar succeeds for structs) must be rejected explicitly.
-        let (_p, d) = check("Acc { s: i32 }\nfn step(a: Acc, x: i32) -> Acc = Acc { s: a.s + x }\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(Acc { s: 0 }, step).len()\n}\n");
-        assert!(d.has_errors(), "scan with a struct accumulator must error");
+    fn scan_independent_struct_accumulator_checks() {
+        // Complete independent Copy records use canonical record-array storage.
+        let (_p, d) = check("Acc { s: i32 }\nfn step(a: Acc, x: i32) -> Acc = Acc { s: a.s + x }\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(Acc { s: 0 }, step).len() as i32\n}\n");
+        assert!(!d.has_errors(), "scan with an independent struct accumulator must check: {d:?}");
     }
 
     #[test]

@@ -3069,6 +3069,14 @@ Record: `impl/04-mir.md` (CFG), `non-goals.md`.
   receiver during mapper evaluation and joins mapper-capture borrows into the result region. A Move
   value leaving a value-carrying `task_group` forwards its tail local's cleanup bit and clears that
   inner source before an outer return or call takes ownership.
+- **Copy record prefix states** (Plan223): `scan` admits existing Copy record inputs
+  and already-formed independent Copy record accumulators without explicit `align(N)`.
+  The complete graph excludes views, callables, pointers, resources and Move fields,
+  including inactive and zero-length payloads. Complete AoS states are emitted once
+  per surviving element; init is not emitted. Independent elements retain no input or
+  capture borrows, but the result header and allocation region remain tracked.
+  Existing Copy scalar/sum outputs and their borrowed-content checks are preserved;
+  root tuple and Move accumulators remain excluded.
 - **Uniform aggregate ownership mode**: one owning aggregate slot carries one runtime cleanup bit,
   so its owned members are all free-standing or all arena-owned. Mixed tuples, structs, sum values,
   and owned arrays are rejected, and owned field/element assignments preserve the existing mode;

@@ -756,6 +756,19 @@ inferred). A lambda may capture enclosing variables by value — with no hidden 
 environment (it compiles like a named function, captures passed as arguments). `where(.active)`
 is shorthand for a one-field lambda.
 
+`source.scan(init, f) -> array<A>` materializes the running state after each
+surviving element, in source order; `init: A` is evaluated once and never emitted,
+and `f: (A, E) -> A` runs once per survivor. Input E may be an existing Copy
+record. Alongside existing Copy scalar/sum accumulators, A may be an already-formed
+independent Copy record without explicit `align(N)`: its complete inline graph,
+including every variant and zero-length field, must contain no views, callables,
+pointers, resources or Move values. Record results use canonical AoS storage;
+root tuple accumulators remain unsupported. Source and captures remain live
+through the call. Independent result elements retain none of their borrows;
+borrowed outputs retain their lifetimes, and every result keeps its ordinary
+heap or explicit-arena allocation lifetime. No hidden clone or element move is
+introduced. Detailed domain and closure: Plan223.
+
 Pipeline operands are evaluated in written order: receiver/source, each stage and its one-time
 Copy-capture snapshot, then terminal arguments and their captures. In `reduce(init, fn ...)` and
 `scan(init, fn ...)`, stage captures are snapshotted before `init`, while reducer captures are
