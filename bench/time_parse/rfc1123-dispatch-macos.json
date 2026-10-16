@@ -1,0 +1,196 @@
+{
+  "measured_at_utc": "2026-10-16T17:45:42.846617+00:00",
+  "baseline_commit": "4a6d26cc5ee9e3a32c3a664fbde73dcf97b55dab",
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "versions": {
+    "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26) (Homebrew)\nbinary: rustc\ncommit-hash: 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd\ncommit-date: 2026-06-26\nhost: aarch64-apple-darwin\nrelease: 1.96.1\nLLVM version: 22.1.8",
+    "cc": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+    "cpu": "Apple M1"
+  },
+  "compile_flags": [
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-Wl,-dead_strip"
+  ],
+  "protocol": "Two complete per-cell ABBA passes, 5 kinds x 4 groups; unchanged fixture, 50 ms warmup and 7 samples per process; no concurrent agent builds/tests. Every sample retained. Native supervisor owns build/link/probe retirement.",
+  "sample_rows": 1120,
+  "identities": {
+    "baseline": {
+      "time_formats_sha256": "ebc1775782f0689a2261d12501fa54811928cdf5f454a871e8044a8fd02c2918",
+      "fixture_sha256": "3bf3e57fdec50652fa1ecaaab11c4284bc0c8d0f611c34ee41798bd6ba2e514b",
+      "runtime_archive_sha256": "52ace18e608e5afe750a27ff5000c74d7b0313ca25cd62703f39fb13e17016e0",
+      "executable_sha256": "30b71c4096ffe638f0292128d2626f137d98e4e742ee31e6f49e7f4fe65df556"
+    },
+    "candidate": {
+      "time_formats_sha256": "6ff1c18de2d935474a91f79095b57df2371d3f7316e11805fa5de855621e1932",
+      "fixture_sha256": "3bf3e57fdec50652fa1ecaaab11c4284bc0c8d0f611c34ee41798bd6ba2e514b",
+      "runtime_archive_sha256": "5f61e53d6db1a60085ebd7db4fd5a67c4a76a0fe0a8bff80965bd1c6ef1c8dab",
+      "executable_sha256": "72dc7683674653d7db57ea856fb0e801d072c9528f682c25747928e21571f307"
+    }
+  },
+  "medians": [
+    {
+      "kind": 0,
+      "group": 0,
+      "samples_per_arm": 28,
+      "baseline_ns": 14.562000000000001,
+      "candidate_ns": 14.994499999999999,
+      "change_percent": 2.970059
+    },
+    {
+      "kind": 0,
+      "group": 1,
+      "samples_per_arm": 28,
+      "baseline_ns": 14.8985,
+      "candidate_ns": 14.8915,
+      "change_percent": -0.046985
+    },
+    {
+      "kind": 0,
+      "group": 2,
+      "samples_per_arm": 28,
+      "baseline_ns": 20.145,
+      "candidate_ns": 20.2145,
+      "change_percent": 0.344999
+    },
+    {
+      "kind": 0,
+      "group": 3,
+      "samples_per_arm": 28,
+      "baseline_ns": 12.346499999999999,
+      "candidate_ns": 12.252500000000001,
+      "change_percent": -0.761349
+    },
+    {
+      "kind": 1,
+      "group": 0,
+      "samples_per_arm": 28,
+      "baseline_ns": 18.296999999999997,
+      "candidate_ns": 18.315,
+      "change_percent": 0.098377
+    },
+    {
+      "kind": 1,
+      "group": 1,
+      "samples_per_arm": 28,
+      "baseline_ns": 18.847,
+      "candidate_ns": 18.948500000000003,
+      "change_percent": 0.538547
+    },
+    {
+      "kind": 1,
+      "group": 2,
+      "samples_per_arm": 28,
+      "baseline_ns": 19.7635,
+      "candidate_ns": 20.0735,
+      "change_percent": 1.568548
+    },
+    {
+      "kind": 1,
+      "group": 3,
+      "samples_per_arm": 28,
+      "baseline_ns": 11.579,
+      "candidate_ns": 11.512,
+      "change_percent": -0.578634
+    },
+    {
+      "kind": 2,
+      "group": 0,
+      "samples_per_arm": 28,
+      "baseline_ns": 20.19,
+      "candidate_ns": 17.414,
+      "change_percent": -13.749381
+    },
+    {
+      "kind": 2,
+      "group": 1,
+      "samples_per_arm": 28,
+      "baseline_ns": 47.144999999999996,
+      "candidate_ns": 17.29,
+      "change_percent": -63.325909
+    },
+    {
+      "kind": 2,
+      "group": 2,
+      "samples_per_arm": 28,
+      "baseline_ns": 43.277,
+      "candidate_ns": 17.9015,
+      "change_percent": -58.635072
+    },
+    {
+      "kind": 2,
+      "group": 3,
+      "samples_per_arm": 28,
+      "baseline_ns": 24.401,
+      "candidate_ns": 13.7385,
+      "change_percent": -43.69698
+    },
+    {
+      "kind": 3,
+      "group": 0,
+      "samples_per_arm": 28,
+      "baseline_ns": 12.7,
+      "candidate_ns": 12.6865,
+      "change_percent": -0.106299
+    },
+    {
+      "kind": 3,
+      "group": 1,
+      "samples_per_arm": 28,
+      "baseline_ns": 12.9085,
+      "candidate_ns": 12.8855,
+      "change_percent": -0.178177
+    },
+    {
+      "kind": 3,
+      "group": 2,
+      "samples_per_arm": 28,
+      "baseline_ns": 13.094,
+      "candidate_ns": 13.082,
+      "change_percent": -0.091645
+    },
+    {
+      "kind": 3,
+      "group": 3,
+      "samples_per_arm": 28,
+      "baseline_ns": 9.186499999999999,
+      "candidate_ns": 8.693,
+      "change_percent": -5.372013
+    },
+    {
+      "kind": 4,
+      "group": 0,
+      "samples_per_arm": 28,
+      "baseline_ns": 9.0205,
+      "candidate_ns": 8.971,
+      "change_percent": -0.54875
+    },
+    {
+      "kind": 4,
+      "group": 1,
+      "samples_per_arm": 28,
+      "baseline_ns": 9.168,
+      "candidate_ns": 9.245,
+      "change_percent": 0.839878
+    },
+    {
+      "kind": 4,
+      "group": 2,
+      "samples_per_arm": 28,
+      "baseline_ns": 9.4455,
+      "candidate_ns": 9.5835,
+      "change_percent": 1.461013
+    },
+    {
+      "kind": 4,
+      "group": 3,
+      "samples_per_arm": 28,
+      "baseline_ns": 7.8195,
+      "candidate_ns": 7.8375,
+      "change_percent": 0.230194
+    }
+  ],
+  "limits": "Apple M1 local native repeated-call corpus only; no Linux, application throughput or universal speedup claim."
+}

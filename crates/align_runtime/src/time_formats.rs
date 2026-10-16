@@ -11,6 +11,37 @@ const MONTHS: [&str; 12] = [
 ];
 const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
+fn weekday_index(name: &[u8]) -> Option<usize> {
+    match name {
+        b"Sun" => Some(0),
+        b"Mon" => Some(1),
+        b"Tue" => Some(2),
+        b"Wed" => Some(3),
+        b"Thu" => Some(4),
+        b"Fri" => Some(5),
+        b"Sat" => Some(6),
+        _ => None,
+    }
+}
+
+fn month_index(name: &[u8]) -> Option<usize> {
+    match name {
+        b"Jan" => Some(0),
+        b"Feb" => Some(1),
+        b"Mar" => Some(2),
+        b"Apr" => Some(3),
+        b"May" => Some(4),
+        b"Jun" => Some(5),
+        b"Jul" => Some(6),
+        b"Aug" => Some(7),
+        b"Sep" => Some(8),
+        b"Oct" => Some(9),
+        b"Nov" => Some(10),
+        b"Dec" => Some(11),
+        _ => None,
+    }
+}
+
 fn resolution(kind: i32) -> Option<i128> {
     match kind {
         0 => Some(1),
@@ -216,13 +247,13 @@ fn parse(bytes: &[u8], kind: i32) -> Option<i64> {
     let mut weekday = None;
     if kind == 2 {
         let name = bytes.get(..3)?;
-        weekday = Some(WEEKDAYS.iter().position(|s| s.as_bytes() == name)?);
+        weekday = Some(weekday_index(name)?);
         p.pos = 3;
         p.literal(b", ")?;
         day = p.digits(2)?;
         p.literal(b" ")?;
         let name = bytes.get(p.pos..p.pos + 3)?;
-        month = i64::try_from(MONTHS.iter().position(|s| s.as_bytes() == name)?).ok()? + 1;
+        month = i64::try_from(month_index(name)?).ok()? + 1;
         p.pos += 3;
         p.literal(b" ")?;
         year = p.digits(4)?;
@@ -402,6 +433,32 @@ pub unsafe extern "C" fn align_rt_time_parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rfc1123_names_match_the_closed_english_tables() {
+        type Decoder = fn(&[u8]) -> Option<usize>;
+        for (names, decode) in [
+            (&WEEKDAYS[..], weekday_index as Decoder),
+            (&MONTHS[..], month_index as Decoder),
+        ] {
+            for (index, name) in names.iter().enumerate() {
+                let bytes: [u8; 3] = name.as_bytes().try_into().unwrap();
+                assert_eq!(decode(&bytes), Some(index), "{name}");
+                for length in 0..3 {
+                    assert_eq!(decode(&bytes[..length]), None, "short {name}");
+                }
+                assert_eq!(decode(format!("{name} ").as_bytes()), None);
+                for position in 0..3 {
+                    for byte in u8::MIN..=u8::MAX {
+                        let mut changed = bytes;
+                        changed[position] = byte;
+                        let expected = names.iter().position(|name| name.as_bytes() == changed);
+                        assert_eq!(decode(&changed), expected, "{changed:?}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn wire_golden_vectors_and_precision_endpoints() {
