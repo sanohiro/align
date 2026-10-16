@@ -141,7 +141,10 @@ diagnostic voice (`file:line:col: message`, lowercase, terse, backticked code, r
 - **Honesty rule (load-bearing):** the message asserts only what the remark justifies. Concrete
   mappable cause (aliasing / no-vector-form / unrecognized reduction / inline cost) → cause +
   concrete Align remedy. Vague cause (`cost model`) → say only that; **never** upgrade a
-  cost-model decline into an aliasing story; no fabricated suggestions.
+  cost-model decline into an aliasing story; no fabricated suggestions. LLVM22's
+  standalone vectorization-profitability refusal uses the same CostModel diagnostic
+  as its prefixed refusal; interleaving and SLP refusals are separate observations
+  ([Plan211](211-vectorization-cost-diagnostics.md)).
 - Example renderings (the voice to match):
 
 ```text
