@@ -593,15 +593,18 @@ Completion condition (met): data allocated inside `arena {}` is freed at block e
   string elements. Stable results own their spines and retain byte-owner
   lifetime/generation facts. Whole/per-unit imported generic, algorithm-exit,
   effect-order, invalidation and forged-producer owners cover the capability.
-  Move string elements and general comparators remain deferred.
+  Move string elements remain deferred; plan208 supplies explicit comparators.
 - [done, plan 134] **Owned string sort keys** — preserve ordinary returned
   cleanup bits in an unsorted nullable owner column; compare borrowed headers
   and release independently owned key bytes after sorting. Copy source elements
   and all other pipeline ownership restrictions remain.
+- [done, plan 208] **`sort_by(cmp)`** — stable Copy scalar sorting with ordinary
+  two-argument comparisons and captures. Sequential Impure callbacks follow a
+  fixed insertion/merge procedure; no adaptive probes or key columns. Source
+  content lifetimes remain, comparator-only captures do not become result content.
 - [done] **`sort_by_key(f)`** — materialize the surviving (primitive scalar) elements and sort
-  ascending by `f(element)` (an orderable scalar key: int/float/char). Reuses the MIR insertion
-  sort (`lower_array_sort` gained an optional `SortKey`), comparing `key(a) > key(b)` instead of
-  `a > b`; the element need not be numeric (it is ordered by the key). `f` is a named function or
+  ascending by `f(element)` (an orderable scalar key). Reuses stable MIR merge sorting
+  with insertion runs and exactly-once key decoration; the element need not be numeric. `f` is a named function or
   a lambda and **may capture** (the key call is in the enclosing loop, so captures are ordinary
   arguments). Struct-element sort stays deferred (needs struct-array materialization, like `sort`).
 - [done] **mutable element writes + `out` parameters (write mechanism)** — `place[i] = v` into a

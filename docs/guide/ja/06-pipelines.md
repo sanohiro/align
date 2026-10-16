@@ -71,6 +71,8 @@ fn main() -> i32 {
     xs := [10, 21, 32, 3]
     sorted := xs.sort_by_key(fn x { -x })            // descending: negate the key
     print(sorted[0])                                 // 32
+    compared := xs.sort_by(fn a, b { a > b })
+    print(compared[0])                               // 32
 
     (evens, odds) := [1, 2, 3, 4, 5].partition(fn x { x % 2 == 0 })
     print(evens.count())                             // 2
@@ -79,11 +81,13 @@ fn main() -> i32 {
 }
 ```
 
-`sort()` は昇順にソートし、`sort_by_key(f)` は計算したキーでソートします。`partition(p)` は 1 パスで 2 つの所有配列に分割します。条件を満たす要素、続いてそれ以外です。
+`sort()` は昇順にソートし、`sort_by_key(f)` は計算したキーでソートし、`sort_by(cmp)` は「a が b より前」を表す `(a, b) -> bool` の比較関数を使います。`partition(p)` は 1 パスで 2 つの所有配列に分割します。条件を満たす要素、続いてそれ以外です。
 
-現時点でどちらのソートもスカラ専用で、これが構造体の `array<Item>` を扱うときの落とし穴になります。構造体要素に対する `sort` / `sort_by_key` はそのまま拒否され（`'sort' over struct elements is not supported yet (project a field first)`）、`sort_by_key` のキーも順序付け可能なスカラ（整数、浮動小数点数、`char`、`str`）でなければなりません。並べ替えたいフィールドを先に射影してください。
+現時点で3種類のソートはいずれもスカラ専用で、これが構造体の `array<Item>` を扱うときの落とし穴になります。構造体要素に対する `sort` / `sort_by_key` / `sort_by` はそのまま拒否され（`'sort' over struct elements is not supported yet (project a field first)`）、`sort_by_key` のキーも順序付け可能なスカラ（整数、浮動小数点数、`char`、`str`、所有する `string`）でなければなりません。並べ替えたいフィールドを先に射影してください。
 
-> **コスト:** どちらのソートも安定ソートで、最悪計算量は O(n log n) です。所有権を持つ結果を生成し、追加の作業領域は最悪 O(n) です。`sort_by_key` はキー関数を入力順に、各要素につきちょうど1回評価します。これらの保証を保つ範囲で、内部のマージ方式が変わることはあります。
+`sort_by` は整数・浮動小数点数・bool・文字・借用文字列を受け入れます。既存の Copy capture を使え、逐次処理の比較関数は Impure でも構いません。安定した順序には狭義弱順序が必要です。不整合でも終了する比較なら、すべての入力要素を保持します。比較専用の capture は結果に残りませんが、元の文字列の借用は残ります。比較は [plan208](../../impl/208-comparator-sorting.md) の固定した挿入・マージ手順に従い、空・単一要素では呼ばず、順序済みの事前検査も行いません。merge scratch は挿入処理後、32要素を超えるときだけ確保し、`ALIGN_SORT_ADAPTIVE=off` でも同じです。
+
+> **コスト:** 3種類ともそれぞれの順序契約の下で安定ソートで、最悪計算量は O(n log n) です。所有権を持つ結果を生成し、追加の作業領域は最悪 O(n) です。`sort_by_key` はキー関数を入力順に、各要素につきちょうど1回評価します。`sort_by` の O(n log n) は比較回数の上限で、比較関数自体の処理コストは別です。比較の観測可能な手順は固定されています。直接・キーソートの内部方式は保証を保つ範囲で変更できます。
 
 ## チャンク分割（一定サイズの切り出し）
 

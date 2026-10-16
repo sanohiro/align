@@ -769,6 +769,13 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             key_ty: *key_ty,
             elem: *elem,
         },
+        ExprKind::ArraySortCmp { source, stages, cmp_func, captures, elem } => ExprKind::ArraySortCmp {
+            source: boxed!(source),
+            stages: clones.stages(stages.len())?,
+            cmp_func: cmp_func.clone(),
+            captures: take_exprs(clones, captures.len())?,
+            elem: *elem,
+        },
         ExprKind::ArrayToArray {
             source,
             stages,
@@ -2950,6 +2957,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             captures,
             ..
         }
+        | ExprKind::ArraySortCmp { source, stages, captures, .. }
         | ExprKind::ArrayPartition {
             source,
             stages,

@@ -74,6 +74,8 @@ fn main() -> i32 {
     xs := [10, 21, 32, 3]
     sorted := xs.sort_by_key(fn x { -x })            // descending: negate the key
     print(sorted[0])                                 // 32
+    compared := xs.sort_by(fn a, b { a > b })
+    print(compared[0])                               // 32
 
     (evens, odds) := [1, 2, 3, 4, 5].partition(fn x { x % 2 == 0 })
     print(evens.count())                             // 2
@@ -82,11 +84,19 @@ fn main() -> i32 {
 }
 ```
 
-`sort()` sorts ascending; `sort_by_key(f)` sorts by a computed key. `partition(p)` splits one pass into two owned arrays: satisfying, then rest.
+`sort()` sorts ascending; `sort_by_key(f)` sorts by a computed key; `sort_by(cmp)` uses an explicit `(a, b) -> bool` comparison meaning a precedes b. `partition(p)` splits one pass into two owned arrays: satisfying, then rest.
 
-Both sorts are scalar-only for now, which is the pitfall on an `array<Item>` of structs: `sort` and `sort_by_key` over struct elements are rejected outright (`'sort' over struct elements is not supported yet (project a field first)`), and a `sort_by_key` key must be an orderable scalar — an int, a float, a `char`, or a `str`. Project the field you want to order by first.
+All three sorts are scalar-only for now, which is the pitfall on an `array<Item>` of structs: `sort`, `sort_by_key` and `sort_by` over struct elements are rejected outright (`'sort' over struct elements is not supported yet (project a field first)`), and a `sort_by_key` key must be an orderable scalar — an int, a float, a `char`, a `str`, or an owned `string`. Project the field you want to order by first.
 
-> **Cost:** Both sorts are stable, have O(n log n) worst-case time, and materialize an owned result. Additional working storage is O(n) in the worst case. `sort_by_key` evaluates its key function exactly once per element, in input order. The current merge strategy may change without changing these guarantees.
+`sort_by` accepts integers, floats, bools, characters and borrowed strings. Its comparator
+uses existing Copy captures and may be Impure in sequential code. Supply a strict weak order
+for stable sorted results. An inconsistent terminating comparator still preserves every input
+element. Comparator-only captures are not retained by the result; borrowed source text is.
+Comparisons follow the fixed insertion/merge procedure in [plan208](../impl/208-comparator-sorting.md),
+with no calls on empty/singleton input and no adaptive probes. For `sort_by`, merge scratch
+is allocated only above 32 elements, after insertion, even with `ALIGN_SORT_ADAPTIVE=off`.
+
+> **Cost:** All three sorts are stable under their ordering contract, have O(n log n) worst-case time, and materialize an owned result. Additional working storage is O(n) in the worst case. `sort_by_key` evaluates its key function exactly once per element, in input order. For `sort_by`, O(n log n) bounds comparison count; callback work is additional. Its observable call procedure is fixed; direct/key internal strategy may change while preserving their guarantees.
 
 ## Chunking
 

@@ -307,6 +307,79 @@ fn copy_string_sort_hir_rejects_forged_metadata() {
     }
 }
 
+#[test]
+fn sort_comparator_domain_and_metadata() -> Result<(), &'static str> {
+    let base = checked_source_program("fn f(xs:slice<i64>,k:i64)->array<i64> { value:=xs.sort_by(fn a:i64,b:i64 { a + k < b + k }); return value }");
+    assert!(body_core_metadata_is_valid(&base));
+    for per_unit in [false, true] { assert!(lower_program_checked(&base, per_unit, None).is_ok()); }
+    for mutation in 0..13 {
+        let mut bad = base.clone();
+        if mutation < 6 {
+            let function = bad.fns.iter_mut().find(|f| matches!(f.origin, hir::FnOrigin::Lifted { .. })).ok_or("lifted comparator")?;
+            match mutation {
+                0 | 1 => { function.locals[function.params[mutation] as usize].ty = Ty::Bool; }
+                2 | 3 => function.param_modes[mutation - 2] = align_ast::ParamMode::Borrow,
+                4 => function.ret = int(64),
+                _ => function.origin = hir::FnOrigin::Lifted { capture_count: 0 },
+            }
+        } else {
+            let expression = body_first_let_init_mut(&mut bad, "f");
+            if mutation == 6 { expression.ty = Ty::DynArray(Scalar::Bool); }
+            else {
+                let hir::ExprKind::ArraySortCmp { source, cmp_func, captures, elem, .. } = &mut expression.kind else { return Err("comparator terminal") };
+                match mutation {
+                    7 => *cmp_func = "missing".into(),
+                    8 => captures.clear(),
+                    9 => captures[0].ty = Ty::Bool,
+                    10 => *elem = Ty::String,
+                    11 => source.ty = Ty::Slice(Scalar::Bool),
+                    _ => source.kind = hir::ExprKind::Local(u32::MAX),
+                }
+            }
+        }
+        // Every public producer, including located and per-unit entry points, fails closed.
+        assert_body_entrypoints_empty(&format!("comparator mutation {mutation}"), &bad);
+    }
+    Ok(())
+}
+
+#[test]
+fn comparator_effect_replay_rejects_forged_parallel_purity() -> Result<(), &'static str> {
+    let mut program = checked_source_program("fn cmp(a:i64,b:i64)->bool = a < b\nfn noisy(a:i64,b:i64)->bool { print(a); return a < b }\nfn worker(n:i64)->i64 { sorted:=[n,0].sort_by(cmp); return sorted[0] }\nfn main() { print([1,2].par_map(worker).sum()) }");
+    assert!(lower_program_checked(&program, false, None).is_ok());
+    let noisy = program.fns.iter().find(|f| f.name == "noisy").ok_or("noisy")?.body.clone();
+    program.fns.iter_mut().find(|f| f.name == "cmp").ok_or("comparator")?.body = noisy;
+    assert!(body_core_metadata_is_valid(&program));
+    assert!(!align_sema::checked_hir_body_facts_are_valid(&program));
+    let sources = SourceMap::new();
+    for per_unit in [false, true] {
+        for map in [None, Some(&sources)] { assert!(lower_program_checked(&program, per_unit, map).is_err()); }
+    }
+    for lowered in [lower_program(&program), lower_program_located(&program, &sources), lower_program_per_unit(&program), lower_program_per_unit_located(&program, &sources)] {
+        assert!(is_empty(&lowered), "forged comparator effect published MIR");
+    }
+    Ok(())
+}
+
+#[test]
+fn comparator_sort_uses_shared_storage_and_calls() -> Result<(), String> {
+    let hir = checked_source_program("fn f(xs:slice<str>,k:i64)->array<str> { value:=xs.sort_by(fn a:str,b:str { if k > 0 { a < b } else { a > b } }); return value }");
+    let target = hir.fns.iter().find(|f| matches!(f.origin, hir::FnOrigin::Lifted { .. })).ok_or("comparator")?.name.clone();
+    for per_unit in [false, true] {
+        let program = lower_program_checked(&hir, per_unit, None).map_err(|e| format!("{e:?}"))?;
+        producer::validate_mir_producers(&program).map_err(|e| format!("{e:?}"))?;
+        let function = program.fns.iter().find(|f| f.name.as_str() == "f").ok_or("sort function")?;
+        let values: Vec<_> = function.blocks.iter().flat_map(|b| &b.stmts).filter_map(|s| match s { Stmt::Let(_, value) => Some(value), _ => None }).collect();
+        let calls: Vec<_> = values.iter().filter_map(|v| match v { Rvalue::Call(name, args) if direct_program_name(name) == Some(target.as_str()) => Some(args), _ => None }).collect();
+        assert_eq!(calls.len(), 2, "one insertion and one merge call site, no adaptive probes");
+        assert!(calls.iter().all(|args| args.len() == 3), "two compared values followed by one capture");
+        assert!(matches!((&calls[0][2], &calls[1][2]), (Operand::Value(a), Operand::Value(b)) if a == b), "capture evaluated once before traversal");
+        assert_eq!(values.iter().filter(|v| matches!(v, Rvalue::HeapAllocBuf { elem: Ty::Str, .. })).count(), 2, "one result and one merge scratch spine");
+        assert!(!values.iter().any(|v| matches!(v, Rvalue::StrClone(_) | Rvalue::CallWithCleanup(_))), "no key owners, cleanup calls or hidden byte clones");
+    }
+    Ok(())
+}
+
 const OWNED_KEY_SORT: &str = "fn key(x: i64) -> string = \"key\".clone()\nfn sorted(xs: slice<i64>) -> array<i64> { value := xs.sort_by_key(key); return value }";
 
 #[test]

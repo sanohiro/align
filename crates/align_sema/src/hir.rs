@@ -1295,6 +1295,9 @@ pub enum ExprKind {
     /// `(elem) -> key_ty`, an orderable scalar). `captures` are a lifted lambda's captured values.
     /// `elem` is the element scalar; the result type is `DynArray(elem)`.
     ArraySortBy { source: Box<Expr>, stages: Vec<Stage>, key_func: String, captures: Vec<Expr>, key_ty: crate::Ty, elem: crate::Ty },
+    /// Stable sorting by an explicit `(elem, elem) -> bool` callable. Comparisons follow the
+    /// sequential insertion/merge procedure; captures are passed after both element operands.
+    ArraySortCmp { source: Box<Expr>, stages: Vec<Stage>, cmp_func: String, captures: Vec<Expr>, elem: crate::Ty },
     /// `source.….to_array()` — materialize the surviving (post-stage) elements into an
     /// *owned* `array<T>` (MMv2 slice 3: arena-bump-allocated). `elem` is the element
     /// scalar type; the expression `ty` is `DynArray(elem)`.

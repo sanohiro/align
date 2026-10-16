@@ -2334,7 +2334,12 @@ use the stable MIR sort already used by numbers and recorded keys. String
 materialization owns only a result spine; keeping content-region and owner
 generation facts avoids an implicit clone and prevents the fresh allocation
 from laundering a local byte borrow. Keyed string elements use the same rule.
-Move string elements and general comparators require separate ownership/callable work.
+Move string elements require separate ownership work. Plan208 supplies explicit
+comparators over the same Copy scalar elements. It reuses the sorter and ordinary
+call transport, with two explicit operands before captures. Sequential Impure
+comparators follow fixed insertion/merge calls; ordered-run shortcuts would add
+or remove observable calls, so they are disabled. Comparator captures affect
+call lifetime and effects, never the result element provenance.
 Existing conservative bound-source generation loans remain the shared collector
 rule. Precision beyond those loans is separate work; allocating a new spine
 does not make replacing a live source binding admissible.

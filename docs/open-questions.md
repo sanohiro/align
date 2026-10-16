@@ -1265,7 +1265,7 @@ operations plus builtin `sum`/`count`/`min`/`max` retain the mask/identity-selec
 Record: `draft.md` §8, `docs/language-spec.md`, `impl/12-pipeline-closure-memory-io-simd-audit.md` §3
 
 ### Lambdas / closures — IMPLEMENTED (map/where/all reducers + capture)
-**Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site, so there is no closure environment / allocation. **Implemented L2b-a1 timing correction:** a pipeline snapshots each stage's Copy captures once at that stage's written position, then evaluates terminal arguments, then snapshots reducer/terminal captures; the fused loop reuses those operands rather than reloading enclosing locals per element. A view capture retains its owner dependency across intervening arguments, so `init` cannot invalidate it before callback execution. Capture is otherwise wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`) for copy values; a direct-source capturing `par_map` and primitive-scalar length-preserving `map` stages now use the generated parallel range kernel with one call-scoped immutable capture context; callable primitive-scalar `where` stages use stable count/prefix/scatter compaction; AoS projection and field filters, plus the recognised invariant `str.contains` filter, use the same stable range path, while richer string-search, unsupported aggregate, and other unsupported forms retain the sequential path. All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures in the same source order, and every callable entering the staged kernel is checked Pure. First-class function values and task-group capture have since shipped as recorded next; fully escaping function values and the remaining owned-value capture shapes stay deferred.
+**Decision: lambdas exist and are the way to pass behavior to stages/reducers; capture by value, no hidden closure environment.** Always part of the design (`draft.md` §8/§11 use `fn x { ... }`); the early implementation accepted only named functions, now lifted. **Implemented**: an inline lambda `fn params { body }` (parameter types inferred) in `map`/`where`/`reduce`/`par_map`/`scan`/`partition`/`any`/`all`/`sort_by_key`/`sort_by` is **lifted** to a synthetic top-level function (`align_sema` `lift_lambda`), so it flows through the same `Rvalue::Call` + fused-loop lowering as a named function — optimized identically. **Capture** of enclosing locals is by value: each captured local becomes a trailing parameter passed at the call site, so there is no closure environment / allocation. **Implemented L2b-a1 timing correction:** a pipeline snapshots each stage's Copy captures once at that stage's written position, then evaluates terminal arguments, then snapshots reducer/terminal captures; the fused loop reuses those operands rather than reloading enclosing locals per element. A view capture retains its owner dependency across intervening arguments, so `init` cannot invalidate it before callback execution. Capture is otherwise wired into **every** stage and reducer (`map`/`where` + `reduce`/`scan`/`partition`/`any`/`all`/`par_map`/`sort_by_key`/`sort_by`) for copy values; a direct-source capturing `par_map` and primitive-scalar length-preserving `map` stages now use the generated parallel range kernel with one call-scoped immutable capture context; callable primitive-scalar `where` stages use stable count/prefix/scatter compaction; AoS projection and field filters, plus the recognised invariant `str.contains` filter, use the same stable range path, while richer string-search, unsupported aggregate, and other unsupported forms retain the sequential path. All three flow analyses (`MoveCheck`/`EscapeCheck`/`EffectScan`) walk stage and node captures in the same source order, and every callable entering the staged kernel is checked Pure. First-class function values and task-group capture have since shipped as recorded next; fully escaping function values and the remaining owned-value capture shapes stay deferred.
 Copy capture does not imply worker-sendability. When `par_map` moves staged and terminal callables
 into workers, the independently non-Send Copy `region` capability is rejected even when reachable
 only through a captured function value's target-relative environment. The same authority as
@@ -3960,7 +3960,7 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    one owning header or null in an unsorted transient owner column; comparison
    columns contain borrowed `str` headers. All key bytes remain live until
    comparisons finish, then one recursive Drop frees independently owned keys. No implicit byte clone occurs.
-   Move string elements and comparator overloads remain deferred (plan 88).
+   Move string elements remain deferred; plan208 adds explicit Copy comparator sorting.
    Existing conservative bound-source generation loans remain; fresh result
    storage does not promise release of a live source loan.
 2. **`else` works on `Result`** (`draft.md` §5 Result; guide ch04 rewritten): `v := f() else
@@ -4038,6 +4038,20 @@ exactly once per surviving element, in input order, before any reordering. The i
 decorate step records those keys; comparisons never invoke the callable again. This makes the
 shipped behavior normative without fixing the internal sorting algorithm. Full context:
 `impl/12-pipeline-closure-memory-io-simd-audit.md` §3.2.
+
+### Explicit comparator sorting — SETTLED 2026-10-16
+
+`source.sort_by(cmp) -> array<T>` accepts the existing primitive Copy/str element
+domain and one by-value `(T, T) -> bool` callable with existing Copy captures.
+It preserves source/stage content lifetimes; comparator captures remain call-only.
+Stability requires a strict weak order. A terminating inconsistent comparator
+still preserves the initialized input permutation. Sequential Impure comparators
+are allowed; effects reach enclosing parallel checks. After collection, the
+fixed 32-element insertion runs and bottom-up merge procedure in `draft.md` §8
+controls observable calls. Empty/singleton inputs invoke none; no adaptive probes
+or key columns exist. Scratch is delayed until merging even in diagnostic off-mode.
+[Plan208](impl/208-comparator-sorting.md) owns the exact contract and closure matrix.
+Move/aggregate elements and new callable transport remain outside this boundary.
 
 ### `pkg.kv` v1 typed RESP2 client — SETTLED 2026-09-02
 

@@ -2441,3 +2441,36 @@ records, `tuple_carrier_provenance_replay` owns stale facts, and the driver
 `tuple_carriers` owner runs source and executable twins in both compilation modes.
 Canonical MIR v3 scalar tag 62 and its exact ordinal/golden are specified once in
 Plan17; the source interface tuple codec does not change.
+
+## Explicit comparator sort records (plan208)
+
+`ArraySortCmp { source, stages, cmp_func, captures, elem }` is the checked record
+for `sort_by`. The source is an admitted array/slice pipeline, never a JSON
+scanner. Its final element exactly equals `elem`, belongs to the existing keyed
+sort Copy scalar/str domain, and matches the result's dynamic-array scalar.
+`pipeline_callable_ok` authenticates an explicit input sequence: two copies of
+that final type, followed by captures, with exact bool return and by-value modes.
+Every lifted capture count and capture type must match. Existing one-input
+consumers use the same validator with a one-element sequence. Source resolution
+also refuses non-by-value modes before publishing a pipeline record.
+
+Replay includes source, stages and captures in their ordinary eager order. Both
+comparator operand origins and all capture effects reach the enclosing parallel
+check. Comparator captures are evaluated/reserved but contribute no result
+content or output lifetime: only copied source/stage values do. The new variant
+participates in replay clone/depth, type remapping/finalization, escape, storage,
+borrow/move, mutable access and cleanup analysis. MIR uses ordinary named calls,
+with no runtime/interface format extension.
+
+`sort_comparator_domain_and_metadata` mutates both parameter types/modes, return,
+lifted capture count, terminal capture count/type, callable, source, element and
+result at every public lowering entry point. `comparator_effect_replay_rejects_forged_parallel_purity`
+keeps structural metadata valid while making the comparator Impure, proving that
+full effect replay rejects the enclosing parallel boundary. `sort_comparator`
+and `effect_fail_closed` own source, execution and imported effect-state parity.
+
+The shared pipeline action also consumes mutable-access summaries for copied
+capture headers: possible writes end overlapping validated-byte observations
+before source/capture validation finishes. Comparator, keyed and map owners
+pair invalidating byte writes with independent numeric output. This closes an
+existing analysis gap without changing capture syntax or the ordinary write rule.

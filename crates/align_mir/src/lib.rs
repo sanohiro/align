@@ -11134,7 +11134,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 source,
                 stages,
                 elem,
-            } => lower_array_sort(b, source, stages, *elem, None, e),
+            } => lower_array_sort(b, source, stages, *elem, SortOrder::Direct, e),
             hir::ExprKind::ArraySortBy {
                 source,
                 stages,
@@ -11147,11 +11147,22 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 source,
                 stages,
                 *elem,
-                Some(SortKey {
+                SortOrder::Key {
                     func: ProgramCall::from_validated(key_func),
                     captures: captures.clone(),
                     key_ty: *key_ty,
-                }),
+                },
+                e,
+            ),
+            hir::ExprKind::ArraySortCmp { source, stages, cmp_func, captures, elem } => lower_array_sort(
+                b,
+                source,
+                stages,
+                *elem,
+                SortOrder::Comparator {
+                    func: ProgramCall::from_validated(cmp_func),
+                    captures: captures.clone(),
+                },
                 e,
             ),
             hir::ExprKind::ArrayPartition {
@@ -14995,6 +15006,7 @@ fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bo
             | hir::ExprKind::ArrayParMap { .. }
             | hir::ExprKind::ArraySort { .. }
             | hir::ExprKind::ArraySortBy { .. }
+            | hir::ExprKind::ArraySortCmp { .. }
     );
     always_heap || (arena_if_in_arena && outside_arena)
 }
@@ -18156,13 +18168,11 @@ fn lower_array_partition(
     Operand::Value(tup)
 }
 
-/// A `sort_by_key` key: the per-element key function, its captures, and the key type. The sort
-/// compares `key(a)` against `key(b)` instead of `a` against `b` — see [`lower_array_sort`], where
-/// the keys are precomputed once (decorate) rather than recomputed per comparison.
-struct SortKey {
-    func: ProgramCall,
-    captures: Vec<hir::Expr>,
-    key_ty: Ty,
+/// Key decoration and explicit comparison are mutually exclusive strategies of the same sorter.
+enum SortOrder {
+    Direct,
+    Key { func: ProgramCall, captures: Vec<hir::Expr>, key_ty: Ty },
+    Comparator { func: ProgramCall, captures: Vec<hir::Expr> },
 }
 
 /// Insertion-sort base-case cutoff for the merge sort in [`lower_array_sort`]. Runs no longer than
@@ -18382,7 +18392,7 @@ fn sort_copy_step(
     b.push(Stmt::Store(k_slot, k_next));
 }
 
-/// `source.….sort()` / `.sort_by_key(f)` — materialize the surviving elements into an owned
+/// `source.….sort()` / `.sort_by_key(f)` / `.sort_by(cmp)` — materialize the surviving elements into an owned
 /// `array<T>` (the `to_array` collect loop), then sort that buffer ascending and return it.
 ///
 /// The sort is a **stable, bottom-up merge sort** (O(n log n)) with an insertion-sort base case for
@@ -18399,6 +18409,10 @@ fn sort_copy_step(
 /// key buffers is a shallow spine `DropValue` that never touches the pointed-to bytes. Owned
 /// String keys use those same Copy comparison headers, plus an unsorted nullable String column
 /// selected by each call's cleanup bit. Its single recursive Drop releases only heap-owned keys.
+///
+/// `sort_by` calls its comparator as `(current, predecessor)` during insertion and
+/// `(right_head, left_head)` during merge. It has no key column or adaptive probes; even
+/// Impure callbacks follow this fixed procedure. Scratch stays delayed in diagnostic off-mode.
 ///
 /// Elements are always Copy scalars, including borrowed `str` headers. The result and scratch
 /// spines never own string bytes, so no element needs a deep move/drop. Reads use `SliceIndex`; writes use
@@ -18422,12 +18436,13 @@ fn lower_array_sort(
     source: &hir::Expr,
     stages: &[hir::Stage],
     elem: Ty,
-    sort_key: Option<SortKey>,
+    order: SortOrder,
     terminal: &hir::Expr,
 ) -> Operand {
-    let terminal_captures = sort_key
-        .as_ref()
-        .map_or(&[][..], |key| key.captures.as_slice());
+    let terminal_captures = match &order {
+        SortOrder::Direct => &[][..],
+        SortOrder::Key { captures, .. } | SortOrder::Comparator { captures, .. } => captures.as_slice(),
+    };
     let (arr, lowered_captures) = lower_array_collect(
         b,
         source,
@@ -18443,26 +18458,45 @@ fn lower_array_sort(
     if !lowering_continues(b) {
         return Operand::Const(Const::Unit);
     }
-    let has_keys = sort_key.is_some();
-    let owned_keys = sort_key.as_ref().is_some_and(|sk| sk.key_ty == Ty::String);
+    let key = match &order {
+        SortOrder::Key { func, key_ty, .. } => Some((func, *key_ty)),
+        _ => None,
+    };
+    let comparator = match &order {
+        SortOrder::Comparator { func, .. } => Some(func),
+        _ => None,
+    };
+    let has_keys = key.is_some();
+    let owned_keys = key.is_some_and(|(_, ty)| ty == Ty::String);
     // Sorting only copies comparison keys; ownership stays in a separate, unsorted column.
     let kty = if owned_keys {
         Ty::Str
     } else {
-        sort_key.as_ref().map(|sk| sk.key_ty).unwrap_or(elem)
+        key.map_or(elem, |(_, ty)| ty)
     };
 
     // Lower the key function's captures ONCE (loop-invariant); `key_of` reuses them, so a
     // `sort_by_key` key is computed exactly N times (decorate), never per comparison.
     let key_of = |b: &mut Builder, v: Operand| -> Operand {
-        match &sort_key {
-            Some(sk) => {
+        match key {
+            Some((func, ty)) => {
                 let mut args = Vec::with_capacity(1 + lowered_captures.len());
                 args.push(v);
                 args.extend(lowered_captures.iter().cloned());
-                emit_named_call(b, sk.func.clone(), args, sk.key_ty)
+                emit_named_call(b, func.clone(), args, ty)
             }
             None => v,
+        }
+    };
+    let compare = |b: &mut Builder, op: BinOp, left: Operand, right: Operand| -> Operand {
+        if let Some(func) = comparator {
+            let mut args = Vec::with_capacity(2 + lowered_captures.len());
+            // Insertion's predecessor > current is expressed as cmp(current, predecessor).
+            if op == BinOp::Gt { args.extend([right, left]); } else { args.extend([left, right]); }
+            args.extend(lowered_captures.iter().cloned());
+            emit_named_call(b, func.clone(), args, Ty::Bool)
+        } else {
+            sort_cmp(b, op, left, right)
         }
     };
 
@@ -18483,9 +18517,12 @@ fn lower_array_sort(
     // key differ between the two shapes. `CacheContext::from_env` additionally forces the object cache
     // off whenever this var is set (fail-closed). Do not move this read into `align_codegen_llvm`.
     let adaptive = std::env::var("ALIGN_SORT_ADAPTIVE").ok().as_deref() != Some("off");
-    let emit_precheck = adaptive && key_order == KeyOrder::Total;
-    let emit_boundary = adaptive && key_order == KeyOrder::Total;
-    let delay_scratch = adaptive;
+    // Comparator invocations have a fixed sequential procedure, even when the callable is Pure:
+    // purity does not establish ordering laws or totality. Their tiny-input scratch rule is also
+    // independent of the legacy direct/key diagnostic baseline.
+    let emit_precheck = comparator.is_none() && adaptive && key_order == KeyOrder::Total;
+    let emit_boundary = comparator.is_none() && adaptive && key_order == KeyOrder::Total;
+    let delay_scratch = comparator.is_some() || adaptive;
 
     let arr_ptr = {
         let p = b.fresh_value(Ty::Box(scalar_of(elem)));
@@ -18720,7 +18757,7 @@ fn lower_array_sort(
     } else {
         sort_read(b, &arr, jvc.clone(), elem)
     };
-    let gt = sort_cmp(b, BinOp::Gt, kj, cur_key.clone());
+    let gt = compare(b, BinOp::Gt, kj, cur_key.clone());
     b.terminate(Term::Branch(gt, ins_shift, ins_place));
 
     // ins_shift: arr[j+1] = arr[j] (and keys); j -= 1.
@@ -18938,7 +18975,7 @@ fn lower_array_sort(
     } else {
         sort_read(b, &arr, cj.clone(), elem)
     };
-    let take_right = sort_cmp(b, BinOp::Lt, key_j, key_i);
+    let take_right = compare(b, BinOp::Lt, key_j, key_i);
     b.terminate(Term::Branch(take_right, take_r, take_l));
 
     b.cur = take_r;
@@ -25980,6 +26017,7 @@ mod tests {
         let cases = [
             "fn f(xs: array<i64>) -> array<i64> = xs.sort()\n",
             "fn key(value: i64) -> i64 = -value\nfn f(xs: array<i64>) -> array<i64> = xs.sort_by_key(key)\n",
+            "fn cmp(a:i64,b:i64)->bool = a < b\nfn f(xs:array<i64>)->array<i64> = xs.sort_by(cmp)\n",
         ];
         for source in cases {
             let (program, _) = lower_current_plan(source);
@@ -26122,6 +26160,18 @@ mod tests {
             },
         );
         assert!(sort.plan_records.is_empty(), "sort capture precedes donation");
+
+        let comparator = lower_with_terminating_capture(
+            "fn f(xs:array<i64>,k:i64)->array<i64> = xs.sort_by(fn a:i64,b:i64 { a + k < b + k })\n",
+            |terminal| match &mut terminal.kind {
+                hir::ExprKind::ArraySortCmp { source, captures, .. } => {
+                    let returned = (**source).clone();
+                    replace_capture_with_return(&mut captures[0], returned);
+                }
+                _ => panic!("comparator terminal"),
+            },
+        );
+        assert!(comparator.plan_records.is_empty(), "comparator capture precedes donation");
 
         let par_map = lower_with_terminating_capture(
             "fn f(xs: array<i64>, k: i64) -> array<i64> = xs.par_map(fn x { x + k })\n",

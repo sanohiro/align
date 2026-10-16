@@ -62,7 +62,7 @@ xs.field                           xs.reduce(init, f)      // init FIRST
 xs.scan(init, f)                   xs.to_array()           // materialize -> array<T>
 xs.chunks(n)                       xs.map_into(dst)        // write into caller slice
 zip(a, b, ...)                     // lazy equal-length multi-source head (Copy scalars)
-                                   xs.sort() / .sort_by_key(f)   // materializing
+                                   xs.sort() / .sort_by_key(f) / .sort_by(cmp)   // materializing
                                    (evens, odds) := xs.partition(p)
 
 array_builder<T>()                 // 実装済みの heap grow/freeze 形式
@@ -117,13 +117,25 @@ storage: field 'f' owns independent heap storage`。設計は
 ステージへの関数引数は、名前付きの `fn`、ラムダ式 `fn x { … }` / `fn acc, x { … }`、または `.field` 射影の形式をとる。`reduce` や `scan` は **init-first（初期値が先）** である。末尾に初期値を置く古い形式は完全に廃止された（後方互換性を持たせないルールに従い、別名は一切残していない）。
 
 直接の `.sort()` は Copy な `Ord` 要素、すなわち数値・`char`・`str` を受け入れる。
-`sort_by_key` は従来のプリミティブ Copy 要素と `str` を受け入れる。どちらも配列本体を
+`sort_by_key` と `sort_by` は従来のプリミティブ Copy 要素と `str` を受け入れる。いずれも配列本体を
 所有するが、`str` のバイト列は元の所有者から借用し、暗黙の clone や所有権移転はない。
 結果は source と stage capture の内容の寿命を引き継ぎ、ローカル文字列からのビューの
 返却や所有者の無効化後の利用を拒否する。既存の保守的な source-generation の借用も維持する。
 バイト列が static でも、束縛済みの元配列を置換・move・再確保すると、生存する結果の
-借用が無効になる場合がある。所有する `string` 要素と comparator overload は
-未対応のままである（plan 88）。
+借用が無効になる場合がある。所有する `string` と集約型の要素は未対応のままである。
+`source.sort_by(cmp)` は値渡しの `(T, T) -> bool` 関数を1つ受け取り、`cmp(a, b)` は
+「a が b より前」を表す。既存の名前付き・import・inline 関数と Copy capture を使う。
+比較関数だけが使う capture はソート完了まで生存するが、結果の内容には含まれない。
+
+`sort_by` は比較が狭義弱順序を満たす場合に安定である。不整合な比較でも、各呼び出しが
+終了すれば、要素を欠落・重複させない初期化済みの順列を返す。逐次 Impure 比較を許可し、
+その effect は外側の並列処理の純粋性検査へ伝播する。収集後、左から最大32要素ずつの
+挿入ソートを行い、各要素から右から左へ `cmp(current, predecessor)` を呼ぶ。
+続いて幅32、64、…の隣接 run を左からマージし、`cmp(right_head, left_head)` が false
+なら左を選ぶ。空・単一要素や片側の残りのコピーでは呼ばない。順序済みの事前検査や
+境界の省略判定は行わない。厳密な手順は [plan208](../../208-comparator-sorting.md) に従う。
+キー列は確保しない。merge scratch は挿入処理後、32要素を超える場合だけ1本確保する。
+この規則は `ALIGN_SORT_ADAPTIVE=off` でも変わらない。
 
 `sort_by_key` のキーは既存のスカラー `Ord` 値であり、所有する `string` も使える。
 キー関数は生き残った各要素につき入力順に1回実行され、キーのバイト列はすべての比較が

@@ -73,3 +73,19 @@ fn pure_effect_bit_is_accepted_at_par_map() {
     m.insert("geom$noisy".to_string(), FnEffect::Pure);
     assert!(!check_with_effects(&m), "a Pure cross-unit effect bit must be accepted at par_map");
 }
+
+#[test]
+fn comparator_import_effects_fail_closed_at_enclosing_parallel() {
+    let geom = parse("pub fn compare(a:i64,b:i64)->bool = a < b\n");
+    let main = parse("import geom\nfn work(n:i64)->i64 { values:=[n,0].sort_by(geom.compare); return values[0] }\nfn main() { print([1,2].par_map(work).sum()) }\n");
+    let modules = [
+        Module { path: "geom".into(), file: &geom, is_entry: false, interface_only: true },
+        Module { path: "main".into(), file: &main, is_entry: true, interface_only: false },
+    ];
+    for effect in [None, Some(FnEffect::Unknown), Some(FnEffect::Impure), Some(FnEffect::Pure)] {
+        let external = effect.map(|e| ("geom$compare".to_string(), e)).into_iter().collect();
+        let mut diagnostics = Diagnostics::new();
+        check_program_with_effects(&modules, &external, &mut diagnostics);
+        assert_eq!(diagnostics.has_errors(), effect != Some(FnEffect::Pure), "{effect:?}: {:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+}

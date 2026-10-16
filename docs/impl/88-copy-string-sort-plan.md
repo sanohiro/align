@@ -8,7 +8,9 @@ No comparator overload, owned-string copying, aggregate ordering or K1 is added.
 
 The Copy-key boundary and evidence below are historical to plan 88. Plan 134
 supersedes only the owned `string` key exclusion and its transient ownership
-strategy; direct Move elements and comparator overloads remain deferred.
+strategy. Plan208 supplies explicit comparator sorting over the same Copy scalar
+elements; direct Move elements remain deferred. The ledger below retains plan88
+scope rather than restating those later contracts.
 
 ## Public-contract ledger
 
