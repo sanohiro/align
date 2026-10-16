@@ -1,5 +1,9 @@
 # Regex span output storage
 
+The shell entry uses the [shared native supervisor](../native_probe.md) for
+bounded build/link/probe execution and descendant retirement before scratch
+cleanup. Its fixture, compiler flags and historical measurements are unchanged.
+
 This C harness compares the real release runtime's `find_all` and `split`
 entrypoints. It is a local measurement, not a timing correctness gate.
 

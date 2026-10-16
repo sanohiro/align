@@ -2,6 +2,7 @@
 """Actual-process owners for native probe wrappers, phases and cleanup."""
 import os
 import importlib.util
+import json
 import shlex
 from pathlib import Path
 import shutil
@@ -21,20 +22,46 @@ HERE = Path(__file__).resolve().parent
 
 
 class RunnerOwnership(unittest.TestCase):
+    def test_every_direct_c_wrapper_has_a_lifecycle_owner(self):
+        wrappers = {source.parent.name for source in HERE.glob("*/main.c")
+                    if source.with_name("run.sh").is_file()}
+        self.assertEqual(wrappers, set(native_probe.PROBES))
+
     def test_rejects_unknown_probe_before_work(self):
-        for arguments in (
+        invalid = [
             [], ["unknown"], ["../utf8_lossy"], ["utf8_lossy", "extra"],
             ["time_parse"], ["time_parse", "0"], ["time_parse", "5", "0"],
             ["time_parse", "0", "4"], ["time_parse", "00", "0"],
             ["time_parse", "0", "0", "extra"],
-        ):
+            ["time_fields", "5"], ["time_fields", "00"], ["time_fields", "+0"],
+            ["time_fields", "0", "1"], ["rand_sample", "0"],
+        ]
+        for benchmark, upper in (("hex_decode", "108"), ("regex_spans", "50")):
+            invalid.extend([benchmark, value] for value in (
+                "", "-1", upper, "0 ", "1x", "1.0", "0x1", "++1", "--0",
+                "０", "١", "9" * 5000,
+            ))
+            invalid.append([benchmark, "0", "1"])
+        for arguments in invalid:
             with self.subTest(arguments=arguments), patch.object(sys, "argv", ["probe", *arguments]), \
                     patch.object(native_probe.subprocess, "Popen") as spawn, \
-                    patch.object(native_probe.tempfile, "mkdtemp") as acquire:
+                    patch.object(native_probe.tempfile, "mkdtemp") as acquire, \
+                    patch.object(Path, "touch") as touch:
                 with self.assertRaises(SystemExit):
                     native_probe.main()
                 spawn.assert_not_called()
                 acquire.assert_not_called()
+                touch.assert_not_called()
+
+    def test_optional_selectors_and_default_corpora(self):
+        cases = {"time_fields": [[], ["0"], ["4"]],
+                 "hex_decode": [[], ["0"], ["107"], ["+096"], ["-0"], [" \t49"], ["0" * 5000]],
+                 "regex_spans": [[], ["0"], ["49"], ["+0049"], ["-000"], ["\r\n\v\f1"]]}
+        for benchmark, variants in cases.items():
+            for arguments in variants:
+                with self.subTest(benchmark=benchmark, arguments=arguments), \
+                        tempfile.TemporaryDirectory(prefix="align-probe-arguments-") as temporary:
+                    self.exercise(Path(temporary), benchmark, "probe", "exited-leader", arguments)
 
     def test_refreshes_stale_published_runtime_without_changing_source(self):
         cargo = shutil.which("cargo")
@@ -91,7 +118,10 @@ class RunnerOwnership(unittest.TestCase):
                             tempfile.TemporaryDirectory(prefix="align-probe-owner-") as temporary:
                         self.exercise(Path(temporary), benchmark, phase, ending)
 
-    def exercise(self, root, benchmark, phase, ending):
+    def exercise(self, root, benchmark, phase, ending, arguments=None):
+        if arguments is None:
+            arguments = {"time_parse": ["0", "1"], "time_fields": ["4"],
+                         "hex_decode": ["107"], "regex_spans": ["49"]}.get(benchmark, [])
         directory = root / "bench" / benchmark
         directory.mkdir(parents=True)
         shutil.copy(HERE / "native_probe.py", root / "bench/native_probe.py")
@@ -107,11 +137,13 @@ class RunnerOwnership(unittest.TestCase):
         helper = root / "tool"
         helper.write_text(
             f"#!{sys.executable}\n"
-            "import os, pathlib, signal, socket, sys, time\n"
+            "import json, os, pathlib, signal, socket, sys, time\n"
             "phase = 'probe' if pathlib.Path(sys.argv[0]).name == 'probe' else ('link' if '-o' in sys.argv else 'build')\n"
             "if phase == 'probe':\n"
-            "    assert sys.argv[1:] == (['0', '1'] if os.environ['OWNER_BENCH'] == 'time_parse' else [])\n"
+            "    assert sys.argv[1:] == json.loads(os.environ['OWNER_ARGUMENTS'])\n"
             "if phase == 'link':\n"
+            "    strict = os.environ['OWNER_BENCH'] in ('time_parse', 'time_fields', 'hex_decode', 'regex_spans', 'rand_sample')\n"
+            "    assert sys.argv[1:5] == ['-O2', '-Wall', '-Wextra', '-Werror'] if strict else sys.argv[1] == '-O3'\n"
             "    assert pathlib.Path('bench/' + os.environ['OWNER_BENCH'] + '/main.c').is_file()\n"
             "    assert 'bench/' + os.environ['OWNER_BENCH'] + '/main.c' in sys.argv\n"
             "    archives = [pathlib.Path(arg).resolve() for arg in sys.argv if arg.endswith('/libalign_runtime.a')]\n"
@@ -160,12 +192,12 @@ class RunnerOwnership(unittest.TestCase):
                    CARGO_TARGET_DIR="", TMPDIR=str(scratch),
                    PATH=str(root / "bin") + os.pathsep + os.environ["PATH"],
                    OWNER_PHASE=phase, OWNER_BENCH=benchmark,
+                   OWNER_ARGUMENTS=json.dumps(arguments),
                    OWNER_ENDING=ending, OWNER_SOCKET=str(address), OWNER_MARKER=str(marker))
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(str(address))
             listener.listen(1)
             listener.settimeout(4)
-            arguments = ["0", "1"] if benchmark == "time_parse" else []
             child = subprocess.Popen(["bash", str(directory / "run.sh"), *arguments], cwd=root,
                                      env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      start_new_session=True)
