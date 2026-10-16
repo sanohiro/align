@@ -415,7 +415,7 @@ fn canonical_package_topology_and_forbidden_resource_carriers_fail_closed() {
         ),
         (
             "capture",
-            "module main\nimport pkg.template\nfn main() -> i32 { output := pkg.template.html(); closure := fn() { pkg.template.to_string(output) }; return 0 }\n",
+            "module main\nimport pkg.template\nfn main() -> i32 { output := pkg.template.html(); closure := fn { pkg.template.to_string(output) }; return 0 }\n",
         ),
         (
             "temporary-borrow",
@@ -442,5 +442,15 @@ fn canonical_package_topology_and_forbidden_resource_carriers_fail_closed() {
             checked.whole_diags,
             checked.per_unit_diags,
         );
+        if name == "capture" {
+            let diagnostic = "a lambda cannot capture the owned value 'output'";
+            assert!(
+                checked.whole_diags.contains(diagnostic)
+                    && checked.per_unit_diags.contains(diagnostic),
+                "capture must reach ownership checking; whole:\n{}\nper-unit:\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags,
+            );
+        }
     }
 }

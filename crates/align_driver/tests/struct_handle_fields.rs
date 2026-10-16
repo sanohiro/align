@@ -318,7 +318,7 @@ fn change(borrow mut holder: Holder) { holder = Holder { sink: None, data: buffe
             ),
             (
                 "capture",
-                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { callback := fn() { result := sink.flush() } }, None => {} } }",
+                "fn bad(borrow holder: Holder) { match holder.sink { Some(sink) => { callback := fn { result := sink.flush() } }, None => {} } }",
             ),
             (
                 "alias",
@@ -369,6 +369,16 @@ fn change(borrow mut holder: Holder) { holder = Holder { sink: None, data: buffe
                 checked.whole_diags,
                 checked.per_unit_diags
             );
+            if name == "capture" {
+                let diagnostic = "a lambda cannot capture the owned value 'sink'";
+                assert!(
+                    checked.whole_diags.contains(diagnostic)
+                        && checked.per_unit_diags.contains(diagnostic),
+                    "capture must reach ownership checking; whole:\n{}\nper-unit:\n{}",
+                    checked.whole_diags,
+                    checked.per_unit_diags,
+                );
+            }
         }
     }
 }
