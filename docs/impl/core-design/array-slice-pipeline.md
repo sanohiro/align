@@ -65,7 +65,7 @@ xs.field                           xs.reduce(init, f)      // init FIRST
 xs.scan(init, f)                   xs.to_array()           // materialize -> array<T>
 xs.chunks(n)                       xs.map_into(dst)        // write into caller slice
 zip(a, b, ...)                     // lazy equal-length multi-source head (Copy scalars)
-                                   xs.sort() / .sort_by_key(f)   // materializing
+                                   xs.sort() / .sort_by_key(f) / .sort_by(cmp)   // materializing
                                    (evens, odds) := xs.partition(p)
 
 array_builder<T>()                 // shipped heap grow/freeze form
@@ -124,14 +124,17 @@ Function arguments to stages: named `fn`, lambda `fn x { â€¦ }` / `fn acc, x { â
 removed outright (no alias survives, per the no-backward-compat rule).
 
 Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
-`sort_by_key` accepts primitive Copy elements and `str`. Both return an owned
+`sort_by_key` and `sort_by` accept primitive Copy elements and `str`. All return an owned
 array spine; `str` elements retain their byte owners, with no implicit clone or
 byte ownership transfer. Source and stage-capture lifetimes remain attached to
 the result, so local text views cannot escape or survive owner invalidation.
 Existing conservative source-generation loans remain: replacing, moving or
 reallocating a bound source array can invalidate a live result even when its
-copied bytes are static. Owned `string` elements and comparator overloads
-remain unsupported (plan 88).
+copied bytes are static. Owned `string` and aggregate elements remain unsupported.
+`source.sort_by(cmp)` takes one existing named or inline callable with two by-value
+element arguments and a `bool` result; `cmp(a, b)` means a precedes b. Existing
+Copy captures and imported callables are supported. Comparator-only captures
+remain live through sorting but are not stored in the result (plan 208).
 
 A `sort_by_key` key may be any existing scalar `Ord` value, including owned
 `string`. The callable executes once per surviving element in input order.
@@ -144,6 +147,16 @@ owned-string key input; its returned elements and their lifetimes are unchanged.
 Current String producers return heap owners even inside an arena; `clone_in`
 returns a borrowed `str`, whose keys keep the existing shallow cleanup.
 [Plan 134](../134-owned-string-sort-keys.md) owns this cleanup boundary.
+
+`sort_by(cmp)` permits sequential Impure comparisons and is stable for a strict
+weak order; a terminating inconsistent comparator still preserves the input
+permutation. After collection it performs left-to-right insertion runs of at most
+32 elements (`cmp(current, predecessor)`, scanning right to left), then bottom-up
+merges of widths 32, 64, and so on (`cmp(right_head, left_head)`, false selects
+left). Empty/singleton inputs and tail drains make no calls. No adaptive probes
+are allowed. The exact observable procedure is specified in [plan208](../208-comparator-sorting.md). There are no key columns;
+merge scratch is allocated only after insertion
+for more than 32 elements, including with `ALIGN_SORT_ADAPTIVE=off`.
 
 ## Type & ownership classification
 

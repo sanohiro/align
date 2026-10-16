@@ -4622,6 +4622,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ArrayScan { stages, .. }
             | hir::ExprKind::ArraySort { stages, .. }
             | hir::ExprKind::ArraySortBy { stages, .. }
+            | hir::ExprKind::ArraySortCmp { stages, .. }
             | hir::ExprKind::ArrayToArray { stages, .. }
             | hir::ExprKind::ArrayMapInto { stages, .. }
             | hir::ExprKind::ArrayPartition { stages, .. }
@@ -7126,7 +7127,8 @@ impl<'a> BodyValidator<'a> {
                 stages,
                 captures,
                 ..
-            } => {
+            }
+            | hir::ExprKind::ArraySortCmp { source, stages, captures, .. } => {
                 self.push_pipeline_children(source, stages, captures, context, work);
             }
             hir::ExprKind::ArrayMapInto {
@@ -10540,7 +10542,7 @@ impl<'a> BodyValidator<'a> {
         func: &str,
         captures: &[hir::Expr],
         capture_flows: &[BodyFlow],
-        input: Ty,
+        inputs: &[Ty],
         output: (Ty, PipelineOutput),
         context: &BodyContext,
     ) -> bool {
@@ -10557,7 +10559,7 @@ impl<'a> BodyValidator<'a> {
             || capture_flows.iter().zip(captures).any(|(flow, capture)| {
                 !self.body_ty_matches(flow.ty, capture.ty) || !self.ty_copy_ok(flow.ty, context)
             })
-            || !self.ty_copy_ok(input, context)
+            || inputs.iter().any(|input| !self.ty_copy_ok(*input, context))
             || !match output_domain {
                 PipelineOutput::Copy => self.ty_copy_ok(output, context),
                 PipelineOutput::SortKey => {
@@ -10568,8 +10570,8 @@ impl<'a> BodyValidator<'a> {
         {
             return false;
         }
-        let mut expected = Vec::with_capacity(1 + captures.len());
-        expected.push(input);
+        let mut expected = Vec::with_capacity(inputs.len() + captures.len());
+        expected.extend_from_slice(inputs);
         expected.extend(capture_flows.iter().map(|flow| flow.ty));
         if signature.params.len() != expected.len()
             || signature
@@ -10670,7 +10672,7 @@ impl<'a> BodyValidator<'a> {
                     func,
                     captures,
                     capture_flows,
-                    current,
+                    &[current],
                     (stage.out_ty, PipelineOutput::Copy),
                     context,
                 ) {
@@ -10688,7 +10690,7 @@ impl<'a> BodyValidator<'a> {
                         func,
                         captures,
                         capture_flows,
-                        current,
+                        &[current],
                         (Ty::Bool, PipelineOutput::Copy),
                         context,
                     )
@@ -10776,7 +10778,7 @@ impl<'a> BodyValidator<'a> {
                     func,
                     captures,
                     &capture_flows,
-                    elem,
+                    &[elem],
                     (Ty::Bool, PipelineOutput::Copy),
                     context,
                 ) {
@@ -10931,8 +10933,41 @@ impl<'a> BodyValidator<'a> {
                     key_func,
                     captures,
                     &capture_flows,
-                    final_elem,
+                    &[final_elem],
                     (*key_ty, PipelineOutput::SortKey),
+                    context,
+                ) {
+                    return None;
+                }
+                flows.extend(capture_flows);
+                let (falls, breaks) = strict_flow(&flows);
+                Some((Ty::DynArray(scalar), falls, breaks))
+            }
+            hir::ExprKind::ArraySortCmp {
+                source,
+                stages,
+                cmp_func,
+                captures,
+                elem,
+            } => {
+                let (final_elem, mut flows) = self.pipeline_prefix(source, stages, context)?;
+                if matches!(source.ty, Ty::JsonScanner(_)) {
+                    return None;
+                }
+                let scalar = align_sema::ty_to_scalar(final_elem)?;
+                if final_elem != *elem
+                    || (align_sema::scalar_to_prim(scalar).is_none() && scalar != Scalar::Str)
+                    || !self.scalar_copy_ok(scalar)
+                {
+                    return None;
+                }
+                let capture_flows = self.expr_flows(captures)?;
+                if !self.pipeline_callable_ok(
+                    cmp_func,
+                    captures,
+                    &capture_flows,
+                    &[final_elem, final_elem],
+                    (Ty::Bool, PipelineOutput::Copy),
                     context,
                 ) {
                     return None;
@@ -11031,7 +11066,7 @@ impl<'a> BodyValidator<'a> {
                     func,
                     captures,
                     &capture_flows,
-                    final_elem,
+                    &[final_elem],
                     (Ty::Bool, PipelineOutput::Copy),
                     context,
                 ) {
@@ -11073,7 +11108,7 @@ impl<'a> BodyValidator<'a> {
                     func,
                     captures,
                     &capture_flows,
-                    input_elem,
+                    &[input_elem],
                     (*elem, PipelineOutput::Copy),
                     context,
                 ) {

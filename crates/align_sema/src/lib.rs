@@ -4606,6 +4606,7 @@ fn pipeline_stages(kind: &ExprKind) -> Option<&[Stage]> {
         | ExprKind::ArrayScan { stages, .. }
         | ExprKind::ArraySort { stages, .. }
         | ExprKind::ArraySortBy { stages, .. }
+        | ExprKind::ArraySortCmp { stages, .. }
         | ExprKind::ArrayToArray { stages, .. }
         | ExprKind::ArrayMapInto { stages, .. }
         | ExprKind::ArrayPartition { stages, .. }
@@ -4667,6 +4668,7 @@ fn node_captures(kind: &ExprKind) -> &[Expr] {
         | ExprKind::ArrayPartition { captures, .. }
         | ExprKind::ArrayParMap { captures, .. }
         | ExprKind::ArraySortBy { captures, .. }
+        | ExprKind::ArraySortCmp { captures, .. }
         | ExprKind::ArrayAnyAll { captures, .. } => captures,
         _ => &[],
     }
@@ -12023,6 +12025,7 @@ fn compact_abstract_nominal_instances(
             | ExprKind::ArrayScan { elem, .. }
             | ExprKind::ArrayDot { elem, .. }
             | ExprKind::ArraySort { elem, .. }
+            | ExprKind::ArraySortCmp { elem, .. }
             | ExprKind::ArrayToArray { elem, .. }
             | ExprKind::ArrayMapInto { elem, .. }
             | ExprKind::ArrayPartition { elem, .. }
@@ -12058,6 +12061,7 @@ fn compact_abstract_nominal_instances(
             | ExprKind::ArrayScan { stages, .. }
             | ExprKind::ArraySort { stages, .. }
             | ExprKind::ArraySortBy { stages, .. }
+            | ExprKind::ArraySortCmp { stages, .. }
             | ExprKind::ArrayToArray { stages, .. }
             | ExprKind::ArrayMapInto { stages, .. }
             | ExprKind::ArrayPartition { stages, .. }
@@ -15928,6 +15932,11 @@ impl EffectScan<'_> {
                 key_func,
                 captures,
                 ..
+            }
+            | ExprKind::ArraySortCmp {
+                cmp_func: key_func,
+                captures,
+                ..
             } => self.join_named_capture_effects(key_func, captures),
             _ => {}
         }
@@ -17954,6 +17963,7 @@ impl EffectScan<'_> {
             }
             ExprKind::ArrayAnyAll { source, stages, func, .. }
             | ExprKind::ArraySortBy { source, stages, key_func: func, .. }
+            | ExprKind::ArraySortCmp { source, stages, cmp_func: func, .. }
             | ExprKind::ArrayPartition { source, stages, func, .. } => {
                 walk!(source);
                 let origin = self.join_stage_actions(source, stages);
@@ -17965,6 +17975,9 @@ impl EffectScan<'_> {
                         0,
                         &origin,
                     );
+                    if matches!(e.kind, ExprKind::ArraySortCmp { .. }) {
+                        self.join_named_param_boundary_from_origin(func, 1, &origin);
+                    }
                 }
             }
             ExprKind::ArrayReduce {
@@ -22129,6 +22142,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ArrayScan { source, .. }
             | ExprKind::ArraySort { source, .. }
             | ExprKind::ArraySortBy { source, .. }
+            | ExprKind::ArraySortCmp { source, .. }
             | ExprKind::ArrayToArray { source, .. }
             | ExprKind::ArrayParMap { source, .. }
             | ExprKind::ArrayPartition { source, .. }
@@ -22208,11 +22222,15 @@ impl<'a> EscapeCheck<'a> {
                         pipeline_stages(&expression.kind).unwrap_or_default(),
                     ));
                 }
-                facts.extend(
-                    node_captures(&expression.kind)
-                        .iter()
-                        .map(|capture| self.completed_escape_value(capture)),
-                );
+                // A comparator decides order but cannot contribute an element to the result.
+                // Keep its captures live for the call without retaining them as output content.
+                if !matches!(expression.kind, ExprKind::ArraySortCmp { .. }) {
+                    facts.extend(
+                        node_captures(&expression.kind)
+                            .iter()
+                            .map(|capture| self.completed_escape_value(capture)),
+                    );
+                }
                 if let ExprKind::ArrayScan { init, .. } = &expression.kind {
                     facts.push(self.completed_escape_value(init));
                 }
@@ -24913,7 +24931,8 @@ impl<'a> EscapeCheck<'a> {
             // also borrows its source/input, so it needs the shorter of the two regions.)
             ExprKind::ArrayToArray { source, stages, .. }
             | ExprKind::ArraySort { source, stages, elem: Ty::Str }
-            | ExprKind::ArraySortBy { source, stages, elem: Ty::Str, .. } => {
+            | ExprKind::ArraySortBy { source, stages, elem: Ty::Str, .. }
+            | ExprKind::ArraySortCmp { source, stages, elem: Ty::Str, .. } => {
                 // Copy string elements still borrow their byte owners. The sorted spine owns no
                 // bytes, so its allocation cannot erase source or stage-capture provenance.
                 let mut children = Vec::with_capacity(1 + stages.len());
@@ -24959,7 +24978,8 @@ impl<'a> EscapeCheck<'a> {
             }
             ExprKind::ArrayPartition { .. }
             | ExprKind::ArraySort { .. }
-            | ExprKind::ArraySortBy { .. } => {
+            | ExprKind::ArraySortBy { .. }
+            | ExprKind::ArraySortCmp { .. } => {
                 values.push(self.allocation_region(expression));
             }
             // The range-kernel runtime always returns a fresh malloc-backed primitive array, even
@@ -26208,6 +26228,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayDot { .. }
             | ExprKind::ArraySort { .. }
             | ExprKind::ArraySortBy { .. }
+            | ExprKind::ArraySortCmp { .. }
             | ExprKind::ArrayToArray { .. }
             | ExprKind::ArrayToSoa { .. }
             | ExprKind::ArrayMapInto { .. }
@@ -27256,6 +27277,7 @@ impl<'a> EscapeCheck<'a> {
                     | ExprKind::ArrayScan { .. }
                     | ExprKind::ArraySort { .. }
                     | ExprKind::ArraySortBy { .. }
+                    | ExprKind::ArraySortCmp { .. }
                     | ExprKind::ArrayParMap { .. }
                     | ExprKind::JsonOwnedDecode { root_kind: hir::JsonOwnedRoot::Array, .. }
                     | ExprKind::JsonDecodeArray { .. }
@@ -29644,7 +29666,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayPartition { source, stages, .. }
             | ExprKind::ArrayParMap { source, stages, .. }
             | ExprKind::ArraySort { source, stages, .. }
-            | ExprKind::ArraySortBy { source, stages, .. } => {
+            | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArraySortCmp { source, stages, .. } => {
                 self.walk(source, depth);
                 for capture in stage_capture_exprs(stages) {
                     self.walk(capture, depth);
@@ -32621,6 +32644,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         ExprKind::ArrayScan { .. }
         | ExprKind::ArraySort { .. }
         | ExprKind::ArraySortBy { .. }
+        | ExprKind::ArraySortCmp { .. }
         | ExprKind::ArrayToArray { .. }
         | ExprKind::ArrayParMap { .. }
         | ExprKind::RandSample { .. } => {
@@ -39138,7 +39162,7 @@ impl<'a> MoveCheck<'a> {
                 fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
         }
-        if !matches!(e.kind, ExprKind::Closure { .. }) {
+        if !matches!(e.kind, ExprKind::Closure { .. } | ExprKind::ArraySortCmp { .. }) {
             for capture in node_captures(&e.kind) {
                 fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
@@ -39814,6 +39838,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ArrayToArray { source, .. }
             | ExprKind::ArraySort { source, .. }
             | ExprKind::ArraySortBy { source, .. }
+            | ExprKind::ArraySortCmp { source, .. }
             | ExprKind::ArrayParMap { source, .. }
             | ExprKind::ArrayPartition { source, .. }
             | ExprKind::ArrayToSoa { source, .. } => {
@@ -41212,6 +41237,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayAnyAll { source, stages, .. } | ExprKind::ArrayMinMax { source, stages, .. }
             | ExprKind::ArrayReduce { source, stages, .. } | ExprKind::ArrayScan { source, stages, .. }
             | ExprKind::ArraySort { source, stages, .. } | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArraySortCmp { source, stages, .. }
             | ExprKind::ArrayToArray { source, stages, .. } | ExprKind::ArrayMapInto { source, stages, .. }
             | ExprKind::ArrayPartition { source, stages, .. } | ExprKind::ArrayParMap { source, stages, .. } => (source, stages),
             _ => return,
@@ -41223,7 +41249,8 @@ impl<'a> MoveCheck<'a> {
         match &expression.kind {
             ExprKind::ArrayAnyAll { func, captures, .. } | ExprKind::ArrayReduce { func, captures, .. }
             | ExprKind::ArrayScan { func, captures, .. } | ExprKind::ArrayPartition { func, captures, .. }
-            | ExprKind::ArrayParMap { func, captures, .. } | ExprKind::ArraySortBy { key_func: func, captures, .. } => callbacks.push((func, captures, stages.len())),
+            | ExprKind::ArrayParMap { func, captures, .. } | ExprKind::ArraySortBy { key_func: func, captures, .. }
+            | ExprKind::ArraySortCmp { cmp_func: func, captures, .. } => callbacks.push((func, captures, stages.len())),
             _ => {}
         }
         // Each callback observes the element before its own stage. A later map can erase
@@ -41253,8 +41280,25 @@ impl<'a> MoveCheck<'a> {
                     roots.extend(storage.live_roots());
                 }
             }
+            // The callback can write through a copied capture header. Its ByValue mode
+            // does not preserve UTF-8 validation of that backing: project the same access
+            // summary used above onto each eager capture's completed storage identity.
+            let byte_targets = captures.iter().enumerate().filter_map(|(capture, value)| {
+                let parameter = explicit.checked_add(capture).and_then(|index| u32::try_from(index).ok());
+                let may_write = parameter.is_none_or(|parameter| summary.is_none_or(|summary| {
+                    summary.contains(&hir::MutableAccessRoot::Contained(parameter))
+                        || summary.contains(&hir::MutableAccessRoot::Storage(parameter))
+                }));
+                may_write.then(|| self.completed_byte_call_backing(value))
+            }).collect::<Vec<_>>();
             self.record_possible_mutation_roots(roots.clone());
             self.record_mutable_access_roots(roots);
+            for backing in byte_targets { self.borrows.invalidate_validated_bytes(&backing); }
+        }
+        // Source snapshots are checked by the caller. Captured validated views are also
+        // inputs on every repeated invocation, so a sibling capture write cannot invalidate them.
+        for capture in stage_capture_exprs(stages).chain(node_captures(&expression.kind)) {
+            self.validate_pipeline_capture_use(capture);
         }
     }
 
@@ -41853,7 +41897,8 @@ impl<'a> MoveCheck<'a> {
                 .unwrap_or_default(),
             ExprKind::ArrayToArray { source, stages, .. }
             | ExprKind::ArraySort { source, stages, .. }
-            | ExprKind::ArraySortBy { source, stages, .. } => {
+            | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArraySortCmp { source, stages, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, stages);
                 element.flatten_lifetimes()
             }
@@ -42149,7 +42194,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayPartition { source, .. }
             | ExprKind::ArrayParMap { source, .. }
             | ExprKind::ArraySort { source, .. }
-            | ExprKind::ArraySortBy { source, .. } => self.borrow_sources(source),
+            | ExprKind::ArraySortBy { source, .. }
+            | ExprKind::ArraySortCmp { source, .. } => self.borrow_sources(source),
             ExprKind::ArrayReduce { source, init, .. } => {
                 // An empty reduce returns its local initial accumulator unchanged. Nonempty
                 // results cross a callback boundary; source lifetimes do not prove writability.
@@ -48225,6 +48271,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArrayAnyAll { source, stages, .. }
             | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArraySortCmp { source, stages, .. }
             | ExprKind::ArrayPartition { source, stages, .. }
             | ExprKind::ArrayParMap { source, stages, .. } => {
                 if !node_captures(&expression.kind).is_empty() {
@@ -49084,7 +49131,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayPartition { source, stages, .. }
             | ExprKind::ArrayParMap { source, stages, .. }
             | ExprKind::ArraySort { source, stages, .. }
-            | ExprKind::ArraySortBy { source, stages, .. } => {
+            | ExprKind::ArraySortBy { source, stages, .. }
+            | ExprKind::ArraySortCmp { source, stages, .. } => {
                 move_expr!(self, source, moved, false, false);
                 for capture in stage_capture_exprs(stages) {
                     move_expr!(self, capture, moved, false, false);
@@ -56611,6 +56659,9 @@ impl<'a, 't> Checker<'a, 't> {
         if method == "sort_by_key" {
             return self.check_array_sort_by_key(recv, args, span);
         }
+        if method == "sort_by" {
+            return self.check_array_sort_by(recv, args, span);
+        }
         // `http_headers.count(name)` shares its name with the array pipeline terminal. Dispatch both
         // stored views and the mandated `ctx.headers().count(name)` temporary before the
         // syntax-only pipeline lane claims every `.count(...)` call.
@@ -60851,6 +60902,10 @@ impl<'a, 't> Checker<'a, 't> {
             return None;
         };
         let (is_extern, params, ret) = (sig.is_extern, sig.params.clone(), sig.ret);
+        if sig.param_modes.iter().any(|mode| *mode != ast::ParamMode::ByValue) {
+            self.diags.error(format!("'{label}' requires by-value function parameters"), named.span);
+            return None;
+        }
         if self.reject_extern_without_unsafe(is_extern, &named.display_name(), named.span) {
             return None;
         }
@@ -62517,14 +62572,14 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `source.….sort()` — materialize the surviving elements into an owned `array<T>` and sort
     /// them ascending. Elements are Copy `Ord` scalars: numbers, characters and string views.
-    /// Owned string bytes are never implicitly cloned; comparator arguments remain deferred.
+    /// Owned string bytes are never implicitly cloned; explicit comparators use `sort_by`.
     fn check_array_sort(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let Some((source, stages, elem)) = self.check_pipeline(recv, None, span) else {
             return err;
         };
         if !args.is_empty() {
-            self.diags.error("'sort' takes no arguments (comparator sorting is not supported)".to_string(), span);
+            self.diags.error("'sort' takes no arguments (use 'sort_by' for a comparator)".to_string(), span);
             return err;
         }
         if matches!(elem, Ty::Struct(_)) {
@@ -62603,6 +62658,43 @@ impl<'a, 't> Checker<'a, 't> {
         // Other pipeline output positions remain Copy-only.
         Expr {
             kind: ExprKind::ArraySortBy { source: Box::new(source), stages, key_func, captures, key_ty, elem },
+            ty: Ty::DynArray(scalar),
+            span,
+        }
+    }
+
+    /// Materialize Copy elements, then compare them through one sequential two-argument callable.
+    fn check_array_sort_by(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
+        let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        let [fn_arg] = args else {
+            self.diags.error(format!("'sort_by' takes 1 argument (a comparator), got {}", args.len()), span);
+            return err;
+        };
+        let elem_hint = self.named_param_hint(fn_arg, 0);
+        let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
+            return err;
+        };
+        let Some(scalar) = ty_to_scalar(elem).filter(|s| scalar_to_prim(*s).is_some() || *s == Scalar::Str) else {
+            self.diags.error(
+                format!("'sort_by' element must be a Copy scalar (int/float/bool/char/str), got {}", ty_name(elem)),
+                span,
+            );
+            return err;
+        };
+        if self.reject_move_pipeline_call_arg(elem, "sort_by", "element", span) {
+            return err;
+        }
+        let Some((cmp_func, result, captures)) = self.resolve_fn(fn_arg, &[elem, elem], Some(Ty::Bool), "sort_by", span) else {
+            return err;
+        };
+        if result != Ty::Bool {
+            if result != Ty::Error {
+                self.diags.error("'sort_by' comparator must return bool".to_string(), span);
+            }
+            return err;
+        }
+        Expr {
+            kind: ExprKind::ArraySortCmp { source: Box::new(source), stages, cmp_func, captures, elem },
             ty: Ty::DynArray(scalar),
             span,
         }
@@ -72176,7 +72268,8 @@ impl<'a, 't> Checker<'a, 't> {
                     self.finalize_expr(capture);
                 }
             }
-            ExprKind::ArraySortBy { source, stages, captures, .. } => {
+            ExprKind::ArraySortBy { source, stages, captures, .. }
+            | ExprKind::ArraySortCmp { source, stages, captures, .. } => {
                 self.finalize_expr(source);
                 self.finalize_pipeline_stages(stages);
                 for capture in captures {
@@ -81064,9 +81157,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // HTTP timeout setters borrow an existing owner and return unit/Error.
         // OsMemory observes only Copy counts and retains no storage.
         // UnicodeNfc constructs a fresh owned string without retaining input storage.
+        // ArraySortCmp shares the fresh pipeline-element policy with the other sort terminals.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 358,
+            variants, 359,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

@@ -206,9 +206,20 @@ nested function-value environment.
 order and calls the key exactly N times before reordering; the source contract now makes that
 behavior normative. Comparisons consume the recorded keys and never re-evaluate the callable.
 
+Plan208 adds `sort_by(cmp)` over the existing scalar Copy elements, with two
+by-value operands and a bool result. Sequential Impure comparators follow the
+exact insertion/merge procedure in [plan208](208-comparator-sorting.md): complete
+collection, insertion runs of at most 32, then widths 32, 64 and so on. Insertion
+calls `cmp(current, predecessor)`; merging calls `cmp(right_head, left_head)`.
+False preserves the earlier element. No ordered-input/boundary probes are emitted,
+and scratch is delayed until merging under both adaptive settings. Empty/singleton
+inputs invoke no comparator. Comparator captures are call-only; no key columns
+are allocated. Ordering laws are the caller's responsibility, while a terminating
+inconsistent comparator must still yield an initialized permutation.
+
 The tiny-input boundary follows the same rule: an empty surviving input invokes no key;
-a singleton invokes it once through ordinary decoration. Only unkeyed sorting may bypass
-work at length one. `sort_adaptive::tiny_key_evaluation_preserves_survivor_order` owns
+a singleton invokes it once through ordinary decoration. Direct and comparator sorting may bypass
+comparison work at length one. `sort_adaptive::tiny_key_evaluation_preserves_survivor_order` owns
 empty, direct singleton, filtered singleton and pair evaluation traces for integer, float,
 borrowed-string and captured keys. It fails against the former shared `len < 2` bypass.
 Existing total-order precheck, insertion-only and non-adaptive cleanup paths free the

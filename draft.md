@@ -756,14 +756,17 @@ one transient owner-header column for owned string keys (plan 134).
 Aggregates have no order, exactly as they have no `==`.
 
 Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
-`sort_by_key` accepts primitive Copy elements and `str`. Both return an owned
+`sort_by_key` and `sort_by` accept primitive Copy elements and `str`. All return an owned
 array spine; `str` elements retain their byte owners, with no implicit clone or
 byte ownership transfer. Source and stage-capture lifetimes remain attached to
 the result, so local text views cannot escape or survive owner invalidation.
 Existing conservative source-generation loans remain: replacing, moving or
 reallocating a bound source array can invalidate a live result even when its
-copied bytes are static. Owned `string` elements and comparator overloads
-remain unsupported (plan 88).
+copied bytes are static. Owned `string` and aggregate elements remain unsupported.
+`source.sort_by(cmp)` takes one existing named or inline callable with two by-value
+element arguments and a `bool` result; `cmp(a, b)` means a precedes b. Existing
+Copy captures and imported callables are supported. Comparator-only captures
+remain live through sorting but are not stored in the result (plan 208).
 
 The operator and builtin-bound paths compare owned `string` values through a non-consuming,
 zero-cost `str` borrow. Mixed `string`/`str` operands use the same path; comparison neither moves
@@ -1521,6 +1524,31 @@ environment; `region` is rejected independently of effect.
 for each surviving element, in input-index order, before any reordering. Sorting compares the
 recorded keys and never calls the key callable again.
 
+`sort_by(cmp)` is stable when `cmp` defines a strict weak order. A terminating
+inconsistent comparator still produces an initialized permutation of the input;
+its sortedness is unspecified. Sequential comparators may be Impure, and their
+effects propagate into enclosing parallel purity checks. Collection finishes
+before comparisons. Empty and singleton inputs invoke no comparator.
+
+The observable comparison procedure is fixed. Partition the input into consecutive
+runs of at most 32 elements, left to right. In each run, visit each position from
+the second onward, hold its element, and scan predecessors right to left. Call
+`cmp(current, predecessor)` once per predecessor: true shifts it right; false
+stops the scan. Place the current element at the resulting position. Exhausting
+the run's beginning needs no extra comparison. Then merge adjacent runs at widths
+32, 64, 128, and so on, left to right at each width. While both sides are nonempty,
+call `cmp(right_head, left_head)` once: true selects the right, false the left.
+Drain the remaining side without calls. Finish each pair before doubling width;
+stop when width covers the input. Scratch copies invoke no comparator.
+
+There are no ordered-input or boundary shortcuts for `sort_by`. It allocates no
+key-decoration/owner column. Merge scratch is delayed until after insertion:
+none for at most 32 elements, one element spine for larger inputs, including with
+`ALIGN_SORT_ADAPTIVE=off`. That diagnostic's old up-front scratch baseline applies
+only to direct/key sorting. Ordinary as-if optimization must preserve observable
+calls, hard errors and divergence; Pure does not imply total/speculatable.
+
+
 ### Core Array Functions
 
 ```text
@@ -1533,6 +1561,7 @@ partition
 group_by
 sort
 sort_by_key
+sort_by
 chunks
 ```
 

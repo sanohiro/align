@@ -395,14 +395,17 @@ independently owned string bytes are dropped exactly once after sorting. Compari
 materializing terminal adds one transient owner-header column for string keys (plan 134).
 
 Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
-`sort_by_key` accepts primitive Copy elements and `str`. Both return an owned
+`sort_by_key` and `sort_by` accept primitive Copy elements and `str`. All return an owned
 array spine; `str` elements retain their byte owners, with no implicit clone or
 byte ownership transfer. Source and stage-capture lifetimes remain attached to
 the result, so local text views cannot escape or survive owner invalidation.
 Existing conservative source-generation loans remain: replacing, moving or
 reallocating a bound source array can invalidate a live result even when its
-copied bytes are static. Owned `string` elements and comparator overloads
-remain unsupported (plan 88).
+copied bytes are static. Owned `string` and aggregate elements remain unsupported.
+`source.sort_by(cmp)` takes one existing named or inline callable with two by-value
+element arguments and a `bool` result; `cmp(a, b)` means a precedes b. Existing
+Copy captures and imported callables are supported. Comparator-only captures
+remain live through sorting but are not stored in the result (plan 208).
 
 `else` works on `Result` as
 well as `Option` — the intent triangle is `?` propagates / `else` falls back / `match` inspects.
@@ -704,6 +707,7 @@ partition
 group_by
 sort
 sort_by_key
+sort_by
 chunks
 zip
 ```
@@ -764,6 +768,16 @@ alone does not make a trapping or nonterminating call safe to speculate.
 `sort` and `sort_by_key` are stable. A `sort_by_key` key callable may be Impure; it runs exactly once
 for each surviving element, in input-index order, before any reordering, and sorting never calls it
 again.
+
+`sort_by(cmp)` permits sequential Impure comparisons and is stable for a strict
+weak order; a terminating inconsistent comparator still preserves the input
+permutation. After collection it performs left-to-right insertion runs of at most
+32 elements (`cmp(current, predecessor)`, scanning right to left), then bottom-up
+merges of widths 32, 64, and so on (`cmp(right_head, left_head)`, false selects
+left). Empty/singleton inputs and tail drains make no calls. No adaptive probes
+are allowed. The exact observable procedure is specified in `draft.md` §8 and
+plan208. There are no key columns; merge scratch is allocated only after insertion
+for more than 32 elements, including with `ALIGN_SORT_ADAPTIVE=off`.
 
 A pipeline **materializes** either into a fresh owned `array<T>` (`.to_array()`) or into a
 caller-provided `out`/`mut` slice (`.map_into(dst)` — the caller-storage counterpart). `map_into` is

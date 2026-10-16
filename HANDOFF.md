@@ -23,6 +23,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan208](docs/impl/208-comparator-sorting.md) adds `sort_by(cmp)` for scalar
+  Copy elements, completing the comparator portion of LLM Request27. Stable
+  insertion/merge comparisons permit sequential effects and preserve source
+  content lifetimes without retaining comparator-only captures. Move elements
+  and consumer adoption remain separate.
+
 - [Plan207](docs/impl/207-task-copy-record-results.md) admits independent inline
   Copy record task results for media AM-R09. Successful wait authorizes repeated
   by-value reads; copied records outlive the group and captures. Typed result

@@ -1129,6 +1129,7 @@ fn walk_body_records<'a>(
                     captures,
                     ..
                 }
+                | ExprKind::ArraySortCmp { source, stages, captures, .. }
                 | ExprKind::ArrayPartition {
                     source,
                     stages,
