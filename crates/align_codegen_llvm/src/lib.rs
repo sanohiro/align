@@ -10299,7 +10299,8 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         Rvalue::ArrayBuilderPush { builder, .. }
                         | Rvalue::ArrayBuilderPushStr { builder, .. }
                         | Rvalue::ArrayBuilderAppend { builder, .. }
-                        | Rvalue::ArrayBuilderBuild { builder } | Rvalue::ArrayBuilderLen(builder) => {
+                        | Rvalue::ArrayBuilderBuild { builder } | Rvalue::ArrayBuilderLen(builder)
+                        | Rvalue::ArrayBuilderRead { builder, .. } => {
                             allow_loaded(builder, &load_defs, &owner, &mut allowed_loads, &mut bad);
                         }
                         Rvalue::Call(_, args) => {
@@ -16959,6 +16960,27 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|error| self.err(error))?
                     .try_as_basic_value().basic()
                     .ok_or_else(|| self.err("builder length returned no basic value"))?
+            }
+            Rvalue::ArrayBuilderRead { builder, index, elem } => {
+                let owner = self.operand(builder)?;
+                let index = self.operand(index)?;
+                let address = self.builder.build_call(self.runtime(RuntimeKey::ArrayBuilderAt),
+                    &[owner.into(), index.into()], "builder.element")
+                    .map_err(|error| self.err(error))?
+                    .try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("builder element selection returned no address"))?
+                    .into_pointer_value();
+                let element = self.llvm_type(*elem);
+                if self.element_allocation_size(element) == 0 {
+                    element.const_zero()
+                } else {
+                    let loaded = self.builder.build_load(element, address, "builder.copy")
+                        .map_err(|error| self.err(error))?;
+                    loaded.as_instruction_value()
+                        .ok_or_else(|| self.err("builder copy is not a load"))?
+                        .set_alignment(1).map_err(|error| self.err(error))?;
+                    loaded
+                }
             }
             Rvalue::BufferCapacity(buf) => {
                 let bp = self.operand(buf)?.into();
@@ -32488,6 +32510,123 @@ fn main() -> i32 = 0
                 assert!(changed);
                 assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "alignment/{mutation}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn builder_copy_read_mir_matrix() -> Result<(), &'static str> {
+        for element in ["i64", "bool", "Row", "vec4<i32>", "mask4<i32>", "[i64; 2]", "[Row; 1]"] {
+            let base = mir(&format!("Row {{ value: i64 }}\nfn query(borrow b: array_builder<{element}>) -> {element} = b[0]\nfn main() {{}}\n"));
+            emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "valid builder read")?;
+            for mutation in 0..9 {
+                let mut bad = base.clone();
+                let mut changed = false;
+                for function in &mut bad.fns {
+                    for block in &mut function.blocks {
+                        for statement in &mut block.stmts {
+                            let Stmt::Let(result, Rvalue::ArrayBuilderRead { builder, index, elem }) = statement else { continue };
+                            changed = true;
+                            match mutation {
+                                0 => *builder = Operand::Const(Const::Unit),
+                                1 => *builder = Operand::Value(u32::MAX),
+                                2 => *index = Operand::Const(Const::Bool(false)),
+                                3 => *index = Operand::Value(u32::MAX),
+                                4 => *index = Operand::Const(Const::Int(0, Ty::Int(IntTy { bits: 64, signed: false }))),
+                                5 => *elem = Ty::Str,
+                                6 => *elem = Ty::Struct(u32::MAX),
+                                7 => function.value_tys[*result as usize] = Ty::Str,
+                                _ => {
+                                    let Operand::Value(owner) = builder else { return Err("read owner SSA") };
+                                    function.value_tys[*owner as usize] = Ty::Buffer;
+                                }
+                            }
+                        }
+                    }
+                }
+                assert!(changed);
+                assert_xml_producer_rejected(&bad, &format!("builder read {element}/{mutation}"));
+            }
+        }
+        let owned = mir("fn query() -> i64 { mut b: array_builder<i64> := array_builder(); b.push(7); return b[0] }\nfn main() {}\n");
+        for mutation in 0..4 {
+            let mut bad = owned.clone();
+            let mut changed = false;
+            for function in &mut bad.fns {
+                let snapshot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt|
+                    match stmt { Stmt::Let(_, Rvalue::ArrayBuilderRead { builder: Operand::Value(value), .. }) => Some(*value), _ => None });
+                let Some(snapshot) = snapshot else { continue };
+                let slot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt|
+                    match stmt { Stmt::Let(value, Rvalue::Load(slot)) if *value == snapshot => Some(*slot), _ => None }).ok_or("snapshot slot")?;
+                for block in &mut function.blocks {
+                    let index = block.stmts.iter().position(|stmt| match stmt {
+                        Stmt::Let(value, _) if mutation == 0 => *value == snapshot,
+                        Stmt::Let(_, Rvalue::ArrayBuilderRead { .. }) => true,
+                        _ => false,
+                    });
+                    let Some(index) = index else { continue };
+                    let inserted = match mutation {
+                        0 | 1 => Stmt::Drop(slot),
+                        2 => Stmt::Store(slot, Operand::Value(snapshot)),
+                        _ => {
+                            let value = u32::try_from(function.value_tys.len()).map_err(|_| "value id")?;
+                            function.value_tys.push(Ty::Unit);
+                            Stmt::Let(value, Rvalue::ArrayBuilderPush { builder: Operand::Value(snapshot),
+                                value: Operand::Const(Const::Int(9, Ty::Int(IntTy { bits: 64, signed: true }))),
+                                scalar: Ty::Int(IntTy { bits: 64, signed: true }) })
+                        }
+                    };
+                    block.stmts.insert(index, inserted);
+                    changed = true;
+                    break;
+                }
+            }
+            assert!(changed);
+            assert_xml_producer_rejected(&bad, &format!("retired/replaced builder {mutation}"));
+        }
+        let base = mir("fn query(borrow b: array_builder<i64>) { unused := b[0] }\nfn main() {}\n");
+        let mut bad = base.clone();
+        for function in &mut bad.fns {
+            for block in &mut function.blocks {
+                for statement in &mut block.stmts {
+                    if let Stmt::Let(_, Rvalue::ArrayBuilderRead { index, .. }) = statement {
+                        *index = Operand::Const(Const::Bool(false));
+                    }
+                }
+            }
+        }
+        assert_xml_producer_rejected(&bad, "discarded builder read");
+        Ok(())
+    }
+
+    #[test]
+    fn builder_copy_read_native_layout() -> Result<(), &'static str> {
+        for (element, load) in [("bool", "load i1"), ("u8", "load i8"),
+            ("i16", "load i16"), ("i64", "load i64"), ("f32", "load float"),
+            ("vec4<i32>", "load <4 x i32>"), ("mask4<i32>", "load <4 x i1>"),
+            ("Row", "load %Row"), ("[i64; 2]", "load [2 x i64]")] {
+            let base = mir(&format!("Row {{ small: u8, wide: i64 }}\nfn query(borrow b: array_builder<{element}>) -> {element} = b[0]\nfn main() {{}}"));
+            let ir = emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "read layout")?;
+            assert!(ir.contains("call ptr @align_rt_array_builder_at("), "{element}: {ir}");
+            assert!(ir.lines().any(|line| line.contains(load) && line.contains("align 1")), "{element}: {ir}");
+        }
+        let zero = mir("Zero { value: [i64; 0] }\nfn query(borrow b: array_builder<Zero>) -> Zero = b[0]\nfn main() {}");
+        let ir = emit_llvm_ir(&zero, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "zero read")?;
+        assert!(ir.contains("call ptr @align_rt_array_builder_at("));
+        assert!(!ir.contains("builder.copy = load"), "zero-width read dereferenced storage");
+        Ok(())
+    }
+
+    #[test]
+    fn builder_copy_read_header_selection() -> Result<(), &'static str> {
+        for borrowed in [false, true] {
+            let source = format!("fn query(borrow b: array_builder<i64>) -> i64 = b[0]\nfn main() {{ mut b: array_builder<i64> := array_builder(1); b.push(7); print({}); b.push(9); print(b[1]); print(b.build().len()) }}",
+                if borrowed { "query(b)" } else { "b[0]" });
+            let base = mir(&source);
+            let ir = emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "builder header selection")?;
+            assert!(ir.contains(if borrowed { "call ptr @align_rt_array_builder_new(" }
+                else { "call ptr @align_rt_array_builder_init_stack(" }), "{borrowed}: {ir}");
+            assert!(ir.contains("call ptr @align_rt_array_builder_at("));
         }
         Ok(())
     }

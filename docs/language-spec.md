@@ -1550,6 +1550,23 @@ outside i64 raises the allocation-size hard error without wrapping or saturation
 Growth and consuming freeze retain their existing rules; no element or byte
 view is exposed before freeze.
 
+`b[i] -> T` reads one initialized element from a bound `array_builder<T>` local
+or admitted named parameter, including an immutable or shared-borrowed receiver.
+T must already be admitted by the builder and satisfy the complete independent
+Copy graph: every field, zero-length element and inactive payload contains no
+view, owner, raw pointer or callable. This does not widen builder formation.
+The receiver and i64 index evaluate once in that order; the complete builder
+owner stays reserved through index evaluation and the value copy. Moving,
+finishing, replacing or exclusively accessing it during the index rejects.
+A terminating index performs no read. Check representable total initialized
+length before signed bounds (`0 <= i < len`); overflow raises allocation-size
+failure and an invalid index raises the ordinary hard bounds error, even for
+zero-width elements or an unused result. Capacity is never readable length.
+The Pure operation allocates nothing and retains no storage, region or generation
+dependency. The copied value survives later growth, freeze, replacement and Drop.
+Bind temporary/control receivers first. View-bearing and Move elements remain
+unreadable before freeze; text-builder byte views remain outside this surface.
+
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
 Besides Copy scalars and `string`, it accepts nonempty naturally aligned declared records composed
 recursively of Copy scalars, owned `string`, the same record class, `Option<T>` over the accepted

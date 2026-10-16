@@ -68,6 +68,7 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 array_builder<T>()                 // 実装済みの heap grow/freeze 形式
 builder.push(value)
 builder.len() -> i64              // initialized element count
+builder[i] -> T                   // independent Copy elements only
 builder.build() -> array<T>
 ```
 
@@ -77,6 +78,15 @@ builder.build() -> array<T>
 結果は先に束縛する。予約容量は長さに含まない。i64 に収まらない件数は、ラップや飽和を
 行わず allocation-size hard error にする。呼び出し後も追記と消費する finish を行える。
 [Plan 140](../../140-builder-length-plan.md) がソースと native の契約を定める。
+
+`b[i] -> T` は束縛済み builder または既に許可された名前付き引数から、初期化済みの独立した
+Copy 要素をコピーする。既存の builder 型形成規則に従い、長さ0の field と非アクティブな
+payload を含む T 全体に view、owner、raw pointer、callable がないことを要求する。
+Pure な読み出しは割り当てを行わず、結果は成長・build・Drop の後も使える。receiver、i64
+index の順に一度ずつ評価し、コピー完了まで所有者全体を予約する。その間の move、build、
+置換、排他的アクセスは拒否する。サイズ0や未使用の結果も、初期化済み件数の変換後に
+符号付き境界を検査する。一時値や制御式の receiver は先に束縛する。
+[Plan 209](../../209-builder-copy-reads.md) がソースと native の契約を定める。
 
 実装済みの heap-record 拡張は、natural alignment を持つ空でない view-free declared record を
 受け入れる。field は再帰的に Copy scalar、free-standing な `string`、または同じ record class

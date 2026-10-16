@@ -3159,6 +3159,7 @@ array_builder(out: region, capacity: i64) // region with initial capacity
 b.push(v)               // append one element (mut receiver)
 b.append(xs: slice<T>)  // bulk-append Copy-scalar elements (mut receiver)
 b.len() -> i64         // initialized element count; shared, nonconsuming
+b[i] -> T              // independent Copy element only; shared, nonconsuming
 b.build() -> array<T>   // freeze into an owned array<T> (consumes the builder)
 ```
 
@@ -3181,6 +3182,23 @@ results first. The Copy result has no retained lifetime dependency. A count
 outside i64 raises the allocation-size hard error without wrapping or saturation.
 Growth and consuming freeze retain their existing rules; no element or byte
 view is exposed before freeze.
+
+`b[i] -> T` reads one initialized element from a bound `array_builder<T>` local
+or admitted named parameter, including an immutable or shared-borrowed receiver.
+T must already be admitted by the builder and satisfy the complete independent
+Copy graph: every field, zero-length element and inactive payload contains no
+view, owner, raw pointer or callable. This does not widen builder formation.
+The receiver and i64 index evaluate once in that order; the complete builder
+owner stays reserved through index evaluation and the value copy. Moving,
+finishing, replacing or exclusively accessing it during the index rejects.
+A terminating index performs no read. Check representable total initialized
+length before signed bounds (`0 <= i < len`); overflow raises allocation-size
+failure and an invalid index raises the ordinary hard bounds error, even for
+zero-width elements or an unused result. Capacity is never readable length.
+The Pure operation allocates nothing and retains no storage, region or generation
+dependency. The copied value survives later growth, freeze, replacement and Drop.
+Bind temporary/control receivers first. View-bearing and Move elements remain
+unreadable before freeze; text-builder byte views remain outside this surface.
 
 `array_builder<T>` is the **typed** member of the grow-then-freeze family — `builder`
 grows a `string`, `buffer` grows bytes, `array_builder<T>` grows an `array<T>`. It is

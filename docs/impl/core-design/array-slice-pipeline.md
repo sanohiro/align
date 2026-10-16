@@ -71,6 +71,7 @@ zip(a, b, ...)                     // lazy equal-length multi-source head (Copy 
 array_builder<T>()                 // shipped heap grow/freeze form
 builder.push(value)
 builder.len() -> i64              // initialized element count
+builder[i] -> T                   // independent Copy elements only
 builder.build() -> array<T>
 ```
 
@@ -81,6 +82,16 @@ parameters. Bind temporary or control-result receivers first. Reserved capacity
 is not length. An unrepresentable count raises the allocation-size hard error
 without wrapping or saturation. Further growth and consuming finish remain
 valid. [Plan 140](../140-builder-length-plan.md) owns the source/native contract.
+
+`b[i] -> T` copies an initialized independent Copy element from a bound builder or
+admitted named parameter. Existing builder formation still applies; the entire
+T graph, including zero-length fields and inactive payloads, must exclude views,
+owners, raw pointers and callables. The Pure read allocates nothing and its result
+survives growth, build and Drop. Receiver then i64 index evaluate once; keep the
+complete owner reserved through the copy and reject intervening move, build,
+replacement or exclusive access. Convert initialized length before signed bounds,
+even for zero-width/unused reads. Bind temporary/control receivers first.
+[Plan 209](../209-builder-copy-reads.md) fixes the source/native contract.
 
 The shipped heap-record extension admits a nonempty, naturally aligned, view-free declared record
 whose fields recursively contain only Copy scalars, free-standing `string`, or the same record

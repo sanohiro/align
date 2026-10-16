@@ -23,6 +23,8 @@ mod buffer_self_append_tests;
 #[cfg(test)]
 mod builder_length_tests;
 #[cfg(test)]
+mod array_builder_read_tests;
+#[cfg(test)]
 mod sse_storage_tests;
 #[cfg(test)]
 mod http_stream_tests;
@@ -18197,6 +18199,8 @@ fn owned_allocator_failpoint() -> bool {
 }
 
 unsafe fn owned_raw_alloc(size: usize) -> *mut u8 {
+    #[cfg(all(test, feature = "alloc-count"))]
+    RAW_STORAGE_EVENTS.with(|events| events.set(events.get().wrapping_add(1)));
     #[cfg(test)]
     if owned_allocator_failpoint() {
         return core::ptr::null_mut();
@@ -18205,10 +18209,14 @@ unsafe fn owned_raw_alloc(size: usize) -> *mut u8 {
 }
 
 unsafe fn owned_raw_free(ptr: *mut u8) {
+    #[cfg(all(test, feature = "alloc-count"))]
+    RAW_STORAGE_EVENTS.with(|events| events.set(events.get().wrapping_add(1)));
     unsafe { free(ptr as *mut core::ffi::c_void) };
 }
 
 unsafe fn owned_raw_realloc(ptr: *mut u8, size: usize) -> *mut u8 {
+    #[cfg(all(test, feature = "alloc-count"))]
+    RAW_STORAGE_EVENTS.with(|events| events.set(events.get().wrapping_add(1)));
     #[cfg(test)]
     if owned_allocator_failpoint() {
         return core::ptr::null_mut();
@@ -18236,6 +18244,10 @@ static FREE_CALLS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64
 #[cfg(all(feature = "alloc-count", test))]
 std::thread_local! {
     static GLOBAL_ALLOC_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    static GLOBAL_DEALLOC_CALLS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+    // Native malloc/realloc/free attempts are separate from Rust's global allocator. Observation
+    // owners need both counters to detect transient allocation or release without cross-test noise.
+    static RAW_STORAGE_EVENTS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
     static GLOBAL_ALLOC_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
     static GLOBAL_ZEROED_ALLOC_BYTES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
@@ -18265,6 +18277,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingGlobalAllocator {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        let _ = GLOBAL_DEALLOC_CALLS.try_with(|count| count.set(count.get().wrapping_add(1)));
         unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
     }
 
@@ -18595,6 +18608,37 @@ const _: () = assert!(core::mem::size_of::<ArrayBuilder>() + core::mem::size_of:
 pub unsafe extern "C" fn align_rt_array_builder_len(b: *mut ArrayBuilder) -> i64 {
     if b.is_null() { return 0; }
     initialized_builder_len(unsafe { (*b).len })
+}
+
+/// Select initialized element bytes for an immediate compiler value copy. Length conversion
+/// precedes signed bounds checking, including for zero-width elements. A zero stride returns
+/// null only after those checks; capacity beyond the initialized prefix is never readable.
+///
+/// # Safety
+/// A nonnull `b` must address a live, correctly aligned ArrayBuilder with valid header, chunks
+/// and initialized payload. Mutation, finish and freeing must not overlap selection or the
+/// caller's immediate copy. The returned pointer must not be retained across any such operation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_array_builder_at(b: *const ArrayBuilder, index: i64) -> *const u8 {
+    let len = if b.is_null() { 0 } else { initialized_builder_len(unsafe { (*b).len }) };
+    if index < 0 || index >= len { align_rt_bounds_fail(index, len); }
+    // The bounds check proves a nonnull owner and a nonnegative ordinal.
+    let b = unsafe { &*b };
+    if b.elem_size == 0 { return core::ptr::null(); }
+    let mut ordinal = usize::try_from(index).unwrap_or_else(|_| align_rt_alloc_size_fail());
+    let offset = |ordinal: usize| ordinal.checked_mul(b.elem_size)
+        .filter(|bytes| *bytes <= isize::MAX.unsigned_abs())
+        .unwrap_or_else(|| align_rt_alloc_size_fail());
+    if b.arena.is_null() { return unsafe { b.data.add(offset(ordinal)) }; }
+    let mut chunk = b.head;
+    while !chunk.is_null() {
+        let current = unsafe { &*chunk };
+        if ordinal < current.len { return unsafe { current.data.add(offset(ordinal)) }; }
+        ordinal -= current.len;
+        chunk = current.next;
+    }
+    // Unreachable for a valid header. Never turn an inconsistent native count into an address.
+    align_rt_bounds_fail(index, len)
 }
 
 fn array_builder_initial_bytes(capacity: i64, stride: usize) -> (usize, usize) {

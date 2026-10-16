@@ -21041,3 +21041,50 @@ fn indexed_array_field_copy_reads_hir_matrix() -> Result<(), String> {
     }
     Ok(())
 }
+
+#[test]
+fn builder_copy_read_hir_matrix() -> Result<(), &'static str> {
+    for element in ["i64", "bool", "Row", "vec4<i32>", "mask4<i32>", "[i64; 2]", "[Row; 1]"] {
+        let base = checked_source_program(&format!(
+            "Row {{ value: i64 }}\nfn query(borrow b: array_builder<{element}>) -> {element} = b[0]\nfn main() {{}}\n"));
+        assert!(validate_hir::body_only_metadata_is_valid(&base), "valid {element}");
+        assert!(lower_program_checked(&base, false, None).is_ok(), "valid {element}");
+        let discard = |program: &mut hir::Program| -> Result<(), &'static str> {
+            let function = program.fns.iter_mut().find(|f| f.name == "query").ok_or("query function")?;
+            let expression = function.body.value.take().ok_or("query expression")?;
+            function.body.stmts.push(hir::Stmt::Expr(*expression));
+            function.ret = Ty::Unit;
+            Ok(())
+        };
+        let mut discarded = base.clone();
+        discard(&mut discarded)?;
+        assert!(lower_program_checked(&discarded, false, None).is_ok(), "valid discarded {element}");
+        for mutation in 0..10 {
+            let mut bad = base.clone();
+            let function = bad.fns.iter_mut().find(|f| f.name == "query").ok_or("query function")?;
+            let value = function.body.value.as_mut().ok_or("query value")?;
+            let hir::ExprKind::Index { recv, index } = &mut value.kind else { return Err("read operation") };
+            match mutation {
+                0 => recv.ty = Ty::Buffer,
+                1 => recv.kind = hir::ExprKind::Bool(false),
+                2 => recv.kind = hir::ExprKind::Local(u32::MAX),
+                3 => { value.ty = Ty::Str; function.ret = Ty::Str; }
+                4 => index.ty = Ty::Bool,
+                5 => index.kind = hir::ExprKind::Bool(false),
+                6 => recv.ty = Ty::ArrayBuilder(align_sema::Scalar::Struct(u32::MAX)),
+                7 => recv.ty = Ty::ArrayBuilder(align_sema::Scalar::String),
+                8 => {
+                    let hir::ExprKind::Local(local) = recv.kind else { return Err("bound builder") };
+                    recv.ty = Ty::ArrayBuilder(align_sema::Scalar::Str);
+                    function.locals[local as usize].ty = recv.ty;
+                    value.ty = Ty::Str; function.ret = Ty::Str;
+                }
+                _ => index.ty = Ty::Int(align_sema::IntTy { bits: 64, signed: false }),
+            }
+            assert_body_entrypoints_empty(&format!("builder-copy-read-{element}-{mutation}"), &bad);
+            discard(&mut bad)?;
+            assert_body_entrypoints_empty(&format!("discarded-builder-copy-read-{element}-{mutation}"), &bad);
+        }
+    }
+    Ok(())
+}

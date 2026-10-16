@@ -1351,6 +1351,22 @@ pub fn array_builder_result_ty(elem: ArrayBuilderElem) -> Ty {
     }
 }
 
+/// Existing builder descriptor formation, before allocation-mode-specific constructor checks.
+pub fn array_builder_element_type_ok(
+    element: ArrayBuilderElem,
+    structs: &[StructDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    match element {
+        ArrayBuilderElem::Scalar(Scalar::Param(_) | Scalar::Int(_) | Scalar::Float(_)
+            | Scalar::Bool | Scalar::Char | Scalar::String | Scalar::Str | Scalar::Slice(_)
+            | Scalar::Struct(_) | Scalar::Enum(_) | Scalar::Tagged(_)) => true,
+        ArrayBuilderElem::Aggregate(_) => region_plain_type_ok(element.ty(), structs, enums, tagged_types),
+        _ => false,
+    }
+}
+
 /// Whether a concrete type can be copied into an explicit region without creating an independent
 /// owner. This is the shared source/HIR boundary predicate; diagnostics use a path-aware mirror in
 /// [`Checker::region_plain_error`].
@@ -4764,6 +4780,41 @@ pub fn independent_copy_type(
         }
     }
     true
+}
+
+/// Copy reads do not widen builder formation. A descriptor must already be constructible in
+/// heap or region storage, and its complete element graph must retain no storage authority.
+pub fn array_builder_copy_element(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Ty> {
+    let descriptor = ty.array_builder_element()?;
+    if !array_builder_element_type_ok(descriptor, structs, enums, tagged_types) { return None; }
+    let element = descriptor.ty();
+    if matches!(element, Ty::Array(Scalar::Struct(_), _)) {
+        return None;
+    }
+    let formed = region_plain_type_ok(element, structs, enums, tagged_types)
+        || matches!(element, Ty::Struct(id) if heap_tree_record_type_ok(id, structs, tagged_types));
+    (formed && independent_copy_type(element, structs, tuples, enums, tagged_types))
+        .then_some(element)
+}
+
+fn independent_builder_read(
+    expression: &Expr,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    matches!(&expression.kind, ExprKind::Index { recv, .. }
+        if matches!(recv.kind, ExprKind::Local(_))
+            && array_builder_copy_element(recv.ty, structs, tuples, enums, tagged_types)
+                .is_some_and(|element| expand_tagged_ty(element, tagged_types)
+                    == expand_tagged_ty(expression.ty, tagged_types)))
 }
 
 /// Structured task slots contain primitives or ordinary records with no retained authority.
@@ -21457,6 +21508,9 @@ impl<'a> EscapeCheck<'a> {
     }
 
     fn indexed_escape_content(&self, expression: &Expr) -> EscapeValueFact {
+        if independent_builder_read(expression, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return EscapeValueFact::default();
+        }
         let (recv, index, fields) = match &expression.kind {
             ExprKind::Index { recv, index } => (recv.as_ref(), index.as_ref(), &[][..]),
             ExprKind::ElemField {
@@ -21928,6 +21982,9 @@ impl<'a> EscapeCheck<'a> {
     }
 
     fn escape_place_fallback_roots(&self, expression: &Expr) -> BorrowRoots {
+        if independent_builder_read(expression, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return BorrowRoots::default();
+        }
         let local_root = |local: LocalId| {
             let local = self.borrowed_projection_owners.get(&local).copied().unwrap_or(local);
             self.f
@@ -25130,6 +25187,8 @@ impl<'a> EscapeCheck<'a> {
             {
                 values.push(Region::Static);
             }
+            ExprKind::Index { .. } if independent_builder_read(expression, self.structs,
+                self.tuples, self.enums, self.tagged_types) => values.push(Region::Static),
             // `arr[i]` reads an element; a `str` element is a view into the array's storage, so it
             // inherits the array's region (it must not outlive it). A scalar element is Copy and
             // not region-tracked, so inheriting the array's region is harmless (never checked).
@@ -38969,6 +39028,9 @@ impl<'a> MoveCheck<'a> {
     /// a temp root, which is the whole reason the two functions differ (see the FP fixed in the
     /// second review round: `names = src.map(up).to_array()` moved into an owning `array<str>`).
     fn storage_roots(&self, e: &Expr) -> BorrowRoots {
+        if independent_builder_read(e, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return BorrowRoots::default();
+        }
         // Borrowing through a wrapper borrows what is inside it — the SAME set
         // [`may_need_synthetic_owner`] sees through, single-sourced in `borrow_transparent_value` so
         // the two cannot drift. Without this, a block recorded no root at all (neither `IterTemp`,
@@ -39142,6 +39204,9 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn borrow_fact_one(&self, e: &Expr) -> BorrowFact {
+        if independent_builder_read(e, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return BorrowFact::default();
+        }
         let mut fact = BorrowFact::default();
         if self.non_fallthrough.contains(&e.span) {
             return fact;
@@ -39225,6 +39290,9 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn completed_headers(&self, expression: &Expr) -> ProjectedHeaderFact {
+        if independent_builder_read(expression, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return ProjectedHeaderFact::default();
+        }
         self.borrows
             .value_headers
             .get(&Self::expr_key(expression))
@@ -39640,6 +39708,9 @@ impl<'a> MoveCheck<'a> {
     /// freeze only ordinary content into their completion; a nested header-bearing element/field
     /// forwards the selected content header and never the outer collection header itself.
     fn indexed_generation_content(&self, expression: &Expr) -> MoveValueFact {
+        if independent_builder_read(expression, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return MoveValueFact::default();
+        }
         let (recv, index, field_path) = match &expression.kind {
             ExprKind::Index { recv, index } => (recv.as_ref(), index.as_ref(), &[][..]),
             ExprKind::ElemField {
@@ -42084,6 +42155,9 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn borrow_sources_inner(&self, e: &Expr) -> BorrowRoots {
+        if independent_builder_read(e, self.structs, self.tuples, self.enums, self.tagged_types) {
+            return BorrowRoots::default();
+        }
         let union = |parts: Vec<&Expr>| {
             let mut roots = BorrowRoots::new();
             for p in parts {
@@ -45855,6 +45929,7 @@ impl<'a> MoveCheck<'a> {
         // The generic worklist discovers children before evaluating them, so keep this one on the
         // recursive path where the reservation encloses the child's complete evaluation.
         if matches!(expression.kind, ExprKind::BorrowedIndex { .. })
+            || matches!(&expression.kind, ExprKind::Index { recv, .. } if recv.ty.is_array_builder())
             || matches!(&expression.kind, ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. }
                 if indexed_array_field_has_length(inner.ty)
                     && matches!(inner.kind, ExprKind::ElemField { .. }))
@@ -49089,6 +49164,8 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. } => {
                 let selected_base = match &inner.kind {
+                    ExprKind::Local(_) if inner.ty.is_array_builder()
+                        && matches!(e.kind, ExprKind::Index { .. }) => Self::mutable_actual_place(inner),
                     ExprKind::ElemField { recv, .. }
                         if indexed_array_field_has_length(inner.ty) =>
                             Self::mutable_actual_place(recv),
@@ -65112,6 +65189,27 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             self.check_expr(recv, None)
         };
+        if r.ty.is_array_builder() {
+            if !matches!(r.kind, ExprKind::Local(_)) {
+                self.diags.error("array_builder indexing requires a bound variable or named parameter", recv.span);
+                return err;
+            }
+            let element = array_builder_copy_element(r.ty, self.structs, self.tuples,
+                self.enums, self.tagged_types).or_else(|| match r.ty {
+                    // The abstract template is discarded. Its body is checked again with every
+                    // concrete argument, where the complete independent graph is mandatory.
+                    Ty::ArrayBuilder(Scalar::Param(parameter))
+                        if self.param_bound(parameter) == Bound::RegionPlain => Some(Ty::Param(parameter)),
+                    _ => None,
+                });
+            let Some(element) = element else {
+                self.diags.error("array_builder indexing requires an independent Copy element without views or owners", recv.span);
+                return err;
+            };
+            let i = self.check_array_index_expr(index);
+            if i.ty == Ty::Error { return err; }
+            return Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: element, span };
+        }
         // `v[i]` on a vector reads lane `i`. The lane must be a **constant** literal in `0..N` (a SIMD
         // lane index is a fixed position; a dynamic lane would risk an out-of-range poison value). It
         // lowers to `extractelement`, reusing this `Index` node (MIR branches on the receiver type).
@@ -76496,24 +76594,7 @@ fn resolve_type(
                 return Ty::Error;
             };
             match elem {
-                ArrayBuilderElem::Scalar(Scalar::Param(_)) => Ty::array_builder(elem),
-                ArrayBuilderElem::Scalar(
-                    Scalar::Int(_)
-                    | Scalar::Float(_)
-                    | Scalar::Bool
-                    | Scalar::Char
-                    | Scalar::String
-                    | Scalar::Str
-                    | Scalar::Slice(_)
-                    | Scalar::Struct(_)
-                    | Scalar::Enum(_)
-                    | Scalar::Tagged(_),
-                ) => Ty::array_builder(elem),
-                ArrayBuilderElem::Aggregate(_)
-                    if region_plain_type_ok(elem.ty(), cx.structs, cx.enums, cx.tagged_types) =>
-                {
-                    Ty::array_builder(elem)
-                }
+                element if array_builder_element_type_ok(element, cx.structs, cx.enums, cx.tagged_types) => Ty::array_builder(element),
                 _ => {
                     diags.error(
                         format!(

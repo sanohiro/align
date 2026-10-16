@@ -1658,6 +1658,16 @@ pub fn native_owner_mir_contract<'a>(
             contract.result = i64_ty;
             contract.operands = vec![(builder, owner, read)];
         }
+        Rvalue::ArrayBuilderRead { builder, index, elem } => {
+            let owner = xml_operand_base_ty(function, builder).filter(|ty|
+                align_sema::array_builder_copy_element(*ty, &program.structs, &program.tuples,
+                    &program.enums, &program.tagged_types).is_some_and(|element|
+                        align_sema::expand_tagged_ty(element, &program.tagged_types)
+                            == align_sema::expand_tagged_ty(*elem, &program.tagged_types)))
+                .unwrap_or(Ty::Error);
+            contract.result = *elem;
+            contract.operands = vec![(builder, owner, read), (index, i64_ty, read)];
+        }
         Rvalue::BufferCapacity(buffer) => {
             contract.result = i64_ty;
             contract.operands = vec![(buffer, Ty::Buffer, read)];
@@ -3653,7 +3663,12 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
         let definition = (*definition).clone();
         if let Some(contract) = native_owner_mir_contract(self.graph.program, self.graph.function, &definition) {
-            if result_ty != contract.result || !path.is_empty()
+            // Independent builder copies authenticate the entire result graph at the opcode.
+            // Its selected inline fields inherit that proof, never the builder's storage.
+            let independent_read = matches!(definition, Rvalue::ArrayBuilderRead { .. });
+            if (if independent_read {
+                !xml_value_flow_matches(self.graph.program, result_ty, contract.result)
+            } else { result_ty != contract.result }) || (!path.is_empty() && !independent_read)
                 || contract.outputs.iter().any(|&(slot, ty)| {
                     self.graph.function.slots.get(slot as usize) != Some(&ty)
                         || self.graph.function.params.contains(&slot)
@@ -6748,7 +6763,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::BufferBytes(..)
             | Rvalue::BufferLen(..)
             | Rvalue::BufferCapacity(..)
-            | Rvalue::BuilderLen(..) | Rvalue::ArrayBuilderLen(..)
+            | Rvalue::BuilderLen(..) | Rvalue::ArrayBuilderLen(..) | Rvalue::ArrayBuilderRead { .. }
             | Rvalue::BytesRead { .. }
             | Rvalue::BytesSet { .. }
             | Rvalue::BytesFill { .. }
@@ -8988,6 +9003,116 @@ fn validate_resource_rvalues_inner(
     Ok(())
 }
 
+/// A read snapshots a stable builder header before its index runs. Authenticate that snapshot
+/// against every CFG path: producer type/provenance alone cannot reject a later Drop or replacement.
+fn validate_builder_read_reservations(
+    program: &Program,
+    function: &Function,
+    local_contracts: &HashSet<ProgramCall>,
+) -> Result<(), ProducerError> {
+    if !function.blocks.iter().flat_map(|block| &block.stmts)
+        .any(|statement| matches!(statement, Stmt::Let(_, Rvalue::ArrayBuilderRead { .. }))) {
+        return Ok(());
+    }
+    let definitions: HashMap<_, _> = function.blocks.iter().flat_map(|block| &block.stmts)
+        .filter_map(|statement| match statement { Stmt::Let(id, value) => Some((*id, value)), _ => None })
+        .collect();
+    let reads = definitions.iter().filter_map(|(&id, value)| match value {
+        Rvalue::ArrayBuilderRead { builder, .. } => Some((id, builder)), _ => None,
+    }).collect::<Vec<_>>();
+    for (read, owner) in reads {
+        let fail = || ProducerError::Lowering(format!(
+            "array builder read in '{}' has no live unchanged owner snapshot", function.name));
+        let Operand::Value(snapshot) = owner else { return Err(fail()) };
+        let Some(Rvalue::Load(slot)) = definitions.get(snapshot).copied() else { return Err(fail()) };
+        if !function.slots.get(*slot as usize).is_some_and(|ty| ty.is_array_builder()) {
+            return Err(fail());
+        }
+        let aliases = |operand: &Operand| {
+            let mut operand = operand;
+            let mut seen = HashSet::new();
+            loop {
+                match operand {
+                    Operand::BorrowedPlace(place) => break place.slot == *slot,
+                    Operand::Arg(argument) => break function.params.get(*argument as usize) == Some(slot),
+                    Operand::Value(value) if seen.insert(*value) => match definitions.get(value).copied() {
+                        Some(Rvalue::Load(source)) => break source == slot,
+                        Some(Rvalue::Use(source)) => operand = source,
+                        _ => break false,
+                    },
+                    _ => break false,
+                }
+            }
+        };
+        // The boolean states are finite even across loops. Store starts a fresh owner; a snapshot
+        // can be used only after its exact Load and before any owner-changing operation.
+        let mut pending = VecDeque::from([(function.entry, false, false)]);
+        let mut seen = HashSet::new();
+        let mut reached = false;
+        while let Some((block, mut live, mut reserved)) = pending.pop_front() {
+            if !seen.insert((block, live, reserved)) { continue; }
+            let block = function.blocks.get(block as usize).ok_or_else(&fail)?;
+            for statement in &block.stmts {
+                let mut changed = false;
+                let mut retired = false;
+                match statement {
+                    Stmt::Store(destination, source) if destination == slot => {
+                        live = !matches!(source, Operand::Value(value)
+                            if matches!(definitions.get(value), Some(Rvalue::RawNull)));
+                        reserved = false;
+                    }
+                    Stmt::Store(_, source) if aliases(source) => retired = true,
+                    Stmt::Drop(source) | Stmt::DropFlagMoveOut { slot: source, .. }
+                        if source == slot => retired = true,
+                    Stmt::DropValue(source) if aliases(source) => retired = true,
+                    Stmt::Let(id, _) if id == snapshot => reserved = live,
+                    Stmt::Let(id, _) if *id == read => {
+                        reached = true;
+                        if !reserved { return Err(fail()); }
+                    }
+                    Stmt::Let(_, value) => {
+                        match value {
+                            Rvalue::ArrayBuilderBuild { builder } if aliases(builder) => retired = true,
+                            Rvalue::ArrayBuilderPush { builder, .. }
+                            | Rvalue::ArrayBuilderPushStr { builder, .. }
+                            | Rvalue::ArrayBuilderAppend { builder, .. } if aliases(builder) => changed = true,
+                            _ => {}
+                        }
+                        let call = match value {
+                            Rvalue::Call(DirectCall::Program(target), args) => Some((args.as_slice(),
+                                xml_direct_call_facts(program, target, local_contracts).map(|facts| facts.modes))),
+                            Rvalue::CallWithCleanup(call) => Some((call.args.as_slice(),
+                                xml_direct_call_facts(program, &call.target, local_contracts).map(|facts| facts.modes))),
+                            Rvalue::CallIndirect { args, signature, .. }
+                            | Rvalue::RawCall { args, signature, .. } => Some((args.as_slice(), Some(signature.param_modes.clone()))),
+                            Rvalue::CallIndirectWithCleanup(call) => Some((call.args.as_slice(), Some(call.signature.param_modes.clone()))),
+                            Rvalue::Call(DirectCall::Runtime(_), args) => Some((args.as_slice(), None)),
+                            _ => None,
+                        };
+                        if let Some((args, modes)) = call {
+                            for (index, _) in args.iter().enumerate().filter(|(_, argument)| aliases(argument)) {
+                                match modes.as_ref().and_then(|modes| modes.get(index)) {
+                                    Some(align_ast::ParamMode::Borrow) => {}
+                                    Some(align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out) => changed = true,
+                                    _ => retired = true,
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if retired { live = false; }
+                if changed || retired { reserved = false; }
+            }
+            for successor in crate::byte_ranges::successors(&block.term) {
+                pending.push_back((successor, live, reserved));
+            }
+        }
+        if !reached { return Err(fail()); }
+    }
+    Ok(())
+}
+
 fn validate_resource_rvalues_component(
     program: &Program,
     component: &[usize],
@@ -9067,6 +9192,7 @@ fn validate_resource_rvalues_component(
         if component.binary_search(&function_index).is_err() {
             continue;
         }
+        validate_builder_read_reservations(program, function, local_contracts)?;
         let mut primary_definitions = vec![0u32; function.value_tys.len()];
         let mut auxiliary_definitions = vec![0u32; function.value_tys.len()];
         let mut value_definitions = vec![None; function.value_tys.len()];
