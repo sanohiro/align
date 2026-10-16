@@ -2446,8 +2446,13 @@ Plan17; the source interface tuple codec does not change.
 
 `ArraySortCmp { source, stages, cmp_func, captures, elem }` is the checked record
 for `sort_by`. The source is an admitted array/slice pipeline, never a JSON
-scanner. Its final element exactly equals `elem`, belongs to the existing keyed
-sort Copy scalar/str domain, and matches the result's dynamic-array scalar.
+scanner. Its final element exactly equals `elem` and passes the shared
+`comparator_sort_result` classifier: existing primitive Copy/str elements or an
+already-formed independent Copy record without explicit alignment (plan220).
+The result is exactly `DynArray(scalar)` or `DynStructArray(id, Aos)` respectively.
+Existing structural field/collection validation remains required; malformed IDs,
+cycles, hidden views/Move/callable authority and zero-length wrappers cannot
+bypass the complete graph check.
 `pipeline_callable_ok` authenticates an explicit input sequence: two copies of
 that final type, followed by captures, with exact bool return and by-value modes.
 Every lifted capture count and capture type must match. Existing one-input
@@ -2467,7 +2472,11 @@ lifted capture count, terminal capture count/type, callable, source, element and
 result at every public lowering entry point. `comparator_effect_replay_rejects_forged_parallel_purity`
 keeps structural metadata valid while making the comparator Impure, proving that
 full effect replay rejects the enclosing parallel boundary. `sort_comparator`
-and `effect_fail_closed` own source, execution and imported effect-state parity.
+and `effect_fail_closed` own source, execution and imported effect-state parity. Plan220's
+`sort_records` owner also rejects forged result/scratch header, physical load,
+call argument and heap/arena allocation types at full, partition and LLVM
+boundaries. Locally dropped scratch must satisfy those equations even when no
+returned-owner proof traverses it.
 
 The shared pipeline action also consumes mutable-access summaries for copied
 capture headers: possible writes end overlapping validated-byte observations

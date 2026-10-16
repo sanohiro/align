@@ -340,6 +340,37 @@ fn sort_comparator_domain_and_metadata() -> Result<(), &'static str> {
         // Every public producer, including located and per-unit entry points, fails closed.
         assert_body_entrypoints_empty(&format!("comparator mutation {mutation}"), &bad);
     }
+    for fields in [
+        "extra:i64", "extra:[i64;0]", "extra:Option<i64>", "extra:Result<i64,Error>",
+        "extra:(i64,bool)", "extra:Nested", "extra:[Nested;2]", "extra:Choice",
+    ] {
+        let source = format!("Nested {{ value:i64 }}\nChoice {{ Value(Nested),Empty }}\nRow {{key:i64,{fields}}}\nfn f(xs:slice<Row>)->array<Row> {{value:=xs.sort_by(fn a:Row,b:Row {{a.key<b.key}});return value}}");
+        let good = checked_source_program(&source);
+        for per_unit in [false, true] { assert!(lower_program_checked(&good, per_unit, None).is_ok(), "{fields}"); }
+    }
+    let records = checked_source_program("Row {key:i64,extra:i64}\nOther {key:i64}\nfn f(xs:slice<Row>)->array<Row> {value:=xs.sort_by(fn a:Row,b:Row {a.key<b.key});return value}");
+    let row = records.structs.iter().position(|record| record.name == "Row").ok_or("Row")?;
+    let row_id = u32::try_from(row).map_err(|_| "Row id")?;
+    for poison in [Ty::Str, Ty::String, Ty::Raw, Ty::Slice(Scalar::Bool), Ty::Fn(0),
+        Ty::Resource(0), Ty::Array(Scalar::Str, 0), Ty::Option(Scalar::Str),
+        Ty::Result(Scalar::Bool, Scalar::String), Ty::Struct(row_id), Ty::Struct(u32::MAX),
+        Ty::Tuple(u32::MAX), Ty::Enum(u32::MAX), Ty::Tagged(u32::MAX)] {
+        let mut bad = records.clone();
+        bad.structs[row].fields[1].ty = poison;
+        assert_body_entrypoints_empty(&format!("record comparator graph {poison:?}"), &bad);
+    }
+    for mutation in 0..4 {
+        let mut bad = records.clone();
+        if mutation == 0 { bad.structs[row].align = Some(32); }
+        else {
+            body_first_let_init_mut(&mut bad, "f").ty = match mutation {
+                1 => Ty::DynArray(Scalar::Struct(row_id)),
+                2 => Ty::DynStructArray(row_id, Layout::Soa),
+                _ => Ty::DynStructArray(u32::MAX, Layout::Aos),
+            };
+        }
+        assert_body_entrypoints_empty("record comparator result/formation", &bad);
+    }
     Ok(())
 }
 
@@ -363,19 +394,34 @@ fn comparator_effect_replay_rejects_forged_parallel_purity() -> Result<(), &'sta
 
 #[test]
 fn comparator_sort_uses_shared_storage_and_calls() -> Result<(), String> {
-    let hir = checked_source_program("fn f(xs:slice<str>,k:i64)->array<str> { value:=xs.sort_by(fn a:str,b:str { if k > 0 { a < b } else { a > b } }); return value }");
-    let target = hir.fns.iter().find(|f| matches!(f.origin, hir::FnOrigin::Lifted { .. })).ok_or("comparator")?.name.clone();
-    for per_unit in [false, true] {
-        let program = lower_program_checked(&hir, per_unit, None).map_err(|e| format!("{e:?}"))?;
-        producer::validate_mir_producers(&program).map_err(|e| format!("{e:?}"))?;
-        let function = program.fns.iter().find(|f| f.name.as_str() == "f").ok_or("sort function")?;
-        let values: Vec<_> = function.blocks.iter().flat_map(|b| &b.stmts).filter_map(|s| match s { Stmt::Let(_, value) => Some(value), _ => None }).collect();
-        let calls: Vec<_> = values.iter().filter_map(|v| match v { Rvalue::Call(name, args) if direct_program_name(name) == Some(target.as_str()) => Some(args), _ => None }).collect();
-        assert_eq!(calls.len(), 2, "one insertion and one merge call site, no adaptive probes");
-        assert!(calls.iter().all(|args| args.len() == 3), "two compared values followed by one capture");
-        assert!(matches!((&calls[0][2], &calls[1][2]), (Operand::Value(a), Operand::Value(b)) if a == b), "capture evaluated once before traversal");
-        assert_eq!(values.iter().filter(|v| matches!(v, Rvalue::HeapAllocBuf { elem: Ty::Str, .. })).count(), 2, "one result and one merge scratch spine");
-        assert!(!values.iter().any(|v| matches!(v, Rvalue::StrClone(_) | Rvalue::CallWithCleanup(_))), "no key owners, cleanup calls or hidden byte clones");
+    for (source, elem) in [
+        ("fn f(xs:slice<str>,k:i64)->array<str> { value:=xs.sort_by(fn a:str,b:str { if k > 0 { a < b } else { a > b } }); return value }", Ty::Str),
+        ("Row {key:i64,tag:u8}\nfn f(xs:slice<Row>,k:i64)->array<Row> { value:=xs.sort_by(fn a:Row,b:Row { if k > 0 { a.key < b.key } else { a.key > b.key } }); return value }", Ty::Struct(0)),
+    ] {
+        let hir = checked_source_program(source);
+        let target = hir.fns.iter().find(|f| matches!(f.origin, hir::FnOrigin::Lifted { .. })).ok_or("comparator")?.name.clone();
+        for per_unit in [false, true] {
+            let program = lower_program_checked(&hir, per_unit, None).map_err(|e| format!("{e:?}"))?;
+            producer::validate_mir_producers(&program).map_err(|e| format!("{e:?}"))?;
+            let function = program.fns.iter().find(|f| f.name.as_str() == "f").ok_or("sort function")?;
+            let values: Vec<_> = function.blocks.iter().flat_map(|b| &b.stmts).filter_map(|s| match s { Stmt::Let(_, value) => Some(value), _ => None }).collect();
+            let calls: Vec<_> = values.iter().filter_map(|v| match v { Rvalue::Call(name, args) if direct_program_name(name) == Some(target.as_str()) => Some(args), _ => None }).collect();
+            assert_eq!(calls.len(), 2, "one insertion and one merge call site, no adaptive probes");
+            assert!(calls.iter().all(|args| args.len() == 3), "two compared values followed by one capture");
+            for args in &calls {
+                assert_eq!(function.operand_ty(&args[0]), elem);
+                assert_eq!(function.operand_ty(&args[1]), elem);
+                assert_eq!(function.operand_ty(&args[2]), int(64));
+            }
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                if let Stmt::Let(value, Rvalue::MakeDynArray { .. }) = statement {
+                    assert_eq!(function.value_tys[*value as usize], collected_array_type(elem));
+                }
+            }
+            assert!(matches!((&calls[0][2], &calls[1][2]), (Operand::Value(a), Operand::Value(b)) if a == b), "capture evaluated once before traversal");
+            assert_eq!(values.iter().filter(|v| matches!(v, Rvalue::HeapAllocBuf { elem: allocated, .. } if *allocated == elem)).count(), 2, "one result and one merge scratch spine");
+            assert!(!values.iter().any(|v| matches!(v, Rvalue::StrClone(_) | Rvalue::CallWithCleanup(_))), "no key owners, cleanup calls or hidden byte clones");
+        }
     }
     Ok(())
 }

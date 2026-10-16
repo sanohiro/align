@@ -10954,10 +10954,13 @@ impl<'a> BodyValidator<'a> {
                 if matches!(source.ty, Ty::JsonScanner(_)) {
                     return None;
                 }
-                let scalar = align_sema::ty_to_scalar(final_elem)?;
+                let result = align_sema::comparator_sort_result(final_elem,
+                    &self.program.structs, &self.program.tuples, &self.program.enums,
+                    &self.program.tagged_types)?;
+                // Both result classifiers derive their header from this same final element.
+                // Keep its stored discriminator exact; formation needs no second ID comparison.
                 if final_elem != *elem
-                    || (align_sema::scalar_to_prim(scalar).is_none() && scalar != Scalar::Str)
-                    || !self.scalar_copy_ok(scalar)
+                    || self.array_to_array_result(final_elem).is_none()
                 {
                     return None;
                 }
@@ -10974,7 +10977,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 flows.extend(capture_flows);
                 let (falls, breaks) = strict_flow(&flows);
-                Some((Ty::DynArray(scalar), falls, breaks))
+                Some((result, falls, breaks))
             }
             hir::ExprKind::ArrayToArray { source, stages, elem } => {
                 let (final_elem, flows) = self.pipeline_prefix(source, stages, context)?;

@@ -4782,6 +4782,27 @@ pub fn independent_copy_type(
     true
 }
 
+/// Comparator sorting copies complete independent records into the existing natural AoS
+/// collection representation. Copy alone is insufficient: views and callables carry authority.
+pub fn comparator_sort_result(
+    elem: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Ty> {
+    if let Ty::Struct(id) = elem {
+        if structs.get(id as usize)?.align.is_some()
+            || !independent_copy_type(elem, structs, tuples, enums, tagged_types)
+        {
+            return None;
+        }
+        return Some(Ty::DynStructArray(id, Layout::Aos));
+    }
+    let scalar = ty_to_scalar(elem)?;
+    (scalar_to_prim(scalar).is_some() || scalar == Scalar::Str).then_some(Ty::DynArray(scalar))
+}
+
 /// Copy reads do not widen builder formation. A descriptor must already be constructible in
 /// heap or region storage, and its complete element graph must retain no storage authority.
 pub fn array_builder_copy_element(
@@ -62776,9 +62797,9 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
-        let Some(scalar) = ty_to_scalar(elem).filter(|s| scalar_to_prim(*s).is_some() || *s == Scalar::Str) else {
+        let Some(result_ty) = comparator_sort_result(elem, self.structs, self.tuples, self.enums, self.tagged_types) else {
             self.diags.error(
-                format!("'sort_by' element must be a Copy scalar (int/float/bool/char/str), got {}", ty_name(elem)),
+                format!("'sort_by' element must be a Copy scalar (int/float/bool/char/str) or an independent Copy record without align(N), got {}", ty_name(elem)),
                 span,
             );
             return err;
@@ -62797,7 +62818,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         Expr {
             kind: ExprKind::ArraySortCmp { source: Box::new(source), stages, cmp_func, captures, elem },
-            ty: Ty::DynArray(scalar),
+            ty: result_ty,
             span,
         }
     }

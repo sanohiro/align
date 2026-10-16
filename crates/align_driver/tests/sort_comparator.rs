@@ -173,7 +173,7 @@ fn sort_comparator_domain_body() {
         "fn wrong(a:i64,borrow b:i64)->bool = a < b\nfn main() { x := [1,2].sort_by(wrong) }",
         "import core.json\nRow { value:i64 }\nfn main() { rows:json.scanner<Row>:=json.scan(\"[]\"); x:=rows.value.sort_by(fn a,b { a < b }) }",
         "fn bad(xs:array<string>) { x := xs.sort_by(fn a,b { true }) }\nfn main() {}",
-        "Row { value:i64 }\nfn main() { x := [Row { value:1 }].sort_by(fn a,b { true }) }",
+        "Row { value:str }\nfn main() { x := [Row { value:\"view\" }].sort_by(fn a,b { true }) }",
         "fn main() { x := missing.sort_by(fn a,b { true }) }",
     ] {
         let checked = diff_check_multi("comparator-invalid", &[("main.align", source)], "main.align");

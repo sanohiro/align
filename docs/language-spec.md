@@ -395,13 +395,21 @@ independently owned string bytes are dropped exactly once after sorting. Compari
 materializing terminal adds one transient owner-header column for string keys (plan 134).
 
 Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
-`sort_by_key` and `sort_by` accept primitive Copy elements and `str`. All return an owned
-array spine; `str` elements retain their byte owners, with no implicit clone or
-byte ownership transfer. Source and stage-capture lifetimes remain attached to
-the result, so local text views cannot escape or survive owner invalidation.
-Existing conservative source-generation loans remain: replacing, moving or
-reallocating a bound source array can invalidate a live result even when its
-copied bytes are static. Owned `string` and aggregate elements remain unsupported.
+`sort_by_key` and `sort_by` accept primitive Copy elements and `str`.
+`sort_by` additionally accepts already-formed records without explicit `align(N)`
+whose complete inline graph is independent Copy data: numeric/bool/char/RNG
+fields and existing nested records, fixed arrays, tuples and Option/Result/sum
+carriers of such data. Every variant and zero-length element type is checked;
+views, callables, pointers, resources and Move fields are excluded. Existing
+field and collection formation restrictions still apply (plan220).
+All return an owned array spine. Record values copy completely into AoS storage;
+`str` elements retain their byte owners, with no implicit clone or byte ownership
+transfer. Source and stage-capture content lifetimes remain attached where present,
+so local text views cannot escape or survive owner invalidation. Existing
+conservative source-generation loans remain: replacing, moving or reallocating
+a bound source array can invalidate a live borrowed-text result even when its
+copied bytes are static. Owned `string` elements and other aggregate roots remain
+unsupported. `sort` and `sort_by_key` do not accept record elements.
 `source.sort_by(cmp)` takes one existing named or inline callable with two by-value
 element arguments and a `bool` result; `cmp(a, b)` means a precedes b. Existing
 Copy captures and imported callables are supported. Comparator-only captures
