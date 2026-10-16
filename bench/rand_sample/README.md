@@ -1,5 +1,9 @@
 # Sparse random sampling
 
+The shell entry uses the [shared native supervisor](../native_probe.md) for
+bounded build/link/probe execution and descendant retirement before scratch
+cleanup. Its fixture, compiler flags and historical measurements are unchanged.
+
 Measure the actual non-test release runtime's `rng.sample` entry point, with
 an independently implemented dense partial-Fisher-Yates oracle. The candidate
 keeps exactly the same selected elements, ordering and final RNG state while

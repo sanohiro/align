@@ -1,5 +1,9 @@
 # Hexadecimal group decoding
 
+The shell entry uses the [shared native supervisor](../native_probe.md) for
+bounded build/link/probe execution and descendant retirement before scratch
+cleanup. Its fixture, compiler flags and historical measurements are unchanged.
+
 This C harness compares the actual release runtime's `hex_decode` entrypoint.
 It is a local latency measurement, not a timing correctness gate.
 

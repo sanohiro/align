@@ -1,5 +1,9 @@
 # Named UTC field rendering
 
+The shell entry uses the [shared native supervisor](../native_probe.md) for
+bounded build/link/probe execution and descendant retirement before scratch
+cleanup. Its fixture, compiler flags and historical measurements are unchanged.
+
 This C consumer measures the actual non-test release runtime's formatter entry,
 including final owned-string allocation and free. It is a local measurement,
 not a timing correctness gate.
