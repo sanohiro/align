@@ -2100,7 +2100,7 @@ pub enum ExprKind {
     /// (not consumed — like a `buffer` method). `default` is `None` for `flag_bool` (default `false`),
     /// `Some(str)` for `flag_str`, `Some(i64)` for `flag_i64`. Pure.
     CliFlag { cmd: Box<Expr>, kind: CliFlagKind, name: Box<Expr>, default: Option<Box<Expr>> },
-    /// `c.parse(args)` — parse the `array<str>` argv `args` against `cmd`'s flag table, yielding
+    /// `c.parse(args)` — parse `array<str>` or `slice<str>` argv against `cmd`'s flag table, yielding
     /// `Result<parsed, Error>` (the `ty`). An unknown flag / missing value / malformed i64 / wrong
     /// kind is `Error.Invalid`. **`cmd` is borrowed, NOT consumed** (`c.usage()` stays callable after
     /// parse, including on the `Err` path). `args` is borrowed. Pure.

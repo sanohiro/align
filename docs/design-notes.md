@@ -2419,6 +2419,12 @@ without re-tokenizing argv. Last-value-wins stays uniform; callers own duplicate
 and application-range policy. [Plan181](impl/181-cli-float-occurrences.md) records
 the synchronous Copy observations and unchanged command/parsed ownership.
 
+Subcommand dispatch already selects a contiguous argument range. Accepting its
+`slice<str>` directly in the same parser avoids a caller-built header array;
+the selected first element remains the command name. The existing synchronous
+borrow and independently owned parsed text suffice without another argv source
+or parser. [Plan206](impl/206-cli-argument-slices.md) records this carrier extension.
+
 
 ### Linear object keys
 

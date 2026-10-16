@@ -3759,6 +3759,13 @@ lookups borrow synchronously and allocate nothing; unknown names/wrong-kind
 getters retain runtime aborts. No new argv source or duplicate/range policy.
 [Plan181](impl/181-cli-float-occurrences.md) owns the exact contract and tests.
 
+`parse` also accepts `slice<str>` alongside `array<str>` (2026-10-16). Both are
+call-scoped shared borrows of headers and text; parsed owns independent copies.
+The selected span's first element is skipped, with empty/one-element inputs
+using defaults. Fixed arrays use an explicit slice. Bounds precede parsing;
+no new argv source, implicit array allocation or flag grammar is introduced.
+[Plan206](impl/206-cli-argument-slices.md) owns carrier validation and tests.
+
 ### M10 scope decision (2026-07-04)
 
 Settled ahead of any `std.encoding`/`std.rand`/`std.cli` implementation (`impl/07-roadmap.md` M10;

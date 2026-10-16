@@ -67446,17 +67446,18 @@ impl<'a, 't> Checker<'a, 't> {
             }
             "parse" => {
                 if args.len() != 1 {
-                    self.diags.error(format!("'.parse()' takes 1 argument (the argv `array<str>`), got {}", args.len()), span);
+                    self.diags.error(format!("'.parse()' takes 1 argument (an argv `array<str>` or `slice<str>`), got {}", args.len()), span);
                     return err;
                 }
                 let argv = self.check_expr(&args[0], None);
                 if argv.ty == Ty::Error {
                     return err;
                 }
-                // The argument is `main(args)`'s `array<str>` (`DynArray(Str)`) — the one argv source.
-                if self.resolve(argv.ty) != Ty::DynArray(Scalar::Str) {
+                // Arrays and borrowed subcommand slices share the synchronous argv span ABI.
+                let argv_ty = self.resolve(argv.ty);
+                if !matches!(argv_ty, Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str)) {
                     self.diags.error(
-                        format!("'.parse()' takes the `array<str>` from `main(args)`, got {}", ty_name(argv.ty)),
+                        format!("'.parse()' takes `array<str>` or `slice<str>`, got {}", ty_name(argv_ty)),
                         args[0].span,
                     );
                     return err;

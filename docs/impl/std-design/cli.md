@@ -12,6 +12,8 @@ These specifications define the contract for each module's implementation.
 A parser over `main(args: array<str>)`'s `array<str>` (§17) — the one argv source (no
 `env.args`). Pure in-language, no syscalls. v1 is an explicit flag-registration builder;
 struct-decode (the `json.decode`-shaped ideal) waits for derive. This is the last M10 slice.
+The same parser accepts borrowed `slice<str>` spans for subcommands and explicitly
+sliced fixed arrays. It does not acquire another argv source.
 
 ## Signatures
 
@@ -23,7 +25,7 @@ c.flag_bool(name: str)                          // register a bool flag (default
 c.flag_str(name: str, default: str)             // str flag with a default
 c.flag_i64(name: str, default: i64)             // i64 flag with a default
 c.flag_f64(name: str, default: f64)             // register an f64 flag with a default
-c.parse(args: array<str>) -> Result<parsed, Error>
+c.parse(args: array<str>) -> Result<parsed, Error> // also accepts slice<str>
 p.get_bool(name: str) -> bool                   // total after a successful parse
 p.get_str(name: str) -> str
 p.get_i64(name: str) -> i64
@@ -33,6 +35,16 @@ c.usage() -> string
 ```
 
 ## Type & ownership classification
+
+`parse` borrows the selected array/slice and every text backing only during the
+synchronous call. The selected span's element zero is skipped; empty and
+one-element spans parse only defaults. Bounds are checked before parsing and
+tokens outside the span are not read. A slice adds no argv allocation or element
+copy. Parsed owns independent names/values and may outlive the command, argv
+headers and text sources; `get_str` retains its parsed-owner lifetime. UTF-8
+elements remain length-delimited, including embedded NUL in string values.
+The grammar and errors below apply identically to both carriers.
+[Plan206](../206-cli-argument-slices.md) records the exact admission and owners.
 
 The load-bearing decision:
 

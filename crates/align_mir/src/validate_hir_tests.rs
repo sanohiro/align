@@ -14044,21 +14044,26 @@ fn hir_body_validator_native() {
         vec![body_test_local(0, "cmd", Ty::CliCommand, false, false)],
         Ty::Unit
     );
-    add!(
-        "native_cli_parse",
-        body_test_expr(
-            hir::ExprKind::CliParse {
-                cmd: Box::new(native_local(0, Ty::CliCommand)),
-                args: Box::new(native_local(1, Ty::DynArray(Scalar::Str))),
-            },
-            native_result(Ty::CliParsed, error),
-        ),
-        vec![
-            body_test_local(0, "cmd", Ty::CliCommand, false, false),
-            body_test_local(1, "args", Ty::DynArray(Scalar::Str), false, false),
-        ],
-        native_result(Ty::CliParsed, error)
-    );
+    for (name, argv_ty) in [
+        ("native_cli_parse", Ty::DynArray(Scalar::Str)),
+        ("native_cli_parse_slice", Ty::Slice(Scalar::Str)),
+    ] {
+        add!(
+            name,
+            body_test_expr(
+                hir::ExprKind::CliParse {
+                    cmd: Box::new(native_local(0, Ty::CliCommand)),
+                    args: Box::new(native_local(1, argv_ty)),
+                },
+                native_result(Ty::CliParsed, error),
+            ),
+            vec![
+                body_test_local(0, "cmd", Ty::CliCommand, false, false),
+                body_test_local(1, "args", argv_ty, false, false),
+            ],
+            native_result(Ty::CliParsed, error)
+        );
+    }
     add!(
         "native_cli_get_bool",
         body_test_expr(
@@ -15015,6 +15020,35 @@ fn hir_body_validator_native() {
         "native nominal metadata"
     );
     assert!(body_core_metadata_is_valid(&program), "native body metadata");
+    for name in ["native_cli_parse", "native_cli_parse_slice"] {
+        for fault in 0..6 {
+            let mut reject = program.clone();
+            let wrong_args = match fault {
+                2 => Some(Ty::Slice(Scalar::Int(IntTy { bits: 64, signed: true }))),
+                3 => Some(Ty::Slice(Scalar::String)),
+                4 => Some(Ty::Array(Scalar::Str, 1)),
+                _ => None,
+            };
+            // Keep the local declaration consistent so generic local typing cannot
+            // conceal a missing CLI carrier-domain check.
+            if let Some(function) = reject.fns.iter_mut().find(|function| function.name == name) {
+                if let Some(local) = function.locals.get_mut(1) {
+                    if let Some(ty) = wrong_args { local.ty = ty; }
+                }
+            }
+            let expression = body_value_expression_mut(&mut reject, name);
+            let hir::ExprKind::CliParse { cmd, args } = &mut expression.kind else {
+                panic!("CLI parse fixture discriminator");
+            };
+            match fault {
+                0 => cmd.ty = Ty::Bool,
+                1 => **cmd = body_test_expr(hir::ExprKind::CliCommand { name: Box::new(native_str()) }, Ty::CliCommand),
+                2..=4 => if let Some(ty) = wrong_args { args.ty = ty; },
+                _ => expression.ty = Ty::Bool,
+            }
+            assert!(!body_core_metadata_is_valid(&reject), "{name}: malformed field {fault}");
+        }
+    }
     for name in ["native_cli_get_f64", "native_cli_occurrences"] {
         for fault in 0..4 {
             let mut reject = program.clone();

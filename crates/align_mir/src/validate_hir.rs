@@ -10006,7 +10006,8 @@ impl<'a> BodyValidator<'a> {
                 strict(Ty::Unit, &children)
             }
             hir::ExprKind::CliParse { cmd, args } => {
-                (local(cmd, Ty::CliCommand) && cmd.ty == Ty::CliCommand && args.ty == Ty::DynArray(Scalar::Str))
+                (local(cmd, Ty::CliCommand) && cmd.ty == Ty::CliCommand
+                    && matches!(args.ty, Ty::DynArray(Scalar::Str) | Ty::Slice(Scalar::Str)))
                     .then(|| result(Ty::CliParsed, &[cmd, args]))?
             }
             hir::ExprKind::CliGetBool { parsed, name } => {

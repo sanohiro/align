@@ -4094,6 +4094,10 @@ socket
 
 A parser over `main(args: array<str>)`'s `array<str>` (§17) — the one way to reach argv (`std.env`
 above: "there is no `env.args`"); `std.cli` is not a second argv source.
+The same parser also accepts a borrowed `slice<str>`, such as `args[1..]` for
+a subcommand. Both carriers are borrowed only for the synchronous call; parsed
+names and values are independently owned. No argv array is materialized for a
+slice. Fixed arrays use an explicit `[..]` slice.
 
 ```text
 c := cli.command(name: str)                    // builder
@@ -4101,7 +4105,7 @@ c.flag_bool(name: str)                          // register a bool flag (default
 c.flag_str(name: str, default: str)             // register a str flag with a default
 c.flag_i64(name: str, default: i64)             // register an i64 flag with a default
 c.flag_f64(name: str, default: f64)             // register an f64 flag with a default
-c.parse(args: array<str>) -> Result<parsed, Error>
+c.parse(args: array<str>) -> Result<parsed, Error> // also accepts slice<str>
 p.get_bool(name: str) -> bool                   // total after a successful parse (see below)
 p.get_str(name: str) -> str
 p.get_i64(name: str) -> i64
@@ -4139,6 +4143,12 @@ reads flags from `args[1..]` in three forms: `--name` (a bool flag, set to `true
 str/i64/f64 flag with no following value, an unknown flag, a bare positional token, or a malformed `i64`/`f64`
 is an *input* error (`Error.Invalid`). Richer conventions (`-x` short flags, `--` end-of-flags,
 clustered bools, positionals) are deferred behind this same signature.
+The selected span supplies its own element zero: for `args[1..]`, the subcommand
+name is skipped. Empty and one-element spans parse only defaults. Slice bounds
+are checked before parsing; no arguments outside the selected span are read.
+Length-delimited string values preserve embedded NUL. Parsed output can outlive
+the command, argv headers and their text backing; `get_str` still borrows parsed.
+[Plan206](docs/impl/206-cli-argument-slices.md) owns carrier validation and tests.
 
 **v1 is an explicit flag-registration builder API.** Align has no derive/attributes yet, so
 decoding straight into a struct (the `json.decode`-shaped ideal) waits for that mechanism. This API
