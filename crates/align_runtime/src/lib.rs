@@ -3323,14 +3323,31 @@ fn builder_push_u64(buf: &mut BuilderBuf, v: u64) {
         return;
     }
     let mut tmp = [0u8; 20]; // widest u64 = 20 digits
-    let mut i = tmp.len();
-    let mut n = v;
-    while n > 0 {
-        i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-    }
+    let i = decimal_magnitude(&mut tmp, v);
     buf.extend_from_slice(&tmp[i..]);
+}
+
+/// Return the first initialized decimal byte. At most ten pairs fit in 20 bytes;
+/// each table offset is twice a remainder in 0..100 and therefore fits usize.
+fn decimal_magnitude(tmp: &mut [u8; 20], mut n: u64) -> usize {
+    const PAIRS: &[u8; 200] = b"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+    let mut i = tmp.len();
+    while n >= 100 {
+        let pair = usize::from((n % 100) as u8) * 2;
+        n /= 100;
+        i -= 2;
+        tmp[i..i + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+    }
+    let tail = n as u8; // n < 100 after the loop
+    if tail >= 10 {
+        let pair = usize::from(tail) * 2;
+        i -= 2;
+        tmp[i..i + 2].copy_from_slice(&PAIRS[pair..pair + 2]);
+    } else {
+        i -= 1;
+        tmp[i] = b'0' + tail;
+    }
+    i
 }
 
 /// Read a little-endian integer of `w` (1/2/4/8) bytes at `ptr` as a zero-extended `u64`.
@@ -3747,21 +3764,10 @@ fn builder_push_i64(buf: &mut BuilderBuf, v: i64) {
         buf.extend_from_slice(&tmp[..len]);
         return;
     }
-    // 20 = the widest i64 decimal (`-9223372036854775808`). Emit digits back-to-front from the
-    // value's magnitude computed via `n % 10` / `unsigned_abs` (works for `i64::MIN` — never negates).
+    // A signed magnitude has at most 19 digits, leaving room for the sign even
+    // for i64::MIN. unsigned_abs never negates that value in the signed domain.
     let mut tmp = [0u8; 20];
-    let mut i = tmp.len();
-    // Work on the unsigned magnitude (`unsigned_abs` handles `i64::MIN`): the loop then uses unsigned
-    // div/mod, which LLVM lowers to a multiply+shift — no signed-division sign corrections per digit.
-    let mut n = v.unsigned_abs();
-    loop {
-        i -= 1;
-        tmp[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            break;
-        }
-    }
+    let mut i = decimal_magnitude(&mut tmp, v.unsigned_abs());
     if v < 0 {
         i -= 1;
         tmp[i] = b'-';
@@ -34536,7 +34542,20 @@ mod tests {
     #[test]
     fn builder_write_int_matches_format() {
         // The hand-rolled itoa must equal `format!("{v}")` across the i64 range incl. edges.
-        for v in [0i64, 7, -1, 42, -123, i64::MAX, i64::MIN, 1000000000000, -9999] {
+        let mut values: Vec<i64> = (-100_000..=100_000).collect();
+        values.extend([i64::MAX, i64::MIN]);
+        for width in 1..=18 {
+            let power = 10_i64.pow(width);
+            for value in [power - 1, power, power + 1] {
+                values.extend([value, -value]);
+            }
+        }
+        let mut seed = 0x512e_66ab_129c_804f_u64;
+        for _ in 0..4096 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            values.push(i64::from_ne_bytes(seed.to_ne_bytes()));
+        }
+        for v in values {
             let mut b = builder_value(std::ptr::null_mut(), 0);
             unsafe { align_rt_builder_write_int(&mut b, v) };
             assert_eq!(String::from_utf8(b.buf.as_slice().to_vec()).unwrap(), format!("{v}"), "write_int({v})");
@@ -34545,7 +34564,18 @@ mod tests {
 
     #[test]
     fn builder_write_uint_matches_format_including_u64_max() {
-        for value in [0u64, 7, 42, u32::MAX as u64, i64::MAX as u64, u64::MAX] {
+        let mut values: Vec<u64> = (0..=100_000).collect();
+        values.extend([u64::from(u32::MAX), i64::MAX as u64, 1_u64 << 63, u64::MAX]);
+        for width in 1..=19 {
+            let power = 10_u64.pow(width);
+            values.extend([power - 1, power, power + 1]);
+        }
+        let mut seed = 0xbec8_438a_7124_055d_u64;
+        for _ in 0..4096 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            values.push(seed);
+        }
+        for value in values {
             let mut builder = builder_value(std::ptr::null_mut(), 0);
             unsafe { align_rt_builder_write_uint(&mut builder, value) };
             assert_eq!(
@@ -34702,6 +34732,16 @@ mod tests {
                 Box::new(|b| unsafe { align_rt_builder_write_int(b, -42) }),
             ),
             (
+                "wide-int",
+                b"-9223372036854775808".to_vec(),
+                Box::new(|b| unsafe { align_rt_builder_write_int(b, i64::MIN) }),
+            ),
+            (
+                "wide-uint",
+                b"18446744073709551615".to_vec(),
+                Box::new(|b| unsafe { align_rt_builder_write_uint(b, u64::MAX) }),
+            ),
+            (
                 "bool",
                 b"true".to_vec(),
                 Box::new(|b| unsafe { align_rt_builder_write_bool(b, 1) }),
@@ -34734,6 +34774,15 @@ mod tests {
                         7,
                         b"y".as_ptr(),
                         1,
+                    )
+                }),
+            ),
+            (
+                "wide-batched",
+                b"x-9223372036854775808y".to_vec(),
+                Box::new(|b| unsafe {
+                    align_rt_builder_write_str_int_str(
+                        b, b"x".as_ptr(), 1, i64::MIN, b"y".as_ptr(), 1,
                     )
                 }),
             ),

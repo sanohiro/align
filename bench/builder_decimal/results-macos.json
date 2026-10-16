@@ -1,0 +1,166 @@
+{
+  "base": "3e5e0d5cb8736be14c1c9f083a58f08068f8ac1c",
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "protocol": "Two complete per-group ABBA passes, all 392 samples retained; no concurrent builds/tests.",
+  "baseline": {
+    "crates/align_runtime/src/lib.rs": "90fef9b2ea9aa06f77c7388745fbb68e8b0117d65ed7773f5af9d404af98d4c0",
+    "bench/builder_decimal/main.c": "9bd7eed0adfea8fd4c06d0b3a42d6753ffdb4126fa32017a6b00511e3d306217",
+    "target/release/libalign_runtime.a": "1b1bd25ef3d5ebaff718dd39f849603eac9cd91063385c567259b46e19090bde",
+    ".git/align-builder-decimal/baseline": "3f38199c92b0cfbb34c89e11822fa9e8719f2ad638470335378417dda533ff88",
+    "binary_bytes": 409192
+  },
+  "candidate": {
+    "crates/align_runtime/src/lib.rs": "4b47480c6a3b1c588bf215516cf65d044d7923c42ea9d22a2deb7a8353ee0fa5",
+    "bench/builder_decimal/main.c": "9bd7eed0adfea8fd4c06d0b3a42d6753ffdb4126fa32017a6b00511e3d306217",
+    "target/release/libalign_runtime.a": "4aae32f8ff3fd7ad42287ae04c3da868a0d89049e6edbdf713cc797fc54cae76",
+    ".git/align-builder-decimal/candidate": "1ad977a8a8f8fb0927537804c05bbf323d9b491618b101542f73924313309abb",
+    "binary_bytes": 409256
+  },
+  "medians": [
+    {
+      "group": 0,
+      "baseline": 8.349,
+      "candidate": 8.808499999999999,
+      "percent": 5.503653132111608,
+      "delta": 0.45949999999999847
+    },
+    {
+      "group": 1,
+      "baseline": 10.473500000000001,
+      "candidate": 10.4505,
+      "percent": -0.21960185229389362,
+      "delta": -0.023000000000001464
+    },
+    {
+      "group": 2,
+      "baseline": 16.5935,
+      "candidate": 13.255,
+      "percent": -20.119323831620804,
+      "delta": -3.338499999999998
+    },
+    {
+      "group": 3,
+      "baseline": 7.2105,
+      "candidate": 7.4175,
+      "percent": 2.8708133971292016,
+      "delta": 0.20700000000000074
+    },
+    {
+      "group": 4,
+      "baseline": 14.8755,
+      "candidate": 12.9605,
+      "percent": -12.87351685657625,
+      "delta": -1.915000000000001
+    },
+    {
+      "group": 5,
+      "baseline": 18.4375,
+      "candidate": 18.79,
+      "percent": 1.911864406779662,
+      "delta": 0.35249999999999915
+    },
+    {
+      "group": 6,
+      "baseline": 24.5565,
+      "candidate": 23.4005,
+      "percent": -4.70751124956732,
+      "delta": -1.1559999999999988
+    }
+  ],
+  "build_logs": {
+    "baseline": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.02s\nbaseline built\n",
+    "candidate": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.06s\ncandidate built\n"
+  },
+  "toolchain": {
+    "rust": "rustc 1.96.1 (31fca3adb 2026-06-26) (Homebrew)",
+    "cc": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+  },
+  "admission": "At least 10% gain in a wide-value group; no group regresses by both more than 5% and 0.5 ns.",
+  "prior_qualification": "An initial two-pass comparison used bounded direct usize casts; final code converts proven sub-100 values through u8 and usize::from. The complete final comparison was repeated, with no initial samples pooled or final samples discarded.",
+  "per_pass_medians": [
+    {
+      "repetition": 0,
+      "group": 0,
+      "baseline": 8.306999999999999,
+      "candidate": 8.808499999999999
+    },
+    {
+      "repetition": 0,
+      "group": 1,
+      "baseline": 10.568000000000001,
+      "candidate": 10.8095
+    },
+    {
+      "repetition": 0,
+      "group": 2,
+      "baseline": 16.572499999999998,
+      "candidate": 13.252500000000001
+    },
+    {
+      "repetition": 0,
+      "group": 3,
+      "baseline": 7.1985,
+      "candidate": 7.4165
+    },
+    {
+      "repetition": 0,
+      "group": 4,
+      "baseline": 14.877,
+      "candidate": 12.9835
+    },
+    {
+      "repetition": 0,
+      "group": 5,
+      "baseline": 18.4085,
+      "candidate": 19.03
+    },
+    {
+      "repetition": 0,
+      "group": 6,
+      "baseline": 24.558500000000002,
+      "candidate": 23.407
+    },
+    {
+      "repetition": 1,
+      "group": 0,
+      "baseline": 8.411000000000001,
+      "candidate": 8.814
+    },
+    {
+      "repetition": 1,
+      "group": 1,
+      "baseline": 10.45,
+      "candidate": 10.433
+    },
+    {
+      "repetition": 1,
+      "group": 2,
+      "baseline": 16.6035,
+      "candidate": 13.256499999999999
+    },
+    {
+      "repetition": 1,
+      "group": 3,
+      "baseline": 7.218999999999999,
+      "candidate": 7.418
+    },
+    {
+      "repetition": 1,
+      "group": 4,
+      "baseline": 14.86,
+      "candidate": 12.955
+    },
+    {
+      "repetition": 1,
+      "group": 5,
+      "baseline": 18.492,
+      "candidate": 18.758
+    },
+    {
+      "repetition": 1,
+      "group": 6,
+      "baseline": 24.552999999999997,
+      "candidate": 23.392
+    }
+  ]
+}
