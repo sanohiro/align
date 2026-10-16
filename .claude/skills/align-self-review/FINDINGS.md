@@ -691,3 +691,10 @@ allowlist. The named ratchet and final capability owners passed after that fix.
 | PR | Reviewed candidate | Priority | Root-cause key | Finding and closure |
 |---|---|---|---|---|
 | #1379 | Plan221 initial strategy | P2 | `analysis-fact-consumer-sweep` | Key-only sort captures still entered both content initialization and borrow-result facts, contradicting the independent-result lifetime promise. Both analyses now share the existing comparator exclusion; scalar/record positives and source-text expiry/call-time mutation negatives discriminate terminal captures from actual result contents. Strategy continuation confirmed the closure before implementation. |
+
+PR #1380 local preflight qualification (not a review event): the panic-source
+ratchet counted a new test-only `expect` in a sequential-capture fixture. An
+explicit `let Some` fixture assertion closes it without changing production
+behavior or raising the limit. The completed native owner separately fails on
+the old production implementation with the capture-SSA defect and passes after
+restoring the reviewed candidate; both negative and positive evidence are retained.

@@ -25,6 +25,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan223](docs/impl/223-copy-record-scan.md) composes prefix `scan` with Copy
+  record inputs and independent Copy record accumulator arrays. Complete AoS
+  prefix states retain ordinary allocation/cleanup; independent contents shed
+  callback-only borrows while fresh headers and borrowed outputs stay tracked.
+
 - [Plan222](docs/impl/222-sequential-par-map-captures.md) preserves original HIR
   capture identities in sequential `par_map` fallback. Sibling branches no longer
   reuse non-dominating capture operands; existing execution selection, ordered

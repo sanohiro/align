@@ -377,6 +377,92 @@ fn sort_comparator_domain_and_metadata() -> Result<(), &'static str> {
 }
 
 #[test]
+fn scan_record_domain_and_metadata() -> Result<(), &'static str> {
+    let base = checked_source_program("Acc {sum:i64,pad:u8}\nRow {value:i64}\nfn f(xs:slice<Row>,initial:Acc,k:i64)->array<Acc> {value:=xs.scan(initial,fn a:Acc,x:Row {Acc {sum:a.sum+x.value+k,pad:a.pad}});return value}");
+    for per_unit in [false, true] { assert!(lower_program_checked(&base, per_unit, None).is_ok()); }
+    for mutation in 0..15 {
+        let mut bad = base.clone();
+        if mutation < 6 {
+            let callback = bad.fns.iter_mut().find(|f| matches!(f.origin, hir::FnOrigin::Lifted { .. })).ok_or("scan callback")?;
+            match mutation {
+                0 | 1 => callback.locals[callback.params[mutation] as usize].ty = Ty::Bool,
+                2 | 3 => callback.param_modes[mutation - 2] = align_ast::ParamMode::Borrow,
+                4 => callback.ret = Ty::Bool,
+                _ => callback.origin = hir::FnOrigin::Lifted { capture_count: 0 },
+            }
+        } else {
+            let expression = body_first_let_init_mut(&mut bad, "f");
+            if mutation == 6 { expression.ty = Ty::DynArray(Scalar::Struct(0)); }
+            else if mutation == 7 { expression.ty = Ty::DynStructArray(0, Layout::Soa); }
+            else {
+                let hir::ExprKind::ArrayScan { source, func, captures, init, elem, .. } = &mut expression.kind else { return Err("scan terminal") };
+                match mutation {
+                    8 => *func = "missing".into(),
+                    9 => captures.clear(),
+                    10 => captures[0].ty = Ty::Bool,
+                    11 => *elem = Ty::String,
+                    12 => init.ty = Ty::Bool,
+                    13 => source.ty = Ty::Slice(Scalar::Bool),
+                    _ => source.kind = hir::ExprKind::Local(u32::MAX),
+                }
+            }
+        }
+        assert_body_entrypoints_empty(&format!("scan metadata {mutation}"), &bad);
+    }
+    for fields in ["value:i64", "value:[i64;0]", "value:Option<i64>", "value:Result<i64,Error>", "value:(i64,bool)", "value:Nested", "value:[Nested;2]", "value:Choice"] {
+        let good = checked_source_program(&format!("Nested {{n:i64}}\nChoice {{Value(Nested),Empty}}\nAcc {{{fields}}}\nfn f(xs:slice<i64>,a:Acc)->array<Acc> {{value:=xs.scan(a,fn prior:Acc,x:i64 {{prior}});return value}}"));
+        for per_unit in [false, true] { assert!(lower_program_checked(&good, per_unit, None).is_ok(), "{fields}"); }
+    }
+    for poison in [Ty::Str, Ty::String, Ty::Raw, Ty::Slice(Scalar::Bool), Ty::Fn(0), Ty::Resource(0),
+        Ty::Array(Scalar::Str, 0), Ty::Option(Scalar::Str), Ty::Result(Scalar::Bool, Scalar::String),
+        Ty::Struct(0), Ty::Struct(u32::MAX), Ty::Tuple(u32::MAX), Ty::Enum(u32::MAX), Ty::Tagged(u32::MAX)] {
+        let mut bad = base.clone();
+        bad.structs[0].fields[1].ty = poison;
+        assert_body_entrypoints_empty(&format!("scan graph {poison:?}"), &bad);
+    }
+    let mut aligned = base.clone();
+    aligned.structs[0].align = Some(32);
+    assert_body_entrypoints_empty("scan root alignment", &aligned);
+    let sum = checked_source_program("Choice {Value(i64),Empty}\nAcc {value:Choice}\nfn f(xs:slice<i64>,a:Acc)->array<Acc> {value:=xs.scan(a,fn prior:Acc,x:i64 {prior});return value}");
+    let mut borrowed_sum = sum.clone();
+    borrowed_sum.enums[0].variants[0].payload[0] = Scalar::Str;
+    assert_body_entrypoints_empty("scan inactive borrowed variant", &borrowed_sum);
+    Ok(())
+}
+
+#[test]
+fn record_scan_uses_typed_accumulator_and_output() -> Result<(), String> {
+    let hir = checked_source_program("Acc {sum:i64,pad:u8}\nRow {value:i64}\nfn f(xs:slice<Row>,initial:Acc,k:i64)->array<Acc> {value:=xs.scan(initial,fn a:Acc,x:Row {Acc {sum:a.sum+x.value+k,pad:a.pad}});return value}");
+    let target = hir.fns.iter().find(|f| matches!(f.origin, hir::FnOrigin::Lifted { .. })).ok_or("scan callback")?.name.clone();
+    for per_unit in [false, true] {
+        let program = lower_program_checked(&hir, per_unit, None).map_err(|e| format!("{e:?}"))?;
+        producer::validate_mir_producers(&program).map_err(|e| format!("{e:?}"))?;
+        let function = program.fns.iter().find(|f| f.name.as_str() == "f").ok_or("scan function")?;
+        let values: Vec<_> = function.blocks.iter().flat_map(|b| &b.stmts).filter_map(|s| match s { Stmt::Let(_, value) => Some(value), _ => None }).collect();
+        let calls: Vec<_> = values.iter().filter_map(|v| match v { Rvalue::Call(name, args) if direct_program_name(name) == Some(target.as_str()) => Some(args), _ => None }).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 3);
+        assert_eq!(function.operand_ty(&calls[0][0]), Ty::Struct(0));
+        assert_eq!(function.operand_ty(&calls[0][1]), Ty::Struct(1));
+        assert_eq!(function.operand_ty(&calls[0][2]), int(64));
+        let folded = function.blocks.iter().flat_map(|b| &b.stmts).find_map(|statement| match statement {
+            Stmt::Let(value, Rvalue::Call(name, _)) if direct_program_name(name) == Some(target.as_str()) => Some(*value),
+            _ => None,
+        }).ok_or("folded value")?;
+        let statements: Vec<_> = function.blocks.iter().flat_map(|b| &b.stmts).collect();
+        assert_eq!(statements.iter().filter(|statement| matches!(statement, Stmt::Store(slot, Operand::Value(value)) if *value == folded && function.slots[*slot as usize] == Ty::Struct(0))).count(), 1);
+        assert_eq!(statements.iter().filter(|statement| matches!(statement, Stmt::PtrStore(_, _, Operand::Value(value)) if *value == folded)).count(), 1);
+        assert_eq!(values.iter().filter(|v| matches!(v, Rvalue::HeapAllocBuf { elem: Ty::Struct(0), .. })).count(), 1);
+        for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+            if let Stmt::Let(value, Rvalue::MakeDynArray { .. }) = statement {
+                assert_eq!(function.value_tys[*value as usize], Ty::DynStructArray(0, Layout::Aos));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn comparator_effect_replay_rejects_forged_parallel_purity() -> Result<(), &'static str> {
     let mut program = checked_source_program("fn cmp(a:i64,b:i64)->bool = a < b\nfn noisy(a:i64,b:i64)->bool { print(a); return a < b }\nfn worker(n:i64)->i64 { sorted:=[n,0].sort_by(cmp); return sorted[0] }\nfn main() { print([1,2].par_map(worker).sum()) }");
     assert!(lower_program_checked(&program, false, None).is_ok());
@@ -1819,11 +1905,11 @@ fn raw_nominal_comparisons_stay_enumerated() {
 /// than through a source fixture the producer would never emit.
 #[test]
 fn delegated_gates_still_refuse_a_genuinely_different_type() {
-    // `scan-accumulator`: a struct accumulator is the one shape the shared authority excludes.
-    let struct_accumulator = "Acc { n: i64 }\nfn step(acc: Acc, x: i64) -> Acc = acc\nfn main() -> i32 {\n  xs := [1, 2].scan(Acc { n: 0 }, step)\n  return xs.len() as i32\n}\n";
+    // `scan-accumulator`: a view-bearing record remains outside the independent domain.
+    let struct_accumulator = "Acc { n: str }\nfn step(acc: Acc, x: i64) -> Acc = acc\nfn main() -> i32 {\n  xs := [1, 2].scan(Acc { n: \"view\" }, step)\n  return xs.len() as i32\n}\n";
     assert!(
         source_is_rejected(struct_accumulator),
-        "a struct scan accumulator must still be refused",
+        "a view-bearing struct scan accumulator must still be refused",
     );
 
     // `ord-key`: a bool key has no total order under `Bound::Ord`.

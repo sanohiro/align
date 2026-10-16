@@ -428,6 +428,11 @@ alignment checked-add with ordinary add fails the exact intrinsic-count gate.
 | `sort` / `sort_by_key` | Materialize, stable bottom-up merge sort with 32-element insertion runs; decorate keys once; **adaptive total-order fast paths (below), SHIPPED** | Good worst-case/stability shape; ordered-run adaptation (`w64`) SHIPPED for total-order keys — ordered-input wins, negatives within ≈ 2% — see §4.1 |
 | `scan` | Loop-carried dependency | Correctly scalar in the general case; lack of vectorization is not a missed LLVM flag |
 
+Plan223 composes `scan` with existing Copy record inputs and independent Copy record
+accumulators through the same typed collector and ordinary calls. Result-content
+independence preserves the separate fresh array header and allocation region;
+view-bearing outputs retain their source/capture lifetimes. No SIMD or speed claim.
+
 The upper-bound allocation used by filtering does not necessarily touch every page: malloc-backed
 unused capacity is generally demand-paged, and right-sizing group outputs already measured as a
 no-op. Do not add a second count pass merely to make capacity equal length. It would evaluate a Pure

@@ -10849,11 +10849,13 @@ impl<'a> BodyValidator<'a> {
                 // Delegated: the producer owns which accumulators materialize into `array<A>`.
                 // The validator's own `scalar_to_prim` spelling of that rule rejected `()` and
                 // every sum-type accumulator that `check_array_scan` accepts.
-                let output_scalar = align_sema::scan_accumulator_scalar(*output_elem);
+                let result = align_sema::scan_accumulator_result(*output_elem,
+                    &self.program.structs, &self.program.tuples, &self.program.enums,
+                    &self.program.tagged_types)?;
                 if !self.body_ty_matches(init_flow.ty, *output_elem)
                     || !self.ty_copy_ok(input_elem, context)
                     || !self.ty_copy_ok(*output_elem, context)
-                    || output_scalar.is_none()
+                    || self.array_to_array_result(*output_elem).is_none()
                 {
                     return None;
                 }
@@ -10873,7 +10875,7 @@ impl<'a> BodyValidator<'a> {
                 flows.extend(capture_flows);
                 let (falls, breaks) = strict_flow(&flows);
                 Some((
-                    Ty::DynArray(output_scalar?),
+                    result,
                     falls,
                     breaks,
                 ))

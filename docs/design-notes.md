@@ -394,6 +394,13 @@ and scanner error cleanup are explicit. Value-carrying scopes preserve the same 
 Move value leaving a `task_group` forwards its tail local's runtime cleanup bit and clears the inner
 source.
 
+**Prefix states reuse complete Copy values.** `scan` admits existing Copy record inputs
+and independent Copy record accumulators through the ordinary aggregate call and
+AoS collector (Plan223). Complete-graph independence removes source/capture borrows
+from element contents, while fresh result-header generations and allocation regions
+remain tracked. Copy view-bearing scalar/sum outputs keep their existing lifetime
+checks; Move accumulators still need a separate per-iteration ownership strategy.
+
 **One aggregate, one allocation mode.** A bound aggregate has one path-local cleanup bit, so all of
 its owned members are free-standing or all are arena-owned. A mixed aggregate is rejected instead
 of leaking heap members or individually freeing arena storage. Borrowed members remain governed by

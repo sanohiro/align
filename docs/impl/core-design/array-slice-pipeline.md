@@ -134,6 +134,19 @@ Function arguments to stages: named `fn`, lambda `fn x { … }` / `fn acc, x { �
 `.field` projection forms. `reduce`/`scan` are **init-first** — the old trailing-init order was
 removed outright (no alias survives, per the no-backward-compat rule).
 
+`source.scan(init, f) -> array<A>` materializes the running state after each
+surviving element, in source order; `init: A` is evaluated once and never emitted,
+and `f: (A, E) -> A` runs once per survivor. Input E may be an existing Copy
+record. Alongside existing Copy scalar/sum accumulators, A may be an already-formed
+independent Copy record without explicit `align(N)`: its complete inline graph,
+including every variant and zero-length field, must contain no views, callables,
+pointers, resources or Move values. Record results use canonical AoS storage;
+root tuple accumulators remain unsupported. Source and captures remain live
+through the call. Independent result elements retain none of their borrows;
+borrowed outputs retain their lifetimes, and every result keeps its ordinary
+heap or explicit-arena allocation lifetime. No hidden clone or element move is
+introduced. Detailed domain and closure: Plan223.
+
 Direct `.sort()` accepts Copy `Ord` elements: numbers, `char` and `str`.
 `sort_by_key` and `sort_by` accept primitive Copy elements and `str`.
 Both additionally accept already-formed records without explicit `align(N)`
