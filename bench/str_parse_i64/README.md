@@ -51,3 +51,36 @@ and no group regression exceeding both 5% and 0.5 ns. All groups pass; the
 endpoint cost is +0.349 ns. These are local primitive observations, with no
 Linux, end-to-end application or portable throughput claim. CI checks semantic
 and process-lifecycle invariants, not these host-sensitive timings.
+
+## Validated zero prefixes, 2026-10-17
+
+This separate comparison starts from main
+`479a112258f4d53dd95c9263240bab37ddb14246`, including the short-input path above.
+For inputs longer than 18 digits, Plan218 admits the initial ASCII zero run
+without multiply/add arithmetic and then selects the existing scanner by the
+remaining length. Original sign/nonempty admission and complete validation of
+every remaining byte are preserved. No grammar or native ABI changes.
+
+The identical 95-golden C fixture, compiler flags and actual release producers
+ran on Apple M1 macOS arm64 with Rust 1.96.1 and Apple clang 21.0.0. Two complete
+seven-group ABBA passes retain all 392 samples, with no concurrent builds/tests.
+[Zero-prefix samples](zero-prefix-macos.csv) and
+[producer identities, logs and medians](zero-prefix-macos.json) are separate
+from the earlier short-input comparison.
+
+| Group | Baseline ns/call | Candidate ns/call | Change |
+| --- | ---: | ---: | ---: |
+| 0: short positive | 8.106 | 8.269 | +2.0% |
+| 1: short negative | 8.325 | 8.384 | +0.7% |
+| 2: short explicit plus | 8.305 | 8.343 | +0.4% |
+| 3: endpoints and overflow | 25.229 | 25.414 | +0.7% |
+| 4: leading zeros | 82.585 | 27.363 | -66.9% |
+| 5: short invalid | 4.231 | 4.523 | +6.9% |
+| 6: long invalid | 35.374 | 20.233 | -42.8% |
+
+The predeclared gate requires at least 10% improvement in the leading-zero
+group and no group regression exceeding both 5% and 0.5 ns. Every group passes.
+The short-invalid cost is +0.292 ns and is retained alongside the improvements;
+there is no uniform speedup claim. Both passes reproduce the leading-zero and
+long-invalid gains. These measurements establish neither Linux nor application
+throughput improvement.
