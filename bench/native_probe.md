@@ -1,21 +1,27 @@
 # Local native runtime probe runner
 
-The Base64, CSV field-discovery/normalization, percent/form escape, escaped-output and UTF-8 replacement probes share
+The Base64, buffer, CSV field-discovery/normalization, percent/form escape,
+escaped-output, UTF-8 replacement and timestamp parser probes share
 `bench/native_probe.py`. Their existing entry points remain:
 
 ```sh
 bash bench/base64_decode/run.sh
 bash bench/buffer_zero/run.sh
+bash bench/buffer_pages/run.sh
 bash bench/csv_quoted_scan/run.sh
 bash bench/csv_normalization/run.sh
 bash bench/escaped_decode/run.sh
 bash bench/encoding_writes/run.sh
 bash bench/utf8_lossy/run.sh
+bash bench/time_parse/run.sh 0 1
 ```
 
-The runner accepts only those seven probe names, builds the ordinary release
+The runner accepts only those nine probe names, builds the ordinary release
 runtime through `scripts/cargo.sh`, links the selected `main.c` with `-O3` and
 the existing macOS/Linux library flags, and passes its CSV output through.
+The timestamp parser instead retains its measured `-O2 -Wall -Wextra -Werror`
+flags and requires exactly two arguments: kind 0–4 and group 0–3. Every other
+probe takes no arguments. Malformed arguments reject before scratch acquisition.
 `CC` selects one compiler executable (default `cc`); `CARGO_TARGET_DIR` selects
 the Cargo target directory (default `target`, relative to the repository).
 Before building, the runner refreshes the runtime source mtime without changing

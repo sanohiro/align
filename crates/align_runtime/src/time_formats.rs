@@ -21,12 +21,6 @@ fn resolution(kind: i32) -> Option<i128> {
     }
 }
 
-fn year_start(year: i64) -> i64 {
-    let previous = year - 1;
-    previous * 365 + previous.div_euclid(4) - previous.div_euclid(100) + previous.div_euclid(400)
-        - 719_162
-}
-
 fn month_days(year: i64, month: i64) -> Option<i64> {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
@@ -44,11 +38,15 @@ fn civil_days(year: i64, month: i64, day: i64) -> Option<i64> {
     if !(1..=month_days(year, month)?).contains(&day) {
         return None;
     }
-    let mut days = year_start(year) + day - 1;
-    for m in 1..month {
-        days += month_days(year, m)?;
-    }
-    Some(days)
+    // Inverse of civil_date's public-domain March-based derivation. The parser's
+    // four-digit year bounds adjusted_year to -1..9999; all intermediates fit i64.
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = adjusted_year.div_euclid(400);
+    let year_in_era = adjusted_year.rem_euclid(400);
+    let march_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_in_year = (153 * march_month + 2) / 5 + day - 1;
+    let day_in_era = year_in_era * 365 + year_in_era / 4 - year_in_era / 100 + day_in_year;
+    Some(era * 146_097 + day_in_era - 719_468)
 }
 
 fn civil_date(days: i64) -> Option<(i64, i64, i64)> {
