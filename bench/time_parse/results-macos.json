@@ -1,0 +1,168 @@
+{
+  "date": "2026-10-17",
+  "host": "Apple M1, macOS arm64",
+  "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26) (Homebrew)",
+  "cc": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "profile": "release, non-test runtime",
+  "baseline": {
+    "commit": "4e2eed525be52f0502aee5ad7aef0bded29c49e2",
+    "runtime_source_sha256": "57e005e717911a91795cb2ce08daf7ba557f07e02002ca658c4b02e5634f354c",
+    "runtime_archive_sha256": "93311f08728051a25f1d20cb9b96655ec514f5bdc87fe25e5a6e98513e14fdfa",
+    "benchmark_source_sha256": "3bf3e57fdec50652fa1ecaaab11c4284bc0c8d0f611c34ee41798bd6ba2e514b"
+  },
+  "candidate_source_sha256": "ebc1775782f0689a2261d12501fa54811928cdf5f454a871e8044a8fd02c2918",
+  "candidate_archive_sha256": "52ace18e608e5afe750a27ff5000c74d7b0313ca25cd62703f39fb13e17016e0",
+  "binary_sha256": {
+    "baseline": "f8756b5d7d69ae4339261aa054d85eba47b7953bfa4c6cef02de2d014596626a",
+    "candidate": "667261fae7bcc35b8899effc7ba21670701e7d3fe20a91d3c227dff5b5645dcd"
+  },
+  "binary_bytes": {
+    "baseline": 34568,
+    "candidate": 34568
+  },
+  "benchmark_source_sha256": "3bf3e57fdec50652fa1ecaaab11c4284bc0c8d0f611c34ee41798bd6ba2e514b",
+  "sample_file_sha256": "244b3b8507f55598f25cacea3d2ef62b6b169abfed448ef45ef1049d4f713393",
+  "protocol": "Two complete passes; per kind/group baseline/candidate/candidate/baseline; seven samples per process, 28 per arm/cell. No samples discarded. Qualification and runner reproduction are separate, not pooled. No concurrent agent builds/tests.",
+  "medians": [
+    {
+      "kind": 0,
+      "group": 0,
+      "baseline_ns": 14.5785,
+      "candidate_ns": 14.56,
+      "change_percent": -0.12689920087800566
+    },
+    {
+      "kind": 0,
+      "group": 1,
+      "baseline_ns": 15.9275,
+      "candidate_ns": 14.908999999999999,
+      "change_percent": -6.394600533668193
+    },
+    {
+      "kind": 0,
+      "group": 2,
+      "baseline_ns": 21.069,
+      "candidate_ns": 20.135,
+      "change_percent": -4.43305330105842
+    },
+    {
+      "kind": 0,
+      "group": 3,
+      "baseline_ns": 12.413,
+      "candidate_ns": 12.342500000000001,
+      "change_percent": -0.567952952549744
+    },
+    {
+      "kind": 1,
+      "group": 0,
+      "baseline_ns": 18.19,
+      "candidate_ns": 18.2925,
+      "change_percent": 0.5634964266080233
+    },
+    {
+      "kind": 1,
+      "group": 1,
+      "baseline_ns": 19.356,
+      "candidate_ns": 18.843,
+      "change_percent": -2.6503409795412325
+    },
+    {
+      "kind": 1,
+      "group": 2,
+      "baseline_ns": 20.8825,
+      "candidate_ns": 19.761,
+      "change_percent": -5.370525559679162
+    },
+    {
+      "kind": 1,
+      "group": 3,
+      "baseline_ns": 11.7345,
+      "candidate_ns": 11.573,
+      "change_percent": -1.376283608163964
+    },
+    {
+      "kind": 2,
+      "group": 0,
+      "baseline_ns": 20.1905,
+      "candidate_ns": 20.1755,
+      "change_percent": -0.07429236522127347
+    },
+    {
+      "kind": 2,
+      "group": 1,
+      "baseline_ns": 47.3635,
+      "candidate_ns": 46.945499999999996,
+      "change_percent": -0.8825361301424195
+    },
+    {
+      "kind": 2,
+      "group": 2,
+      "baseline_ns": 44.3545,
+      "candidate_ns": 43.266000000000005,
+      "change_percent": -2.4540914676075665
+    },
+    {
+      "kind": 2,
+      "group": 3,
+      "baseline_ns": 25.052,
+      "candidate_ns": 24.4145,
+      "change_percent": -2.5447070094203994
+    },
+    {
+      "kind": 3,
+      "group": 0,
+      "baseline_ns": 12.618,
+      "candidate_ns": 12.6905,
+      "change_percent": 0.5745760025360536
+    },
+    {
+      "kind": 3,
+      "group": 1,
+      "baseline_ns": 13.91,
+      "candidate_ns": 12.8975,
+      "change_percent": -7.278936017253768
+    },
+    {
+      "kind": 3,
+      "group": 2,
+      "baseline_ns": 14.257,
+      "candidate_ns": 13.1005,
+      "change_percent": -8.111804727502282
+    },
+    {
+      "kind": 3,
+      "group": 3,
+      "baseline_ns": 8.989,
+      "candidate_ns": 9.184000000000001,
+      "change_percent": 2.1693180554010594
+    },
+    {
+      "kind": 4,
+      "group": 0,
+      "baseline_ns": 9.0015,
+      "candidate_ns": 9.0175,
+      "change_percent": 0.17774815308559955
+    },
+    {
+      "kind": 4,
+      "group": 1,
+      "baseline_ns": 10.317,
+      "candidate_ns": 9.154499999999999,
+      "change_percent": -11.267810410002921
+    },
+    {
+      "kind": 4,
+      "group": 2,
+      "baseline_ns": 10.656,
+      "candidate_ns": 9.446,
+      "change_percent": -11.355105105105112
+    },
+    {
+      "kind": 4,
+      "group": 3,
+      "baseline_ns": 7.864,
+      "candidate_ns": 7.82,
+      "change_percent": -0.5595116988809767
+    }
+  ]
+}
