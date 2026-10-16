@@ -1,7 +1,7 @@
 # Checked decimal parsing
 
 This direct native probe measures the existing allocation-free
-`align_rt_str_parse_i64` entry point. Its 95 fixed goldens contain short positive,
+`align_rt_str_parse_i64` entry point. Its 111 fixed goldens contain short positive,
 negative and explicit-plus values; i64 endpoints and overflow; long leading
 zeros; and short/long invalid text, including embedded NUL and invalid UTF-8.
 Every warmup and timed call checks exact status and output. Each sample also
@@ -84,3 +84,36 @@ The short-invalid cost is +0.292 ns and is retained alongside the improvements;
 there is no uniform speedup claim. Both passes reproduce the leading-zero and
 long-invalid gains. These measurements establish neither Linux nor application
 throughput improvement.
+
+## Four-digit accumulation, 2026-10-17
+
+This comparison starts from main
+`e8e4b2d3ea7421888cbf78da44f46f1547d8e466`, including the validated zero-prefix
+path above. Plan219 groups 8..18 remaining digits into four-byte coefficients,
+validates all four bytes before arithmetic, and retains scalar accumulation for
+shorter inputs and final remainders. Every accumulated prefix stays below 10^18.
+The expanded 111-golden corpus adds 7/8-digit valid and malformed controls before
+building either producer; both producers use that identical fixture.
+
+Two complete seven-group ABBA passes retain all 392 samples on Apple M1 macOS
+arm64, with no concurrent builds/tests or discarded samples. The first completed
+baseline process was retained when the measurement collector's CSV-header
+handling was corrected; the remaining processes continued from that checkpoint.
+[Samples](digit-blocks-macos.csv) and [identities, logs and medians](digit-blocks-macos.json)
+record the actual release producers and remain separate from earlier comparisons.
+
+| Group | Baseline ns/call | Candidate ns/call | Change |
+| --- | ---: | ---: | ---: |
+| 0: short positive | 7.887 | 6.746 | -14.5% |
+| 1: short negative | 8.016 | 6.891 | -14.0% |
+| 2: short explicit plus | 7.989 | 6.824 | -14.6% |
+| 3: endpoints and overflow | 25.941 | 26.004 | +0.2% |
+| 4: leading zeros | 28.087 | 27.170 | -3.3% |
+| 5: short invalid | 4.775 | 4.671 | -2.2% |
+| 6: long invalid | 22.148 | 21.084 | -4.8% |
+
+The predeclared gate requires at least 10% improvement in one short-valid group
+and no group regression exceeding both 5% and 0.5 ns. Every group passes; both
+passes reproduce the short-valid gains. The endpoint cost is +0.063 ns. These
+are local primitive measurements, with no Linux or application throughput claim
+and no host-sensitive timing gate in CI.
