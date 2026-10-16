@@ -32584,6 +32584,60 @@ fn main() -> i32 = 0
             assert!(changed);
             assert_xml_producer_rejected(&bad, &format!("retired/replaced builder {mutation}"));
         }
+        for discarded in [false, true] {
+          let result = if discarded { "unused := b[0]" } else { "return b[0]" };
+          let ret = if discarded { "" } else { "-> i64" };
+          let base = mir(&format!("fn query() {ret} {{ mut b: array_builder<i64> := array_builder(); b.push(7); {result} }}\nfn main() {{}}"));
+          for forwarded in [false, true] { for retirement in 0..5 { for joined in [false, true] {
+            let mut bad = base.clone();
+            for function in &mut bad.fns {
+                let original = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt|
+                    match stmt { Stmt::Let(value, Rvalue::ArrayBuilderNew { .. }) => Some(*value), _ => None });
+                let Some(original) = original else { continue };
+                let snapshot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt|
+                    match stmt { Stmt::Let(_, Rvalue::ArrayBuilderRead { builder: Operand::Value(value), .. }) => Some(*value), _ => None }).ok_or("snapshot")?;
+                let (block_index, index, slot) = function.blocks.iter().enumerate().find_map(|(bi, block)|
+                    block.stmts.iter().enumerate().find_map(|(si, stmt)| match stmt {
+                        Stmt::Let(value, Rvalue::Load(slot)) if *value == snapshot => Some((bi, si, *slot)), _ => None,
+                    })).ok_or("snapshot load")?;
+                let load = u32::try_from(function.value_tys.len()).map_err(|_| "load id")?;
+                function.value_tys.push(function.slots[slot as usize]);
+                let alias = u32::try_from(function.value_tys.len()).map_err(|_| "alias id")?;
+                function.value_tys.push(function.slots[slot as usize]);
+                let prefix = [Stmt::Let(load, Rvalue::Load(slot)),
+                    Stmt::Let(alias, Rvalue::Use(Operand::Value(load)))];
+                let retired_value = if retirement >= 3 { original } else { load };
+                let retire = match retirement {
+                    0 => Stmt::Drop(slot),
+                    1 | 3 => {
+                        let output = u32::try_from(function.value_tys.len()).map_err(|_| "build id")?;
+                        function.value_tys.push(Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })));
+                        Stmt::Let(output, Rvalue::ArrayBuilderBuild { builder: Operand::Value(retired_value) })
+                    }
+                    _ => Stmt::DropValue(Operand::Value(retired_value)),
+                };
+                let mut invalid = vec![retire];
+                if retirement < 3 {
+                    invalid.push(Stmt::Store(slot, Operand::Value(if forwarded { alias } else { original })));
+                }
+                let block = &mut function.blocks[block_index];
+                block.stmts.splice(index..index, prefix);
+                if joined {
+                    let tail = block.stmts.split_off(index + 2);
+                    let term = block.term.clone();
+                    let invalid_id = u32::try_from(function.blocks.len()).map_err(|_| "block id")?;
+                    function.blocks[block_index].term = Term::Branch(Operand::Const(Const::Bool(true)), invalid_id, invalid_id + 1);
+                    function.blocks.push(align_mir::Block { id: invalid_id, stmts: invalid, stmt_lines: vec![], term: Term::Goto(invalid_id + 1) });
+                    function.blocks.push(align_mir::Block { id: invalid_id + 1, stmts: tail, stmt_lines: vec![], term });
+                } else {
+                    block.stmts.splice(index + 2..index + 2, invalid);
+                }
+            }
+            let label = format!("revived builder {discarded}/{forwarded}/{retirement}/{joined}");
+            assert_xml_producer_rejected(&bad, &label);
+            assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{label}");
+          } } }
+        }
         let base = mir("fn query(borrow b: array_builder<i64>) { unused := b[0] }\nfn main() {}\n");
         let mut bad = base.clone();
         for function in &mut bad.fns {

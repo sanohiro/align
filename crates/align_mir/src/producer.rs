@@ -9004,7 +9004,7 @@ fn validate_resource_rvalues_inner(
 }
 
 /// A read snapshots a stable builder header before its index runs. Authenticate that snapshot
-/// against every CFG path: producer type/provenance alone cannot reject a later Drop or replacement.
+/// against every CFG path, preserving ownership identity through moves, forwarded SSA and stores.
 fn validate_builder_read_reservations(
     program: &Program,
     function: &Function,
@@ -9014,9 +9014,67 @@ fn validate_builder_read_reservations(
         .any(|statement| matches!(statement, Stmt::Let(_, Rvalue::ArrayBuilderRead { .. }))) {
         return Ok(());
     }
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct State {
+        slots: Vec<usize>,
+        values: Vec<usize>,
+        args: Vec<usize>,
+        reserved: bool,
+    }
+    impl State {
+        fn operand(&self, operand: &Operand) -> usize {
+            match operand {
+                Operand::Value(value) => self.values.get(*value as usize).copied().unwrap_or(0),
+                Operand::Arg(argument) => self.args.get(*argument as usize).copied().unwrap_or(0),
+                Operand::BorrowedPlace(place) => self.slots.get(place.slot as usize).copied().unwrap_or(0),
+                _ => 0,
+            }
+        }
+        fn fresh(&self) -> usize {
+            self.slots.iter().chain(&self.values).chain(&self.args).copied().max().unwrap_or(0) + 1
+        }
+        fn retire(&mut self, identity: usize) {
+            if identity == 0 { return; }
+            for token in self.slots.iter_mut().chain(&mut self.values).chain(&mut self.args) {
+                if *token == identity { *token = 0; }
+            }
+        }
+        // Identities are equality classes, not allocation counters. Canonical renaming makes
+        // repeated allocations through loops a finite state space without reviving stale aliases.
+        fn normalize(&mut self) {
+            let mut names = HashMap::new();
+            for token in self.slots.iter_mut().chain(&mut self.values).chain(&mut self.args) {
+                if *token != 0 {
+                    let next = names.len() + 1;
+                    *token = *names.entry(*token).or_insert(next);
+                }
+            }
+        }
+    }
     let definitions: HashMap<_, _> = function.blocks.iter().flat_map(|block| &block.stmts)
         .filter_map(|statement| match statement { Stmt::Let(id, value) => Some((*id, value)), _ => None })
         .collect();
+    let is_builder_operand = |operand: &Operand| match operand {
+        Operand::Value(value) => function.value_tys.get(*value as usize).is_some_and(|ty| ty.is_array_builder()),
+        Operand::Arg(argument) => function.params.get(*argument as usize)
+            .and_then(|slot| function.slots.get(*slot as usize)).is_some_and(|ty| ty.is_array_builder()),
+        Operand::BorrowedPlace(place) => place.ty.is_array_builder(),
+        _ => false,
+    };
+    let is_null = |operand: &Operand| {
+        let mut operand = operand;
+        let mut seen = HashSet::new();
+        loop {
+            match operand {
+                Operand::Value(value) if seen.insert(*value) => match definitions.get(value).copied() {
+                    Some(Rvalue::RawNull) => break true,
+                    Some(Rvalue::Use(source)) => operand = source,
+                    _ => break false,
+                },
+                _ => break false,
+            }
+        }
+    };
     let reads = definitions.iter().filter_map(|(&id, value)| match value {
         Rvalue::ArrayBuilderRead { builder, .. } => Some((id, builder)), _ => None,
     }).collect::<Vec<_>>();
@@ -9028,54 +9086,73 @@ fn validate_builder_read_reservations(
         if !function.slots.get(*slot as usize).is_some_and(|ty| ty.is_array_builder()) {
             return Err(fail());
         }
-        let aliases = |operand: &Operand| {
-            let mut operand = operand;
-            let mut seen = HashSet::new();
-            loop {
-                match operand {
-                    Operand::BorrowedPlace(place) => break place.slot == *slot,
-                    Operand::Arg(argument) => break function.params.get(*argument as usize) == Some(slot),
-                    Operand::Value(value) if seen.insert(*value) => match definitions.get(value).copied() {
-                        Some(Rvalue::Load(source)) => break source == slot,
-                        Some(Rvalue::Use(source)) => operand = source,
-                        _ => break false,
-                    },
-                    _ => break false,
-                }
+        let mut initial = State { slots: vec![0; function.slots.len()],
+            values: vec![0; function.value_tys.len()], args: vec![0; function.params.len()], reserved: false };
+        for (index, parameter) in function.params.iter().enumerate() {
+            if function.slots.get(*parameter as usize).is_some_and(|ty| ty.is_array_builder()) {
+                initial.args[index] = index + 1;
             }
-        };
-        // The boolean states are finite even across loops. Store starts a fresh owner; a snapshot
-        // can be used only after its exact Load and before any owner-changing operation.
-        let mut pending = VecDeque::from([(function.entry, false, false)]);
+        }
+        initial.normalize();
+        let mut pending = VecDeque::from([(function.entry, initial)]);
         let mut seen = HashSet::new();
         let mut reached = false;
-        while let Some((block, mut live, mut reserved)) = pending.pop_front() {
-            if !seen.insert((block, live, reserved)) { continue; }
+        while let Some((block, mut state)) = pending.pop_front() {
+            if !seen.insert((block, state.clone())) { continue; }
             let block = function.blocks.get(block as usize).ok_or_else(&fail)?;
             for statement in &block.stmts {
-                let mut changed = false;
-                let mut retired = false;
+                let tracked = state.slots[*slot as usize];
                 match statement {
-                    Stmt::Store(destination, source) if destination == slot => {
-                        live = !matches!(source, Operand::Value(value)
-                            if matches!(definitions.get(value), Some(Rvalue::RawNull)));
-                        reserved = false;
+                    Stmt::Store(destination, source)
+                        if function.slots.get(*destination as usize).is_some_and(|ty| ty.is_array_builder()) => {
+                        let identity = state.operand(source);
+                        if identity == 0 && !is_null(source) { return Err(fail()); }
+                        let old = state.slots[*destination as usize];
+                        if destination == slot || (identity != 0 && identity == tracked) { state.reserved = false; }
+                        // Publishing an owner consumes all earlier SSA/slot aliases. Only a fresh
+                        // Load from its new place may authorize another transfer or observation.
+                        // A null store moves the owner into an SSA operand before build/call;
+                        // it clears the place but does not free that pending transferred owner.
+                        if identity != 0 { state.retire(old); }
+                        state.retire(identity);
+                        state.slots[*destination as usize] = identity;
                     }
-                    Stmt::Store(_, source) if aliases(source) => retired = true,
-                    Stmt::Drop(source) | Stmt::DropFlagMoveOut { slot: source, .. }
-                        if source == slot => retired = true,
-                    Stmt::DropValue(source) if aliases(source) => retired = true,
-                    Stmt::Let(id, _) if id == snapshot => reserved = live,
-                    Stmt::Let(id, _) if *id == read => {
-                        reached = true;
-                        if !reserved { return Err(fail()); }
+                    Stmt::DropFlagMoveOut { slot: source, .. } => {
+                        if source == slot { state.reserved = false; }
+                        if let Some(identity) = state.slots.get_mut(*source as usize) { *identity = 0; }
                     }
-                    Stmt::Let(_, value) => {
+                    Stmt::Drop(source) => {
+                        let identity = state.slots.get(*source as usize).copied().unwrap_or(0);
+                        if identity != 0 && identity == tracked { state.reserved = false; }
+                        state.retire(identity);
+                    }
+                    Stmt::DropValue(source) => {
+                        let identity = state.operand(source);
+                        if identity == 0 && is_builder_operand(source) && !is_null(source) { return Err(fail()); }
+                        if identity != 0 && identity == tracked { state.reserved = false; }
+                        state.retire(identity);
+                    }
+                    Stmt::Let(id, value) => {
+                        if *id == read {
+                            reached = true;
+                            if !state.reserved || tracked == 0 || state.operand(owner) != tracked { return Err(fail()); }
+                        }
+                        let (mut changed, mut retired) = (Vec::new(), Vec::new());
                         match value {
-                            Rvalue::ArrayBuilderBuild { builder } if aliases(builder) => retired = true,
-                            Rvalue::ArrayBuilderPush { builder, .. }
+                            Rvalue::ArrayBuilderLen(builder)
+                            | Rvalue::ArrayBuilderRead { builder, .. }
+                            | Rvalue::ArrayBuilderBuild { builder }
+                            | Rvalue::ArrayBuilderPush { builder, .. }
                             | Rvalue::ArrayBuilderPushStr { builder, .. }
-                            | Rvalue::ArrayBuilderAppend { builder, .. } if aliases(builder) => changed = true,
+                            | Rvalue::ArrayBuilderAppend { builder, .. } => {
+                                let identity = state.operand(builder);
+                                if identity == 0 { return Err(fail()); }
+                                if matches!(value, Rvalue::ArrayBuilderBuild { .. }) { retired.push(identity); }
+                                else if matches!(value, Rvalue::ArrayBuilderPush { .. }
+                                    | Rvalue::ArrayBuilderPushStr { .. } | Rvalue::ArrayBuilderAppend { .. }) {
+                                    changed.push(identity);
+                                }
+                            }
                             _ => {}
                         }
                         let call = match value {
@@ -9090,22 +9167,46 @@ fn validate_builder_read_reservations(
                             _ => None,
                         };
                         if let Some((args, modes)) = call {
-                            for (index, _) in args.iter().enumerate().filter(|(_, argument)| aliases(argument)) {
+                            for (index, argument) in args.iter().enumerate() {
+                                let identity = state.operand(argument);
+                                if identity == 0 {
+                                    if is_builder_operand(argument) { return Err(fail()); }
+                                    continue;
+                                }
                                 match modes.as_ref().and_then(|modes| modes.get(index)) {
                                     Some(align_ast::ParamMode::Borrow) => {}
-                                    Some(align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out) => changed = true,
-                                    _ => retired = true,
+                                    Some(align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out) => changed.push(identity),
+                                    _ => retired.push(identity),
                                 }
                             }
+                        }
+                        if tracked != 0 && changed.iter().chain(&retired).any(|identity| *identity == tracked) {
+                            state.reserved = false;
+                        }
+                        for identity in retired { state.retire(identity); }
+                        if function.value_tys.get(*id as usize).is_some_and(|ty| ty.is_array_builder()) {
+                            let identity = match value {
+                                Rvalue::Load(source) => state.slots.get(*source as usize).copied().unwrap_or(0),
+                                Rvalue::Use(source) => state.operand(source),
+                                Rvalue::RawNull => 0,
+                                // The mandatory producer graph separately authenticates creation
+                                // and returned-owner contracts; it cannot establish temporal life.
+                                Rvalue::ArrayBuilderNew { .. } | Rvalue::Call(..) | Rvalue::CallWithCleanup(_)
+                                | Rvalue::CallIndirect { .. } | Rvalue::CallIndirectWithCleanup(_) | Rvalue::RawCall { .. } => state.fresh(),
+                                _ => 0,
+                            };
+                            state.values[*id as usize] = identity;
+                        }
+                        if id == snapshot {
+                            state.reserved = state.slots[*slot as usize] != 0;
                         }
                     }
                     _ => {}
                 }
-                if retired { live = false; }
-                if changed || retired { reserved = false; }
             }
+            state.normalize();
             for successor in crate::byte_ranges::successors(&block.term) {
-                pending.push_back((successor, live, reserved));
+                pending.push_back((successor, state.clone()));
             }
         }
         if !reached { return Err(fail()); }

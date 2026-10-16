@@ -229,11 +229,23 @@ fn main() {
     break local[0]
   }
   print(value)
+  mut first: array_builder<i64> := array_builder()
+  first.push(12)
+  mut moved := first
+  print(moved[0])
+  mut round := 0
+  loop {
+    moved = array_builder()
+    moved.push(20 + round)
+    print(moved[0])
+    round = round + 1
+    if round == 3 { break }
+  }
 }
 "#;
     if let Some(output) = execute(stage, &[("main.align", source)], false) {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "71\n8\n9\n10\n9\n11\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "71\n8\n9\n10\n9\n11\n12\n20\n21\n22\n");
     }
 }
 
