@@ -464,26 +464,32 @@ fn warning_bearing_unit_replays_its_warnings() {
     );
 
     // The replayed span must resolve through the REPLAYING walk's source map, not the one that
-    // produced it: the rendered warning names the second project's own file.
-    let rendered = render_diagnostics("memo-warned-rendered", &files);
-    assert!(
-        rendered.contains("memo-warned-rendered")
-            && rendered.contains("d.align")
-            && rendered.contains("unused import"),
-        "a replayed diagnostic must render against the replaying project: {rendered}"
-    );
-}
-
-/// Build per-unit in a fresh project and return the FULLY RENDERED diagnostics (file name, line,
-/// column), which is what a user sees and what a stale span would corrupt.
-fn render_diagnostics(tag: &str, files: &[(&'static str, String)]) -> String {
+    // produced it: the rendered warning names this fresh project's own file.
     let refs: Vec<(&str, &str)> = files.iter().map(|(n, s)| (*n, s.as_str())).collect();
-    let proj = Proj::new(tag, &refs, "main.align");
+    let proj = Proj::new("memo-warned-rendered", &refs, "main.align");
+    let warned_source = proj
+        .dir
+        .join("d.align")
+        .canonicalize()
+        .expect("resolve warned source");
     let entry = proj.dir.join("main.align");
     let entry_src = std::fs::read_to_string(&entry).expect("read entry");
     let mut sm = SourceMap::new();
     let walk = build_per_unit(&mut sm, &entry.display().to_string(), &entry_src);
-    align_driver::format_diagnostics(&sm, &walk.diags)
+    let rendered = align_driver::format_diagnostics(&sm, &walk.diags);
+    let rendered_stats = memo::stats();
+    assert_eq!(
+        rendered_stats.unit_misses, after.unit_misses,
+        "rendering must replay: {rendered_stats:?}"
+    );
+    assert_eq!(
+        rendered_stats.unit_hits - after.unit_hits, 4,
+        "every rendered unit must replay: {rendered_stats:?}"
+    );
+    assert!(
+        rendered.contains(&format!("{}:2:8: warning: unused import `c`", warned_source.display())),
+        "a replayed diagnostic must render against the replaying project: {rendered}"
+    );
 }
 
 /// M5. The process-global compiler toggles are key material.

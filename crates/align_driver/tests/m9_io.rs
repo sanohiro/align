@@ -940,7 +940,7 @@ fn buffer_capacity_formation_and_move_diagnostics() {
         ("result", "fn main() { data := buffer(3); value: bool := data.capacity() }", "i64 vs bool"),
         ("move", "fn take(data: buffer) {}\nfn main() { data := buffer(3); before := data.capacity(); take(data); print(data.capacity()) }", "moved"),
         ("borrowed_return", "fn bad(borrow data: buffer) -> buffer { before := data.capacity(); return data }\nfn main() {}", "borrow"),
-        ("borrowed_payload_capture", "fn bad(borrow data: Option<buffer>) { match data { Some(active) => { callback := fn() { active.capacity() } }, None => {} } }\nfn main() {}", "borrow"),
+        ("borrowed_payload_capture", "fn bad(borrow data: Option<buffer>) { match data { Some(active) => { callback := fn { active.capacity() } }, None => {} } }\nfn main() {}", "a lambda cannot capture the owned value 'active'"),
         ("unresolved_receiver", "fn main() { print(missing.capacity()) }", "undefined"),
     ] {
         let files = [("main.align", source)];
