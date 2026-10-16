@@ -1320,7 +1320,12 @@ reallocation, and no second collection or ownership rule is introduced. Text
 counts UTF-8 bytes; typed builders count elements across their existing storage
 modes. Checked conversion is necessary even with bounded allocation sizes because
 zero-width region elements have no corresponding byte-size bound. Plan 140 owns
-the exact source/native contract; indexed and byte-view readers remain deferred.
+the exact length contract. Plan 209 additionally permits by-value reads of an
+already-admitted independent Copy element. The value contains no view or owner,
+so later growth cannot invalidate it. Reserving the whole builder while the
+index evaluates prevents a dangling native selection; detaching only the
+completed copy preserves subsequent growth. Text-byte views and view-bearing
+or Move element reads still need a separate provenance contract.
 
 ## Why recursive heap record builders stop at record/string array elements
 

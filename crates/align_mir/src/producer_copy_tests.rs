@@ -102,6 +102,11 @@ fn producer_plain_copy_type_graph() -> Result<(), Box<dyn std::error::Error>> {
             Ty::Result(int, Scalar::Struct(id)),
         ] {
             assert!(!xml_plain_copy_type(&program, root), "{leaf:?}/{root:?}");
+            if let Some(element) = align_sema::array_builder_elem(root) {
+                assert!(align_sema::array_builder_copy_element(Ty::array_builder(element),
+                    &program.structs, &program.tuples, &program.enums, &program.tagged_types).is_none(),
+                    "builder read accepted {leaf:?}/{root:?}");
+            }
         }
     }
     for leaf in [Scalar::Str, Scalar::String, Scalar::Fn(0)] {

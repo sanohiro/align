@@ -4933,6 +4933,16 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    retain no owner dependency; temporary/control results must first be bound.
    Counts outside i64 raise allocation-size failure without wrapping. No views
    before freeze, element admission, growth and Drop rules remain unchanged.
+   **Independent Copy reads SETTLED 2026-10-16 (plan 209):** `b[i] -> T` on a
+   bound builder or admitted named parameter copies one initialized independent
+   element. Intersect existing builder formation with the complete independent
+   Copy graph; every field, zero-length element and inactive payload participates.
+   No views, owners, raw pointers or callables. Reserve the complete receiver
+   through once-only i64 index evaluation and copying; intervening move, finish,
+   replacement or exclusive access rejects. Convert total length before signed
+   bounds, including zero-width/unused reads. The Pure allocation-free result
+   retains no builder lifetime and survives growth/finish/Drop. Existing storage,
+   formation, parameter and cleanup restrictions remain; text views stay deferred.
 
 7. **Streaming line/record reads** *(general)* — `read_line`-class chunked record iteration over
    a reader; multi-GB `expert_trace.jsonl` is the concrete consumer for the already-recorded

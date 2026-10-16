@@ -265,4 +265,20 @@ fn main() -> Result<(), Error> {
 - **動的配列の構築**： データを読み込みながら最終的な要素数が決まっていくような処理のために、`push` や `append` で要素を追加し、`len()` で途中の要素数を調べ、最後に `build()` で所有権を消費して配列を完成させる `array_builder<T>`。
 - **ストリーミング処理向けの最適化**： バッファリングされた `read_line`（行単位の読み込み）、アリーナのメモリを部分的に再利用するための `checkpoint` と `reset` 機構、そして前述した HTTP レスポンスのストリーミング機能。
 
+既に追加した独立した Copy 値は `b[i]` で読み出せます。値は成長や `build()` の後も使えます。
+添字は初期化済みの長さの範囲内に限られ、予約容量はデータに含みません。string、view、
+所有権を持つ要素は build 前にはこの方法で読めません。添字の評価中は builder を変更しません。
+
+```align
+fn main() {
+  mut spans: array_builder<i64> := array_builder(1)
+  spans.push(7)
+  first := spans[0]
+  spans.push(9)
+  values := spans.build()
+  print(first)
+  print(values[1])
+}
+```
+
 処理に必要な層を選んでください。バイト列の読み書きは `reader` / `writer`、ソケットは `std.net`、HTTP は `std.http` を使います。ルーティング、ミドルウェア、アプリケーションプロトコル、フレームワークは `pkg` が担当します。Align が提供する `pkg.web`、`pkg.frame`、`pkg.auth` は、第 [23](23-packages.md) 章で紹介します。

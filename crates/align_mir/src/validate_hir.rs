@@ -11225,6 +11225,13 @@ impl<'a> BodyValidator<'a> {
                 // Exactly one ordinary index changes its logical type: an owned string-array
                 // element is viewed as `str` while the array retains ownership of the `string`.
                 let physical_result = match receiver.ty {
+                    ty if ty.is_array_builder() => {
+                        if !matches!(recv.kind, hir::ExprKind::Local(_)) {
+                            return None;
+                        }
+                        align_sema::array_builder_copy_element(ty, &self.program.structs,
+                            &self.program.tuples, &self.program.enums, &self.program.tagged_types)?
+                    }
                     Ty::Vec(scalar, lanes) => {
                         let hir::ExprKind::Int(lane) = &index.kind else { return None };
                         if *lane < 0 || (*lane as u128) >= lanes as u128 {

@@ -3,11 +3,12 @@
 ## Current work direction
 
 The owner's latest instruction (2026-10-16) is to process outstanding requests,
-then proceed to planned work, completing PR and merge for each capability before
-starting the next. Continue until the owner asks to stop. Reconcile all three
-external request registers first and validate each request against real consumer
-evidence and Align's design. Consumer adoption remains external; retain a
-reasoned deferral when the required design conflicts with Align's invariants.
+including unstarted requests, completing PR and merge for each capability before
+starting the next. Stop after that request pass; do not continue into planned
+work. Reconcile all three external request registers first and validate each
+request against real consumer evidence and Align's design. Consumer adoption
+remains external; retain a reasoned deferral when the required design conflicts
+with Align's invariants.
 
 Prioritize existing std/library usability, useful bounded transport/library
 composition, then measured execution/storage/startup improvements. Complex
@@ -22,6 +23,12 @@ Align v0.9.0 is released; Requests138–141 are included. The workspace version 
 not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI state.
 
 ## Recent completed capabilities
+
+- [Plan209](docs/impl/209-builder-copy-reads.md) adds independent Copy indexed
+  reads from unfinished typed builders for LLM Request28's numeric columns.
+  Reads preserve initialized bounds and owner reservations while copied values
+  outlive growth, build and Drop. Text-byte views, view-bearing elements and
+  consumer adoption remain separate.
 
 - [Plan208](docs/impl/208-comparator-sorting.md) adds `sort_by(cmp)` for scalar
   Copy elements, completing the comparator portion of LLM Request27. Stable

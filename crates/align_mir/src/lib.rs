@@ -2061,6 +2061,9 @@ pub enum Rvalue {
     BuilderLen(Operand),
     /// Read the total initialized element count of an admitted array builder.
     ArrayBuilderLen(Operand),
+    /// Copy one initialized independent element. Checks the live owner and signed bounds even
+    /// when the result is discarded; no storage address or retained view escapes this operation.
+    ArrayBuilderRead { builder: Operand, index: Operand, elem: Ty },
     /// Checked zero-copy `slice<u8>` to `Option<slice<T>>` descriptor view.
     /// The little-endian requirement is retained for driver target admission.
     BytesView {
@@ -4282,7 +4285,7 @@ pub fn function_embedded_types(f: &Function) -> Vec<Ty> {
                     | Rvalue::BytesFill { scalar: elem, .. }
                     | Rvalue::BufferPut { scalar: elem, .. }
                     | Rvalue::ArrayBuilderPush { scalar: elem, .. } => types.push(*elem),
-                    Rvalue::ArrayBuilderNew { elem, .. } => types.push(*elem),
+                    Rvalue::ArrayBuilderNew { elem, .. } | Rvalue::ArrayBuilderRead { elem, .. } => types.push(*elem),
                     Rvalue::ParMapParallel {
                         src,
                         stages,
@@ -4727,7 +4730,7 @@ fn remap_function_embedded_types(
                     | Rvalue::BytesFill { scalar, .. }
                     | Rvalue::BufferPut { scalar, .. }
                     | Rvalue::ArrayBuilderPush { scalar, .. } => remap_ty(scalar, remap),
-                    Rvalue::ArrayBuilderNew { elem, .. } => remap_ty(elem, remap),
+                    Rvalue::ArrayBuilderNew { elem, .. } | Rvalue::ArrayBuilderRead { elem, .. } => remap_ty(elem, remap),
                     Rvalue::ParMapParallel {
                         src,
                         stages,
@@ -13712,6 +13715,13 @@ fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand 
 /// through its `{ptr,len}` value (`SliceIndex`); a fixed stack `array` loads through its slot
 /// (`Index`).
 fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty) -> Operand {
+    if recv.ty.is_array_builder() {
+        let owner = lower_required!(b, lower_borrowed_owned(b, recv), Operand::Const(Const::Unit));
+        let index = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
+        let value = b.fresh_value(elem_ty);
+        b.push(Stmt::Let(value, Rvalue::ArrayBuilderRead { builder: owner, index, elem: elem_ty }));
+        return Operand::Value(value);
+    }
     // `v[lane]` on a vector → `extractelement` (no bounds check: sema validated a constant lane).
     if let Ty::Vec(_, _) = recv.ty {
         let vv = lower_required!(b, lower_expr(b, recv), Operand::Const(Const::Unit));

@@ -278,4 +278,21 @@ Three other tools support streaming and larger programs:
 - `array_builder<T>` with `push`, `append`, nonconsuming `len()`, and consuming `build()` for a result whose final length is discovered while reading.
 - buffered `read_line` and arena checkpoint/reset for streaming workloads, plus HTTP response streaming described above.
 
+Read an already-appended independent Copy value with `b[i]`. The value remains
+usable after growth or `build()`. The index must be inside the initialized length;
+reserved capacity is not data. Strings, views and owning elements cannot be read
+this way before build. Keep the builder unchanged while evaluating the index.
+
+```align
+fn main() {
+  mut spans: array_builder<i64> := array_builder(1)
+  spans.push(7)
+  first := spans[0]
+  spans.push(9)
+  values := spans.build()
+  print(first)
+  print(values[1])
+}
+```
+
 Choose the narrowest layer that names the work: `reader`/`writer` for bytes, `std.net` for sockets, `std.http` for HTTP, and `pkg` for routing, middleware, protocols, and frameworks. The first-party `pkg.web`, `pkg.frame`, and `pkg.auth` packages now provide concrete examples; chapter [23](23-packages.md) introduces them.

@@ -92,3 +92,7 @@ The English and Japanese library contracts, specifications, HIR/native ledgers
 and Settled record agree. Assessment, author obligation extraction, mutation
 control and independent review evidence are retained under
 `.git/builder-length-assessment/`.
+
+Plan 209 subsequently supplies independent Copy indexed reads from admitted typed
+builders. Its separate ledger preserves the no-views-before-freeze boundary;
+text byte views and view-bearing element reads remain deferred.
