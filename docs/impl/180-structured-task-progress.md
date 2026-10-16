@@ -7,6 +7,9 @@ capability closes capture access/retention before enabling earlier dispatch.
 It does not resume K1, general aggregate-provenance experiments, exclusive or
 owned task captures/results, or consumer GPU/adoption work.
 
+[Plan207](207-task-copy-record-results.md) subsequently extends primitive results to
+independent Copy records without changing this scheduler/capture contract.
+
 ## Public contract ledger
 
 | Surface | Contract |

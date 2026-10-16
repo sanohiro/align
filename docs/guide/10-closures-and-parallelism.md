@@ -105,7 +105,7 @@ pool can delay its start. A captured view shares its original bytes: keep that b
 and alive until `wait`. Dropping or reassigning the task handle does not end this protection.
 Tasks may read shared views and modify storage they create themselves.
 
-Unlike `par_map`, spawned tasks may perform I/O and other impure work. `wait()` also helps execute its group's pending tasks, allowing nested groups to progress even when every worker is occupied. It cannot resolve a blocking cycle created by the program. Task results currently contain primitive Copy values, optionally through `Result`; returning an owned string or array from a task remains unsupported.
+Unlike `par_map`, spawned tasks may perform I/O and other impure work. `wait()` also helps execute its group's pending tasks, allowing nested groups to progress even when every worker is occupied. It cannot resolve a blocking cycle created by the program. Task results may be primitive Copy values or ordinary records containing only independent inline Copy data, optionally through `Result<R, Error>`. After a successful wait, `get()` copies the value and may be repeated; the copied record can outlive the group. Records containing views, pointers, callables or owned values are excluded. Returning an owned string or array remains unsupported.
 
 Tasks that can fail return `Result`. Propagate a group failure with `wait()?`:
 

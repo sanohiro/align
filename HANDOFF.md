@@ -23,6 +23,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan207](docs/impl/207-task-copy-record-results.md) admits independent inline
+  Copy record task results for media AM-R09. Successful wait authorizes repeated
+  by-value reads; copied records outlive the group and captures. Typed result
+  slots preserve target/source alignment. Borrowed/owned results and exclusive
+  captures remain separate; consumer adoption remains external.
+
 - [Plan206](docs/impl/206-cli-argument-slices.md) admits borrowed `slice<str>`
   arguments to the existing CLI parser for media AM-R10. The selected first
   element remains the command name; parsed text is independently owned, and
