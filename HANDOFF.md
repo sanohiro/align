@@ -233,9 +233,12 @@ implementation: qualify each real-use requirement and its safety strategy
 independently. Keep parked source and evidence archived outside the active
 worktree; their adoption is not a prerequisite for independent work.
 
-- Request28's indexed/view builder readers still require their own provenance
-  closure; the shipped scalar length and mutable-output capabilities do not
-  resume K1.
+- Request28's independent Copy typed-builder reads ship under Plan209.
+  [Plan210](docs/impl/210-text-builder-byte-views.md) confirms that text-byte
+  views cannot reuse the current summaries: helper returns lose read-only
+  authority. The complete view capability remains behind the interprocedural
+  access prerequisite; this assessment does not resume K1. View-bearing typed
+  elements remain separate.
 - [Plan196](docs/impl/196-indexed-array-field-length.md) implements R137's scalar
   `rows[index].ids.len()` observation across stable fixed/dynamic AoS and slice
   bases. The parent remains owned, checked bounds precede the read, and the i64
