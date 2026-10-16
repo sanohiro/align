@@ -1,6 +1,6 @@
 # Compiler check-time scaling measurement
 
-This local benchmark owns plan 21 items 11–26 checking measurements. It
+This local benchmark owns plan 21 items 11–27 checking measurements. It
 compares release compiler binaries on the same generated straight arithmetic,
 Result `?`, and Result `match` chains inside a loop. Each case uses 16, 128 or
 512 values. `--corpus storage` selects fixed-array declarations in straight-line
@@ -469,3 +469,26 @@ and straight fixed-array controls within 3 ms. The Result-match per-unit
 control increases 1.7 ms. The improvement is local to the measured workload,
 without a uniform-speedup, runtime-allocation,
 near-linear or consumer-time claim. Request 37 consumer acceptance stays external.
+
+## Item 27 result (2026-10-16)
+
+The same host/profile compares `f14903a82ed49a5f848872cb5df78542b86cbe0c`
+(the identical source tree merged in PR1365) with singleton generation-origin
+membership using equality. Both binaries use `DYLD_SHARED_REGION=private`;
+no builds/tests overlap measurement. Both corpora use `--llvm-parity`.
+[Full samples and hashes](results-singleton-renames-macos.json) retain all 30
+cells and a separate five-sample replication of the two large loop cells.
+
+| 512-value fixed-array loop | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| check | 0.749 s | 0.733 s | 1.02x |
+| check-per-unit | 1.496 s | 1.459 s | 1.03x |
+| check, separate replication | 0.740 s | 0.729 s | 1.02x |
+| check-per-unit, separate replication | 1.489 s | 1.451 s | 1.03x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four distinct
+rejected controls agree. All 16-value controls stay within 0.3 ms; numeric
+controls stay within 6.8 ms and straight fixed-array controls within 2.9 ms.
+The 512-value Result-match per-unit median increases 6.7 ms. This is a small
+local improvement in generation-heavy checking, with no uniform-speedup,
+near-linear, runtime-resource or consumer-time claim.
