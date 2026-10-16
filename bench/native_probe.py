@@ -10,7 +10,7 @@ import tempfile
 import time
 
 
-PROBES = ("base64_decode", "buffer_zero", "buffer_pages", "csv_quoted_scan", "csv_normalization", "escaped_decode", "encoding_writes", "utf8_lossy")
+PROBES = ("base64_decode", "buffer_zero", "buffer_pages", "csv_quoted_scan", "csv_normalization", "escaped_decode", "encoding_writes", "utf8_lossy", "time_parse")
 LIMITS = {"build": 900, "link": 60, "probe": 60}
 pending_signal = 0
 
@@ -74,9 +74,15 @@ def run_phase(phase, argv, *, stdout=None):
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in PROBES:
+    if len(sys.argv) < 2 or sys.argv[1] not in PROBES:
         raise SystemExit("usage: python3 bench/native_probe.py {" + ",".join(PROBES) + "}")
     benchmark = sys.argv[1]
+    arguments = sys.argv[2:]
+    if benchmark == "time_parse":
+        if len(arguments) != 2 or arguments[0] not in ("0", "1", "2", "3", "4") or arguments[1] not in ("0", "1", "2", "3"):
+            raise SystemExit("usage: python3 bench/native_probe.py time_parse kind[0..4] group[0..3]")
+    elif arguments:
+        raise SystemExit("native probe does not accept extra arguments")
     for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, record_signal)
     system = os.uname().sysname
@@ -95,9 +101,10 @@ def main():
         probe = str(Path(scratch) / "probe")
         flags = (["-Wl,-dead_strip"] if system == "Darwin" else
                  ["-Wl,--gc-sections", "-lpthread", "-ldl", "-lm"])
-        run_phase("link", [os.environ.get("CC") or "cc", "-O3",
+        compiler_flags = (["-O2", "-Wall", "-Wextra", "-Werror"] if benchmark == "time_parse" else ["-O3"])
+        run_phase("link", [os.environ.get("CC") or "cc", *compiler_flags,
                            f"bench/{benchmark}/main.c", str(runtime), *flags, "-o", probe])
-        run_phase("probe", [probe])
+        run_phase("probe", [probe, *arguments])
     except CleanupError:
         cleanup_safe = False
         print(f"Preserving scratch after child cleanup failure: {scratch}", file=sys.stderr)

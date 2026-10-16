@@ -18,7 +18,10 @@ for the native grammar and exhaustive calendar owners.
 
 The script requires a writable checkout and forces its release runtime producer
 before linking, so a shared Cargo archive cannot silently select another tree.
-It acquires one private scratch directory and deletes it on exit. The C harness
+The [shared native supervisor](../native_probe.md) bounds build, link and probe
+work and retires descendants before removing its private scratch directory,
+including on timeout, interruption and leader exit. It retains the measured
+`-O2 -Wall -Wextra -Werror` link compilation. The C harness
 warms the selected group for 50 ms, then records seven samples of approximately
 one million calls each (a whole number of passes over every group member).
 Observed call/error counts and the unsigned result checksum must match the

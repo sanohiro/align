@@ -22,7 +22,12 @@ HERE = Path(__file__).resolve().parent
 
 class RunnerOwnership(unittest.TestCase):
     def test_rejects_unknown_probe_before_work(self):
-        for arguments in ([], ["unknown"], ["../utf8_lossy"], ["utf8_lossy", "extra"]):
+        for arguments in (
+            [], ["unknown"], ["../utf8_lossy"], ["utf8_lossy", "extra"],
+            ["time_parse"], ["time_parse", "0"], ["time_parse", "5", "0"],
+            ["time_parse", "0", "4"], ["time_parse", "00", "0"],
+            ["time_parse", "0", "0", "extra"],
+        ):
             with self.subTest(arguments=arguments), patch.object(sys, "argv", ["probe", *arguments]), \
                     patch.object(native_probe.subprocess, "Popen") as spawn, \
                     patch.object(native_probe.tempfile, "mkdtemp") as acquire:
@@ -103,7 +108,9 @@ class RunnerOwnership(unittest.TestCase):
         helper.write_text(
             f"#!{sys.executable}\n"
             "import os, pathlib, signal, socket, sys, time\n"
-            "phase = 'link' if '-o' in sys.argv else ('build' if len(sys.argv) > 1 else 'probe')\n"
+            "phase = 'probe' if pathlib.Path(sys.argv[0]).name == 'probe' else ('link' if '-o' in sys.argv else 'build')\n"
+            "if phase == 'probe':\n"
+            "    assert sys.argv[1:] == (['0', '1'] if os.environ['OWNER_BENCH'] == 'time_parse' else [])\n"
             "if phase == 'link':\n"
             "    assert pathlib.Path('bench/' + os.environ['OWNER_BENCH'] + '/main.c').is_file()\n"
             "    assert 'bench/' + os.environ['OWNER_BENCH'] + '/main.c' in sys.argv\n"
@@ -158,7 +165,8 @@ class RunnerOwnership(unittest.TestCase):
             listener.bind(str(address))
             listener.listen(1)
             listener.settimeout(4)
-            child = subprocess.Popen(["bash", str(directory / "run.sh")], cwd=root,
+            arguments = ["0", "1"] if benchmark == "time_parse" else []
+            child = subprocess.Popen(["bash", str(directory / "run.sh"), *arguments], cwd=root,
                                      env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      start_new_session=True)
             retired = False

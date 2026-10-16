@@ -14,6 +14,7 @@ allocation, error, compiler or artifact-format change is selected.
 | Exact calendar | Change only `civil_days` and remove its unused `year_start` helper. Retain `month_days` admission. Move January/February to the preceding year, use Euclidean division for the 400-year era, and compute the March-relative ordinal without a loop. `civil_date_matches_every_representable_epoch_day` independently advances all 213,504 reachable dates and checks both conversion directions, including non-leap centuries and the 2000 leap era. It is independent of both arithmetic conversions. |
 | Invalid and normalized input | Existing `time_formats::tests` retains five grammars, widths, invalid months/days, offsets, both i64 endpoints, pre-epoch values, native span/kind/overlap validation and canonical zero on failure. The parser's four-digit year and two-digit fields bound all calendar intermediates. No input or output reference lifetime changes. |
 | Source composition | Existing driver `time_formats` retains exact values and errors, all five names, imports/generic replay, whole/per-unit, control paths, Pure use, owned formatter outputs and independent Copy parser results. No move, cleanup, interface or lowering code changes. |
+| Probe lifecycle | Reuse `native_probe` for bounded build/link/probe phases and descendant retirement before scratch removal on timeout, interruption and leader exit. Extend its existing actual-process owner across the timestamp wrapper and exact kind/group arguments; malformed arguments reject before acquisition. Preserve the measured compiler flags. |
 | Performance admission | Measure actual non-test release native parser calls using one independently checked C fixture for both revisions. Include January controls, other months, leap/century/offset/endpoint inputs and malformed controls for every format. Retain actual status/value checks, call counts, balanced ABBA samples, producer hashes and build evidence. Run without concurrent builds/tests; discard without useful improvement or with a material ordinary-case regression. No application, network or portable throughput promise. |
 
 The author matrix precedes implementation. This is private arithmetic within the
@@ -34,3 +35,10 @@ the basic-ISO rejected group increases 0.195 ns (2.2%). All 147 fixed native
 input/result goldens agree. The [measurement record](../../bench/time_parse/README.md)
 retains every sample, observed work, identities and limitations. No uniform
 speedup or Linux/application throughput claim follows.
+
+The independent implementation review found that the initial shell runner had
+only scratch cleanup, without child deadlines or group retirement. The shared
+native supervisor now owns all three phases; its parameterized process owner
+covers the new wrapper and argument forwarding. A stalled-build negative control
+times out with the original wrapper. This changes only measurement orchestration;
+the calendar implementation, C fixture and paired samples remain identical.
