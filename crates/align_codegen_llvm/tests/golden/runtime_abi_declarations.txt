@@ -346,7 +346,7 @@ key|ParMapFilter|par_map_filter|Callback|declare { ptr, i64 } @align_rt_par_map_
 key|ParMapReduce|par_map_reduce|Callback|declare i64 @align_rt_par_map_reduce(ptr, ptr, i64, i64, i64, i64, ptr) #2
 key|PathBase|path_base|PureArgRead|declare { ptr, i64 } @align_rt_path_base(ptr readonly, i64) #6
 key|PathDir|path_dir|PureArgRead|declare { ptr, i64 } @align_rt_path_dir(ptr readonly, i64) #6
-key|PathExt|path_ext|PureArgRead|declare { ptr, i64 } @align_rt_path_ext(ptr readonly, i64) #6
+key|PathExt|path_ext|DispatchCache|declare { ptr, i64 } @align_rt_path_ext(ptr readonly, i64) #7
 key|PathJoin|path_join|ArgRead|declare { ptr, i64 } @align_rt_path_join(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #3
 key|PathNormalize|path_normalize|ArgRead|declare { ptr, i64 } @align_rt_path_normalize(ptr readonly captures(none), i64) #3
 key|PercentDecode|percent_decode|IndirectStorage|declare i32 @align_rt_percent_decode(ptr, i64, ptr) #2
@@ -364,7 +364,7 @@ key|ProcessCpuCount|process_cpu_count|HostState|declare i64 @align_rt_process_cp
 key|ProcessCurrentImage|process_current_image|HostState|declare i32 @align_rt_process_current_image(ptr) #2
 key|ProcessExec|process_exec|HostState|declare i32 @align_rt_process_exec(ptr, i64, ptr, i64) #2
 key|ProcessExecutable|process_executable|HostState|declare i32 @align_rt_process_executable(ptr, ptr) #2
-key|ProcessExit|process_exit|ProcessExit|declare void @align_rt_process_exit(i64) #7
+key|ProcessExit|process_exit|ProcessExit|declare void @align_rt_process_exit(i64) #8
 key|ProcessImageFree|process_image_free|HostState|declare void @align_rt_process_image_free(ptr) #2
 key|ProcessImageLen|process_image_len|HostState|declare i64 @align_rt_process_image_len(ptr) #2
 key|ProcessImageReadAt|process_image_read_at|HostState|declare i32 @align_rt_process_image_read_at(ptr, i64, ptr, i64, ptr) #2
@@ -414,16 +414,16 @@ key|ScopeReap|scope_reap|HostState|declare i32 @align_rt_scope_reap(ptr, i64, pt
 key|ScopeRelease|scope_release|HostState|declare i32 @align_rt_scope_release(ptr, ptr) #2
 key|StrClone|str_clone|ArgRead|declare { ptr, i64 } @align_rt_str_clone(ptr readonly captures(none), i64) #3
 key|StrCmp|str_cmp|PureArgRead|declare i32 @align_rt_str_cmp(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
-key|StrContains|str_contains|DispatchCache|declare i32 @align_rt_str_contains(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #8
+key|StrContains|str_contains|DispatchCache|declare i32 @align_rt_str_contains(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #7
 key|StrEndsWith|str_ends_with|PureArgRead|declare i32 @align_rt_str_ends_with(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
 key|StrEq|str_eq|PureArgRead|declare i32 @align_rt_str_eq(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
 key|StrEqIgnoreCase|str_eq_ignore_case|PureArgRead|declare i32 @align_rt_str_eq_ignore_case(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
-key|StrFind|str_find|DispatchCache|declare i64 @align_rt_str_find(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #8
-key|StrFinderFind|str_finder_find|DispatchCache|declare i64 @align_rt_str_finder_find(ptr readonly captures(none), ptr readonly captures(none), i64) #8
+key|StrFind|str_find|DispatchCache|declare i64 @align_rt_str_find(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #7
+key|StrFinderFind|str_finder_find|DispatchCache|declare i64 @align_rt_str_finder_find(ptr readonly captures(none), ptr readonly captures(none), i64) #7
 key|StrFinderFree|str_finder_free|IndirectStorage|declare void @align_rt_str_finder_free(ptr) #2
 key|StrFinderNew|str_finder_new|AllocNew|declare noalias ptr @align_rt_str_finder_new(ptr readonly captures(none), i64) #4
 key|StrParseI64|str_parse_i64|IndirectStorage|declare i32 @align_rt_str_parse_i64(ptr readonly captures(none), i64, ptr captures(none)) #2
-key|StrRfind|str_rfind|DispatchCache|declare i64 @align_rt_str_rfind(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #8
+key|StrRfind|str_rfind|DispatchCache|declare i64 @align_rt_str_rfind(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #7
 key|StrStartsWith|str_starts_with|PureArgRead|declare i32 @align_rt_str_starts_with(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
 key|StrTrim|str_trim|PureArgRead|declare { ptr, i64 } @align_rt_str_trim(ptr readonly, i64) #6
 key|StrTrimEnd|str_trim_end|PureArgRead|declare { ptr, i64 } @align_rt_str_trim_end(ptr readonly, i64) #6
@@ -459,7 +459,7 @@ key|UdpSocketFree|udp_socket_free|HostState|declare void @align_rt_udp_socket_fr
 key|UnicodeNfc|unicode_nfc|IndirectStorage|declare i32 @align_rt_unicode_nfc(ptr captures(none), ptr readonly captures(none), i64) #2
 key|Utf8BoundaryFail|utf8_boundary_fail|FailNoReturn|declare void @align_rt_utf8_boundary_fail(i64, i64) #1
 key|Utf8DecodeLossy|utf8_decode_lossy|ArgRead|declare { ptr, i64 } @align_rt_utf8_decode_lossy(ptr readonly captures(none), i64) #3
-key|Utf8Valid|utf8_valid|DispatchCache|declare i32 @align_rt_utf8_valid(ptr readonly captures(none), i64) #8
+key|Utf8Valid|utf8_valid|DispatchCache|declare i32 @align_rt_utf8_valid(ptr readonly captures(none), i64) #7
 key|XmlAttributeCount|xml_attribute_count|IndirectStorage|declare i64 @align_rt_xml_attribute_count(ptr) #2
 key|XmlAttributeName|xml_attribute_name|IndirectStorage|declare i32 @align_rt_xml_attribute_name(ptr, ptr, i64) #2
 key|XmlAttributeValue|xml_attribute_value|IndirectStorage|declare i32 @align_rt_xml_attribute_value(ptr, ptr, i64) #2
@@ -494,6 +494,6 @@ attributes #3 = { nounwind memory(argmem: read, inaccessiblemem: readwrite) }
 attributes #4 = { nofree nounwind memory(argmem: read, inaccessiblemem: readwrite) }
 attributes #5 = { nounwind memory(argmem: readwrite, inaccessiblemem: readwrite) }
 attributes #6 = { nofree nosync nounwind willreturn memory(argmem: read) }
-attributes #7 = { noreturn nounwind memory(inaccessiblemem: readwrite) }
-attributes #8 = { nofree nosync nounwind willreturn }
+attributes #7 = { nofree nosync nounwind willreturn }
+attributes #8 = { noreturn nounwind memory(inaccessiblemem: readwrite) }
 attributes #9 = { nofree nosync nounwind willreturn memory(none) }

@@ -492,7 +492,7 @@ declaration golden owns the emitted declaration and the class token together.
 | `ParMapReduce` | `align_rt_par_map_reduce` | `Callback` |
 | `PathBase` | `align_rt_path_base` | `PureArgRead` |
 | `PathDir` | `align_rt_path_dir` | `PureArgRead` |
-| `PathExt` | `align_rt_path_ext` | `PureArgRead` |
+| `PathExt` | `align_rt_path_ext` | `DispatchCache` |
 | `PathJoin` | `align_rt_path_join` | `ArgRead` |
 | `PathNormalize` | `align_rt_path_normalize` | `ArgRead` |
 | `PercentDecode` | `align_rt_percent_decode` | `IndirectStorage` |
