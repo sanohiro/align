@@ -32638,6 +32638,33 @@ fn main() -> i32 = 0
             assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{label}");
           } } }
         }
+        let replaced = mir("fn replace(borrow mut b: array_builder<i64>) { b = array_builder(); b.push(19) }\nfn query() -> i64 { mut b: array_builder<i64> := array_builder(); b.push(7); replace(b); return b[0] }\nfn main() {}\n");
+        emit_llvm_ir(&replaced, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "post-call reload")?;
+        for forwarded in [false, true] {
+            let mut bad = replaced.clone();
+            let function = bad.fns.iter_mut().find(|function| function.name.as_str() == "query").ok_or("query")?;
+            let snapshot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt|
+                match stmt { Stmt::Let(_, Rvalue::ArrayBuilderRead { builder: Operand::Value(value), .. }) => Some(*value), _ => None }).ok_or("snapshot")?;
+            let slot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt|
+                match stmt { Stmt::Let(value, Rvalue::Load(slot)) if *value == snapshot => Some(*slot), _ => None }).ok_or("snapshot slot")?;
+            let stale = u32::try_from(function.value_tys.len()).map_err(|_| "stale id")?;
+            function.value_tys.push(function.slots[slot as usize]);
+            let alias = u32::try_from(function.value_tys.len()).map_err(|_| "alias id")?;
+            function.value_tys.push(function.slots[slot as usize]);
+            let mut changed = false;
+            for block in &mut function.blocks {
+                let Some(index) = block.stmts.iter().position(|stmt| match stmt {
+                    Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), _)) => target.as_str() == "replace",
+                    _ => false,
+                }) else { continue };
+                block.stmts.splice(index..index, [Stmt::Let(stale, Rvalue::Load(slot)), Stmt::Let(alias, Rvalue::Use(Operand::Value(stale)))]);
+                block.stmts.insert(index + 3, Stmt::Store(slot, Operand::Value(if forwarded { alias } else { stale })));
+                changed = true;
+            }
+            assert!(changed);
+            assert_xml_producer_rejected(&bad, "exclusive-call stale builder");
+            assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err());
+        }
         let base = mir("fn query(borrow b: array_builder<i64>) { unused := b[0] }\nfn main() {}\n");
         let mut bad = base.clone();
         for function in &mut bad.fns {

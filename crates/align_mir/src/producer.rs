@@ -9137,7 +9137,7 @@ fn validate_builder_read_reservations(
                             reached = true;
                             if !state.reserved || tracked == 0 || state.operand(owner) != tracked { return Err(fail()); }
                         }
-                        let (mut changed, mut retired) = (Vec::new(), Vec::new());
+                        let (mut changed, mut retired, mut exclusive) = (Vec::new(), Vec::new(), Vec::new());
                         match value {
                             Rvalue::ArrayBuilderLen(builder)
                             | Rvalue::ArrayBuilderRead { builder, .. }
@@ -9175,15 +9175,24 @@ fn validate_builder_read_reservations(
                                 }
                                 match modes.as_ref().and_then(|modes| modes.get(index)) {
                                     Some(align_ast::ParamMode::Borrow) => {}
-                                    Some(align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out) => changed.push(identity),
+                                    Some(align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out) => exclusive.push(identity),
                                     _ => retired.push(identity),
                                 }
                             }
                         }
-                        if tracked != 0 && changed.iter().chain(&retired).any(|identity| *identity == tracked) {
+                        if tracked != 0 && changed.iter().chain(&retired).chain(&exclusive).any(|identity| *identity == tracked) {
                             state.reserved = false;
                         }
                         for identity in retired { state.retire(identity); }
+                        for identity in exclusive {
+                            // A callee can replace/free its exclusive argument. The updated caller
+                            // place remains owned, but no pre-call SSA may name its new generation.
+                            let places = state.slots.iter().enumerate().filter_map(|(slot, token)|
+                                (*token == identity).then_some(slot)).collect::<Vec<_>>();
+                            let replacement = state.fresh();
+                            state.retire(identity);
+                            for place in places { state.slots[place] = replacement; }
+                        }
                         if function.value_tys.get(*id as usize).is_some_and(|ty| ty.is_array_builder()) {
                             let identity = match value {
                                 Rvalue::Load(source) => state.slots.get(*source as usize).copied().unwrap_or(0),

@@ -81,6 +81,7 @@ fn formation_and_domains_in(stage: &Path) {
         ("Choice { Data(str), Empty }\nfn query(borrow b: array_builder<Choice>) { v := b[0] }\nfn main() {}", "independent Copy"),
         ("fn query(borrow b: array_builder<()>) { v := b[0] }\nfn main() {}", "got ()"),
         ("fn query(borrow b: array_builder<raw>) { v := b[0] }\nfn main() {}", "got raw"),
+        ("fn query(action: fn(borrow mut array_builder<i64>) -> ()) {}\nfn main() {}", "function-type parameter must be a scalar"),
     ] {
         let actual = check_diagnostics("read-domain", source);
         assert!(check_errs("read-domain", source) && actual.contains(diagnostic), "{source}\n{actual}");
@@ -214,6 +215,7 @@ fn query() -> Row {
   }
 }
 fn consume(b: array_builder<i64>) -> i64 = b[0]
+fn replace(borrow mut b: array_builder<i64>) { b = array_builder(); b.push(19) }
 fn main() {
   row := query()
   print(row.values[1])
@@ -233,10 +235,14 @@ fn main() {
   first.push(12)
   mut moved := first
   print(moved[0])
+  replace(moved)
+  print(moved[0])
   mut round := 0
   loop {
     moved = array_builder()
     moved.push(20 + round)
+    print(moved[0])
+    replace(moved)
     print(moved[0])
     round = round + 1
     if round == 3 { break }
@@ -245,7 +251,7 @@ fn main() {
 "#;
     if let Some(output) = execute(stage, &[("main.align", source)], false) {
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "71\n8\n9\n10\n9\n11\n12\n20\n21\n22\n");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "71\n8\n9\n10\n9\n11\n12\n19\n20\n19\n21\n19\n22\n19\n");
     }
 }
 
