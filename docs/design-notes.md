@@ -2447,3 +2447,14 @@ locale behavior are unchanged. Official complete NFC conformance, pinned data
 and the existing sealed package/native bridge qualify this library capability;
 no new language extension or ambient Unicode dependency is needed.
 [Plan191](impl/191-unicode-nfc.md) owns its safety and compiler closure.
+
+
+## Independent record task results
+
+A worker may return several scalar observations as one ordinary Copy record.
+The existing task slot and successful-wait proof already provide publication
+and lifetime boundaries. Plan207 admits only a complete independent inline data
+graph, reusing Plan182/205's authority rather than treating all Copy views as
+independent. Reading the result copies bits and detaches the copied value from
+the group; it neither transfers ownership nor invents shared mutable results.
+Target layout and explicit alignment govern the same typed slot and trampoline.

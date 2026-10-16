@@ -3649,7 +3649,7 @@ impl<'a> BodyValidator<'a> {
             Ty::Resource(id) | Ty::ResourceRef(id) => {
                 self.program.resources.get(id as usize).is_some()
             }
-            Ty::Task(payload) => primitive_task_scalar(payload) && self.body_scalar_ok(payload),
+            Ty::Task(payload) => task_result_type(self.program, payload) && self.body_scalar_ok(payload),
             Ty::ArenaHandle | Ty::Builder => true,
             Ty::ArrayBuilder(element) => self.body_scalar_ok(element),
             ty @ (Ty::VecArrayBuilder(..)
@@ -7694,7 +7694,7 @@ impl<'a> BodyValidator<'a> {
                 }
                 let closure_flow = self.expr_flow(closure)?;
                 let Ty::Task(ok) = expression.ty else { return None };
-                if !primitive_task_scalar(ok) || !matches!(closure_flow.ty, Ty::Fn(_)) {
+                if !task_result_type(self.program, ok) || !matches!(closure_flow.ty, Ty::Fn(_)) {
                     return None;
                 }
                 let Ty::Fn(fid) = closure_flow.ty else { return None };
@@ -7721,7 +7721,7 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::TaskGet(task) => {
                 let flow = self.expr_flow(task)?;
                 let Ty::Task(scalar) = flow.ty else { return None };
-                if !primitive_task_scalar(scalar) {
+                if !task_result_type(self.program, scalar) {
                     return None;
                 }
                 Some((align_sema::scalar_to_ty(scalar), flow.falls, flow.breaks))
@@ -14169,10 +14169,13 @@ fn fixed_array_shape(expression: &hir::Expr, ty: Ty) -> Option<(Scalar, u32)> {
     }
 }
 
-fn primitive_task_scalar(scalar: Scalar) -> bool {
-    matches!(
-        scalar,
-        Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit
+fn task_result_type(program: &hir::Program, scalar: Scalar) -> bool {
+    align_sema::task_result_type(
+        align_sema::scalar_to_ty(scalar),
+        &program.structs,
+        &program.tuples,
+        &program.enums,
+        &program.tagged_types,
     )
 }
 

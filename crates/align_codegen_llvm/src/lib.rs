@@ -4530,7 +4530,7 @@ fn lower_prepared_module<'c>(
 
     // Pass 1d: a canonical `spawn` trampoline per result type `R`. It runs the spawned closure
     // (`thunk(env) -> R`) and stores the result into `slot` (the typed store is why it is generated,
-    // not in the runtime). ④b-1 calls it sequentially at `wait`; ④b-2 runs it on a worker thread.
+    // not in the runtime). A worker or the participating waiter executes it before completion.
     // A trampoline per (result type `R`, fallibility): `tramp(thunk, env, slot) -> i32` runs the
     // spawned closure and writes its result into `slot`, returning an error code (`0` = ok). A
     // fallible closure returns `Result<R, Error>`; the trampoline stores the `Ok` payload and
@@ -4593,9 +4593,10 @@ fn lower_prepared_module<'c>(
                 ],
                 &target_data,
             )?;
-            let agg = return_transport::build_indirect_call(ctx, &tb, result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r", false)
-                .map_err(lower)?
-                .try_as_basic_value()
+            let call = return_transport::build_indirect_call(ctx, &tb, result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r", false)
+                .map_err(lower)?;
+            call.set_tail_call_kind(inkwell::values::LLVMTailCallKind::LLVMTailCallKindNoTail);
+            let agg = call.try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?
                 .into_struct_value();
@@ -4617,8 +4618,9 @@ fn lower_prepared_module<'c>(
         } else if *r == Ty::Unit {
             // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`); call it with a void
             // signature and store a dummy into the (i32-sized) slot.
-            return_transport::build_indirect_call(ctx, &tb, ctx.void_type().fn_type(&[ptr.into()], false), thunk, &[env.into()], "", false)
+            let call = return_transport::build_indirect_call(ctx, &tb, ctx.void_type().fn_type(&[ptr.into()], false), thunk, &[env.into()], "", false)
                 .map_err(lower)?;
+            call.set_tail_call_kind(inkwell::values::LLVMTailCallKind::LLVMTailCallKindNoTail);
             tb.build_store(slot, i32t.const_zero()).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
@@ -4633,6 +4635,10 @@ fn lower_prepared_module<'c>(
                 false,
             )
             .map_err(lower)?;
+            // This callback converts R into the runtime's status and cannot forward R as its
+            // own return. LLVM 22's ARM64 tail-call classifier crashes for zero-sized aggregate
+            // R here; keep this explicit ABI handoff non-tail for every task result shape.
+            call.set_tail_call_kind(inkwell::values::LLVMTailCallKind::LLVMTailCallKindNoTail);
             add_scalar_call_facts(
                 ctx,
                 call,
@@ -5717,6 +5723,60 @@ fn callable_declarations(
     Ok(declarations)
 }
 
+// Spawn consumes one freshly lowered literal closure in the current block. Authenticate its
+// actual callable ABI, not merely the repr-only Fn tag whose return is the successful payload.
+fn task_request_is_valid(
+    program: &Program,
+    declarations: &HashMap<ProgramCall, ProgramDeclaration>,
+    function: &Function,
+    preceding: &[Stmt],
+    result: ValueId,
+    request: &Rvalue,
+) -> Result<bool, CodegenError> {
+    let Rvalue::SpawnTask { tg, closure, capture_tys, r, fallible } = request else {
+        return Ok(false);
+    };
+    if !align_sema::task_result_type(
+        *r, &program.structs, &program.tuples, &program.enums, &program.tagged_types,
+    ) || function.value_tys.get(result as usize).copied() != ty_to_scalar(*r).map(Ty::Task)
+        || preflight_operand_ty(function, tg) != Some(Ty::ArenaHandle)
+    {
+        return Ok(false);
+    }
+    let Some(Ty::Fn(fid)) = preflight_operand_ty(function, closure) else { return Ok(false) };
+    let Some(signature) = program.fn_types.get(fid as usize) else { return Ok(false) };
+    if !signature.params.is_empty() || !source_ty_matches(signature.ret, *r, program)? {
+        return Ok(false);
+    }
+    let Operand::Value(closure_id) = closure else { return Ok(false) };
+    let mut definitions = preceding.iter().filter_map(|statement| match statement {
+        Stmt::Let(value, definition) if value == closure_id => Some(definition),
+        _ => None,
+    });
+    let Some(definition) = definitions.next() else { return Ok(false) };
+    if definitions.next().is_some() {
+        return Ok(false);
+    }
+    let target = match definition {
+        Rvalue::FnAddr { target, .. } if capture_tys.is_empty() => target,
+        Rvalue::Closure { lifted, capture_tys: actual, .. } if actual == capture_tys => lifted,
+        _ => return Ok(false),
+    };
+    let Some(declaration) = declarations.get(target) else { return Ok(false) };
+    let expected = if *fallible {
+        let Some(error) = program.enums.iter().position(|definition| definition.name == "Error")
+            .and_then(|index| u32::try_from(index).ok()) else { return Ok(false) };
+        let Some(payload) = ty_to_scalar(*r) else { return Ok(false) };
+        Ty::Result(payload, Scalar::Enum(error))
+    } else {
+        *r
+    };
+    Ok(declaration.signature.params == *capture_tys
+        && declaration.signature.modes.iter().all(|mode| *mode == align_ast::ParamMode::ByValue)
+        && declaration.signature.cleanup == hir::ReturnCleanupAbi::None
+        && source_ty_matches(declaration.signature.ret, expected, program)?)
+}
+
 fn callable_preflight(
     program: &Program,
     exports: &[String],
@@ -5726,7 +5786,7 @@ fn callable_preflight(
     let mut generated = Vec::new();
     for function in program.fns.iter().filter(|function| scope.defines(function)) {
         for block in &function.blocks {
-            for statement in &block.stmts {
+            for (statement_index, statement) in block.stmts.iter().enumerate() {
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
@@ -6041,10 +6101,30 @@ fn callable_preflight(
                                     .to_string(),
                             ));
                         }
+                        if !task_request_is_valid(
+                            program, &declarations, function, &block.stmts[..statement_index],
+                            *value, rvalue,
+                        )? {
+                            return Err(CodegenError::Lowering("spawn result/callable metadata invalid".into()));
+                        }
                         generated.push(GeneratedId::Task {
                             fallible: *fallible,
                             result: canonical_metadata(CanonicalTy::from_program(*r, program))?,
                         });
+                    }
+                    Rvalue::BoxGet(task)
+                        if matches!(preflight_operand_ty(function, task), Some(Ty::Task(_))) =>
+                    {
+                        let Some(Ty::Task(payload)) = preflight_operand_ty(function, task) else {
+                            return Err(callable_metadata_error().into());
+                        };
+                        let result = function.value_tys.get(*value as usize).copied();
+                        let ty = scalar_to_ty(payload);
+                        if !align_sema::task_result_type(
+                            ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types,
+                        ) || !result.is_some_and(|result| result == ty) {
+                            return Err(CodegenError::Lowering("task get payload metadata invalid".into()));
+                        }
                     }
                     Rvalue::ParMapParallel {
                         src,
@@ -14608,26 +14688,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     re.into()
                 };
                 // The result slot (a `box<R>` in the region — the `Task<R>` handle).
-                let rbytes = match r {
-                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit => {
-                        let t = scalar_type(
-                            self.ctx,
-                            *r,
-                            self.struct_types,
-                            self.enum_types,
-                            self.tagged_types,
-                        );
-                        self.target_data.get_store_size(&t)
-                    }
-                    _ => return Err(self.err("a spawned task result must be a primitive scalar")),
-                };
-                let ralign = self.target_data.get_abi_alignment(&scalar_type(
-                    self.ctx,
-                    *r,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                )) as u64;
+                // Preflight authenticates R and its callable before any LLVM construction.
+                let result_type = self.llvm_type(*r);
+                let rbytes = self.target_data.get_store_size(&result_type);
+                let ralign = u64::from(self.type_align(*r));
                 let slot = self
                     .builder
                     .build_call(self.runtime(RuntimeKey::TgAlloc), &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
@@ -14655,7 +14719,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 } else {
                     self.ctx.ptr_type(AddressSpace::default()).const_null()
                 };
-                // The per-(R, fallibility) trampoline runs the closure and writes the slot at `wait`.
+                // The per-(R, fallibility) trampoline writes the result before publishing completion.
                 let tramp_id = GeneratedId::Task {
                     fallible: *fallible,
                     result: canonical_ty(*r, self.program)?,
@@ -37757,6 +37821,48 @@ fn main() -> i32 = 0
             text.contains("has no LLVM value"),
             "the missing-value read must say so, got: {text}"
         );
+    }
+
+    #[test]
+    fn task_record_result_metadata_and_alignment() {
+        let source = "align(32) Pair { left: i64, right: i64 }\nfn make() -> Pair = Pair {left: 1, right: 2}\nfn main() -> i32 { task_group { t := spawn(fn { make() }); wait(); result := t.get(); print(result.left) }; return 0 }\n";
+        let valid = mir(source);
+        let text = emit_llvm_ir(&valid, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap_or_else(|error| panic!("{error}"));
+        assert!(text.lines().any(|line| line.contains("@align_rt_tg_alloc(") && line.contains("i64 32, i64 32")), "explicit result alignment: {text}");
+        for mutation in 0..6 {
+            let mut invalid = valid.clone();
+            let mut changed = false;
+            for function in &mut invalid.fns {
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(value, request) = statement else { continue };
+                        if let Rvalue::SpawnTask { r, fallible, capture_tys, closure, .. } = request {
+                            match mutation {
+                                0 => *r = Ty::Str,
+                                1 => function.value_tys[*value as usize] = Ty::Task(Scalar::Bool),
+                                2 => *fallible = true,
+                                3 => capture_tys.push(Ty::Bool),
+                                4 => *closure = Operand::Const(Const::Unit),
+                                _ => continue,
+                            }
+                            changed = true;
+                        } else if mutation == 5 && matches!(request, Rvalue::BoxGet(_)) {
+                            function.value_tys[*value as usize] = Ty::Bool;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            assert!(changed);
+            let declarations = callable_declarations(&invalid).unwrap_or_else(|error| panic!("{error}"));
+            let error = callable_preflight(&invalid, &[], declarations, ModuleScope::Whole)
+                .err().unwrap_or_else(|| panic!("forged task metadata must reject before LLVM"));
+            assert!(error.to_string().contains(if mutation == 5 {
+                "task get payload metadata invalid"
+            } else {
+                "spawn result/callable metadata invalid"
+            }), "{mutation}: {error}");
+        }
     }
 
     #[test]

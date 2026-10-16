@@ -1253,8 +1253,16 @@ Each Task is a Move handle whose compiler-known origin names its spawning group 
 reassignment, block tails, and value-producing control flow preserve that origin; calls, returns,
 captures, imports, and aggregate reconstruction do not. `get()` checks that exact still-active
 group. A nested group preserves outer facts: its own `wait()` cannot authorize an outer Task, while
-handling an outer Wait Result inside it updates the outer group. Current task results are primitive
-Copy values, so `get()` is non-consuming and repeatable. Exiting a group removes every proof that
+handling an outer Wait Result inside it updates the outer group. Task results are primitive
+Int/Float/Bool/Char/Unit or ordinary records whose complete existing inline graph contains only
+independent Copy data: numeric/bool/char/unit/RNG leaves, numeric vectors/masks, and record, tuple,
+fixed-array, Option/Result and sum fields of those leaves. Inactive/zero-length payloads also
+participate; views, raw pointers, callables, task/region/native/heap owners and inline cycles
+reject. Root tuple/sum/tagged/array/vector results retain their existing restrictions.
+`Result<R, Error>` uses the same successful-wait boundary. `get()` copies R without consuming the
+handle or allocating a buffer, and is repeatable. The copied value may outlive the group and its
+captures. Slots honor target layout and existing source alignment; field/payload formation stays
+unchanged. Exiting a group removes every proof that
 names it, including proof on its block result; handling that Result outside cannot authorize an
 outer Task. Proofs for still-active outer groups remain. Owned results remain future work.
 

@@ -904,8 +904,8 @@ pub enum Ty {
     /// A sum type, indexed into `Program.enums`. S1a: tag-only variants — a Copy/`Static` value
     /// represented as the variant tag (`i32`); constructed `Type.Variant`, consumed by `match`.
     Enum(u32),
-    /// `Task<R>` — a handle to a spawned task's result (`task_group`, slice ④). The payload is a
-    /// scalar. ④a represents it identically to `R` (eager execution); ④b makes it a real future.
+    /// A Move handle to a group-owned result slot. R is a primitive or independent Copy record;
+    /// successful wait authorizes repeated by-value reads without exposing the slot.
     Task(Scalar),
     /// A **dictionary-encoded** AoS struct array (`s.dict_encode(.key)`, the A2 reuse rail). Carries
     /// `(struct_id, key_field)`: the source struct and the interned `str` key field. A Move,
@@ -4762,6 +4762,19 @@ pub fn independent_copy_type(
         }
     }
     true
+}
+
+/// Structured task slots contain primitives or ordinary records with no retained authority.
+/// Root tuple/collection/sum admission remains separate from record field composition.
+pub fn task_result_type(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Struct(_))
+        && independent_copy_type(ty, structs, tuples, enums, tagged_types)
 }
 
 /// The immediate indexed-field read may copy only data independent of its parent storage.
@@ -21891,6 +21904,9 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::NamedArena { block, .. }
             | ExprKind::TaskGroup(block)
             | ExprKind::Unsafe(block) => self.block_escape_value(block),
+            ExprKind::TaskGet(_) if task_result_type(
+                expression.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+            ) => EscapeValueFact::default(),
             ExprKind::TaskGet(inner) | ExprKind::BoxGet(inner) => {
                 self.completed_escape_value(inner)
             }
@@ -25575,8 +25591,11 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::IndexField { base, .. } => {
                 values.push(self.local_contained_region(*base));
             }
-            // `t.get()` exposes the task's result; a region-tracked result borrows whatever the
-            // task closure did, so it inherits the inner value's region (conservative, never longer).
+            // A checked get copies independent data; the slot/handle stays group-bounded.
+            // Keep malformed or future unsupported result graphs conservative.
+            ExprKind::TaskGet(_) if task_result_type(
+                expression.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+            ) => values.push(Region::Static),
             ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
             // A `task_group {}` opens a region for its spawned tasks (like `arena {}`), so its value
             // is evaluated one level deeper — else a binding capturing a task_group's value (a `Task`
@@ -42308,6 +42327,9 @@ impl<'a> MoveCheck<'a> {
                 }
                 roots
             }
+            ExprKind::TaskGet(_) if task_result_type(
+                e.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+            ) => BorrowRoots::new(),
             ExprKind::OptionSome(inner)
             | ExprKind::ResultOk(inner)
             | ExprKind::ResultErr(inner)
@@ -49482,8 +49504,8 @@ impl<'a> MoveCheck<'a> {
                     self.parallel_transfer_roots.extend(self.borrows.expand_byte_validation_roots(roots));
                 }
             }
-            // `t.get()` moves the result out of the task when `R` is an owned/move type, so it
-            // consumes the task (a second `get()` would double-free the buffer).
+            // Admitted task results are independent Copy values, so get retains the handle.
+            // Unsupported owning results stay conservative until their separate lifecycle exists.
             ExprKind::TaskGet(inner) => {
                 let consuming =
                     is_owned_droppable(e.ty, self.structs, self.tuples, self.enums, self.tagged_types);
@@ -54351,20 +54373,21 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((name, ret, captures)) = self.lift_lambda(params, body, &[], None, arg.span) else {
             return err;
         };
-        // Classify the result: `Result<ok, Error>` → a fallible task (`wait()?` surfaces the `Err`),
-        // `Task<ok>`; a primitive scalar → an infallible task, `Task<scalar>`. The result is stored
-        // in a `box` in the region, so `ok` must be a box-able primitive (owned/view results are a
-        // later slice).
-        let is_prim = |s: Scalar| matches!(s, Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Unit);
-        let (ok, fallible) = match self.finalize(ret) {
-            Ty::Result(o, Scalar::Enum(eid)) if eid == self.error_enum_id && is_prim(o) => (o, true),
+        // The group owns the slot, but the copied result retains no group/capture authority.
+        // Fallible tasks initialize it only on Ok; the existing wait proof gates every read.
+        let result = expand_tagged_ty(self.finalize(ret), self.tagged_types);
+        let admitted = |scalar| task_result_type(
+            scalar_to_ty(scalar), self.structs, self.tuples, self.enums, self.tagged_types,
+        );
+        let (ok, fallible) = match result {
+            Ty::Result(o, Scalar::Enum(eid)) if eid == self.error_enum_id && admitted(o) => (o, true),
             // A type error in the lambda body was already reported — don't cascade.
             Ty::Error => return err,
             other => match ty_to_scalar(other) {
-                Some(s) if is_prim(s) => (s, false),
+                Some(s) if admitted(s) => (s, false),
                 _ => {
                     self.diags.error(
-                        format!("a spawned task must return a primitive scalar or `Result<scalar, Error>` for now, got {}", ty_name(other)),
+                        format!("a spawned task must return a primitive or independent Copy record, optionally in `Result<R, Error>`, got {}", ty_name(other)),
                         arg.span,
                     );
                     return err;

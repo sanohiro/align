@@ -1916,9 +1916,9 @@ fn main() {
   task_group {
     a := spawn(fn { fs.exists("a.txt") })   // a separate task; the `fn { }` makes the
     b := spawn(fn { fs.exists("b.txt") })   // "runs as a separate task" visible
-    wait()                                   // join all primitive-result tasks
+    wait()                                   // join all tasks
     print(a.get())                           // extract a result after its group joined
-    print(a.get())                           // primitive results may be read again
+    print(a.get())                           // Copy results may be read again
     print(b.get())
   }
 }
@@ -1962,8 +1962,18 @@ Local moves, reassignment, block tails, and value-producing control flow preserv
 calls, returns, captures, imports, and aggregate reconstruction do not transport it. `get()` checks
 the originating group, not merely the innermost active group. Entering a nested group preserves
 outer group facts: an inner `wait()` cannot authorize an outer Task, while handling an outer
-fallible Wait Result inside the inner group updates the outer group's success fact. Current task
-results are primitive Copy values, so `get()` does not consume the Task handle and may be repeated.
+fallible Wait Result inside the inner group updates the outer group's success fact. Task result R
+may be a primitive Int/Float/Bool/Char/Unit or an ordinary record containing only independent inline
+Copy data: numeric/bool/char/unit/RNG leaves, valid numeric vectors/masks, and existing record,
+tuple, fixed-array, Option/Result and sum fields containing only those leaves. Every reachable
+field and payload participates, including inactive variants and zero-length array elements.
+Views, raw pointers, callables, task/region/native/heap owners and recursive inline cycles are
+excluded. Root tuple/sum/tagged/array/vector results retain their existing restrictions. A task
+may instead return `Result<R, Error>` through the same successful-wait boundary.
+`get()` copies the complete R without consuming the Task handle, exposing the slot or allocating
+an additional buffer, and may be repeated. This copied value may outlive the task group and its
+captured backing. Result slots honor the target layout and any existing source `align(N)`;
+ordinary field/payload type-formation restrictions still apply.
 Leaving a nested group removes proofs that name that group, including proof on its block result;
 handling that Result outside cannot authorize an enclosing Task. Proofs for still-active outer
 groups remain. Owned task results remain a future extension.

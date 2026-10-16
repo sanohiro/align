@@ -8421,6 +8421,50 @@ fn hir_body_validator_local_type_placement_is_fail_closed() {
 }
 
 #[test]
+fn hir_body_validator_task_record_results() {
+    let source = "Pair { left: i64, right: i64 }\nfn make() -> Pair = Pair {left: 1, right: 2}\nfn run() -> Pair = task_group { t := spawn(fn { make() }); wait(); t.get() }\nfn main() {}\n";
+    let valid = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&valid));
+    assert!(lower_program_checked(&valid, false, None).is_ok());
+    for field in [Ty::Str, Ty::String, Ty::Raw, Ty::Array(Scalar::Str, 0), Ty::Struct(0)] {
+        let mut invalid = valid.clone();
+        invalid.structs[0].fields[0].ty = field;
+        assert!(!body_core_metadata_is_valid(&invalid), "task record field {field:?}");
+    }
+    for mutation in 0..4 {
+        let mut invalid = valid.clone();
+        let hir::ExprKind::TaskGroup(group) = &mut body_value_expression_mut(&mut invalid, "run").kind else {
+            panic!("task group fixture");
+        };
+        let hir::Stmt::Let { init, .. } = &mut group.stmts[0] else { panic!("spawn binding") };
+        let hir::ExprKind::Spawn { closure, fallible } = &mut init.kind else { panic!("spawn") };
+        match mutation {
+            0 => init.ty = Ty::Task(Scalar::Int(IntTy { bits: 64, signed: true })),
+            1 => *fallible = true,
+            2 => closure.ty = Ty::Unit,
+            3 => group.value.as_deref_mut().unwrap_or_else(|| panic!("get tail")).ty = int(64),
+            _ => panic!("unknown mutation"),
+        }
+        assert!(!body_core_metadata_is_valid(&invalid), "task record mutation {mutation}");
+        assert!(lower_program_checked(&invalid, false, None).is_err());
+    }
+    // A type-formation twin isolates the graph guard from constructor mismatches.
+    let mut placement = baseline_program();
+    placement.structs[0].fields[0].ty = int(64);
+    placement.fns.push(body_test_function(
+        hir::Block { stmts: Vec::new(), value: Some(Box::new(body_test_expr(hir::ExprKind::Unit, Ty::Unit))) },
+        vec![hir::Local { id: 0, name: "task".into(), ty: Ty::Task(Scalar::Struct(0)), is_mut: false, is_param: false, align: None }],
+        Ty::Unit,
+    ));
+    assert!(body_core_metadata_is_valid(&placement));
+    for field in [Ty::Str, Ty::String, Ty::Raw, Ty::Array(Scalar::Str, 0), Ty::Struct(0)] {
+        let mut invalid = placement.clone();
+        invalid.structs[0].fields[0].ty = field;
+        assert!(!body_core_metadata_is_valid(&invalid), "task local graph {field:?}");
+    }
+}
+
+#[test]
 fn hir_body_validator_expression_inventory() {
     let integer = int(64);
     let float = Ty::Float(FloatTy { bits: 64 });
