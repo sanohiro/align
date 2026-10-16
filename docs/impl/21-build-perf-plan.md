@@ -3619,3 +3619,38 @@ within 2.2 ms and straight fixed-array controls within 3 ms. The Result-match
 per-unit control increases 1.7 ms; no uniform speedup is claimed.
 `results-borrow-root-macos.json` retains complete samples and source/binary
 identities. This does not establish near-linear or consumer-level checking time.
+
+## Item 27: singleton storage-generation lookup
+
+A bounded release profile of the 1,024-value fixed-array loop on the post-PR1365
+source identifies generation-renaming scans as a remaining check-time cost.
+`StorageGenerationRenames::changes` searches its ordered origin set for each
+Current reference. A singleton set needs only equality with its first element;
+keep the existing ordered lookup for every other cardinality. `StorageOrigin`
+and its fields derive congruent equality and ordering. The set representation,
+origin identity, iteration order and every rename/merge operation remain unchanged.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Membership | Change only the Current-generation membership query. Existing `storage_generation_unaffected_leaf_rename_matrix` independently enumerates empty, absent, singleton and multiple origins across all origin classes and Current/Prior/parameter/caller generations. No mutation, cached selection or new fact is introduced. |
+| Borrow/header effects | The same matrix retains complete header, fallback-root, ended-root and validation-backing equality, including selected/unselected siblings, projection paths, read-only erasure and minimum-ending collisions. Existing allocation-identity owner retains unchanged collections. |
+| Source and compilation boundaries | Existing sema `storage_generation` owners and driver generation owners in `return_provenance` and `borrow_liveness` retain construction, move-in/out, nulling, Drop/replacement/return, control joins/early exits, malformed inputs, generics, whole/per-unit, interfaces and allocation provenance. No HIR/MIR, ABI, source contract or safety-strategy change. |
+| Performance admission | Compare exact release binaries with the existing numeric/storage corpora, five alternating samples after warmup, actual checked-work output and exact MIR/raw LLVM/rejected diagnostic parity. First screen the storage corpus; discard the candidate without a useful repeatable improvement. No runtime-resource, near-linear or consumer-time claim. |
+
+The author matrix pass leaves every non-membership operation unchanged. This
+uses the existing ordered set's exact cardinality rather than inferring absence
+from a directory or a producer's history. Boundary checking belongs to the one
+fresh preflight review if measurements qualify the candidate. K1/Plan61 and
+external consumer adoption remain deferred. The capability is below 1,000
+handwritten changed lines.
+
+Five alternating Apple M1 release samples improve the 512-value fixed-array-loop
+whole/per-unit medians from 0.749/1.496 s to 0.733/1.459 s. An independent
+repetition of those two cells improves 0.740/1.489 s to 0.729/1.451 s.
+All 15 MIR/raw LLVM pairs, checked-work outputs and four distinct rejected
+controls agree across the 30-cell corpus. All 16-value controls stay within
+0.3 ms; numeric controls within 6.8 ms and straight fixed-array controls within
+2.9 ms. Result-match per-unit increases 6.7 ms, so no uniform speedup is claimed.
+`results-singleton-renames-macos.json` retains the complete samples and hashes.

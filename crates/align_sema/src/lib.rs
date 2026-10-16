@@ -31556,7 +31556,13 @@ impl StorageGenerationRenames {
 
     fn changes(&self, generation: &StorageGeneration) -> bool {
         match generation {
-            StorageGeneration::Current(origin) => self.origins.contains(origin),
+            StorageGeneration::Current(origin) => {
+                if self.origins.len() == 1 {
+                    self.origins.first() == Some(origin)
+                } else {
+                    self.origins.contains(origin)
+                }
+            }
             StorageGeneration::Prior(_)
             | StorageGeneration::ParameterValue { .. }
             | StorageGeneration::CallerStorage { .. } => false,
