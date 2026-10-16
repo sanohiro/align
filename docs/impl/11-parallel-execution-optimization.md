@@ -113,8 +113,9 @@ struct values. An AoS struct source may add compiler-generated field projection 
 `where(.field)` stages; the projection uses the logical-to-physical field map and the field filter
 uses the same stable count/prefix/scatter path as a callable filter.
 
-Otherwise it appends a normal `map` stage and executes the sequential collect loop
-([MIR lowering](../../crates/align_mir/src/lib.rs#L2874-L2921)). In particular:
+Otherwise it executes the terminal callback through the sequential collect loop,
+borrowing original stage and terminal captures
+([Plan222](222-sequential-par-map-captures.md)). In particular:
 
 - a capturing `par_map` with worker-Send Copy captures uses the range kernel and immutable context;
 - `ArenaHandle` is non-Send at every reachable callable-environment depth and rejects before MIR

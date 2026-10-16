@@ -11347,22 +11347,15 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     }
                     return Operand::Value(v);
                 }
-                // Sequential fallback: append a `map(f)` stage (carrying any captures) and materialize
-                // via the collect loop.
-                let mut stages2 = stages.clone();
-                stages2.push(hir::Stage {
-                    kind: hir::StageKind::Map {
-                        func: func.clone(),
-                        captures: captures.clone(),
-                    },
-                    out_ty: *elem,
-                });
+                // Keep original HIR identities: the eager-expression cache outlives this
+                // terminal while sibling branches lower. Temporary cloned captures could reuse
+                // an earlier branch's address and therefore its non-dominating SSA operand.
                 let result = lower_array_collect(
                     b,
                     source,
-                    &stages2,
+                    stages,
                     *elem,
-                    CollectKind::Collect,
+                    CollectKind::Map { func, captures },
                     CollectPlanInputs {
                         terminal: e,
                         terminal_captures: &[],
@@ -16319,6 +16312,12 @@ fn lower_json_scan_reduce(
 enum CollectKind<'a> {
     /// `to_array`: append the element itself.
     Collect,
+    /// Sequential `par_map`: apply the terminal callback after the original stages.
+    /// Borrow its original captures just like scan; never synthesize short-lived HIR stages.
+    Map {
+        func: &'a str,
+        captures: &'a [hir::Expr],
+    },
     /// `scan(init, f)`: thread an accumulator (`acc = f(acc, element)`, seeded with `init`) and
     /// append the running accumulator. `captures` are a lifted lambda's captured values, passed
     /// after the `(acc, element)` arguments.
@@ -16331,6 +16330,10 @@ enum CollectKind<'a> {
 
 enum PreparedCollectKind {
     Collect,
+    Map {
+        func: ProgramCall,
+        captures: Vec<Operand>,
+    },
     Scan {
         func: ProgramCall,
         init: Operand,
@@ -16385,6 +16388,19 @@ fn lower_array_collect(
     };
     let kind = match kind {
         CollectKind::Collect => PreparedCollectKind::Collect,
+        CollectKind::Map { func, captures } => {
+            let mut lowered = Vec::with_capacity(captures.len());
+            for capture in captures {
+                lowered.push(lower_expr(b, capture));
+                if !lowering_continues(b) {
+                    return (Operand::Const(Const::Unit), Vec::new());
+                }
+            }
+            PreparedCollectKind::Map {
+                func: ProgramCall::from_validated(func),
+                captures: lowered,
+            }
+        }
         CollectKind::Scan {
             func,
             init,
@@ -16485,7 +16501,7 @@ fn lower_array_collect(
             b.push(Stmt::Store(s, init.clone()));
             Some(s)
         }
-        PreparedCollectKind::Collect => None,
+        PreparedCollectKind::Collect | PreparedCollectKind::Map { .. } => None,
     };
 
     let header = b.new_block();
@@ -16646,7 +16662,8 @@ fn lower_array_collect(
     }
 
     // append: out_ptr[out_idx] = <value>; out_idx += 1. For `to_array` the value is the
-    // element; for `scan` it is the updated accumulator `acc = f(acc, element)`. A struct source
+    // element; for `scan` it is the updated accumulator `acc = f(acc, element)`; for sequential
+    // `par_map` it is the terminal callback's result. A struct source
     // deliberately has no eager scalar `cur`: load the whole element here, just as a whole-struct
     // `map`/`where` argument does above. This also preserves the element after `where`, whose
     // predicate load does not replace `cur`.
@@ -16668,6 +16685,9 @@ fn lower_array_collect(
         }
     };
     let value = match (&kind, scan_acc) {
+        (PreparedCollectKind::Map { func, captures }, _) => {
+            emit_named_call(b, func.clone(), stage_call_args(cur, captures), elem)
+        }
         (PreparedCollectKind::Scan { func, captures, .. }, Some(acc_slot)) => {
             let prev = b.fresh_value(elem);
             b.push(Stmt::Let(prev, Rvalue::Load(acc_slot)));
@@ -26200,6 +26220,37 @@ mod tests {
             },
         );
         assert!(par_map.plan_records.is_empty(), "par-map capture precedes its decision");
+
+        // Nested records use the sequential fallback. Neither a prior stage nor the terminal
+        // capture may start its collect allocation or publish decisions after an early exit.
+        for terminal_capture in [false, true] {
+            let sequential = lower_with_terminating_capture(
+                "Inner { value:i64 }\nOuter { inner:Inner }\nfn f(xs:array<Outer>,k:i64)->i64 = xs.inner.value.map(fn x:i64 {x+k}).par_map(fn x:i64 {x-k}).sum()\n",
+                |terminal| {
+                    let hir::ExprKind::ArraySum { source, .. } = &mut terminal.kind else {
+                        panic!("sequential sum terminal");
+                    };
+                    let hir::ExprKind::ArrayParMap { stages, captures, .. } = &mut source.kind else {
+                        panic!("sequential par-map source");
+                    };
+                    let returned = captures[0].clone();
+                    let capture = if terminal_capture {
+                        &mut captures[0]
+                    } else {
+                        stages.iter_mut().find_map(|stage| match &mut stage.kind {
+                            hir::StageKind::Map { captures, .. } => captures.first_mut(),
+                            _ => None,
+                        }).expect("sequential map capture")
+                    };
+                    replace_capture_with_return(capture, returned);
+                },
+            );
+            assert!(sequential.plan_records.is_empty());
+            assert!(!any_rvalue(&sequential, |rvalue| matches!(rvalue,
+                Rvalue::HeapAllocBuf { .. } | Rvalue::ArenaAlloc { .. }
+                    | Rvalue::ParMapParallel { .. } | Rvalue::ParMapReduce { .. }
+            )));
+        }
 
         let chunks = lower_with_terminating_capture(
             "fn f(xs: array<i64>, k: i64) -> array<i64> = xs.chunks(2).par_map(fn x { x.len() + k })\n",

@@ -25,6 +25,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan222](docs/impl/222-sequential-par-map-captures.md) preserves original HIR
+  capture identities in sequential `par_map` fallback. Sibling branches no longer
+  reuse non-dominating capture operands; existing execution selection, ordered
+  mapping, allocation and cleanup remain unchanged.
+
 - [Plan221](docs/impl/221-copy-record-sort-keys.md) composes `sort_by_key` with
   the existing independent Copy record domain. Complete AoS values retain the
   existing one-key-per-element and owned-string-key cleanup rules. Key-only
