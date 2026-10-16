@@ -15737,19 +15737,11 @@ pub unsafe extern "C" fn align_rt_path_ext(ptr: *const u8, len: i64) -> AlignStr
     if end == 0 {
         return AlignStr { ptr, len: 0 };
     }
-    let mut start = end;
-    while start > 0 && b[start - 1] != b'/' {
-        start -= 1;
-    }
-    let mut i = end;
-    while i > start {
-        i -= 1;
-        if b[i] == b'.' {
-            if i == start {
-                // Leading dot → dotfile, no extension.
-                return AlignStr { ptr, len: 0 };
-            }
-            return str_subview(&b[i..end]);
+    if let Some(dot) = memchr::memrchr2(b'.', b'/', &b[..end]) {
+        // The last delimiter must be a dot within the final component, not
+        // its leading dot. A final slash means that component has no dot.
+        if b[dot] == b'.' && dot > 0 && b[dot - 1] != b'/' {
+            return str_subview(&b[dot..end]);
         }
     }
     AlignStr { ptr, len: 0 }
@@ -43676,6 +43668,40 @@ mod tests {
         assert_eq!(ext("a/b.c"), ".c");
         assert_eq!(ext("noext"), "");
         assert_eq!(ext("a.txt/"), ".txt");
+    }
+
+    #[test]
+    fn path_ext_exact_subview_matches_component_reference() {
+        let check = |bytes: &[u8]| {
+            let end = bytes.iter().rposition(|&byte| byte != b'/').map_or(0, |i| i + 1);
+            let component = bytes[..end].rsplit(|&byte| byte == b'/').next().expect("one component");
+            let dot = component.iter().rposition(|&byte| byte == b'.').filter(|&i| i != 0);
+            let (offset, length) = dot.map_or((0, 0), |i| (end - component.len() + i, component.len() - i));
+            let out = unsafe { align_rt_path_ext(bytes.as_ptr(), i64::try_from(bytes.len()).expect("bounded fixture")) };
+            assert_eq!(out.ptr, bytes[offset..].as_ptr(), "{bytes:?}");
+            assert_eq!(out.len, i64::try_from(length).expect("bounded fixture"), "{bytes:?}");
+        };
+        // Exhaust every short arrangement of both delimiters and ordinary data.
+        for width in 0..=9 {
+            let count = (0..width).fold(1usize, |n, _| n * 3);
+            for mut value in 0..count {
+                let mut bytes = vec![b'a'; width];
+                for byte in &mut bytes {
+                    *byte = [b'a', b'.', b'/'][value % 3];
+                    value /= 3;
+                }
+                check(&bytes);
+            }
+        }
+        // Exercise aligned and misaligned long tails around vector/word boundaries.
+        for offset in 0..32 {
+            for width in [15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1024] {
+                for suffix in ["", ".x", "/", "/.x", "/.x.y", ".界///"] {
+                    let text = format!("{}prefix.dot/{}{suffix}", "p".repeat(offset), "a".repeat(width));
+                    check(&text.as_bytes()[offset..]);
+                }
+            }
+        }
     }
 
     #[test]

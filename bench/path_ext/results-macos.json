@@ -1,0 +1,319 @@
+{
+  "date": "2026-10-17",
+  "host": "Apple M1, macOS arm64",
+  "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26) (Homebrew)",
+  "cc": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "profile": "release, non-test static runtime; C -O2 -Wall -Wextra -Werror; Apple dead_strip linker",
+  "baseline_commit": "8f80e3836877fdff190740d0bd890b0952dbfd1e",
+  "baseline": {
+    "crates/align_runtime/src/lib.rs": "3e849ac7b0c75d7f847a50ad64c6c64fbab84a61d429cfe4dc52206f2c2a987a",
+    "/Users/hiro/Projects/align/.git/align-path-extension/main.c": "35de874b27ddc37be92e8cce3ed39ed19fbd4d84f0076977982f5340cc4f11c9",
+    "target/release/libalign_runtime.a": "8b4ead9fc54819b7b2b63ed1bcbc21ae3ab8af5cb14b1a753a158d6369386026",
+    "/Users/hiro/Projects/align/.git/align-path-extension/baseline": "64d35210b56edffe50f58b23d0ae1bd2c7dc844086b20d3274c3fa8378990dfb"
+  },
+  "candidate": {
+    "crates/align_runtime/src/lib.rs": "90fef9b2ea9aa06f77c7388745fbb68e8b0117d65ed7773f5af9d404af98d4c0",
+    "/Users/hiro/Projects/align/.git/align-path-extension/main.c": "35de874b27ddc37be92e8cce3ed39ed19fbd4d84f0076977982f5340cc4f11c9",
+    "target/release/libalign_runtime.a": "1b1bd25ef3d5ebaff718dd39f849603eac9cd91063385c567259b46e19090bde",
+    "/Users/hiro/Projects/align/.git/align-path-extension/candidate": "8ce3cb565c4a283244809294ad6bf799f2c39f3f246a66534cbd39818bebbb00"
+  },
+  "benchmark_source_sha256": "35de874b27ddc37be92e8cce3ed39ed19fbd4d84f0076977982f5340cc4f11c9",
+  "source_path_note": "Qualification compiled the identical main.c bytes from the recorded scratch path before the fixture was copied to bench/path_ext/main.c.",
+  "binary_bytes": {
+    "baseline": 422760,
+    "candidate": 422760
+  },
+  "observed_builds": {
+    "baseline": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.09s\n",
+    "candidate": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.02s\n"
+  },
+  "protocol": "Two complete passes. Per kind/group: baseline/candidate/candidate/baseline; each process warms for at least 50 ms, then seven samples of approximately one million checked calls. 28 samples per arm/cell, all retained; qualification excluded. No concurrent builds or tests. Includes pointer/length checks, fixture iteration and work counting.",
+  "sample_sha256": "2e7638ecd0b38122d55998ef0b5404768abd07f47ee4fe6d5ff49207a732057e",
+  "medians": [
+    {
+      "kind": 0,
+      "group": 0,
+      "baseline_ns": 8.1465,
+      "candidate_ns": 8.146,
+      "change_percent": -0.006137605106470989,
+      "calls": 999996,
+      "checksum": "7333304",
+      "passes": [
+        {
+          "baseline": 8.1475,
+          "candidate": 8.146
+        },
+        {
+          "baseline": 8.146,
+          "candidate": 8.1455
+        }
+      ]
+    },
+    {
+      "kind": 0,
+      "group": 1,
+      "baseline_ns": 133.118,
+      "candidate_ns": 132.9785,
+      "change_percent": -0.10479424270196658,
+      "calls": 1000000,
+      "checksum": "303600000",
+      "passes": [
+        {
+          "baseline": 133.223,
+          "candidate": 132.9555
+        },
+        {
+          "baseline": 133.05349999999999,
+          "candidate": 133.0335
+        }
+      ]
+    },
+    {
+      "kind": 0,
+      "group": 2,
+      "baseline_ns": 135.3145,
+      "candidate_ns": 135.235,
+      "change_percent": -0.05875201844591782,
+      "calls": 1000000,
+      "checksum": "308600000",
+      "passes": [
+        {
+          "baseline": 135.42149999999998,
+          "candidate": 135.3045
+        },
+        {
+          "baseline": 135.2505,
+          "candidate": 135.208
+        }
+      ]
+    },
+    {
+      "kind": 0,
+      "group": 3,
+      "baseline_ns": 6.6605,
+      "candidate_ns": 6.6585,
+      "change_percent": -0.030027775692509362,
+      "calls": 1000000,
+      "checksum": "682000000",
+      "passes": [
+        {
+          "baseline": 6.749499999999999,
+          "candidate": 6.6515
+        },
+        {
+          "baseline": 6.647,
+          "candidate": 6.7335
+        }
+      ]
+    },
+    {
+      "kind": 0,
+      "group": 4,
+      "baseline_ns": 7.281,
+      "candidate_ns": 7.281,
+      "change_percent": 0.0,
+      "calls": 1000000,
+      "checksum": "3625000",
+      "passes": [
+        {
+          "baseline": 7.2825,
+          "candidate": 7.2805
+        },
+        {
+          "baseline": 7.2805,
+          "candidate": 7.281
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "group": 0,
+      "baseline_ns": 7.474,
+      "candidate_ns": 7.47,
+      "change_percent": -0.05351886540005957,
+      "calls": 999996,
+      "checksum": "1583327",
+      "passes": [
+        {
+          "baseline": 7.489000000000001,
+          "candidate": 7.4695
+        },
+        {
+          "baseline": 7.47,
+          "candidate": 7.47
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "group": 1,
+      "baseline_ns": 113.8395,
+      "candidate_ns": 113.8375,
+      "change_percent": -0.0017568594380623637,
+      "calls": 1000000,
+      "checksum": "2500000",
+      "passes": [
+        {
+          "baseline": 113.86449999999999,
+          "candidate": 113.834
+        },
+        {
+          "baseline": 113.8315,
+          "candidate": 113.842
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "group": 2,
+      "baseline_ns": 116.10300000000001,
+      "candidate_ns": 116.09899999999999,
+      "change_percent": -0.0034452167472109885,
+      "calls": 1000000,
+      "checksum": "2500000",
+      "passes": [
+        {
+          "baseline": 116.1175,
+          "candidate": 116.09899999999999
+        },
+        {
+          "baseline": 116.095,
+          "candidate": 116.09700000000001
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "group": 3,
+      "baseline_ns": 23.862000000000002,
+      "candidate_ns": 23.945,
+      "change_percent": 0.3478333752409579,
+      "calls": 1000000,
+      "checksum": "679000000",
+      "passes": [
+        {
+          "baseline": 23.858,
+          "candidate": 23.9555
+        },
+        {
+          "baseline": 23.9145,
+          "candidate": 23.897
+        }
+      ]
+    },
+    {
+      "kind": 1,
+      "group": 4,
+      "baseline_ns": 6.777,
+      "candidate_ns": 6.78,
+      "change_percent": 0.044267374944673143,
+      "calls": 1000000,
+      "checksum": "625000",
+      "passes": [
+        {
+          "baseline": 6.773,
+          "candidate": 6.8
+        },
+        {
+          "baseline": 6.7965,
+          "candidate": 6.78
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "group": 0,
+      "baseline_ns": 9.343499999999999,
+      "candidate_ns": 7.543,
+      "change_percent": -19.270080804837576,
+      "calls": 999996,
+      "checksum": "3499986",
+      "passes": [
+        {
+          "baseline": 9.3445,
+          "candidate": 7.546
+        },
+        {
+          "baseline": 9.343499999999999,
+          "candidate": 7.543
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "group": 1,
+      "baseline_ns": 264.25300000000004,
+      "candidate_ns": 11.588,
+      "change_percent": -95.6148085357593,
+      "calls": 1000000,
+      "checksum": "0",
+      "passes": [
+        {
+          "baseline": 264.31399999999996,
+          "candidate": 11.583
+        },
+        {
+          "baseline": 264.1675,
+          "candidate": 11.5945
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "group": 2,
+      "baseline_ns": 273.5485,
+      "candidate_ns": 19.1555,
+      "change_percent": -92.9974026543739,
+      "calls": 1000000,
+      "checksum": "308600000",
+      "passes": [
+        {
+          "baseline": 273.5485,
+          "candidate": 19.153
+        },
+        {
+          "baseline": 273.56600000000003,
+          "candidate": 19.156
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "group": 3,
+      "baseline_ns": 8.0445,
+      "candidate_ns": 6.9535,
+      "change_percent": -13.56206103549008,
+      "calls": 1000000,
+      "checksum": "341500000",
+      "passes": [
+        {
+          "baseline": 8.0445,
+          "candidate": 6.951
+        },
+        {
+          "baseline": 8.0455,
+          "candidate": 6.955500000000001
+        }
+      ]
+    },
+    {
+      "kind": 2,
+      "group": 4,
+      "baseline_ns": 7.749,
+      "candidate_ns": 6.7875,
+      "change_percent": -12.408052651955092,
+      "calls": 1000000,
+      "checksum": "2625000",
+      "passes": [
+        {
+          "baseline": 7.7485,
+          "candidate": 6.788
+        },
+        {
+          "baseline": 7.749,
+          "candidate": 6.7875
+        }
+      ]
+    }
+  ]
+}
