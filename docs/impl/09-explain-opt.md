@@ -150,8 +150,7 @@ diagnostic voice (`file:line:col: message`, lowercase, terse, backticked code, r
 ```text
 app.align:42:9: not vectorized — the pipeline's source and destination may be the same array;
   the compiler can't prove they don't overlap. Write the result into a distinct `out` array.
-app.align:71:9: not vectorized — the compiler judged it not worthwhile here (short pipeline or
-  cheap per-element work); nothing to change in the source.
+app.align:71:9: not vectorized — the compiler's cost model found no benefit from vectorizing this loop.
 app.align:80:9: not vectorized — the pipeline calls a function with no vector form (`sin`), so
   the loop can't be widened. Use a vectorizable operation, or accept the scalar loop here.
 app.align:95:9: not vectorized — the combine here wasn't recognized as associative, so its
