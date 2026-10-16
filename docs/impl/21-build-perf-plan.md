@@ -3690,3 +3690,37 @@ straight fixed-array controls within 2.6 ms. Result-match per-unit increases
 Forcing singleton queries to false fails the existing control-edge-join and
 formation/malformed owners. Byte-identical restoration passes all 18 sema
 generation owners; the existing coverage discriminates the changed boundary.
+
+## Item 29: singleton projected-header scans
+
+The bounded post-item28 profile still reaches projected-header traversal in
+`ProjectedHeaderFact::rename_generations` and the escape-value change query.
+Keep the exact ordered map and all leaf operations. Empty maps need no visit;
+a singleton can use its first entry directly; larger maps retain the existing
+ordered iteration. Apply the same cardinality split to the immutable query and
+the mutable traversal, without a new representation, cache or analysis fact.
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Exact traversal | Empty visits no leaf; singleton visits its sole leaf once; larger maps retain their ordered traversal and the query's short-circuiting behavior. No key or leaf is removed or replaced. Existing sema generation owners cover complete projected facts; a temporary skipped-singleton mutation must fail an existing owner. |
+| Header and fallback authority | Preserve both generation references and fallback roots in the escape-value query, the exhaustive outer-field inventory and every leaf rename operation. Existing unaffected-leaf, allocation, control-edge-join and formation/malformed owners retain paths, stable generations, independent fallback changes and collision behavior. `escape_shared_values_detach_only_selected_generations` separately covers singleton primary/fallback changes, shared/unique payloads and snapshot identity. |
+| Source and compilation boundaries | Reuse sema `generation` and driver generation matrices in `return_provenance` and `borrow_liveness` for construction, move-in/out, nulling, Drop/replacement/return, branches/loops/exits, malformed input, generics, interfaces, whole/per-unit and allocation provenance. No source, HIR/MIR, ABI or safety-strategy change. |
+| Performance admission | Compare exact merged-main and candidate release binaries with storage first, then all 30 numeric/storage cells, five alternating samples after warmup, checked-work output and exact MIR/raw LLVM/rejected diagnostic parity. Repeat large affected cells without competing builds/tests. Discard without useful repeatable benefit; disclose control regressions without a uniform-speedup, runtime-resource or consumer-time promise. |
+
+The author matrix pass precedes the edit. This retains the reviewed header and
+generation authority; one fresh preflight review checks a qualified candidate.
+K1/Plan61 and external consumer adoption remain deferred. The complete capability
+is below 1,000 handwritten changed lines.
+
+Five alternating Apple M1 release samples improve 512-value fixed-array-loop
+whole/per-unit medians from 0.690/1.381 s to 0.672/1.337 s. A separate repetition
+improves 0.689/1.374 s to 0.663/1.331 s. All 15 MIR/raw LLVM pairs, checked-work
+outputs and four distinct rejected controls agree across the 30-cell corpus.
+Every 16-value control stays within 0.4 ms, numeric controls within 8.0 ms and
+straight fixed-array controls within 3.1 ms. Result-match per-unit increases
+7.9 ms; no uniform speedup is claimed. The compiler binary grows by 288 bytes.
+`results-singleton-headers-macos.json` retains complete samples and identities.
+Forcing the singleton query false fails the shared-value detachment owner;
+byte-identical restoration passes all 21 sema `generation` owners.

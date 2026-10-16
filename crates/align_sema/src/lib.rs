@@ -18932,10 +18932,15 @@ impl EscapeValueFact {
             individual: _,
             may_individual: _,
         } = self;
-        headers.leaves.values().any(|leaf| {
+        let changes = |leaf: &StorageHeaderLeaf| {
             storage_set_any(&leaf.generations, |reference| renames.changes(&reference.generation))
                 || storage_set_any(&leaf.fallback_roots, |root| root.generation_changes(renames))
-        })
+        };
+        match headers.leaves.len() {
+            0 => false,
+            1 => headers.leaves.first_key_value().is_some_and(|(_, leaf)| changes(leaf)),
+            _ => headers.leaves.values().any(changes),
+        }
     }
 
     fn has_projected_evidence(&self, path: &[BorrowProjection]) -> bool {
@@ -31836,8 +31841,18 @@ impl ProjectedHeaderFact {
     }
 
     fn rename_generations(&mut self, renames: &StorageGenerationRenames) {
-        for leaf in self.leaves.values_mut() {
-            leaf.rename_generations(renames);
+        match self.leaves.len() {
+            0 => {}
+            1 => {
+                if let Some(mut entry) = self.leaves.first_entry() {
+                    entry.get_mut().rename_generations(renames);
+                }
+            }
+            _ => {
+                for leaf in self.leaves.values_mut() {
+                    leaf.rename_generations(renames);
+                }
+            }
         }
     }
 }
