@@ -516,3 +516,28 @@ controls within 12.4 ms and straight fixed-array controls within 2.6 ms. The
 512-value Result-match per-unit median increases 12.3 ms. The compiler binary
 grows by 112 bytes. This is a local checking-time improvement, without a uniform
 speedup, near-linear scaling, runtime-resource or consumer-time claim.
+
+## Item 29 result (2026-10-17)
+
+The same host/profile compares merged
+`38557f37cfe65b2a6d6aedd0c4c424b64f5cd267` with direct singleton projected-header
+query and traversal. The baseline binary was built from PR1368's candidate,
+whose Git tree is identical to that merge. Map keys, leaf predicates and rename
+operations remain unchanged. Both binaries use `DYLD_SHARED_REGION=private`;
+no builds/tests overlap measurement. Both corpora use `--llvm-parity`.
+[Full samples and hashes](results-singleton-headers-macos.json) retain all 30
+cells and a separate five-sample replication of the large loops.
+
+| 512-value fixed-array loop | Baseline median | Candidate median | Ratio |
+| --- | ---: | ---: | ---: |
+| check | 0.690 s | 0.672 s | 1.03x |
+| check-per-unit | 1.381 s | 1.337 s | 1.03x |
+| check, separate replication | 0.689 s | 0.663 s | 1.04x |
+| check-per-unit, separate replication | 1.374 s | 1.331 s | 1.03x |
+
+All 15 source MIR/raw LLVM pairs, actual checked-work outputs and four distinct
+rejected controls agree. Every 16-value control stays within 0.4 ms, numeric
+controls within 8.0 ms and straight fixed-array controls within 3.1 ms. The
+512-value Result-match per-unit median increases 7.9 ms. The compiler binary
+grows by 288 bytes. This is a local checking-time improvement, without a uniform
+speedup, near-linear scaling, runtime-resource or consumer-time claim.
