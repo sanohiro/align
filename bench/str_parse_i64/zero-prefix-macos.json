@@ -1,0 +1,165 @@
+{
+  "base": "479a112258f4d53dd95c9263240bab37ddb14246",
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "protocol": "Two complete per-group ABBA passes, all 392 samples retained; no concurrent builds/tests.",
+  "baseline": {
+    "crates/align_runtime/src/lib.rs": "4b47480c6a3b1c588bf215516cf65d044d7923c42ea9d22a2deb7a8353ee0fa5",
+    "bench/str_parse_i64/main.c": "c91ec6927eab12eff6ddbfada5a6a80847ca1dc65507c6c907abc69f2a093358",
+    "target/release/libalign_runtime.a": "4aae32f8ff3fd7ad42287ae04c3da868a0d89049e6edbdf713cc797fc54cae76",
+    ".git/align-decimal-zero-prefix/baseline": "71b5215da1e16924abb44c809f7ac92a31c0235c6c18c9d4e1b48a1f2ead2a55",
+    "binary_bytes": 33816
+  },
+  "candidate": {
+    "crates/align_runtime/src/lib.rs": "60626b8e47f7a9616106fa5fd8e866fc2834ef4d63469b070bffa1eeb9ea1dea",
+    "bench/str_parse_i64/main.c": "c91ec6927eab12eff6ddbfada5a6a80847ca1dc65507c6c907abc69f2a093358",
+    "target/release/libalign_runtime.a": "508116bf516e3eb6756743c117bb316d40b6d295b9f107066c3cbdbe5a801201",
+    ".git/align-decimal-zero-prefix/candidate": "e479cde5f5addfd21ef703a3432e790fa5ab15c1e99f532fbd7d577455961de9",
+    "binary_bytes": 33816
+  },
+  "medians": [
+    {
+      "group": 0,
+      "baseline": 8.106,
+      "candidate": 8.269,
+      "percent": 2.0108561559338822,
+      "delta": 0.16300000000000026
+    },
+    {
+      "group": 1,
+      "baseline": 8.325,
+      "candidate": 8.384,
+      "percent": 0.7087087087087163,
+      "delta": 0.05900000000000105
+    },
+    {
+      "group": 2,
+      "baseline": 8.305499999999999,
+      "candidate": 8.342500000000001,
+      "percent": 0.44548792968517326,
+      "delta": 0.037000000000002586
+    },
+    {
+      "group": 3,
+      "baseline": 25.229,
+      "candidate": 25.414,
+      "percent": 0.7332831265607131,
+      "delta": 0.18500000000000227
+    },
+    {
+      "group": 4,
+      "baseline": 82.585,
+      "candidate": 27.363,
+      "percent": -66.8668644426954,
+      "delta": -55.221999999999994
+    },
+    {
+      "group": 5,
+      "baseline": 4.231,
+      "candidate": 4.523,
+      "percent": 6.901441739541481,
+      "delta": 0.2919999999999998
+    },
+    {
+      "group": 6,
+      "baseline": 35.373999999999995,
+      "candidate": 20.2325,
+      "percent": -42.804036863232874,
+      "delta": -15.141499999999994
+    }
+  ],
+  "build_logs": {
+    "baseline": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.19s\nbaseline built\n",
+    "candidate": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.05s\ncandidate built\n"
+  },
+  "toolchain": {
+    "rust": "rustc 1.96.1 (31fca3adb 2026-06-26) (Homebrew)",
+    "cc": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+  },
+  "admission": "At least 10% gain in the leading-zero group; no group regresses by both more than 5% and 0.5 ns.",
+  "per_pass_medians": [
+    {
+      "repetition": 0,
+      "group": 0,
+      "baseline": 8.138,
+      "candidate": 8.561
+    },
+    {
+      "repetition": 0,
+      "group": 1,
+      "baseline": 8.3245,
+      "candidate": 8.3825
+    },
+    {
+      "repetition": 0,
+      "group": 2,
+      "baseline": 8.305,
+      "candidate": 8.3415
+    },
+    {
+      "repetition": 0,
+      "group": 3,
+      "baseline": 25.231,
+      "candidate": 25.404
+    },
+    {
+      "repetition": 0,
+      "group": 4,
+      "baseline": 82.585,
+      "candidate": 27.369
+    },
+    {
+      "repetition": 0,
+      "group": 5,
+      "baseline": 4.23,
+      "candidate": 4.5225
+    },
+    {
+      "repetition": 0,
+      "group": 6,
+      "baseline": 35.373,
+      "candidate": 20.2315
+    },
+    {
+      "repetition": 1,
+      "group": 0,
+      "baseline": 8.0945,
+      "candidate": 8.247
+    },
+    {
+      "repetition": 1,
+      "group": 1,
+      "baseline": 8.3255,
+      "candidate": 8.384
+    },
+    {
+      "repetition": 1,
+      "group": 2,
+      "baseline": 8.306000000000001,
+      "candidate": 8.343
+    },
+    {
+      "repetition": 1,
+      "group": 3,
+      "baseline": 25.224,
+      "candidate": 25.4255
+    },
+    {
+      "repetition": 1,
+      "group": 4,
+      "baseline": 82.614,
+      "candidate": 27.3525
+    },
+    {
+      "repetition": 1,
+      "group": 5,
+      "baseline": 4.2315000000000005,
+      "candidate": 4.523
+    },
+    {
+      "repetition": 1,
+      "group": 6,
+      "baseline": 35.373999999999995,
+      "candidate": 20.2345
+    }
+  ]
+}

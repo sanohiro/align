@@ -15391,12 +15391,18 @@ pub unsafe extern "C" fn align_rt_str_parse_i64(data: *const u8, len: i64, out: 
     let Ok(len) = usize::try_from(len) else { return AL_INVALID; };
     if len == 0 || len > isize::MAX.unsigned_abs() || data.is_null() { return AL_INVALID; }
     let bytes = unsafe { core::slice::from_raw_parts(data, len) };
-    let (negative, digits) = match bytes[0] {
+    let (negative, mut digits) = match bytes[0] {
         b'-' => (true, &bytes[1..]),
         b'+' => (false, &bytes[1..]),
         _ => (false, bytes),
     };
     if digits.is_empty() { return AL_INVALID; }
+    if digits.len() > 18 {
+        // Only proven ASCII zeroes may be discarded. The nonempty original
+        // slice can become empty only when all its bytes represent zero.
+        let first = digits.iter().position(|&byte| byte != b'0').unwrap_or(digits.len());
+        digits = &digits[first..];
+    }
     let mut value = 0_i64;
     if digits.len() <= 18 {
         // Every decimal prefix is at most 10^18 - 1, below i64::MAX. The
@@ -28913,7 +28919,11 @@ mod tests {
     fn str_parse_i64_allocates_nothing() {
         let mut out = 0_i64;
         let before = global_alloc_count();
-        for text in [b"42".as_slice(), b"-9223372036854775808", b"bad", b"9223372036854775808"] {
+        for text in [
+            b"42".as_slice(), b"-9223372036854775808", b"bad", b"9223372036854775808",
+            b"000000000000000000000000000000000000000042",
+            b"00000000000000000000000000000000000000000x",
+        ] {
             let len = i64::try_from(text.len()).unwrap_or(i64::MAX);
             for _ in 0..100 {
                 std::hint::black_box(unsafe { align_rt_str_parse_i64(text.as_ptr(), len, &mut out) });
