@@ -15392,6 +15392,18 @@ pub unsafe extern "C" fn align_rt_str_parse_i64(data: *const u8, len: i64, out: 
     };
     if digits.is_empty() { return AL_INVALID; }
     let mut value = 0_i64;
+    if digits.len() <= 18 {
+        // Every decimal prefix is at most 10^18 - 1, below i64::MAX. The
+        // optional sign is already removed, so neither accumulation nor
+        // applying a negative sign can overflow in this length-bounded path.
+        for &byte in digits {
+            if !byte.is_ascii_digit() { return AL_INVALID; }
+            value = value * 10 + i64::from(byte - b'0');
+        }
+        if negative { value = -value; }
+        unsafe { out.write(value); }
+        return 0;
+    }
     for &byte in digits {
         if !byte.is_ascii_digit() { return AL_INVALID; }
         let digit = i64::from(byte - b'0');
@@ -28860,6 +28872,42 @@ mod tests {
             assert_eq!(out, 0);
         }
         assert_eq!(unsafe { align_rt_str_parse_i64(core::ptr::null(), -1, core::ptr::null_mut()) }, AL_INVALID);
+    }
+
+    #[test]
+    fn str_parse_i64_short_boundary_matches_decimal_oracle() {
+        let check = |text: &[u8]| {
+            let expected = core::str::from_utf8(text).ok().and_then(|text| text.parse::<i64>().ok());
+            let mut out = 123_i64;
+            let status = unsafe { align_rt_str_parse_i64(text.as_ptr(), i64::try_from(text.len()).expect("bounded fixture"), &mut out) };
+            assert_eq!((status, out), expected.map_or((AL_INVALID, 0), |value| (0, value)), "{text:?}");
+        };
+        // Every byte replacement across both routes, with the sign counted
+        // separately. Zero and nine exercise opposite arithmetic boundaries.
+        for width in 1..=22 {
+            for prefix in [b"".as_slice(), b"-", b"+"] {
+                for digit in [b'0', b'9'] {
+                    let mut text = prefix.to_vec();
+                    text.extend(core::iter::repeat_n(digit, width));
+                    check(&text);
+                    for position in 0..text.len() {
+                        let original = text[position];
+                        for byte in u8::MIN..=u8::MAX {
+                            text[position] = byte;
+                            check(&text);
+                        }
+                        text[position] = original;
+                    }
+                }
+            }
+        }
+        for zeros in [19, 20, 64, 4096] {
+            for prefix in ["", "-", "+"] {
+                for suffix in ["0", "42", "9223372036854775807", "9223372036854775808", "9223372036854775809", "x"] {
+                    check(format!("{prefix}{}{suffix}", "0".repeat(zeros)).as_bytes());
+                }
+            }
+        }
     }
 
     #[cfg(feature = "alloc-count")]

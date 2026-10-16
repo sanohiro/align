@@ -35,6 +35,8 @@ class RunnerOwnership(unittest.TestCase):
             ["time_parse", "0", "0", "extra"],
             ["time_fields", "5"], ["time_fields", "00"], ["time_fields", "+0"],
             ["time_fields", "0", "1"], ["rand_sample", "0"],
+            ["str_parse_i64"], ["str_parse_i64", "7"], ["str_parse_i64", "00"],
+            ["str_parse_i64", "-1"], ["str_parse_i64", "0", "1"],
         ]
         for benchmark, upper in (("hex_decode", "108"), ("regex_spans", "50")):
             invalid.extend([benchmark, value] for value in (
@@ -121,7 +123,8 @@ class RunnerOwnership(unittest.TestCase):
     def exercise(self, root, benchmark, phase, ending, arguments=None):
         if arguments is None:
             arguments = {"time_parse": ["0", "1"], "time_fields": ["4"],
-                         "hex_decode": ["107"], "regex_spans": ["49"]}.get(benchmark, [])
+                         "hex_decode": ["107"], "regex_spans": ["49"],
+                         "str_parse_i64": ["6"]}.get(benchmark, [])
         directory = root / "bench" / benchmark
         directory.mkdir(parents=True)
         shutil.copy(HERE / "native_probe.py", root / "bench/native_probe.py")
@@ -142,7 +145,7 @@ class RunnerOwnership(unittest.TestCase):
             "if phase == 'probe':\n"
             "    assert sys.argv[1:] == json.loads(os.environ['OWNER_ARGUMENTS'])\n"
             "if phase == 'link':\n"
-            "    strict = os.environ['OWNER_BENCH'] in ('time_parse', 'time_fields', 'hex_decode', 'regex_spans', 'rand_sample')\n"
+            "    strict = os.environ['OWNER_BENCH'] in ('time_parse', 'time_fields', 'hex_decode', 'regex_spans', 'rand_sample', 'str_parse_i64')\n"
             "    assert sys.argv[1:5] == ['-O2', '-Wall', '-Wextra', '-Werror'] if strict else sys.argv[1] == '-O3'\n"
             "    assert pathlib.Path('bench/' + os.environ['OWNER_BENCH'] + '/main.c').is_file()\n"
             "    assert 'bench/' + os.environ['OWNER_BENCH'] + '/main.c' in sys.argv\n"
