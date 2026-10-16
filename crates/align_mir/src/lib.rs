@@ -11152,7 +11152,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 *elem,
                 SortOrder::Key {
                     func: ProgramCall::from_validated(key_func),
-                    captures: captures.clone(),
+                    captures,
                     key_ty: *key_ty,
                 },
                 e,
@@ -11164,7 +11164,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 *elem,
                 SortOrder::Comparator {
                     func: ProgramCall::from_validated(cmp_func),
-                    captures: captures.clone(),
+                    captures,
                 },
                 e,
             ),
@@ -18175,10 +18175,12 @@ fn lower_array_partition(
 }
 
 /// Key decoration and explicit comparison are mutually exclusive strategies of the same sorter.
-enum SortOrder {
+/// The eager worklist keys expressions by address. Keep the original HIR alive and stable;
+/// temporary cloned captures could reuse another sort branch's cached operand.
+enum SortOrder<'a> {
     Direct,
-    Key { func: ProgramCall, captures: Vec<hir::Expr>, key_ty: Ty },
-    Comparator { func: ProgramCall, captures: Vec<hir::Expr> },
+    Key { func: ProgramCall, captures: &'a [hir::Expr], key_ty: Ty },
+    Comparator { func: ProgramCall, captures: &'a [hir::Expr] },
 }
 
 /// Insertion-sort base-case cutoff for the merge sort in [`lower_array_sort`]. Runs no longer than
@@ -18218,7 +18220,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         // IEEE 754: not a total order (NaN is unordered) — must keep the merge path.
         Scalar::Float(_) => KeyOrder::PartialFloat,
         // Fail-closed. These are not valid sort keys today (sema restricts `sort` to
-        // Copy Ord scalars and `sort_by_key` to Copy scalars), but they are enumerated explicitly so a
+        // Copy Ord scalars and keyed comparison columns to Copy Ord scalars), but they are explicit so a
         // future new `Scalar` variant is a compile error here until it is deliberately triaged into
         // Total or PartialFloat.
         Scalar::Unit
@@ -18450,12 +18452,12 @@ fn lower_array_sort(
     source: &hir::Expr,
     stages: &[hir::Stage],
     elem: Ty,
-    order: SortOrder,
+    order: SortOrder<'_>,
     terminal: &hir::Expr,
 ) -> Operand {
     let terminal_captures = match &order {
         SortOrder::Direct => &[][..],
-        SortOrder::Key { captures, .. } | SortOrder::Comparator { captures, .. } => captures.as_slice(),
+        SortOrder::Key { captures, .. } | SortOrder::Comparator { captures, .. } => *captures,
     };
     let (arr, lowered_captures) = lower_array_collect(
         b,

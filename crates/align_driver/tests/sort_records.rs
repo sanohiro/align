@@ -22,13 +22,14 @@ pub fn valid(row:Row)->bool {
   expected:=if row.id%2==0 {row.id} else {-1}
   return row.small==251 && row.flag==(row.id%2==0) && row.fraction==1.5 && row.meta.value==row.id+11 && row.meta.fixed[0]==row.id && row.meta.fixed[1]==row.id+1 && row.meta.fixed[2]==row.id+2 && row.meta.pair.0==row.id+3 && row.meta.pair.1 && optional==expected && result==expected && choice==expected && random.next()==reference.next()
 }
-pub fn agrees(keys:slice<i64>,expected:slice<i64>)->bool {
+pub fn key(row:Row)->i64 = identity(row.key)
+pub fn agrees(keys:slice<i64>,expected:slice<i64>,keyed:bool)->bool {
   mut builder:array_builder<i64>:=array_builder()
   mut i:=0
   loop {if i==keys.len() {break};builder.push(i);i=i+1}
   indices:=builder.build()
   source:=indices.map(fn index:i64 {make(index,keys[index])}).to_array()
-  sorted:=source.sort_by(before)
+  sorted:=if keyed {source.sort_by_key(key)} else {source.sort_by(before)}
   if sorted.len()!=expected.len() {return false}
   i=0
   loop {if i==sorted.len() {break};row:=sorted[i];if row.id!=expected[i] || row.key!=keys[row.id] || !valid(row) || source[i].id!=i {return false};i=i+1}
@@ -92,11 +93,13 @@ fn comparator_record_order_layout_and_replay() {
                 let mut indices: Vec<i64> = (0..n).collect();
                 indices.sort_by_key(|i| keys[*i as usize]);
                 source.push_str(&format!(
-                    "print(model.agrees({},{}))\n",
+                    "print(model.agrees({},{},false))\nprint(model.agrees({},{},true))\n",
+                    view(&keys),
+                    view(&indices),
                     view(&keys),
                     view(&indices)
                 ));
-                expected.push_str("true\n");
+                expected.push_str("true\ntrue\n");
             }
             for cyclic in [false, true] {
                 source.push_str(&format!("print(model.permutation({n},{cyclic}))\n"));
@@ -128,14 +131,34 @@ fn comparator_record_order_layout_and_replay() {
   print(lengths[0].id==1 && lengths[1].id==0)
   ids:=fixed.id.sort_by(fn a:i64,b:i64 {a>b})
   print(ids[0]==2 && ids[2]==0)
+  key_fixed:=fixed.sort_by_key(fn row:Flat {row.key})
+  key_slice:=fixed[..].sort_by_key(fn row:Flat {row.key})
+  key_map:=[2,1,3].map(fn n:i64 {Flat {key:n,id:n+10}}).where(fn row:Flat {row.key>1}).sort_by_key(fn row:Flat {-row.key})
+  key_project:=wraps.row.sort_by_key(fn row:Flat {row.key})
+  key_native:=natives.sort_by_key(fn row:Native {row.wide})
+  key_text:=spans.sort_by_key(fn row:Span {text[row.start..row.end]})
+  key_float:=fixed.sort_by_key(fn row:Flat {row.key as f64})
+  key_char:=fixed.sort_by_key(fn row:Flat {if row.key==1 {'a'} else {'z'}})
+  print(key_float[0].id==1 && key_float[1].id==0 && key_float[2].id==2)
+  print(key_char[0].id==1 && key_char[1].id==0 && key_char[2].id==2)
+  key_lengths:=views.map(fn row:View {Flat {key:row.text.len(),id:row.id}}).sort_by_key(fn row:Flat {row.key})
+  print(key_fixed[0].id==1 && key_fixed[1].id==0 && key_fixed[2].id==2)
+  print(key_slice[0].id==1 && key_slice[1].id==0 && key_slice[2].id==2)
+  print(key_map.len()==2 && key_map[0].id==13 && key_map[1].id==12)
+  print(key_project[0].id==10 && key_project[1].id==20)
+  print(key_native[0].small==7 && key_native[1].small==251)
+  print(key_text[0].id==1 && key_text[1].id==2 && key_text[2].id==0)
+  print(key_lengths[0].id==1 && key_lengths[1].id==0)
   arena {
     columns:=fixed.to_soa()
+    key_columns:=columns.sort_by_key(fn row:Flat {row.key})
+    print(key_columns[0].id==1 && key_columns[1].id==0 && key_columns[2].id==2)
     transposed:=columns.sort_by(fn a:Flat,b:Flat {a.key<b.key})
     print(transposed[0].id==1 && transposed[1].id==0 && transposed[2].id==2)
   }
 }
 "#);
-        expected.push_str(&"true\n".repeat(10));
+        expected.push_str(&"true\n".repeat(20));
         let files = [("main.align", source.as_str()), ("model.align", MODEL)];
         assert_output(
             build_and_run_multi("record-sort-whole", &files, "main.align"),
@@ -373,6 +396,203 @@ fn main()->Result<(),Error> {{
                 "true\ntrue\ntrue\n103\n101\n102\n1\n3\n2\n3\n2\n1\ntrue\n",
             );
         }
+    });
+}
+
+#[test]
+fn key_record_lifetimes_and_cleanup() {
+    owned_fixture::run("key_record_lifetimes_and_cleanup", |_| {
+        let declarations = "Row {key:i64,tag:i64,pad:u8}\n";
+        for body in [
+            "fn bad()->array<Row> = arena {rows:=[Row {key:1,tag:2,pad:3}];rows.sort_by_key(fn row:Row {row.key})}",
+            "fn main() {mut rows:=[Row {key:1,tag:2,pad:3}].to_array();values:=rows.sort_by_key(fn row:Row {rows[0].key=9;row.key});print(values[0].key)}",
+            "fn noisy(row:Row)->i64 {print(row.tag);return row.key}\nfn worker(n:i64)->i64 {rows:=[Row {key:n,tag:0,pad:3}];values:=rows.sort_by_key(noisy);return values[0].key}\nfn main() {print([1,2].par_map(worker).sum())}",
+            "fn bad()->array<str> {owner:=\"local\".clone();view:str:=owner;return [view].sort_by_key(fn text:str {\"stable\"})}",
+            "fn main() {mut owner:=\"local\".clone();values:=[owner.trim()].sort_by_key(fn text:str {\"key\".clone()});owner=\"new\".clone();print(values[0])}",
+            "fn main() {rows:=[Row {key:1,tag:2,pad:3}];values:=rows.sort_by_key(fn row:Row {true})}",
+        ] {
+            let source = format!("{declarations}{body}");
+            let checked = diff_check_multi(
+                "key-record-invalid",
+                &[("main.align", &source)],
+                "main.align",
+            );
+            assert!(
+                checked.whole_errors && checked.per_unit_errors,
+                "{source}\n{}\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+        }
+        for declaration in [
+            "Row {value:str}",
+            "Row {value:string}",
+            "Row {value:[str;0]}",
+            "Choice {Text(str),Empty}\nRow {value:Choice}",
+            "Row {value:fn(i64)->i64}",
+            "layout(C) Row {value:raw}",
+            "align(32) Row {value:i64}",
+        ] {
+            let source = format!(
+                "{declaration}\nfn bad(xs:slice<Row>) {{values:=xs.sort_by_key(fn row:Row {{0}})}}"
+            );
+            let checked = diff_check_multi(
+                "key-record-domain",
+                &[("main.align", &source)],
+                "main.align",
+            );
+            assert!(
+                checked.whole_errors && checked.per_unit_errors,
+                "{source}\n{}\n{}",
+                checked.whole_diags,
+                checked.per_unit_diags
+            );
+        }
+        assert!(backend_available(), "record key owner requires LLVM");
+        let mut source = format!("{COUNTERS}\n{declarations}\nZero {{empty:[i64;0]}}\n");
+        let terminal = "if kind==0 {xs.sort_by_key(fn row:Row {print(row.tag);row.key})} else if kind==1 {xs.sort_by_key(fn row:Row {print(row.tag);text[row.key..row.key+1]})} else {xs.sort_by_key(fn row:Row {print(row.tag);text[row.key..row.key+1].clone()})}";
+        source.push_str(&format!(r#"
+fn agrees(values:slice<Row>,expected:slice<i64>)->bool {{
+  if values.len()!=expected.len() {{return false}}
+  mut i:=0
+  loop {{if i==values.len() {{break}};row:=values[i];if row.tag!=expected[i] || row.pad!=251 {{return false}};i=i+1}}
+  return true
+}}
+fn sorted(xs:slice<Row>,kind:i64)->array<Row> {{owner:="abcdefghij".clone();text:str:=owner;return {terminal}}}
+fn region_check(xs:slice<Row>,expected:slice<i64>,kind:i64)->bool = arena {{owner:="abcdefghij".clone();text:str:=owner;values:={terminal};agrees(values[..],expected)}}
+fn heap_check(xs:slice<Row>,expected:slice<i64>,kind:i64)->bool {{values:=sorted(xs,kind);return agrees(values[..],expected)}}
+fn measure(xs:slice<Row>,expected:slice<i64>,kind:i64,region:bool,count:i64) {{
+  a:=allocated();f:=freed();bytes:=live()
+  ok:=if region {{region_check(xs,expected,kind)}} else {{heap_check(xs,expected,kind)}}
+  print(ok && allocated()-a==count && freed()-f==count && live()==bytes)
+}}
+fn scalar_capture()->array<i64> {{owner:="temporary".clone();text:str:=owner;return [2,1].sort_by_key(fn value:i64 {{text}})}}
+fn scalar_text_capture()->array<str> {{owner:="temporary".clone();text:str:=owner;return ["z","a"].sort_by_key(fn value:str {{text}})}}
+fn scalar_owned_capture()->array<i64> {{owner:="temporary".clone();text:str:=owner;return [2,1].sort_by_key(fn value:i64 {{text.clone()}})}}
+fn fallible(xs:slice<Row>,fail:bool)->Result<array<Row>,Error> {{if fail {{return Err(Error.Invalid)}};return Ok(sorted(xs,2))}}
+fn early(flag:bool)->i64 {{rows:=[Row {{key:1,tag:1,pad:251}}];values:=(if flag {{return 7}} else {{rows[..]}}).sort_by_key(fn row:Row {{row.key}});return values[0].key}}
+fn scalar_branch(xs:slice<i64>,flag:bool,compare:bool)->array<i64> {{
+  ascending:=1;descending:= -1
+  return if compare {{if flag {{xs.sort_by(fn a:i64,b:i64 {{a*ascending<b*ascending}})}} else {{xs.sort_by(fn a:i64,b:i64 {{a*descending<b*descending}})}}}} else {{if flag {{xs.sort_by_key(fn value:i64 {{value*ascending}})}} else {{xs.sort_by_key(fn value:i64 {{value*descending}})}}}}
+}}
+fn record_branch(xs:slice<Row>,flag:bool)->array<Row> {{
+  ascending:=1;descending:= -1
+  return if flag {{xs.sort_by(fn a:Row,b:Row {{a.key*ascending<b.key*ascending}})}} else {{xs.sort_by(fn a:Row,b:Row {{a.key*descending<b.key*descending}})}}
+}}
+fn transitions() {{
+  rows:=[Row {{key:2,tag:20,pad:251}},Row {{key:1,tag:10,pad:251}}]
+  selected:=if true {{sorted(rows[..],1)}} else {{sorted(rows[..],1)}}
+  fallback:=fallible(rows[..],false) else {{sorted(rows[..],2)}}
+  optional:Option<array<Row>>:=Some(sorted(rows[..],2))
+  matched:=match optional {{Some(value)=>value,None=>sorted(rows[..],2)}}
+  looped:=loop {{break sorted(rows[..],2)}}
+  mut replacement:=sorted(rows[..],2)
+  replacement=sorted(rows[..],2)
+  moved:=replacement
+  print(selected[0].tag==10 && fallback[0].tag==10 && matched[0].tag==10 && looped[0].tag==10 && moved[0].tag==10 && rows[0].tag==20)
+  scalar:=scalar_capture();text:=scalar_text_capture();owned:=scalar_owned_capture()
+  print(scalar[0]==2 && text[0]=="z" && owned[0]==2 && early(true)==7)
+  mut owner:="key".clone()
+  view:str:=owner
+  independent:=rows.sort_by_key(fn row:Row {{view}})
+  owner="new".clone()
+  print(independent[0].tag==20 && owner.len()==3)
+  mut original:=rows.to_array()
+  copied:=original.sort_by_key(fn row:Row {{row.key}})
+  original=[Row {{key:0,tag:0,pad:251}}].to_array()
+  print(copied[0].tag==10 && original[0].tag==0)
+  match fallible(rows[..],true) {{Ok(value)=>print(false),Err(error)=>print(true)}}
+  ascending_key:=scalar_branch([2,1][..],true,false);descending_key:=scalar_branch([2,1][..],false,false)
+  ascending_cmp:=scalar_branch([2,1][..],true,true);descending_cmp:=scalar_branch([2,1][..],false,true)
+  ascending_row:=record_branch(rows[..],true);descending_row:=record_branch(rows[..],false)
+  print(ascending_key[0]==1 && descending_key[0]==2 && ascending_cmp[0]==1 && descending_cmp[0]==2 && ascending_row[0].tag==10 && descending_row[0].tag==20)
+}}
+fn propagated(xs:slice<Row>)->Result<i64,Error> {{values:=fallible(xs,false).map_err(fn error:Error {{error}})?;return Ok(values[0].tag)}}
+fn zero(xs:slice<Zero>,region:bool) {{
+  if region {{arena {{values:=xs.sort_by_key(fn row:Zero {{print(row.empty.len());0}});print(values.len()==xs.len())}};return}}
+  values:=xs.sort_by_key(fn row:Zero {{print(row.empty.len());0}});print(values.len()==xs.len())
+}}
+fn traced()->bool {{values:=[3,1,2].map(fn n:i64 {{print(n+100);Row {{key:n,tag:n,pad:251}}}}).sort_by_key(fn row:Row {{print(row.tag);row.key}});return values[0].tag==1 && values[2].tag==3}}
+fn main() {{unsafe {{align_rt_requested_live_reset()}}
+"#));
+        let mut expected = String::new();
+        let adaptive = std::env::var("ALIGN_SORT_ADAPTIVE").as_deref() != Ok("off");
+        for n in [0, 1, 32, 33, 65] {
+            let mut keys: Vec<i64> = (0..n).map(|i| (i * 7) % 9).collect();
+            for ordered in [false, true] {
+                if ordered {
+                    keys.sort();
+                }
+                let mut ids: Vec<usize> = (0..keys.len()).collect();
+                ids.sort_by_key(|&i| keys[i]);
+                let elements = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, key)| format!("Row {{key:{key},tag:{i},pad:251}}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let rows = if n == 0 {
+                    "[Row {key:0,tag:0,pad:251}][0..0]".into()
+                } else {
+                    format!("[{elements}][..]")
+                };
+                let indices: Vec<i64> =
+                    ids.into_iter().map(|i| i64::try_from(i).unwrap()).collect();
+                for kind in 0..3 {
+                    for region in [false, true] {
+                        let nonempty = usize::from(n > 0);
+                        let scratch = if adaptive {
+                            usize::from(n > 32 && !ordered) * 2
+                        } else {
+                            nonempty * 2
+                        };
+                        let count = 1
+                            + usize::from(n > 0 && !region)
+                            + nonempty
+                            + scratch
+                            + if kind == 2 { nonempty + keys.len() } else { 0 };
+                        source.push_str(&format!(
+                            "measure({rows},{},{kind},{region},{count})\n",
+                            view(&indices)
+                        ));
+                        for i in 0..n {
+                            expected.push_str(&format!("{i}\n"));
+                        }
+                        expected.push_str("true\n");
+                    }
+                }
+            }
+        }
+        source.push_str("a:=allocated();f:=freed();transitions();print(allocated()-a==freed()-f && live()==0)\nresult:=propagated([Row {key:1,tag:10,pad:251}][..]) else -1;print(result==10)\n");
+        for _ in 0..6 {
+            expected.push_str("20\n10\n");
+        }
+        expected.push_str("true\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n10\ntrue\n");
+        source.push_str("print(traced())\n");
+        expected.push_str("103\n101\n102\n3\n1\n2\ntrue\n");
+        let zeros = vec!["Zero {empty:[]}"; 65].join(",");
+        source.push_str(&format!("zeros:=[{zeros}]\nza:=allocated();zf:=freed()\n"));
+        let mut zero_allocations = 0;
+        for n in [0, 1, 32, 33, 65] {
+            for region in [false, true] {
+                source.push_str(&format!("zero(zeros[0..{n}],{region})\n"));
+                expected.push_str(&"0\n".repeat(n));
+                expected.push_str("true\n");
+                zero_allocations += usize::from(n > 0) * if adaptive { 1 } else { 2 };
+            }
+        }
+        // The result and element scratch have zero-byte extent; only key columns allocate.
+        source.push_str(&format!("print(allocated()-za=={zero_allocations} && freed()-zf=={zero_allocations} && live()==0)\n}}\n"));
+        expected.push_str("true\n");
+        let files = [("main.align", source.as_str())];
+        assert_output(
+            build_and_run_multi("record-key-lifecycle", &files, "main.align"),
+            &expected,
+        );
+        assert_output(
+            build_per_unit_multi("record-key-lifecycle-units", &files, "main.align").link_and_run(),
+            &expected,
+        );
     });
 }
 

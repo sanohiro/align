@@ -86,16 +86,17 @@ fn main() -> i32 {
 
 `sort()` sorts ascending; `sort_by_key(f)` sorts by a computed key; `sort_by(cmp)` uses an explicit `(a, b) -> bool` comparison meaning a precedes b. `partition(p)` splits one pass into two owned arrays: satisfying, then rest.
 
-`sort` and `sort_by_key` accept scalar elements; a `sort_by_key` key must be an
+`sort` accepts scalar Copy Ord elements; a `sort_by_key` key must be an
 orderable scalar: an int, float, `char`, `str` or owned `string`.
 
-`sort_by` accepts integers, floats, bools, characters, borrowed strings and
+`sort_by_key` and `sort_by` accept integers, floats, bools, characters, borrowed strings and
 independent Copy records without explicit `align(N)`. Such records contain only
 independent data through existing nested records, fixed arrays, tuples and
 Option/Result/sum fields; no view, callable, pointer, resource or Move field is
 allowed, even in an inactive variant or zero-length array. Existing field and
 collection formation restrictions apply. For example, a numeric span record
-can use text captured by the comparator without storing a text view in the record.
+can use text captured by the key function or comparator without storing a text
+view in the record. Key-only captures are not retained by the result.
 Its comparator uses existing Copy captures and may be Impure in sequential code. Supply a strict weak order
 for stable sorted results. An inconsistent terminating comparator still preserves every input
 element. Comparator-only captures are not retained by the result; borrowed source text is.

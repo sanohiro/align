@@ -2,6 +2,10 @@
 
 Status: implemented; capability owners pass.
 
+[Plan221](221-copy-record-sort-keys.md) subsequently admits the same independent
+Copy record elements to keyed sorting. The original capability boundary below
+records its own scope; the key ownership and record representation proofs remain.
+
 This implements the explicitly deferred Category A capability in plan23:
 `Ord` already includes `string`, but fused `sort_by_key` lacks per-key cleanup.
 Request27 records the consumer sorting family. Direct Move string elements,

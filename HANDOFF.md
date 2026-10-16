@@ -25,6 +25,13 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan221](docs/impl/221-copy-record-sort-keys.md) composes `sort_by_key` with
+  the existing independent Copy record domain. Complete AoS values retain the
+  existing one-key-per-element and owned-string-key cleanup rules. Key-only
+  captures are call-live rather than result contents; sort captures borrow
+  stable HIR identities across sibling branches. Direct sort and Move/view
+  record elements retain their limits. Consumer adoption remains external.
+
 - [Plan220](docs/impl/220-copy-record-comparator-sort.md) extends `sort_by` to
   already-formed independent Copy records for LLM Request27's composite keys.
   Complete AoS values use the existing stable comparator and ordinary call ABI;

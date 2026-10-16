@@ -3954,7 +3954,8 @@ freedom that blocks optimization, no complexity, no soundness breaks; inconvenie
    Owned `string` uses the same runtime comparison through an implicit non-consuming `str` borrow;
    direct, mixed-view, and generic `Ord` comparisons are implemented.
    Direct `.sort()` accepts the Copy `Ord` domain (numbers, `char`, `str`), and
-   `.sort_by_key` accepts primitive Copy elements and `str`. Result spines own
+   `.sort_by_key` accepts primitive Copy elements, `str` and the existing independent
+   Copy record domain (plan221). Result spines own
    no borrowed string bytes and retain source/stage content lifetimes. Plan 134
    adds owned `string` keys: each ordinary returned cleanup bit selects exactly
    one owning header or null in an unsorted transient owner column; comparison
@@ -4058,6 +4059,10 @@ zero-length element type is inspected. View/callable/pointer/resource/Move graph
 other aggregate roots and new callable transport remain outside this boundary.
 Complete record values use ordinary AoS result/scratch storage and by-value calls;
 no ordering operator, new allocation class or per-element cleanup is introduced.
+Plan221 admits that same record domain to `sort_by_key` with unchanged Ord keys,
+exactly-once input-order evaluation and owned-key cleanup. Key-only captures
+remain call-live but are excluded from result contents; actual source/stage
+borrowed contents still retain their lifetimes. Direct sort remains scalar-only.
 
 ### `pkg.kv` v1 typed RESP2 client — SETTLED 2026-09-02
 

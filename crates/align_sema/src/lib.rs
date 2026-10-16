@@ -4782,9 +4782,9 @@ pub fn independent_copy_type(
     true
 }
 
-/// Comparator sorting copies complete independent records into the existing natural AoS
+/// Callback sorting copies complete independent records into the existing natural AoS
 /// collection representation. Copy alone is insufficient: views and callables carry authority.
-pub fn comparator_sort_result(
+pub fn copy_sort_result(
     elem: Ty,
     structs: &[StructDef],
     tuples: &[hir::TupleDef],
@@ -22305,9 +22305,9 @@ impl<'a> EscapeCheck<'a> {
                         pipeline_stages(&expression.kind).unwrap_or_default(),
                     ));
                 }
-                // A comparator decides order but cannot contribute an element to the result.
-                // Keep its captures live for the call without retaining them as output content.
-                if !matches!(expression.kind, ExprKind::ArraySortCmp { .. }) {
+                // Key/comparator callbacks decide order but cannot contribute a result element.
+                // Keep their captures live for the call without retaining them as output content.
+                if !matches!(expression.kind, ExprKind::ArraySortBy { .. } | ExprKind::ArraySortCmp { .. }) {
                     facts.extend(
                         node_captures(&expression.kind)
                             .iter()
@@ -39273,7 +39273,7 @@ impl<'a> MoveCheck<'a> {
                 fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
         }
-        if !matches!(e.kind, ExprKind::Closure { .. } | ExprKind::ArraySortCmp { .. }) {
+        if !matches!(e.kind, ExprKind::Closure { .. } | ExprKind::ArraySortBy { .. } | ExprKind::ArraySortCmp { .. }) {
             for capture in node_captures(&e.kind) {
                 fact.direct.extend(self.borrow_sources(capture).into_iter().filter(|root| *root != BorrowRoot::ReadOnly));
             }
@@ -62731,9 +62731,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `source.….sort_by_key(f)` — materialize the surviving (primitive scalar) elements and sort
-    /// them ascending by `f(element)`. Copy string views are also admitted. The element is ordered
-    /// by the key; the key `f` returns an orderable value (int/float/char or str/string compared
+    /// `source.….sort_by_key(f)` — materialize surviving Copy scalars or independent records
+    /// and sort them ascending by `f(element)`. Copy string views are also admitted.
+    /// The element is ordered by the key; the key `f` returns an orderable value (int/float/char or str/string compared
     /// byte-lexicographically). `f` may be a named function or a lambda (which may capture).
     fn check_array_sort_by_key(&mut self, recv: &ast::Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -62745,14 +62745,9 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
-        if matches!(elem, Ty::Struct(_)) {
-            self.diags.error("'sort_by_key' over struct elements is not supported yet (project a field first)".to_string(), span);
-            return err;
-        }
-        // The result materializes Copy scalar values, including borrowed string headers.
-        let Some(scalar) = ty_to_scalar(elem).filter(|s| scalar_to_prim(*s).is_some() || *s == Scalar::Str) else {
+        let Some(result_ty) = copy_sort_result(elem, self.structs, self.tuples, self.enums, self.tagged_types) else {
             self.diags.error(
-                format!("'sort_by_key' element must be a Copy scalar (int/float/bool/char/str), got {}", ty_name(elem)),
+                format!("'sort_by_key' element must be a Copy scalar (int/float/bool/char/str) or an independent Copy record without align(N), got {}", ty_name(elem)),
                 span,
             );
             return err;
@@ -62781,7 +62776,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Other pipeline output positions remain Copy-only.
         Expr {
             kind: ExprKind::ArraySortBy { source: Box::new(source), stages, key_func, captures, key_ty, elem },
-            ty: Ty::DynArray(scalar),
+            ty: result_ty,
             span,
         }
     }
@@ -62797,7 +62792,7 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = self.check_pipeline(recv, elem_hint, span) else {
             return err;
         };
-        let Some(result_ty) = comparator_sort_result(elem, self.structs, self.tuples, self.enums, self.tagged_types) else {
+        let Some(result_ty) = copy_sort_result(elem, self.structs, self.tuples, self.enums, self.tagged_types) else {
             self.diags.error(
                 format!("'sort_by' element must be a Copy scalar (int/float/bool/char/str) or an independent Copy record without align(N), got {}", ty_name(elem)),
                 span,

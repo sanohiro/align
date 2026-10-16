@@ -2,6 +2,10 @@
 
 Status: implemented; owner verification and preflight review close this capability.
 
+[Plan221](221-copy-record-sort-keys.md) subsequently admits the same independent
+Copy record elements to keyed sorting. The original capability boundary below
+records its own scope; the key ownership and record representation proofs remain.
+
 LLM Request27 explicitly asks for a composite Copy key without packed scalar
 encoding. Plan208 delivers scalar comparators but excludes all record elements.
 Extend that same terminal to the existing independent inline Copy record class
