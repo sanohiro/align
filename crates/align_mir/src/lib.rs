@@ -26237,10 +26237,13 @@ mod tests {
                     let capture = if terminal_capture {
                         &mut captures[0]
                     } else {
-                        stages.iter_mut().find_map(|stage| match &mut stage.kind {
+                        let Some(capture) = stages.iter_mut().find_map(|stage| match &mut stage.kind {
                             hir::StageKind::Map { captures, .. } => captures.first_mut(),
                             _ => None,
-                        }).expect("sequential map capture")
+                        }) else {
+                            panic!("fixture lacks its sequential map capture");
+                        };
+                        capture
                     };
                     replace_capture_with_return(capture, returned);
                 },
