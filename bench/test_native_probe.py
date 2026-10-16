@@ -40,6 +40,8 @@ class RunnerOwnership(unittest.TestCase):
             ["path_ext"], ["path_ext", "0"], ["path_ext", "3", "0"],
             ["path_ext", "0", "5"], ["path_ext", "00", "0"],
             ["path_ext", "0", "0", "extra"],
+            ["builder_decimal"], ["builder_decimal", "7"], ["builder_decimal", "00"],
+            ["builder_decimal", "-1"], ["builder_decimal", "0", "1"],
         ]
         for benchmark, upper in (("hex_decode", "108"), ("regex_spans", "50")):
             invalid.extend([benchmark, value] for value in (
@@ -127,7 +129,8 @@ class RunnerOwnership(unittest.TestCase):
         if arguments is None:
             arguments = {"time_parse": ["0", "1"], "time_fields": ["4"],
                          "hex_decode": ["107"], "regex_spans": ["49"],
-                         "str_parse_i64": ["6"], "path_ext": ["2", "4"]}.get(benchmark, [])
+                         "str_parse_i64": ["6"], "path_ext": ["2", "4"],
+                         "builder_decimal": ["6"]}.get(benchmark, [])
         directory = root / "bench" / benchmark
         directory.mkdir(parents=True)
         shutil.copy(HERE / "native_probe.py", root / "bench/native_probe.py")
@@ -148,7 +151,7 @@ class RunnerOwnership(unittest.TestCase):
             "if phase == 'probe':\n"
             "    assert sys.argv[1:] == json.loads(os.environ['OWNER_ARGUMENTS'])\n"
             "if phase == 'link':\n"
-            "    strict = os.environ['OWNER_BENCH'] in ('time_parse', 'time_fields', 'hex_decode', 'regex_spans', 'rand_sample', 'str_parse_i64', 'path_ext')\n"
+            "    strict = os.environ['OWNER_BENCH'] in ('time_parse', 'time_fields', 'hex_decode', 'regex_spans', 'rand_sample', 'str_parse_i64', 'path_ext', 'builder_decimal')\n"
             "    assert sys.argv[1:5] == ['-O2', '-Wall', '-Wextra', '-Werror'] if strict else sys.argv[1] == '-O3'\n"
             "    assert pathlib.Path('bench/' + os.environ['OWNER_BENCH'] + '/main.c').is_file()\n"
             "    assert 'bench/' + os.environ['OWNER_BENCH'] + '/main.c' in sys.argv\n"

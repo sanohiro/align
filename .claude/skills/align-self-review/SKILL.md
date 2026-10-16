@@ -104,6 +104,11 @@ The same concept is encoded independently in 2–4 places; you update one and a 
 
 - [ ] **Scalar size/width agree across** `scalar_bytes` ↔ `int_type` / `int_bits` ↔ `abi_type` (a mismatch = heap overflow, e.g. #26 `Scalar::Unit` 1 byte vs i32; #20 `int_bits` 64 vs `int_type` i32).
 - [ ] **A new/changed runtime builtin**: the codegen `add_function` / `fn_type` declaration matches **both** the `align_runtime` `extern "C"` signature **and** every call site (param count, types, return). (#3, #24, #113, #171, #208) — declare the by-value aggregate return the same way `str_clone` does.
+- [ ] **Runtime effects include transitive dependency behavior.** A new search
+  primitive can touch a CPU dispatch cache even when it allocates nothing.
+  Recheck the native effect row on every supported architecture, preserve
+  returned-view escapes, and pin emitted memory/parameter attributes against
+  an unaffected control (#1374's parameterized path-view owner).
 - [ ] **Payload-acceptance rules** (`ty_to_scalar`, what an `Option`/`Result` may carry) don't drift between sema and codegen. (#15, #56, #106 `Ty::Fn` missing in `abi_type`, #122)
 - [ ] **Validation phases are complete, not tag-only.** Write the actual guard
   order from the owning closure matrix. A descriptor kind, driver byte, or

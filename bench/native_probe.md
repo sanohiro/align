@@ -1,7 +1,8 @@
 # Local native runtime probe runner
 
 The Base64, buffer, CSV field-discovery/normalization, percent/form escape,
-escaped-output, UTF-8 replacement, timestamp, Hex, regex and random-sample probes share
+escaped-output, UTF-8 replacement, timestamp, Hex, regex, random-sample,
+decimal parsing/emission and path probes share
 `bench/native_probe.py`. Their existing entry points remain:
 
 ```sh
@@ -18,18 +19,23 @@ bash bench/time_fields/run.sh 3
 bash bench/hex_decode/run.sh 96
 bash bench/regex_spans/run.sh 49
 bash bench/rand_sample/run.sh
+bash bench/str_parse_i64/run.sh 0
+bash bench/path_ext/run.sh 2 0
+bash bench/builder_decimal/run.sh 2
 ```
 
-The runner accepts only those thirteen probe names, builds the ordinary release
+The runner accepts only those sixteen probe names, builds the ordinary release
 runtime through `scripts/cargo.sh`, links the selected `main.c` with `-O3` and
 the existing macOS/Linux library flags, and passes its CSV output through.
-The timestamp, Hex, regex and random-sample fixtures retain their measured
+The timestamp, Hex, regex, random-sample, decimal and path fixtures retain their measured
 `-O2 -Wall -Wextra -Werror` flags. The timestamp parser requires exactly two
 arguments: kind 0–4 and group 0–3. The formatter takes an optional single-digit
 kind 0–4; Hex and regex take optional case indices 0–107 and 0–49, retaining
 the C fixtures' base-10 syntax (leading ASCII whitespace, sign and zeroes).
 Omitting an optional selector runs the complete corpus. Every other probe takes
-no arguments. Malformed arguments reject before scratch acquisition or source
+no arguments except decimal parsing/emission, which require one group 0–6, and
+path operations, which require kind 0–2 and group 0–4. These required selectors
+are single ASCII digits. Malformed arguments reject before scratch acquisition or source
 mtime changes.
 `CC` selects one compiler executable (default `cc`); `CARGO_TARGET_DIR` selects
 the Cargo target directory (default `target`, relative to the repository).

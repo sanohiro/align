@@ -14,9 +14,9 @@ import time
 PROBES = (
     "base64_decode", "buffer_zero", "buffer_pages", "csv_quoted_scan", "csv_normalization",
     "escaped_decode", "encoding_writes", "utf8_lossy", "time_parse", "time_fields",
-    "hex_decode", "regex_spans", "rand_sample", "str_parse_i64", "path_ext",
+    "hex_decode", "regex_spans", "rand_sample", "str_parse_i64", "path_ext", "builder_decimal",
 )
-STRICT_C_PROBES = ("time_parse", "time_fields", "hex_decode", "regex_spans", "rand_sample", "str_parse_i64", "path_ext")
+STRICT_C_PROBES = ("time_parse", "time_fields", "hex_decode", "regex_spans", "rand_sample", "str_parse_i64", "path_ext", "builder_decimal")
 LIMITS = {"build": 900, "link": 60, "probe": 60}
 pending_signal = 0
 
@@ -104,9 +104,9 @@ def main():
     elif benchmark == "path_ext":
         if len(arguments) != 2 or arguments[0] not in ("0", "1", "2") or arguments[1] not in ("0", "1", "2", "3", "4"):
             raise SystemExit("usage: python3 bench/native_probe.py path_ext kind[0..2] group[0..4]")
-    elif benchmark == "str_parse_i64":
+    elif benchmark in ("str_parse_i64", "builder_decimal"):
         if len(arguments) != 1 or arguments[0] not in ("0", "1", "2", "3", "4", "5", "6"):
-            raise SystemExit("usage: python3 bench/native_probe.py str_parse_i64 group[0..6]")
+            raise SystemExit(f"usage: python3 bench/native_probe.py {benchmark} group[0..6]")
     elif benchmark == "time_fields":
         if len(arguments) > 1 or (arguments and arguments[0] not in ("0", "1", "2", "3", "4")):
             raise SystemExit("usage: python3 bench/native_probe.py time_fields [kind 0..4]")
