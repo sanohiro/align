@@ -1451,7 +1451,7 @@ merely because its `Ty` matches.
 | `CapturesGroup` | `env[]; child[caps,index]`; `Captures,i64; result Option<Struct(regex_match_id)>; borrowed; Pure`. |
 | `CliCommand` | `env[]; child[name]`; `Str; result CliCommand; new owned builder; name borrowed/copied; Pure`. |
 | `CliFlag` | `env[kind,default presence]`; `child[cmd,name,default if present]`; `LocalHandle(CliCommand,cmd),Str; Bool requires no default, I64 requires i64 default, F64 requires f64 default, Str requires Str default; result Unit; cmd native state mutated without source mut; Pure`. |
-| `CliParse` | `env[]; child[cmd,args]`; `CliCommand,argv; result ERR(CliParsed); operands borrowed, result newly owned; Pure`. |
+| `CliParse` | `env[]; child[cmd,args]`; `LocalHandle(CliCommand,cmd),DynArray(Str) or Slice(Str); result ERR(CliParsed); operands borrowed only during the call, result newly owned with no argv dependency; Pure`. |
 | `CliGetBool` | `env[]; child[parsed,name]`; `CliParsed,Str; result Bool; borrowed; Pure`. |
 | `CliGetI64` | `env[]; child[parsed,name]`; `CliParsed,Str; result i64; borrowed; Pure`. |
 | `CliGetF64` | `env[]; child[parsed,name]`; `CliParsed,Str; result f64; borrowed; Pure`. |

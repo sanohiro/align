@@ -22,7 +22,7 @@ c.flag_bool(name: str)                          // register a bool flag (default
 c.flag_str(name: str, default: str)             // str flag with a default
 c.flag_i64(name: str, default: i64)             // i64 flag with a default
 c.flag_f64(name: str, default: f64)             // f64 flag with a default
-c.parse(args: array<str>) -> Result<parsed, Error>
+c.parse(args: array<str>) -> Result<parsed, Error> // also accepts slice<str>
 p.get_bool(name: str) -> bool                   // total after a successful parse
 p.get_str(name: str) -> str
 p.get_i64(name: str) -> i64
@@ -32,6 +32,16 @@ c.usage() -> string
 ```
 
 ## Type & ownership classification
+
+同じ `parse` はサブコマンド用の `slice<str>` も受け付ける。固定長配列は
+明示的に `[..]` でスライスする。選択された範囲と各文字列の参照先は同期呼び出し中
+だけ借用する。その範囲の先頭要素を名前として読み飛ばし、空または1要素なら
+既定値だけをパースする。範囲検査はパースより先に行い、範囲外のトークンや
+別の argv 入手経路は参照しない。スライスに伴う argv の割り当てや要素コピーはない。
+結果は名前と値を独立して所有し、command・argv ヘッダー・元の文字列より長く
+生存できる。`get_str` は引き続き parsed の寿命に従う。UTF-8 の各要素は長さ付きで
+扱い、文字列値の埋め込み NUL も保持する。文法とエラーは配列の場合と同じである。
+正確な受理条件と検証は [Plan206](../../206-cli-argument-slices.md) に記録する。
 
 肝となる決定は次のとおり。
 

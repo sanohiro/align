@@ -2626,7 +2626,7 @@ pub enum Rvalue {
         name: Operand,
         default: Option<Operand>,
     },
-    /// `c.parse(args)` — parse the argv `array<str>` `args` (`{ptr,len}` = an `AlignStr` buffer +
+    /// `c.parse(args)` — parse argv `array<str>` or `slice<str>` (`{ptr,len}` = an `AlignStr` buffer +
     /// count) against the command handle `cmd`, writing an owned `cli parsed` handle into `out` and
     /// returning an `i32` status (0 = ok, `AL_INVALID` -> `Error.Invalid`). The caller branches
     /// `Ok(parsed)` / `Err`. Pure.
@@ -21896,7 +21896,7 @@ fn lower_crypto_signature(b: &mut Builder, expression: &hir::Expr) -> Operand {
 /// `c.parse(args)` → the runtime writes an owned `cli parsed` handle into an out slot and returns an
 /// `i32` status (0 = ok; `AL_INVALID` -> `Error.Invalid`). Branch `Ok(<parsed>)` / `Err(<mapped
 /// status>)`. Mirrors [`lower_encoding_decode`], but the source is the command handle + the argv
-/// `array<str>`. The wrapped `parsed` is owned — the unwrapped local `Drop`s it (`cli_parsed_free`).
+/// `array<str>` or `slice<str>`. The wrapped `parsed` is owned and Drop-freed (`cli_parsed_free`).
 fn lower_cli_parse(b: &mut Builder, cmd: &hir::Expr, args: &hir::Expr, result_ty: Ty) -> Operand {
     let out = b.new_slot(Ty::CliParsed);
     let cop = lower_required!(b, lower_expr(b, cmd), Operand::Const(Const::Unit));

@@ -2,13 +2,12 @@
 
 ## Current work direction
 
-The owner's latest instruction (2026-10-15) is to finish the indexed array-field
-Copy-read capability through PR and merge, then stop this implementation batch.
-Do not start another capability without a new request. For later request-driven
-work, reconcile all three external request registers first and validate each
-request against real consumer evidence and Align's design. Consumer adoption
-remains external; retain a reasoned deferral when the required design conflicts
-with Align's invariants.
+The owner's latest instruction (2026-10-16) is to process outstanding requests,
+then proceed to planned work, completing PR and merge for each capability before
+starting the next. Continue until the owner asks to stop. Reconcile all three
+external request registers first and validate each request against real consumer
+evidence and Align's design. Consumer adoption remains external; retain a
+reasoned deferral when the required design conflicts with Align's invariants.
 
 Prioritize existing std/library usability, useful bounded transport/library
 composition, then measured execution/storage/startup improvements. Complex
@@ -23,6 +22,11 @@ Align v0.9.0 is released; Requests138–141 are included. The workspace version 
 not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI state.
 
 ## Recent completed capabilities
+
+- [Plan206](docs/impl/206-cli-argument-slices.md) admits borrowed `slice<str>`
+  arguments to the existing CLI parser for media AM-R10. The selected first
+  element remains the command name; parsed text is independently owned, and
+  slice transport adds no argv allocation. Consumer adoption remains external.
 
 - [Plan205](docs/impl/205-indexed-array-field-copy-reads.md) admits
   `rows[row].values[index]` for independent Copy elements of existing owning

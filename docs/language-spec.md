@@ -1951,7 +1951,12 @@ bounds, secret cleanup, error precedence, ownership, ABI, timing boundary, and c
 `impl/std-design/crypto.md`.
 `std.cli`: an explicit flag-registration builder (`cli.command`/`c.flag_bool`/`flag_str`/`flag_i64`/`flag_f64`/
 `c.parse -> Result<parsed, Error>`/`p.get_*`/`c.usage`) parsing `main(args: array<str>)`'s
-`array<str>` — not a second argv source. Lookups are **total** after a successful `parse` (every
+`array<str>` or a borrowed `slice<str>` of arguments. Both carriers are call-scoped
+borrows; parsed owns independent name/value copies and may outlive argv and its
+text backing. The selected span's first element is skipped; empty/one-element
+spans parse only defaults. Fixed arrays use explicit `[..]`; slices add no argv
+allocation. Slice bounds precede parsing, and no ambient argv is read.
+Lookups are **total** after a successful `parse` (every
 flag has a value or its default, like `json.decode`), but the lookup itself is checked at
 **runtime**, not compile time: a `get_*` call for an unregistered name or the wrong type aborts at
 runtime (Align has no comptime evaluator to statically validate against the builder's registered

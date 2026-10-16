@@ -20480,7 +20480,7 @@ fn cli_parse_value(f: &CliFlag, val: &[u8]) -> Option<CliValue> {
     }
 }
 
-/// `c.parse(args)` — tokenize the argv `array<str>` `{argv, argv_len}` (an `AlignStr` buffer) against
+/// `c.parse(args)` — tokenize the argv array/slice span `{argv, argv_len}` (an `AlignStr` buffer) against
 /// `cmd`'s flag table. `args[0]` is the program name (skipped). Writes an owned `cli parsed` handle to
 /// `*out` and returns `0`, or `AL_INVALID` (`Error.Invalid`) — leaving `*out` null — on any input
 /// error (unknown flag, missing value, malformed/nonfinite number, wrong kind).
