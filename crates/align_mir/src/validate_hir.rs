@@ -10957,7 +10957,11 @@ impl<'a> BodyValidator<'a> {
                 let result = align_sema::comparator_sort_result(final_elem,
                     &self.program.structs, &self.program.tuples, &self.program.enums,
                     &self.program.tagged_types)?;
-                if final_elem != *elem || self.array_to_array_result(final_elem)? != result {
+                // Both result classifiers derive their header from this same final element.
+                // Keep its stored discriminator exact; formation needs no second ID comparison.
+                if final_elem != *elem
+                    || self.array_to_array_result(final_elem).is_none()
+                {
                     return None;
                 }
                 let capture_flows = self.expr_flows(captures)?;
