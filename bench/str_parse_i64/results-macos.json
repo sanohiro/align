@@ -1,0 +1,165 @@
+{
+  "date": "2026-10-17",
+  "host": "Apple M1, macOS arm64",
+  "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26) (Homebrew)",
+  "cc": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "profile": "release, non-test static runtime; C -O2 -Wall -Wextra -Werror; Apple dead_strip linker",
+  "baseline_commit": "727ead761ae9c2556233ab0f9ef82e7680191722",
+  "baseline": {
+    "crates/align_runtime/src/lib.rs": "cf6a839fd4c907b6cc5f6bdf34b5fbb18b4275b3a6de2233fbd3e3dd3aa7fc37",
+    "bench/str_parse_i64/main.c": "c91ec6927eab12eff6ddbfada5a6a80847ca1dc65507c6c907abc69f2a093358",
+    "target/release/libalign_runtime.a": "5f61e53d6db1a60085ebd7db4fd5a67c4a76a0fe0a8bff80965bd1c6ef1c8dab",
+    "/Users/hiro/Projects/align/.git/align-short-decimal/baseline": "861e4fe4977bc6dae74d188b4ce31789352bf5b6c1aa157cf1a3567eab024fbe"
+  },
+  "candidate": {
+    "crates/align_runtime/src/lib.rs": "3e849ac7b0c75d7f847a50ad64c6c64fbab84a61d429cfe4dc52206f2c2a987a",
+    "bench/str_parse_i64/main.c": "c91ec6927eab12eff6ddbfada5a6a80847ca1dc65507c6c907abc69f2a093358",
+    "target/release/libalign_runtime.a": "8b4ead9fc54819b7b2b63ed1bcbc21ae3ab8af5cb14b1a753a158d6369386026",
+    "/Users/hiro/Projects/align/.git/align-short-decimal/candidate": "41632a1d0ca94e74170514734b2d77bef028c29826a2ca3f8caa7652d5c930dc"
+  },
+  "binary_bytes": {
+    "baseline": 33816,
+    "candidate": 33816
+  },
+  "observed_builds": {
+    "baseline": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.01s\n",
+    "candidate": "   Compiling align_runtime v0.9.0 (/Users/hiro/Projects/align/crates/align_runtime)\n    Finished `release` profile [optimized] target(s) in 6.01s\n"
+  },
+  "protocol": "Two complete passes. Per group: baseline/candidate/candidate/baseline; each process warms for at least 50 ms, then seven samples of approximately one million checked calls. 28 samples per arm/group, all retained; qualification excluded. No concurrent builds or tests. Includes fixture iteration, exact status/value checks and work counting.",
+  "sample_sha256": "1fecee3241eb8d86a4b05fb09a7e17843c081059e0aae40bc386142067af5d8d",
+  "medians": [
+    {
+      "group": 0,
+      "baseline_ns": 12.037500000000001,
+      "candidate_ns": 8.088,
+      "change_percent": -32.809968847352046,
+      "calls": 999990,
+      "invalid_count": 0,
+      "checksum": "4478844799141475606",
+      "passes": [
+        {
+          "baseline": 12.041,
+          "candidate": 8.09
+        },
+        {
+          "baseline": 12.0355,
+          "candidate": 8.087499999999999
+        }
+      ]
+    },
+    {
+      "group": 1,
+      "baseline_ns": 12.016,
+      "candidate_ns": 8.3355,
+      "change_percent": -30.629993342210394,
+      "calls": 999990,
+      "invalid_count": 0,
+      "checksum": "13967899274568076010",
+      "passes": [
+        {
+          "baseline": 12.02,
+          "candidate": 8.329
+        },
+        {
+          "baseline": 12.0135,
+          "candidate": 8.383
+        }
+      ]
+    },
+    {
+      "group": 2,
+      "baseline_ns": 12.093499999999999,
+      "candidate_ns": 8.311,
+      "change_percent": -31.27713234382106,
+      "calls": 999990,
+      "invalid_count": 0,
+      "checksum": "4478844799141475606",
+      "passes": [
+        {
+          "baseline": 12.118,
+          "candidate": 8.315000000000001
+        },
+        {
+          "baseline": 12.0855,
+          "candidate": 8.305499999999999
+        }
+      ]
+    },
+    {
+      "group": 3,
+      "baseline_ns": 24.889499999999998,
+      "candidate_ns": 25.238500000000002,
+      "change_percent": 1.4021977138954256,
+      "calls": 999999,
+      "invalid_count": 444444,
+      "checksum": "9223372036855442474",
+      "passes": [
+        {
+          "baseline": 24.8885,
+          "candidate": 25.244
+        },
+        {
+          "baseline": 24.893,
+          "candidate": 25.232
+        }
+      ]
+    },
+    {
+      "group": 4,
+      "baseline_ns": 83.633,
+      "candidate_ns": 82.69749999999999,
+      "change_percent": -1.118577594968495,
+      "calls": 1000000,
+      "invalid_count": 0,
+      "checksum": "5125000",
+      "passes": [
+        {
+          "baseline": 83.622,
+          "candidate": 82.685
+        },
+        {
+          "baseline": 83.633,
+          "candidate": 82.726
+        }
+      ]
+    },
+    {
+      "group": 5,
+      "baseline_ns": 4.3785,
+      "candidate_ns": 4.2265,
+      "change_percent": -3.471508507479737,
+      "calls": 999991,
+      "invalid_count": 999991,
+      "checksum": "1999982",
+      "passes": [
+        {
+          "baseline": 4.3805,
+          "candidate": 4.2275
+        },
+        {
+          "baseline": 4.364,
+          "candidate": 4.226
+        }
+      ]
+    },
+    {
+      "group": 6,
+      "baseline_ns": 37.253,
+      "candidate_ns": 35.3465,
+      "change_percent": -5.117708640914831,
+      "calls": 999999,
+      "invalid_count": 999999,
+      "checksum": "1999998",
+      "passes": [
+        {
+          "baseline": 37.254000000000005,
+          "candidate": 35.347
+        },
+        {
+          "baseline": 37.25,
+          "candidate": 35.341499999999996
+        }
+      ]
+    }
+  ]
+}
