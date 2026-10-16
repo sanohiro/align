@@ -4051,7 +4051,13 @@ fixed 32-element insertion runs and bottom-up merge procedure in `draft.md` §8
 controls observable calls. Empty/singleton inputs invoke none; no adaptive probes
 or key columns exist. Scratch is delayed until merging even in diagnostic off-mode.
 [Plan208](impl/208-comparator-sorting.md) owns the exact contract and closure matrix.
-Move/aggregate elements and new callable transport remain outside this boundary.
+[Plan220](impl/220-copy-record-comparator-sort.md) additionally admits already-formed
+records without explicit `align(N)` whose complete inline graph is independent
+Copy data. Existing field/collection formation still applies; every variant and
+zero-length element type is inspected. View/callable/pointer/resource/Move graphs,
+other aggregate roots and new callable transport remain outside this boundary.
+Complete record values use ordinary AoS result/scratch storage and by-value calls;
+no ordering operator, new allocation class or per-element cleanup is introduced.
 
 ### `pkg.kv` v1 typed RESP2 client — SETTLED 2026-09-02
 

@@ -25,6 +25,13 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan220](docs/impl/220-copy-record-comparator-sort.md) extends `sort_by` to
+  already-formed independent Copy records for LLM Request27's composite keys.
+  Complete AoS values use the existing stable comparator and ordinary call ABI;
+  view/Move/callable records and direct/key sorting retain their limits. Transient
+  allocation/header type equations now validate even without an escaping owner.
+  Consumer adoption remains external.
+
 - [Plan211](docs/impl/211-vectorization-cost-diagnostics.md) makes LLVM22's
   standalone vectorization-profitability refusal visible in ordinary
   `explain-opt` output for Request116. The diagnostic retains the source

@@ -2345,9 +2345,15 @@ call transport, with two explicit operands before captures. Sequential Impure
 comparators follow fixed insertion/merge calls; ordered-run shortcuts would add
 or remove observable calls, so they are disabled. Comparator captures affect
 call lifetime and effects, never the result element provenance.
-Existing conservative bound-source generation loans remain the shared collector
-rule. Precision beyond those loans is separate work; allocating a new spine
-does not make replacing a live source binding admissible.
+Existing conservative bound-source generation loans for borrowed contents remain
+the shared collector rule. Precision beyond those loans is separate work.
+
+Plan220 extends that same comparator to already-formed independent Copy records,
+using the complete graph classification shared with Copy producer/builder reads.
+Copy alone is insufficient: a view or callable field can carry access authority.
+Excluding those graphs allows complete AoS copies and ordinary two-record calls
+without a new ownership or interprocedural permission model. No aggregate order
+or key extraction is inferred; direct/key sorting retains its existing domain.
 
 Plan 134 completes the previously deferred owned-string key path. Sorting keeps
 comparison headers separate from an unsorted ownership column. The key call's

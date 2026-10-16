@@ -86,10 +86,17 @@ fn main() -> i32 {
 
 `sort()` sorts ascending; `sort_by_key(f)` sorts by a computed key; `sort_by(cmp)` uses an explicit `(a, b) -> bool` comparison meaning a precedes b. `partition(p)` splits one pass into two owned arrays: satisfying, then rest.
 
-All three sorts are scalar-only for now, which is the pitfall on an `array<Item>` of structs: `sort`, `sort_by_key` and `sort_by` over struct elements are rejected outright (`'sort' over struct elements is not supported yet (project a field first)`), and a `sort_by_key` key must be an orderable scalar — an int, a float, a `char`, a `str`, or an owned `string`. Project the field you want to order by first.
+`sort` and `sort_by_key` accept scalar elements; a `sort_by_key` key must be an
+orderable scalar: an int, float, `char`, `str` or owned `string`.
 
-`sort_by` accepts integers, floats, bools, characters and borrowed strings. Its comparator
-uses existing Copy captures and may be Impure in sequential code. Supply a strict weak order
+`sort_by` accepts integers, floats, bools, characters, borrowed strings and
+independent Copy records without explicit `align(N)`. Such records contain only
+independent data through existing nested records, fixed arrays, tuples and
+Option/Result/sum fields; no view, callable, pointer, resource or Move field is
+allowed, even in an inactive variant or zero-length array. Existing field and
+collection formation restrictions apply. For example, a numeric span record
+can use text captured by the comparator without storing a text view in the record.
+Its comparator uses existing Copy captures and may be Impure in sequential code. Supply a strict weak order
 for stable sorted results. An inconsistent terminating comparator still preserves every input
 element. Comparator-only captures are not retained by the result; borrowed source text is.
 Comparisons follow the fixed insertion/merge procedure in [plan208](../impl/208-comparator-sorting.md),

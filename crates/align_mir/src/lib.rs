@@ -16710,11 +16710,7 @@ fn lower_array_collect(
     b.cur = exit;
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::Load(acc)));
-    let array_ty = match elem {
-        Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
-        _ => Ty::DynArray(scalar_of(elem)),
-    };
-    let arr = b.fresh_value(array_ty);
+    let arr = b.fresh_value(collected_array_type(elem));
     b.push(Stmt::Let(
         arr,
         Rvalue::MakeDynArray {
@@ -18347,6 +18343,14 @@ fn sort_read(b: &mut Builder, buf: &Operand, idx: Operand, ty: Ty) -> Operand {
     Operand::Value(v)
 }
 
+/// Result and scratch spines share the canonical complete-element collection type.
+fn collected_array_type(elem: Ty) -> Ty {
+    match elem {
+        Ty::Struct(id) => Ty::DynStructArray(id, Layout::Aos),
+        _ => Ty::DynArray(scalar_of(elem)),
+    }
+}
+
 /// Heap-allocate a transient `count`-element scratch buffer of `ty`, returning its raw buffer
 /// pointer (for `PtrStore`) and a `{ptr,len}` value (for `SliceIndex`). Always a free-standing heap
 /// allocation (arena-independent), balanced by `DropValue` before the sort returns (deep for the String owner column) —
@@ -18360,7 +18364,7 @@ fn sort_alloc_buf(b: &mut Builder, ty: Ty, len: &Operand) -> (Operand, Operand) 
             elem: ty,
         },
     ));
-    let val = b.fresh_value(Ty::DynArray(scalar_of(ty)));
+    let val = b.fresh_value(collected_array_type(ty));
     b.push(Stmt::Let(
         val,
         Rvalue::MakeDynArray {

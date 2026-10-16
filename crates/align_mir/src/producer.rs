@@ -12026,7 +12026,8 @@ pub fn slice_index_result_matches(program: &Program, source: Ty, result: Ty, noa
 /// producers require their exact physical result type; the sole representation-compatible
 /// projection is ordinary `DynArray(String) -> Str` indexing. The vectorizer-only noalias form
 /// remains exact. Collection `Field` projections authenticate their physical path and exact
-/// header type even when no returned owner demands their producer graph.
+/// header type even when no returned owner demands their producer graph. Transient buffer
+/// allocations likewise retain their exact element pointer and count/arena operand types.
 pub fn validate_slice_index_rvalues(program: &Program) -> Result<(), ProducerError> {
     let i64_ty = Ty::Int(IntTy {
         bits: 64,
@@ -12038,6 +12039,46 @@ pub fn validate_slice_index_rvalues(program: &Program) -> Result<(), ProducerErr
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
+                // Scratch allocations can be dropped locally without entering a returned
+                // owner's graph. Their type equation is still required before any native use.
+                let allocation = match rvalue {
+                    Rvalue::HeapAllocBuf { count, elem } => Some((count, *elem, None)),
+                    Rvalue::ArenaAlloc { handle, count, elem } => Some((count, *elem, Some(handle))),
+                    _ => None,
+                };
+                if let Some((count, elem, handle)) = allocation {
+                    let expected = align_sema::ty_to_scalar(elem).map(Ty::Box);
+                    if expected.is_none() || function.value_tys.get(*value as usize).copied() != expected
+                        || preflight_operand_ty(function, count) != Some(i64_ty)
+                        || handle.is_some_and(|handle| preflight_operand_ty(function, handle) != Some(Ty::ArenaHandle))
+                    {
+                        return Err(ProducerError::Lowering(format!(
+                            "buffer allocation MIR in function '{}' has an invalid element pointer, count or arena type",
+                            function.name
+                        )));
+                    }
+                }
+                if let Rvalue::MakeDynArray { ptr, len } = rvalue {
+                    let result = function.value_tys.get(*value as usize).copied();
+                    let pointer = preflight_operand_ty(function, ptr);
+                    let valid = match (result, pointer) {
+                        (Some(Ty::DynStructArray(id, Layout::Aos)), Some(Ty::Box(Scalar::Struct(element)))) => id == element,
+                        (Some(Ty::DynArray(element)), Some(Ty::Box(pointer))) =>
+                            !matches!(element, Scalar::Struct(_)) && element == pointer,
+                        // SoA's existing layout producer additionally authenticates its columns;
+                        // the raw allocation pointer carries the first column's scalar type.
+                        (Some(Ty::Soa(id)), Some(Ty::Box(element))) => program.structs.get(id as usize)
+                            .and_then(|record| record.fields.first())
+                            .is_some_and(|field| align_sema::ty_to_scalar(field.ty) == Some(element)),
+                        _ => false,
+                    };
+                    if !valid || preflight_operand_ty(function, len) != Some(i64_ty) {
+                        return Err(ProducerError::Lowering(format!(
+                            "collection header MIR in function '{}' has an invalid physical element or length type",
+                            function.name
+                        )));
+                    }
+                }
                 if let Rvalue::Field(slot, path) = rvalue {
                     let selected = match function.slots.get(*slot as usize) {
                         Some(Ty::Struct(id)) => inline_struct_path_ty(program, *id, path),

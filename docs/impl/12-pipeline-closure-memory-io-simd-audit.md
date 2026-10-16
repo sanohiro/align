@@ -206,8 +206,9 @@ nested function-value environment.
 order and calls the key exactly N times before reordering; the source contract now makes that
 behavior normative. Comparisons consume the recorded keys and never re-evaluate the callable.
 
-Plan208 adds `sort_by(cmp)` over the existing scalar Copy elements, with two
-by-value operands and a bool result. Sequential Impure comparators follow the
+Plans208/220 provide `sort_by(cmp)` over primitive Copy/str elements and already-formed
+independent Copy records without explicit alignment, with two by-value operands
+and a bool result. Plan220 owns the complete record graph and formation boundary. Sequential Impure comparators follow the
 exact insertion/merge procedure in [plan208](208-comparator-sorting.md): complete
 collection, insertion runs of at most 32, then widths 32, 64 and so on. Insertion
 calls `cmp(current, predecessor)`; merging calls `cmp(right_head, left_head)`.
