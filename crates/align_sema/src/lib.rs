@@ -92143,14 +92143,14 @@ fn exit_branch(flag: bool) -> i64 {
     fn scan_over_copy_struct_element_checks() {
         // Complete Copy records are ordinary by-value callback inputs.
         let (_p, d) = check("Point { x: i32, y: i32 }\nfn addx(acc: i32, p: Point) -> i32 = acc + p.x\nfn main() -> i32 {\n  return [Point { x: 1, y: 2 }].scan(0, addx).sum()\n}\n");
-        assert!(!d.has_errors(), "scan over Copy struct elements must check: {d:?}");
+        assert!(!d.has_errors(), "scan over Copy struct elements must check");
     }
 
     #[test]
     fn scan_independent_struct_accumulator_checks() {
         // Complete independent Copy records use canonical record-array storage.
         let (_p, d) = check("Acc { s: i32 }\nfn step(a: Acc, x: i32) -> Acc = Acc { s: a.s + x }\nfn id(x: i32) -> i32 = x\nfn main() -> i32 {\n  return [1, 2, 3].map(id).scan(Acc { s: 0 }, step).len() as i32\n}\n");
-        assert!(!d.has_errors(), "scan with an independent struct accumulator must check: {d:?}");
+        assert!(!d.has_errors(), "scan with an independent struct accumulator must check");
     }
 
     #[test]
