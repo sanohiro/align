@@ -2865,6 +2865,55 @@ do
     exit 1
   }
 done
+# The release corpus is an explicit, dependency-closed selection. Pin its
+# complete inventory independently of the preparation script, including source bytes.
+corpus_project="$tmp_dir/prebuilt-corpus"
+"$repo_root/scripts/prepare-prebuilt-cache-project.sh" "$corpus_project"
+python3 - "$repo_root" "$corpus_project" <<'PY_CORPUS'
+from pathlib import Path
+import sys
+
+repo, project = map(Path, sys.argv[1:])
+expected = set("""align_release_cache_warm
+pkg.auth
+pkg.csv
+pkg.csv.internal.descriptor
+pkg.db
+pkg.db.internal
+pkg.db.internal.descriptor
+pkg.db.internal.postgres
+pkg.db.internal.postgres_status
+pkg.db.internal.resource
+pkg.db.internal.sqlite
+pkg.db.pool
+pkg.db.pool.internal.resource
+pkg.db.postgres
+pkg.db.sqlite
+pkg.frame
+pkg.kv
+pkg.kv.internal.resource
+pkg.s3
+pkg.template
+pkg.template.internal.descriptor
+pkg.template.internal.resource""".splitlines())
+observed = {}
+for source in project.rglob("*.align"):
+    modules = [line.split()[1] for line in source.read_text().splitlines()
+               if line.startswith("module ")]
+    assert len(modules) == 1 and modules[0] not in observed, source
+    observed[modules[0]] = source
+assert set(observed) == expected, (set(observed) - expected, expected - set(observed))
+for tree in ("auth", "csv", "db", "frame", "kv", "s3", "template"):
+    for source in (repo / "apps" / tree / "pkg").rglob("*.align"):
+        destination = project / "pkg" / source.relative_to(repo / "apps" / tree / "pkg")
+        assert destination.read_bytes() == source.read_bytes(), source
+for source in observed.values():
+    for line in source.read_text().splitlines():
+        if line.startswith("import pkg."):
+            assert line.split()[1] in observed, (source, line)
+layout = (repo / "scripts/verify-prebuilt-cache-layout.sh").read_text()
+assert "import pkg.auth\n" in layout, "absent-source control must name a bundled package"
+PY_CORPUS
 grep -Fq 'scripts/verify-prebuilt-cache-layout.sh package' "$release_workflow" || {
   echo "release.yml no longer verifies the staged native cache layout" >&2
   exit 1
@@ -2892,9 +2941,7 @@ if [[ "$historical_guards" -ne 3 ]]; then
   exit 1
 fi
 corpus_links="$(
-  find "$repo_root/apps/web/pkg" "$repo_root/apps/frame/pkg" "$repo_root/apps/auth/pkg" \
-    "$repo_root/apps/db/pkg" "$repo_root/apps/kv/pkg" "$repo_root/apps/csv/pkg" \
-    "$repo_root/apps/ws/pkg" "$repo_root/apps/template/pkg" "$repo_root/apps/s3/pkg" \
+  find "$corpus_project/pkg" \
     -name '*.align' -type f -exec \
     sed -n 's/.*extern "C" link("\([^"]*\)").*/\1/p' '{}' + \
     | LC_ALL=C sort -u | paste -sd, -
@@ -3043,6 +3090,54 @@ mkdir -p "$relative_cache_case/package/share/align/cache/1"
     "$repo_root/scripts/build-prebuilt-cache.sh" \
       "$relative_cache_case/alignc" package/share/align/cache/1
 )
+
+# A compiler failure must remain fatal and visible even when diagnostics were
+# captured for cache/parity checks. Keep failed scratch inside this test's root.
+for failure in warm hot layout benchmark; do
+  failure_case="$tmp_dir/prebuilt-failure-$failure"
+  mkdir -p "$failure_case/package/share/align/cache/1"
+  : > "$failure_case/package/libalign_runtime.a"
+  : > "$failure_case/archive.tar.gz"
+  cat > "$failure_case/package/alignc" <<'FAIL_ALIGNC'
+#!/usr/bin/env bash
+set -euo pipefail
+count=0
+[[ ! -f "$FAILURE_COUNT" ]] || count="$(cat "$FAILURE_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" > "$FAILURE_COUNT"
+if [[ "$count" -ge "$FAILURE_AT" ]]; then
+  echo "forced prebuilt compiler diagnostic" >&2
+  exit 37
+fi
+exec "$SUCCESS_ALIGNC" "$@"
+FAIL_ALIGNC
+  chmod +x "$failure_case/package/alignc"
+  failure_at=1
+  [[ "$failure" != hot ]] || failure_at=2
+  failure_status=0
+  (
+    export TMPDIR="$failure_case"
+    export FAILURE_COUNT="$failure_case/count" FAILURE_AT="$failure_at"
+    export SUCCESS_ALIGNC="$relative_cache_case/alignc"
+    export EXPECTED_CACHE_ROOT="$failure_case/package/share/align/cache/1"
+    case "$failure" in
+      warm|hot)
+        "$repo_root/scripts/build-prebuilt-cache.sh" "$failure_case/package/alignc" \
+          "$EXPECTED_CACHE_ROOT" ;;
+      layout)
+        "$repo_root/scripts/verify-prebuilt-cache-layout.sh" "$failure_case/package" ;;
+      benchmark)
+        "$repo_root/bench/prebuilt_cache/run.sh" "$failure_case/package" \
+          "$failure_case/archive.tar.gz" "$failure_case/summary.md" ;;
+    esac
+  ) >"$failure_case/output" 2>&1 || failure_status=$?
+  if [[ "$failure_status" -ne 37 ]] || \
+      ! grep -Fq 'forced prebuilt compiler diagnostic' "$failure_case/output"; then
+    cat "$failure_case/output" >&2
+    echo "prebuilt $failure lost compiler status/diagnostics: $failure_status" >&2
+    exit 1
+  fi
+done
 
 # scripts/restore-mtime.py undoes actions/checkout's uniform "now" mtime stamp
 # so Cargo's fingerprint cache still hits after a fresh CI checkout. Assert

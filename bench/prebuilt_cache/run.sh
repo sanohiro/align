@@ -23,6 +23,9 @@ cleanup() {
   if [[ $status -eq 0 ]]; then
     rm -rf "$WORK_ROOT"
   else
+    for diagnostics in "$WORK_ROOT"/*.stderr; do
+      [[ ! -f "$diagnostics" ]] || cat "$diagnostics" >&2
+    done
     echo "prebuilt cache benchmark: preserved failed work at $WORK_ROOT" >&2
   fi
 }

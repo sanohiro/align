@@ -21,6 +21,9 @@ cleanup() {
   if [[ $status -eq 0 ]]; then
     rm -rf "$WORK_ROOT"
   else
+    for diagnostics in "$WORK_ROOT"/*.outcomes; do
+      [[ ! -f "$diagnostics" ]] || cat "$diagnostics" >&2
+    done
     echo "prebuilt cache layout: preserved failed work at $WORK_ROOT" >&2
   fi
 }
@@ -83,7 +86,7 @@ python3 "$REPO_ROOT/scripts/prebuilt-cache-inventory.py" verify-outcomes \
 
 mkdir -p "$WORK_ROOT/absent-source"
 cat > "$WORK_ROOT/absent-source/main.align" <<'ALIGN'
-import pkg.web
+import pkg.auth
 fn main() -> i32 = 0
 ALIGN
 if ALIGNC_CACHE=on XDG_CACHE_HOME="$WORK_ROOT/absent-xdg" \

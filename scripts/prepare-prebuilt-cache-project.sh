@@ -14,7 +14,10 @@ if [[ -e "$PROJECT_ROOT" ]]; then
 fi
 mkdir -p "$PROJECT_ROOT/pkg"
 
-for TREE in apps/web/pkg apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg apps/csv/pkg apps/ws/pkg apps/template/pkg apps/s3/pkg; do
+# Keep complete, dependency-closed trees. Web and WebSocket warming is deferred
+# until the documented structured-task callback compatibility gap is repaired
+# (docs/impl/21-build-perf-plan.md, item 4). Selected compilation failures are fatal.
+for TREE in apps/frame/pkg apps/auth/pkg apps/db/pkg apps/kv/pkg apps/csv/pkg apps/template/pkg apps/s3/pkg; do
   cp -R "$REPO_ROOT/$TREE/." "$PROJECT_ROOT/pkg/"
 done
 
@@ -25,16 +28,10 @@ import pkg.db
 import pkg.db.sqlite
 import pkg.db.postgres
 import pkg.db.pool
-import pkg.web
-import pkg.web.types
-import pkg.web.cookie
-import pkg.web.cors
-import pkg.web.multipart
 import pkg.frame
 import pkg.auth
 import pkg.kv
 import pkg.csv
-import pkg.ws
 import pkg.template
 import pkg.s3
 
