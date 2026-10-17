@@ -3093,7 +3093,7 @@ mkdir -p "$relative_cache_case/package/share/align/cache/1"
 
 # A compiler failure must remain fatal and visible even when diagnostics were
 # captured for cache/parity checks. Keep failed scratch inside this test's root.
-for failure in warm hot layout benchmark; do
+for failure in warm hot layout benchmark benchmark-emit benchmark-timing; do
   failure_case="$tmp_dir/prebuilt-failure-$failure"
   mkdir -p "$failure_case/package/share/align/cache/1"
   : > "$failure_case/package/libalign_runtime.a"
@@ -3109,15 +3109,32 @@ if [[ "$count" -ge "$FAILURE_AT" ]]; then
   echo "forced prebuilt compiler diagnostic" >&2
   exit 37
 fi
+if [[ "$FAKE_BENCHMARK" == 1 ]]; then
+  case "$1" in
+    build)
+      printf '#!/bin/sh\nexit 0\n' > main
+      chmod +x main ;;
+    emit-obj) : ;;
+    *) exit 2 ;;
+  esac
+  exit 0
+fi
 exec "$SUCCESS_ALIGNC" "$@"
 FAIL_ALIGNC
   chmod +x "$failure_case/package/alignc"
   failure_at=1
-  [[ "$failure" != hot ]] || failure_at=2
+  fake_benchmark=0
+  case "$failure" in
+    hot) failure_at=2 ;;
+    benchmark) fake_benchmark=1 ;;
+    benchmark-emit) fake_benchmark=1; failure_at=3 ;;
+    benchmark-timing) fake_benchmark=1; failure_at=5 ;;
+  esac
   failure_status=0
   (
     export TMPDIR="$failure_case"
     export FAILURE_COUNT="$failure_case/count" FAILURE_AT="$failure_at"
+    export FAKE_BENCHMARK="$fake_benchmark"
     export SUCCESS_ALIGNC="$relative_cache_case/alignc"
     export EXPECTED_CACHE_ROOT="$failure_case/package/share/align/cache/1"
     case "$failure" in
@@ -3126,7 +3143,7 @@ FAIL_ALIGNC
           "$EXPECTED_CACHE_ROOT" ;;
       layout)
         "$repo_root/scripts/verify-prebuilt-cache-layout.sh" "$failure_case/package" ;;
-      benchmark)
+      benchmark*)
         "$repo_root/bench/prebuilt_cache/run.sh" "$failure_case/package" \
           "$failure_case/archive.tar.gz" "$failure_case/summary.md" ;;
     esac

@@ -77,15 +77,16 @@ if [[ -e "$WORK_ROOT/xdg-correctness/alignc/1/actions" ]]; then
 fi
 
 measure() {
-  python3 - "$@" <<'PY'
+  python3 - "$WORK_ROOT/measurement.stderr" "$@" <<'PY'
 import subprocess
 import sys
 import time
 
-started = time.perf_counter()
-result = subprocess.run(
-    sys.argv[2:], cwd=sys.argv[1], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-)
+with open(sys.argv[1], "wb") as diagnostics:
+    started = time.perf_counter()
+    result = subprocess.run(
+        sys.argv[3:], cwd=sys.argv[2], stdout=subprocess.DEVNULL, stderr=diagnostics
+    )
 if result.returncode != 0:
     raise SystemExit(result.returncode)
 print(f"{time.perf_counter() - started:.6f}")
