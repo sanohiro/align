@@ -2569,7 +2569,7 @@ fn concrete_inline_extern_fact_names_use_symbol_order_independent_of_link_order(
     assert_eq!(
         facts
             .get("lib$both")
-            .and_then(|(_, _, _, _, _, _, _, externs, _, _)| externs.as_ref()),
+            .and_then(|(_, _, _, _, _, _, _, externs, _, _, _)| externs.as_ref()),
         Some(&vec!["a".to_string(), "b".to_string()])
     );
 }
@@ -2813,7 +2813,7 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
     let hex = surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     assert_eq!(
         hex,
-        "14000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c696365010000000003000000693634000000000003000000693634000000000000000100000000010000000000010000000001010000000001000000000000000001010000000000000000000000000000000000000000000000000000"
+        "15000000040000006d61696e0100000007000000696e73706563740000000001000000010005000000736c69636501000000000300000069363400000000000300000069363400000000000000010000000001000000000001000000000000000001000000000000000001010000000001000000000000000001010000000000000000000000000000000000000000000000000000"
     );
 
     let mut artifact = serialize(&summary);
@@ -2831,23 +2831,24 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
 
     // This one-function surface ends with the function's borrow tag, region tag, cleanup ABI,
     // one-element drop-state sequence, producer certificate, effect, empty parallel-transfer
-    // sequence, the five-byte Some([]) mutable-access record, the 15-byte Some([unchanged Contained(0)]) mutable-retention record, the six-byte
+    // sequence, the nine-byte empty conditional/direct mutable-access record, the nine-byte
+    // empty callback contract, the 15-byte Some([unchanged Contained(0)]) mutable-retention record, the six-byte
     // Some([None]) mutable-view-effect record, resource-hook-body bit, generic body option,
     // then the empty top-level sequences.
     let mut bad_borrow = serialize(&summary);
-    bad_borrow[surface.len() - 62] = 0xff;
+    bad_borrow[surface.len() - 75] = 0xff;
     assert_eq!(
         deserialize(&bad_borrow),
         Err(DecodeError::BadTag { what: "return-borrow summary", tag: 0xff })
     );
     let mut bad_region = serialize(&summary);
-    bad_region[surface.len() - 61] = 0xff;
+    bad_region[surface.len() - 74] = 0xff;
     assert_eq!(
         deserialize(&bad_region),
         Err(DecodeError::BadTag { what: "return-region summary", tag: 0xff })
     );
     let mut bad_cleanup = serialize(&summary);
-    bad_cleanup[surface.len() - 60] = 0xff;
+    bad_cleanup[surface.len() - 73] = 0xff;
     assert_eq!(
         deserialize(&bad_cleanup),
         Err(DecodeError::BadTag {
@@ -2856,13 +2857,13 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
         })
     );
     let mut bad_drop_state = serialize(&summary);
-    bad_drop_state[surface.len() - 55] = 0xff;
+    bad_drop_state[surface.len() - 68] = 0xff;
     assert_eq!(
         deserialize(&bad_drop_state),
         Err(DecodeError::BadTag { what: "drop-state effect", tag: 0xff })
     );
     let mut bad_certificate = serialize(&summary);
-    bad_certificate[surface.len() - 54] = 0xff;
+    bad_certificate[surface.len() - 67] = 0xff;
     assert_eq!(
         deserialize(&bad_certificate),
         Err(DecodeError::BadTag {
@@ -2882,7 +2883,7 @@ fn parameter_mode_and_producer_certificate_codec_have_a_byte_golden() {
 }
 
 #[test]
-fn v20_drop_state_surface_has_independent_full_record_goldens() {
+fn v21_drop_state_surface_has_independent_full_record_goldens() {
     let summary = one("pub fn plain(value: i64) -> i64 = value\n\
          pub fn invariant(borrow mut value: string) -> i64 = value.len()\n\
          pub fn changing(borrow mut value: string) { value = \"x\".clone() }\n\
@@ -2890,12 +2891,12 @@ fn v20_drop_state_surface_has_independent_full_record_goldens() {
          fn main() -> i32 = 0\n",
     )
     .remove(0);
-    let expected_hex = "14000000040000006d61696e04000000080000006368616e67696e670000000001000000030006000000737472696e670000000000020000002829000000000000000100000002010000000000010100000001000000000101000000010000000001010000000000000800000064656665727265640100000001000000540001000000030001000000540000000000020000002829000000000000000100000003000200000000000000000126000000666e2064656665727265643c543e28626f72726f77206d75742076616c75653a205429207b7d09000000696e76617269616e740000000001000000030006000000737472696e670000000000030000006936340000000000000001000000010100000000000100000000010100000000010000000000000000010100000000000005000000706c61696e000000000100000000000300000069363400000000000300000069363400000000000000010000000001000000000001000000000101000000000000000001010000000000000000000000000000000000000000000000000000";
+    let expected_hex = "15000000040000006d61696e04000000080000006368616e67696e670000000001000000030006000000737472696e6700000000000200000028290000000000000001000000020100000000000101000000010000000000000000010000000000000000010100000001000000000101000000000000080000006465666572726564010000000100000054000100000003000100000054000000000002000000282900000000000000010000000300020000000000000000000126000000666e2064656665727265643c543e28626f72726f77206d75742076616c75653a205429207b7d09000000696e76617269616e740000000001000000030006000000737472696e67000000000003000000693634000000000000000100000001010000000000010000000000000000010000000000000000010100000000010000000000000000010100000000000005000000706c61696e00000000010000000000030000006936340000000000030000006936340000000000000001000000000100000000000100000000000000000100000000000000000101000000000000000001010000000000000000000000000000000000000000000000000000";
     let surface = encode_interface_surface(&summary);
     assert_eq!(
         surface.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
         expected_hex,
-        "the semantic-to-byte v20 surface must retain exact function and effect ordering"
+        "the semantic-to-byte v21 surface must retain exact function and effect ordering"
     );
     let mut artifact = (0..expected_hex.len() / 2)
         .map(|index| {
@@ -2909,7 +2910,7 @@ fn v20_drop_state_surface_has_independent_full_record_goldens() {
     artifact.extend(interface_hash.hi.to_le_bytes());
     artifact.extend(summary.impl_hash.lo.to_le_bytes());
     artifact.extend(summary.impl_hash.hi.to_le_bytes());
-    let decoded = deserialize(&artifact).expect("independent v20 bytes decode");
+    let decoded = deserialize(&artifact).expect("independent v21 bytes decode");
     assert_eq!(decoded, summary);
     assert_eq!(
         decoded
@@ -3086,7 +3087,7 @@ fn mutable_access_changes_interface_identity_and_survives_round_trip() {
     let write = &write[0];
     let read_function = read.fns.iter().find(|function| function.name == "access").unwrap();
     let write_function = write.fns.iter().find(|function| function.name == "access").unwrap();
-    assert_eq!(read_function.mutable_access, Some(vec![]));
+    assert_eq!(read_function.mutable_access, Some(Default::default()));
     assert!(write_function.mutable_access.as_ref().is_some_and(|roots| !roots.is_empty()));
     assert_ne!(read.interface_hash, write.interface_hash);
     assert_eq!(deserialize(&serialize(write)).unwrap(), *write);

@@ -1722,6 +1722,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::None,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
+                callback_contract: None,
                 mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 0]),
                 mutable_view_effect: None,
                 locals: Vec::new(),
@@ -1786,6 +1787,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
+                callback_contract: None,
                 mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -1860,6 +1862,7 @@ mod tests {
                 return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
+                callback_contract: None,
                 mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -1940,6 +1943,7 @@ mod tests {
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
+                callback_contract: None,
                 mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -2390,6 +2394,7 @@ mod tests {
                 },
                 parallel_transfer: hir::ReturnBorrowSummary::None,
                 mutable_access: None,
+                callback_contract: None,
                 mutable_retention: Some(vec![hir::MutableRetentionDestination::default(); 1]),
                 mutable_view_effect: None,
                 locals: vec![hir::Local {
@@ -2574,7 +2579,9 @@ mod tests {
                         named_return_borrow: &named_return_borrow,
                         named_parallel_transfer: &named_return_borrow,
                         named_mutable_access: &crate::MutableAccessMap::new(),
+                        named_callback_contracts: &crate::callback_access::ContractMap::new(),
                         task_groups: std::collections::HashMap::new(),
+                        immediate_task_closures: Default::default(),
                         named_param_modes: &named_param_modes,
                         named_borrow_mut_retention: &named_borrow_mut_retention,
                         named_view_effect: &named_view_effect,
@@ -2608,6 +2615,9 @@ mod tests {
                         return_roots: crate::BorrowRoots::new(),
                         parallel_transfer_roots: crate::BorrowRoots::new(),
                         mutable_access_roots: crate::BorrowRoots::new(),
+                        callback_returns: Default::default(),
+                        callback_requirements: Default::default(),
+                        conditional_access: Default::default(),
                         borrow_mut_retention: vec![
                             crate::BorrowMutRetentionDestination::default();
                             move_program.fns[0].params.len()

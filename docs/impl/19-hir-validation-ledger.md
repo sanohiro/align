@@ -2227,8 +2227,8 @@ exists. The Request 61 receiver extension adds no HIR record or serialized repre
 
 The authoritative record and closure matrix are in
 `17-library-boundary-prerequisites.md`, Request 43/49, refined by Plan199.
-Interface format20 keeps `mutable_retention` after `mutable_access`, which follows
-`parallel_transfer_params`,
+Interface format21 keeps `mutable_retention` after `callback_contract`, following
+`mutable_access` and `parallel_transfer_params`,
 and records an independent possible-mutation bool before each destination's roots. The HIR stored-function record holds the exact local
 inference result; body replay resets, re-infers, and compares that result. Imported
 records preserve the producer result and pass the shared arity, root-order, index,
@@ -2414,15 +2414,23 @@ No Ty/Scalar or serialized leaf tag is added.
 
 ## Structured task access and retention (plan180)
 
-`Fn::mutable_access` and `ImportedFn::mutable_access` are mandatory analysis surfaces:
-`Option<Vec<MutableAccessRoot>>`, with distinct `Contained(u32)` and `Storage(u32)`
-logical parameter roots, including lifted captures. `None` is unavailable; `Some([])`
-is proven empty. Producer inference, imported certification, concrete-inline comparison,
-replay reset/equality and interface format 18 cover the record. Canonical kind/index order,
-range checks and generic unavailability are shared validation. [Plan180](180-structured-task-progress.md)
-owns the exact bytes and closure matrix. Task captures additionally retain completed
-borrow/storage facts through control joins, generation renaming and pruning until their
-covering join. Discarded handles do not weaken protection.
+`Fn::mutable_access` and `ImportedFn::mutable_access` hold
+`Option<MutableAccessEffects>`: direct roots plus conditional callback access rows.
+Contained/Storage logical roots retain their existing meanings. None is unavailable;
+a present empty record proves no input access. Each concrete function also owns an
+optional `CallbackContract` containing task callback requirements and a complete
+returned callable-leaf source inventory. Generic templates carry None.
+[Plan224](224-task-callback-access.md) owns the exact records, interface21 field order,
+canonical bytes, validation order and closure matrix. Nominal types and FnTy identity
+remain unchanged. Certified imports validate paths against the reconstructed type
+graph before inference; checked-HIR replay resets, recomputes and compares every
+record. Unavailable, malformed or stale evidence cannot discharge a requirement.
+
+[Plan180](180-structured-task-progress.md) retains the task lifetime authority.
+Pending captures preserve completed borrow/storage facts through control joins,
+generation renaming and pruning until their covering join. Discarded handles do
+not weaken protection. Conditional callback access still checks pending captures;
+direct writes and explicit exclusive arguments remain unconditional.
 
 ## Tuple carrier composition (Plan190)
 

@@ -22,13 +22,6 @@ part of the framework even though the first gateway and LLM consumers use fixed 
 consumers do not limit its scope. Historical plan of record: `../15-pkg-web-plan.md`.
 The compiler prerequisite, **F1 field-eligibility widening**, is shipped (see Foundations).
 
-**Current compatibility gap:** importing the full `pkg.web` package fails the structured-task
-capture check in `serve` with `a spawned task cannot modify or exclusively borrow captured backing`.
-The worker invokes callbacks from the captured route table, whose backing access is not proven
-read-only. The multipart documented-handler test reproduces this failure. Choosing one worker
-does not avoid it: imported function bodies are checked before that runtime choice. The API below
-remains the package contract; package/task-capture compatibility needs a separate implementation fix.
-
 ## Minimalism (owner constraint)
 
 The surface is exactly: routing, ctx accessors, responders, middleware-lite, SSE sugar — nothing

@@ -9,6 +9,32 @@ use std::collections::HashMap;
 use align_diag::Diagnostics;
 use align_sema::{check_program_with_effects, FnEffect, Module};
 
+#[test]
+fn shipped_web_and_websocket_task_dispatch_checks() {
+    // Keep the real package graph in the bounded gate: a trivial import must still check
+    // the task consumer bodies, including their opaque handler and middleware dispatch.
+    let paths = [
+        ("pkg.web.types", "apps/web/pkg/web/types.align"),
+        ("pkg.web.internal.router", "apps/web/pkg/web/internal/router.align"),
+        ("pkg.web.internal.query", "apps/web/pkg/web/internal/query.align"),
+        ("pkg.web", "apps/web/pkg/web.align"),
+        ("pkg.ws", "apps/ws/pkg/ws.align"),
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut sources = paths.iter().map(|(module, path)| {
+        let source = std::fs::read_to_string(root.join(path)).unwrap_or_else(|error| panic!("{path}: {error}"));
+        (*module, source)
+    }).collect::<Vec<_>>();
+    sources.push(("main", "module main\nimport pkg.web\nimport pkg.ws\nfn main() -> i32 = 0\n".to_owned()));
+    let files = sources.iter().map(|(_, source)| parse(source)).collect::<Vec<_>>();
+    let modules = sources.iter().zip(&files).map(|((path, _), file)| Module {
+        path: (*path).to_owned(), file, is_entry: *path == "main", interface_only: false,
+    }).collect::<Vec<_>>();
+    let mut diagnostics = Diagnostics::new();
+    check_program_with_effects(&modules, &HashMap::new(), &mut diagnostics);
+    assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>());
+}
+
 fn parse(src: &str) -> align_ast::File {
     let mut sm = align_span::SourceMap::new();
     let fid = sm.add_file("<test>", src);

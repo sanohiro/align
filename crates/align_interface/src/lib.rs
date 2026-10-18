@@ -205,6 +205,7 @@ pub struct IFnSig {
     /// Canonical parameter roots whose contained views may be transferred to parallel workers.
     pub parallel_transfer_params: Vec<u32>,
     pub mutable_access: align_sema::hir::MutableAccessSummary,
+    pub callback_contract: Option<align_sema::hir::CallbackContract>,
     pub mutable_retention: align_sema::hir::MutableRetentionSummary,
     pub mutable_view_effect: align_sema::hir::MutableViewEffectSummary,
     /// Whether the producer source has the exact top-level `unsafe {}` body shape required of a
@@ -591,6 +592,10 @@ pub fn build_summaries_with_effects(
             )
         }))
         .collect();
+    let callback_contract: HashMap<&str, _> = program.fns.iter()
+        .map(|f| (f.name.as_str(), f.callback_contract.clone()))
+        .chain(program.imported_fns.iter().map(|f| (f.name.as_str(), f.callback_contract.clone())))
+        .collect();
     let mutable_access: HashMap<&str, _> = program.fns.iter()
         .map(|function| (function.name.as_str(), function.mutable_access.clone()))
         .chain(program.imported_fns.iter().map(|function| (function.name.as_str(), function.mutable_access.clone())))
@@ -852,6 +857,9 @@ pub fn build_summaries_with_effects(
                             parallel_transfer_params,
                             mutable_access: if is_generic { None } else {
                                 mutable_access.get(canonical.as_str()).cloned().flatten()
+                            },
+                            callback_contract: if is_generic { None } else {
+                                callback_contract.get(canonical.as_str()).cloned().flatten()
                             },
                             mutable_retention: if is_generic { None } else {
                                 mutable_retention.get(canonical.as_str()).cloned().flatten()
@@ -2966,6 +2974,7 @@ pub fn validate_for_import(
                 function.name.clone(),
             ));
         }
+        align_sema::hir::validate_callback_record_order(&function.callback_contract, function.params.len(), !function.type_params.is_empty()).map_err(ImportCompatibilityError::InvalidMutableAccess)?;
         align_sema::hir::validate_mutable_access(
             &function.mutable_access, function.params.len(),
             matches!(function.body, IFnBody::GenericTemplate(_)),
@@ -3365,6 +3374,7 @@ pub fn summary_return_provenance(
                 },
                 function.mutable_view_effect.clone(),
                 function.mutable_access.clone(),
+                function.callback_contract.clone(),
             ),
         );
     }
@@ -3514,6 +3524,7 @@ mod builtin_spelling_tests {
                 effect: Effect::Pure,
                 parallel_transfer_params: Vec::new(),
                 mutable_access: None,
+                callback_contract: None,
                 mutable_retention: None,
                 mutable_view_effect: None,
                 resource_hook_body: false,

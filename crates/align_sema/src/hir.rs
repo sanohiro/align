@@ -297,15 +297,166 @@ pub enum MutableAccessRoot {
     Storage(u32),
 }
 
-/// None is unavailable (conservatively accesses all inputs); Some([]) is proven input-read-only.
-pub type MutableAccessSummary = Option<Vec<MutableAccessRoot>>;
+/// Producer-owned callable flow, independent of nominal and function-type identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum CallbackProjection {
+    StructField(u32), TupleElement(u32), EnumPayload { variant: u32, index: u32 },
+    OptionSome, ResultOk, ResultErr, ArrayElement,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct CallbackInput {
+    pub parameter: u32,
+    pub path: Vec<CallbackProjection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum CallbackRead { Environment, Argument(u32) }
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct CallbackRequirement {
+    pub input: CallbackInput,
+    pub read: CallbackRead,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct CallbackEffects {
+    pub environment_write: bool,
+    pub argument_writes: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub enum CallbackSource { Parameter(CallbackInput), Known(CallbackEffects), Unknown }
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct CallbackReturn {
+    pub path: Vec<CallbackProjection>,
+    pub sources: Vec<CallbackSource>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CallbackContract {
+    pub requirements: Vec<CallbackRequirement>,
+    pub returns: Vec<CallbackReturn>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct ConditionalAccess {
+    pub requirement: CallbackRequirement,
+    pub roots: Vec<MutableAccessRoot>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MutableAccessEffects {
+    pub direct: Vec<MutableAccessRoot>,
+    pub conditional: Vec<ConditionalAccess>,
+}
+
+impl MutableAccessEffects {
+    pub fn is_empty(&self) -> bool { self.direct.is_empty() && self.conditional.is_empty() }
+    /// Ordinary callers must retain every unresolved conditional action.
+    pub fn contains(&self, root: &MutableAccessRoot) -> bool {
+        self.direct.contains(root) || self.conditional.iter().any(|row| row.roots.contains(root))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &MutableAccessRoot> {
+        self.direct.iter().chain(self.conditional.iter().flat_map(|row| row.roots.iter()))
+    }
+}
+
+/// None is unavailable; a present empty record proves input-read-only access.
+pub type MutableAccessSummary = Option<MutableAccessEffects>;
+
+/// Decode-time canonical structure. Nominal paths are resolved after all dependency types exist.
+pub fn validate_callback_record_order(
+    contract: &Option<CallbackContract>, parameter_count: usize, generic: bool,
+) -> Result<(), &'static str> {
+    let Some(contract) = contract else { return Ok(()); };
+    let input_valid = |input: &CallbackInput| (input.parameter as usize) < parameter_count;
+    if generic || contract.requirements.windows(2).any(|p| p[0] >= p[1])
+        || contract.requirements.iter().any(|r| !input_valid(&r.input))
+        || contract.returns.windows(2).any(|p| p[0].path >= p[1].path)
+    { return Err("callback contract canonical structure"); }
+    for row in &contract.returns {
+        if row.sources.windows(2).any(|p| p[0] >= p[1]) {
+            return Err("callback return canonical structure");
+        }
+        for source in &row.sources {
+            match source {
+                CallbackSource::Parameter(input) if !input_valid(input) => return Err("callback source parameter"),
+                CallbackSource::Known(effects) if effects.argument_writes.windows(2).any(|p| p[0] >= p[1]) => return Err("callback source effects order"),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared structural checks. Each caller resolves paths against its own validated type graph;
+/// signature equality includes modes, arity, results and nested callable identity.
+pub fn validate_callback_contract<T: PartialEq>(
+    contract: &Option<CallbackContract>,
+    access: &MutableAccessSummary,
+    generic: bool,
+    parameter: impl std::ops::Fn(&CallbackInput) -> Option<(T, Vec<align_ast::ParamMode>)>,
+    results: &[(Vec<CallbackProjection>, T, Vec<align_ast::ParamMode>)],
+) -> Result<(), &'static str> {
+    let requirement_valid = |requirement: &CallbackRequirement| {
+        parameter(&requirement.input).is_some_and(|(_, modes)| match requirement.read {
+            CallbackRead::Environment => true,
+            CallbackRead::Argument(i) => modes.get(i as usize).is_some_and(|mode|
+                !matches!(mode, align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out)),
+        })
+    };
+    if access.as_ref().is_some_and(|a| a.conditional.iter().any(|row| !requirement_valid(&row.requirement))) {
+        return Err("conditional callback signature");
+    }
+    let Some(contract) = contract else {
+        if access.as_ref().is_some_and(|a| !a.conditional.is_empty()) {
+            return Err("conditional access without callback contract");
+        }
+        return Ok(());
+    };
+    if generic { return Err("generic callback contract"); }
+    if contract.requirements.windows(2).any(|p| p[0] >= p[1])
+        || contract.requirements.iter().any(|r| !requirement_valid(r))
+    { return Err("callback requirements"); }
+    if contract.returns.len() != results.len()
+        || contract.returns.windows(2).any(|p| p[0].path >= p[1].path)
+    { return Err("callback return inventory"); }
+    for (row, (path, signature, modes)) in contract.returns.iter().zip(results) {
+        if &row.path != path || row.sources.windows(2).any(|p| p[0] >= p[1]) {
+            return Err("callback return ordering");
+        }
+        for source in &row.sources {
+            match source {
+                CallbackSource::Parameter(input) => {
+                    if parameter(input).is_none_or(|(incoming, _)| &incoming != signature) {
+                        return Err("callback return source signature");
+                    }
+                }
+                CallbackSource::Known(effects) => {
+                    if effects.argument_writes.windows(2).any(|p| p[0] >= p[1])
+                        || effects.argument_writes.iter().any(|i| *i as usize >= modes.len())
+                        || modes.iter().enumerate().any(|(i, mode)|
+                            matches!(mode, align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out)
+                                && u32::try_from(i).is_ok_and(|i| !effects.argument_writes.contains(&i)))
+                    { return Err("callback returned effects"); }
+                }
+                CallbackSource::Unknown => {}
+            }
+        }
+    }
+    Ok(())
+}
 
 pub fn validate_mutable_access(
     summary: &MutableAccessSummary,
     parameter_count: usize,
     generic: bool,
 ) -> Result<(), &'static str> {
-    let Some(roots) = summary else { return Ok(()); };
+    let Some(effects) = summary else { return Ok(()); };
+    let roots = &effects.direct;
     if generic
         || roots.windows(2).any(|pair| pair[0] >= pair[1])
         || roots.iter().any(|root| {
@@ -316,6 +467,21 @@ pub fn validate_mutable_access(
         })
     {
         return Err("mutable-access roots");
+    }
+    if effects.conditional.windows(2).any(|pair| pair[0].requirement >= pair[1].requirement) {
+        return Err("conditional access ordering");
+    }
+    for row in &effects.conditional {
+        if usize::try_from(row.requirement.input.parameter).map_or(true, |i| i >= parameter_count)
+            || row.roots.is_empty()
+            || row.roots.windows(2).any(|pair| pair[0] >= pair[1])
+            || row.roots.iter().any(|root| {
+                let (MutableAccessRoot::Contained(i) | MutableAccessRoot::Storage(i)) = root;
+                usize::try_from(*i).map_or(true, |i| i >= parameter_count)
+            })
+        {
+            return Err("conditional access roots");
+        }
     }
     Ok(())
 }
@@ -450,6 +616,7 @@ pub struct ImportedFn {
     /// imported body. This validation-only interface fact is stripped before MIR construction.
     pub parallel_transfer_params: Vec<u32>,
     pub mutable_access: MutableAccessSummary,
+    pub callback_contract: Option<CallbackContract>,
     pub mutable_retention: MutableRetentionSummary,
     pub mutable_view_effect: MutableViewEffectSummary,
 }
@@ -706,6 +873,7 @@ pub struct Fn {
     /// Source functions have no capture roots; lifted functions retain capture-relative roots.
     pub parallel_transfer: ReturnBorrowSummary,
     pub mutable_access: MutableAccessSummary,
+    pub callback_contract: Option<CallbackContract>,
     /// Re-inferred from the checked body; imported interfaces consume this exact result.
     pub mutable_retention: MutableRetentionSummary,
     pub mutable_view_effect: MutableViewEffectSummary,

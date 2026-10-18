@@ -27897,8 +27897,29 @@ impl HttpUpgrade {
         if rc == 0 {
             Ok(true)
         } else {
-            Err(io_error_to_status(&std::io::Error::last_os_error()))
+            Err(self.timeout_error(std::io::Error::last_os_error()))
         }
+    }
+
+    fn timeout_error(&self, error: std::io::Error) -> i32 {
+        // Darwin can detach a reset TCP socket's PCB before timeout rearming. Its option
+        // failure is EINVAL while SO_ERROR still owns the transport error. Harvest that
+        // error and poison normally; a failed option must never become successful arming.
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            let mut pending: libc::c_int = 0;
+            let Ok(mut length) = libc::socklen_t::try_from(core::mem::size_of_val(&pending)) else {
+                return io_error_to_status(&error);
+            };
+            let expected = length;
+            let rc = unsafe {
+                libc::getsockopt(self.fd, libc::SOL_SOCKET, libc::SO_ERROR,
+                    (&raw mut pending).cast(), &raw mut length)
+            };
+            if rc == 0 && length == expected && pending != 0 {
+                return io_read_write_status(&std::io::Error::from_raw_os_error(pending));
+            }
+        }
+        io_error_to_status(&error)
     }
 }
 
@@ -50314,6 +50335,54 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
             align_rt_buffer_free(buffer);
             align_rt_http_upgrade_free(upgrade);
         }
+    }
+
+    #[test]
+    fn http_upgrade_reset_error_survives_deadline_rearm() -> std::io::Result<()> {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+
+        for writing in [false, true] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let local = std::net::TcpStream::connect(listener.local_addr()?)?;
+            let (peer, _) = listener.accept()?;
+            let mut upgrade = HttpUpgrade { fd: local.into_raw_fd(), sticky: 0, deadline: None };
+            let buffer = BufferTestHandle(align_rt_buffer_new(1, 1, 0));
+            assert_eq!(upgrade.timeout_error(std::io::Error::from_raw_os_error(libc::EINVAL)), AL_INVALID,
+                "a healthy socket must retain the failed option status");
+            assert_eq!(upgrade.timeout_error(std::io::Error::from_raw_os_error(libc::EIO)), AL_CODE + libc::EIO);
+            let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+            let Ok(length) = libc::socklen_t::try_from(core::mem::size_of_val(&linger)) else {
+                panic!("linger length must fit socklen_t");
+            };
+            assert_eq!(unsafe { libc::setsockopt(peer.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER,
+                (&raw const linger).cast(), length) }, 0);
+            drop(peer);
+            // Observe the reset without consuming SO_ERROR before the real operation.
+            let mut event = libc::pollfd { fd: upgrade.fd, events: libc::POLLIN, revents: 0 };
+            let ready = loop {
+                let rc = unsafe { libc::poll(&raw mut event, 1, 5000) };
+                if rc < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break rc;
+            };
+            assert_eq!(ready, 1, "peer reset must become observable");
+            assert_eq!(unsafe { align_rt_http_upgrade_deadline(&raw mut upgrade, 5_000_000_000) }, 0);
+            let status = if writing {
+                unsafe { align_rt_http_upgrade_write(&raw mut upgrade, b"x".as_ptr(), 1) }
+            } else {
+                unsafe { align_rt_http_upgrade_read_exact(&raw mut upgrade, buffer.0, 1) }
+            };
+            assert_eq!(status, AL_CODE + libc::ECONNRESET, "writing={writing}");
+            assert_eq!(upgrade.fd, -1, "the failed operation closes its descriptor");
+            assert_eq!(unsafe { align_rt_http_upgrade_read_exact(&raw mut upgrade, buffer.0, 1) }, status);
+            assert_eq!(unsafe { align_rt_http_upgrade_write(&raw mut upgrade, b"x".as_ptr(), 1) }, status);
+            assert_eq!(unsafe { align_rt_http_upgrade_shutdown(&raw mut upgrade) }, status);
+        }
+        let spent = HttpUpgrade { fd: -1, sticky: 0, deadline: None };
+        assert_eq!(spent.timeout_error(std::io::Error::from_raw_os_error(libc::EINVAL)), AL_INVALID,
+            "a failed SO_ERROR query must retain the original failure");
+        Ok(())
     }
 
     #[test]

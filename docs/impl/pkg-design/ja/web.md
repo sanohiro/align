@@ -23,13 +23,6 @@ httprouter/fasthttp と Rust の matchit を用いる。これらは比較対象
 限定しない。過去の実行計画は `../../15-pkg-web-plan.md`。コンパイラ側の前提条件である
 **F1 フィールド許可拡張**は出荷済み（下の土台の節参照）。
 
-**現在の互換性の問題:** `pkg.web` 全体を import すると、`serve` 内の構造化タスクの
-キャプチャ検査で `a spawned task cannot modify or exclusively borrow captured backing` が発生する。
-worker がキャプチャしたルートテーブルのコールバックを呼び出す際、参照先へのアクセスが
-読み取り専用だと証明できない。multipart の文書例をコンパイルするテストで再現する。
-実行時の分岐より先に import 先の関数本体を検査するため、worker 数を 1 にしても回避できない。
-以下の API 契約は維持するが、パッケージとタスクのキャプチャ規則の整合には別途実装修正が必要である。
-
 ## 最小主義（owner 制約）
 
 表面は正確に: routing、ctx アクセサ、レスポンダ、middleware-lite、SSE 糖衣 — それだけ。
