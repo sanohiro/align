@@ -299,18 +299,32 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
     let error_read = stage(error_read)?;
     let error_write = stage(error_write)?;
     nonblocking(&error_read)?;
+    #[cfg(target_os = "linux")]
+    let stack = ChildStack::new()?;
     let mask = SignalMask::block()?;
     acquisition()?;
     #[cfg(target_os = "linux")]
-    let pid = unsafe {
-        libc::syscall(
-            libc::SYS_clone,
-            libc::SIGCHLD,
-            0usize,
-            0usize,
-            0usize,
-            0usize,
-        )
+    let pid = {
+        let mut entry = Bootstrap {
+            command,
+            prepared: &prepared,
+            streams: &streams,
+            error_fd: error_write.as_raw_fd(),
+            mask: &mask,
+            force_group,
+            scoped,
+        };
+        // Shared VM, private descriptor table, signal actions, cwd and credentials.
+        // CLONE_VFORK suspends this thread until the child execs or exits, so the
+        // borrowed launch state and child stack outlive every child access.
+        unsafe {
+            libc::clone(
+                enter_bootstrap,
+                stack.top(),
+                libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+                (&raw mut entry).cast(),
+            )
+        }
     };
     #[cfg(target_os = "macos")]
     let pid = unsafe {
@@ -327,26 +341,9 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
         return Err(error());
     }
     #[cfg(target_os = "linux")]
-    if pid == 0 {
-        // Nothing below can unwind or return to parent-side owners or their locks.
-        unsafe {
-            bootstrap(
-                command,
-                &prepared,
-                &streams,
-                error_write.as_raw_fd(),
-                &mask,
-                force_group,
-                scoped,
-            )
-        }
-    }
+    drop(stack);
     child.started = std::time::Instant::now();
-    // Linux's raw syscall returns c_long; Darwin's fork returns pid_t (i32).
-    #[allow(clippy::useless_conversion)]
-    let child_pid =
-        i32::try_from(pid).unwrap_or_else(|_| super::panic_abort("invalid native child PID"));
-    child.pid = child_pid;
+    child.pid = pid;
     if !scoped {
         reservation.children = reservation.children.checked_add(1)
             .unwrap_or_else(|| super::panic_abort("process owner count overflow"));
@@ -530,6 +527,85 @@ impl Drop for SignalMask {
         if unsafe { self.restore_native() } != 0 {
             super::panic_abort("cannot restore launch signal mask");
         }
+    }
+}
+/// Private stack for the shared-address-space launch child: a lowest guard page plus
+/// fixed bootstrap storage (the /proc/self/fd fallback uses an 8 KiB stack buffer).
+#[cfg(target_os = "linux")]
+struct ChildStack {
+    base: *mut libc::c_void,
+    length: usize,
+}
+#[cfg(target_os = "linux")]
+impl ChildStack {
+    const USABLE: usize = 256 * 1024;
+    fn new() -> Result<Self, i32> {
+        acquisition()?;
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|page| page.is_power_of_two())
+            .ok_or(AL_INVALID)?;
+        let length = Self::USABLE + page;
+        let base = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_STACK,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(error());
+        }
+        let stack = Self { base, length };
+        if unsafe { libc::mprotect(base, page, libc::PROT_NONE) } != 0 {
+            return Err(error());
+        }
+        Ok(stack)
+    }
+    fn top(&self) -> *mut libc::c_void {
+        // mmap returns page-aligned memory, so the end is 16-byte aligned for every ABI.
+        unsafe { self.base.cast::<u8>().add(self.length).cast() }
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for ChildStack {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.base, self.length);
+        }
+    }
+}
+#[cfg(target_os = "linux")]
+struct Bootstrap<'a> {
+    command: &'a Command,
+    prepared: &'a Prepared,
+    streams: &'a [i32; 3],
+    error_fd: i32,
+    mask: &'a SignalMask,
+    force_group: bool,
+    scoped: bool,
+}
+/// Child entry on the private stack. The child shares the parent's memory and its
+/// thread pointer, so libc wrappers write the suspended launching thread's errno slot;
+/// CLONE_VFORK keeps that thread stopped until exec or exit, and it reads errno only
+/// after its own later failing calls. The child never returns, unwinds, allocates,
+/// runs Drop glue or takes a lock; every signal stays blocked until just before exec.
+#[cfg(target_os = "linux")]
+extern "C" fn enter_bootstrap(entry: *mut libc::c_void) -> libc::c_int {
+    let entry = unsafe { &*entry.cast::<Bootstrap<'_>>() };
+    unsafe {
+        bootstrap(
+            entry.command,
+            entry.prepared,
+            entry.streams,
+            entry.error_fd,
+            entry.mask,
+            entry.force_group,
+            entry.scoped,
+        )
     }
 }
 #[cfg(target_os = "linux")]
@@ -1198,6 +1274,142 @@ pub(crate) mod tests {
                 .value,
             127
         );
+    }
+    #[test]
+    fn child_setup_and_exec_errno_cross_the_error_frame() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = std::env::temp_dir().join(format!("align-launch-errno-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let plain = directory.join("plain");
+        std::fs::write(&plain, b"not executable").unwrap();
+        let garbage = directory.join("garbage");
+        std::fs::write(&garbage, [0x7f, b'E', b'L', b'F', 0, 0, 0, 0]).unwrap();
+        std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let code = |errno: i32| io_error_to_status(&std::io::Error::from_raw_os_error(errno));
+        let path = |path: &std::path::Path| CString::new(path.as_os_str().as_bytes()).unwrap();
+        for capture in [false, true] {
+            for timeout in [0, 5_000_000_000] {
+                if capture && timeout == 0 { continue; }
+                let mut configuration = command("exit 0");
+                configuration.timeout_ns = timeout;
+                // exec errors: EACCES, ENOEXEC (an exact errno outside the named categories).
+                configuration.target = super::super::CommandTarget::Path(path(&plain));
+                assert_eq!(launch(&configuration, capture, false).err(), Some(code(libc::EACCES)));
+                configuration.target = super::super::CommandTarget::Path(path(&garbage));
+                assert_eq!(launch(&configuration, capture, false).err(), Some(code(libc::ENOEXEC)));
+                // A setup error before exec: chdir into a regular file.
+                configuration.target = super::super::CommandTarget::Path(CString::new("/bin/sh").unwrap());
+                configuration.cwd = Some(path(&plain));
+                assert_eq!(launch(&configuration, capture, true).err(), Some(code(libc::ENOTDIR)));
+            }
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_signal_state_and_group_placement() {
+        const NAME: &str = "process_launch::tests::child_signal_state_and_group_placement";
+        const MARKER: &str = "ALIGN_R154_CHILD_SIGNAL_STATE";
+        if std::env::var_os(MARKER).is_none() {
+            isolated(NAME, MARKER);
+            return;
+        }
+        extern "C" fn caught(_: i32) {}
+        fn field(status: &str, name: &str) -> u64 {
+            let line = status.lines().find(|line| line.starts_with(name)).unwrap();
+            u64::from_str_radix(line[name.len()..].trim(), 16).unwrap()
+        }
+        unsafe {
+            let mut blocked: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGUSR1);
+            assert_eq!(libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, core::ptr::null_mut()), 0);
+            let handler: extern "C" fn(i32) = caught;
+            assert_ne!(libc::signal(libc::SIGUSR2, handler as libc::sighandler_t), libc::SIG_ERR);
+            assert_ne!(libc::signal(libc::SIGHUP, libc::SIG_IGN), libc::SIG_ERR);
+        }
+        let parent = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let output = std::env::temp_dir().join(format!("align-launch-signal-{}", std::process::id()));
+        for (force_group, new_session) in [(false, false), (true, false), (false, true)] {
+            let file = std::fs::File::create(&output).unwrap();
+            let mut configuration = command("exit 0");
+            configuration.target = super::super::CommandTarget::Path(CString::new("/bin/cat").unwrap());
+            configuration.argv = ["cat", "/proc/self/status", "/proc/self/stat"]
+                .map(|s| CString::new(s).unwrap())
+                .to_vec();
+            configuration.new_session = new_session;
+            configuration.stdout_binding = Some(file.into());
+            let mut child = launch(&configuration, false, force_group).unwrap();
+            let pid = child.pid;
+            assert_eq!(child.wait().unwrap().termination.value, 0);
+            let observed = std::fs::read_to_string(&output).unwrap();
+            // The executed image sees the caller's exact thread mask, inherited ignored
+            // dispositions, and no caught handler.
+            assert_eq!(field(&observed, "SigBlk:"), field(&parent, "SigBlk:"));
+            assert_ne!(field(&parent, "SigBlk:") & (1 << (libc::SIGUSR1 - 1)), 0);
+            assert_eq!(field(&observed, "SigIgn:"), field(&parent, "SigIgn:"));
+            assert_ne!(field(&parent, "SigIgn:") & (1 << (libc::SIGHUP - 1)), 0);
+            assert_ne!(field(&parent, "SigCgt:") & (1 << (libc::SIGUSR2 - 1)), 0);
+            assert_eq!(field(&observed, "SigCgt:"), 0);
+            let stat = &observed[observed.rfind(')').unwrap() + 2..];
+            let fields: Vec<i32> = stat.split_whitespace().skip(1).take(3).map(|f| f.parse().unwrap()).collect();
+            let (group, session) = (fields[1], fields[2]);
+            if new_session {
+                assert_eq!((group, session), (pid, pid));
+            } else if force_group {
+                assert_eq!((group, session), (pid, unsafe { libc::getsid(0) }));
+            } else {
+                assert_eq!((group, session), (unsafe { libc::getpgrp() }, unsafe { libc::getsid(0) }));
+            }
+            // The launching thread's own mask is restored after launch.
+            let after = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+            assert_eq!(field(&after, "SigBlk:"), field(&parent, "SigBlk:"));
+        }
+        std::fs::remove_file(&output).unwrap();
+        std::process::exit(0);
+    }
+    // Manual launch-latency probe (plan 49, Linux shared-address-space launch):
+    // ALIGN_LAUNCH_PROBE_MIB=4096 scripts/cargo.sh test -p align_runtime --lib \
+    //   process_launch::tests::launch_resident_size_probe -- --ignored --nocapture
+    // Not a correctness gate; it prints start+reap latency of /bin/true with that much
+    // touched (and, when RLIMIT_MEMLOCK permits, locked) private anonymous memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual launch-latency probe"]
+    fn launch_resident_size_probe() {
+        let mib: usize = std::env::var("ALIGN_LAUNCH_PROBE_MIB").ok().map_or(4096, |v| v.parse().unwrap());
+        let length = mib << 20;
+        let mut locked = false;
+        let region = if length == 0 { core::ptr::null_mut() } else {
+            let region = unsafe { libc::mmap(core::ptr::null_mut(), length, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+            assert_ne!(region, libc::MAP_FAILED);
+            unsafe { libc::madvise(region, length, libc::MADV_NOHUGEPAGE); }
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            for offset in (0..length).step_by(page) {
+                unsafe { region.cast::<u8>().add(offset).write_volatile(1); }
+            }
+            locked = unsafe { libc::mlock(region, length) } == 0;
+            region
+        };
+        let mut configuration = command("exit 0");
+        configuration.target = super::super::CommandTarget::Path(CString::new("/bin/true").unwrap());
+        configuration.argv = vec![CString::new("true").unwrap()];
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            let start = std::time::Instant::now();
+            let mut child = launch(&configuration, false, false).unwrap();
+            assert_eq!(child.wait().unwrap().termination.value, 0);
+            samples.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+        samples.sort_by(f64::total_cmp);
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let rss = status.lines().find(|l| l.starts_with("VmRSS:")).unwrap_or("").to_string();
+        println!("launch probe: touched_mib={mib} mlocked={locked} {rss} start+reap ms min={:.3} median={:.3} max={:.3}",
+            samples[0], samples[samples.len() / 2], samples[samples.len() - 1]);
+        if length != 0 {
+            unsafe { libc::munmap(region, length); }
+        }
     }
     #[test]
     fn cached_readiness_does_not_hide_another_stream() {

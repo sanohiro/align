@@ -141,7 +141,8 @@ blocking; only the parent's capture read ends become nonblocking.
 The selected native launch paths are:
 
 - Linux: marshal environment, argv, PATH candidates and fixed failure storage in
-  the parent. Fork with a private descriptor table, remap standard streams, then
+  the parent. Create the child with a private descriptor table (shared address
+  space, see "Linux shared-address-space launch" below), remap standard streams, then
   use close_range with CLOEXEC on all descriptors >= 3. On ENOSYS/EINVAL use a
   syscall-only /proc/self/fd scan in the single-threaded child with fixed stack
   storage; close every numeric descriptor >= 3 except the scan fd and error
@@ -192,19 +193,81 @@ an expired deadline wins over a newly readable error frame or EOF; an already
 selected earlier error is preserved during cleanup. Timeout closes capture and
 control reads, signals only the owned PID/group whose formation is confirmed,
 and kills/reaps the direct child before returning Timeout. No blocking handshake
-read or wait precedes the deadline check. A stopped pre-exec child and an
-executable lookup that stalls must therefore reach the same cleanup path as a
-running timeout. Untimed start retains no launch-duration promise. Neither path
+read or wait precedes the deadline check. On macOS's timed fork path a stopped
+pre-exec child and an executable lookup that stalls therefore reach the same
+cleanup path as a running timeout. On Linux the parent obtains the PID only
+after the CLONE_VFORK child has exec'd or exited, so the budget does not cover
+the pre-exec window (see "Linux shared-address-space launch"). Untimed start retains no launch-duration promise. Neither path
 promises a bound on kernel scheduling or uninterruptible termination/reaping.
 
 Before fork, save and block all blockable signals in the calling thread; restore
-its exact prior mask in the parent on success and every failure. Linux uses an
-audited raw fork-equivalent syscall with SIGCHLD and no shared VM/fd table, so
+its exact prior mask in the parent on success and every failure. Linux uses
+clone(CLONE_VM | CLONE_VFORK | SIGCHLD) on a private mmap'd child stack, so
 pthread_atfork callbacks are not invoked. Its child uses only native syscalls,
 resets every caught disposition to default while signals remain blocked,
 preserves ignored dispositions, and restores the original thread mask immediately
 before exec. Inspect the child's inherited actions, not a stale parent snapshot.
 No parent signal-subscription handler may run inside this bootstrap.
+
+#### Linux shared-address-space launch
+
+The former fork-equivalent clone copied the parent's page tables, so launch
+cost grew with resident size (seconds for a ~20 GB parent; align-llm request 154).
+Every Linux launch (start, run, run_bytes, scope root) now shares the parent's
+address space until exec, as glibc and musl posix_spawn do. posix_spawn itself
+was rejected because the bootstrap does not map onto it:
+
+| Child operation | posix_spawn equivalent | Maps |
+| --- | --- | --- |
+| Reset caught dispositions, keep ignored | implicit reset plus SETSIGDEF | yes |
+| chdir | addchdir_np (glibc 2.29, musl 1.1.24) | yes |
+| setsid / setpgid(0, 0) | POSIX_SPAWN_SETSID / SETPGROUP | yes |
+| Remap or close fd 0/1/2 | adddup2 / addclose | yes |
+| Restore thread mask | SETSIGMASK | yes |
+| Errno to parent | spawn result | yes |
+| CLOSE_RANGE_CLOEXEC on fd >= 3, then dup2 staged bindings | addclosefrom_np closes the binding sources first (glibc 2.34 only, no musl) | no |
+| /proc/self/fd CLOEXEC fallback | none | no |
+| execveat(image, "", AT_EMPTY_PATH) for a verified image | none | no |
+| PR_SET_NO_NEW_PRIVS for a scope root | none | no |
+
+The bootstrap body, error frame and PATH policy are therefore unchanged; only
+child creation changes. Closure:
+
+- Flags: no CLONE_FILES, CLONE_SIGHAND, CLONE_FS or CLONE_THREAD, so the child's
+  descriptor remapping, disposition reset, chdir and session changes stay private.
+- Construction and failure: the parent maps a 256 KiB stack plus a PROT_NONE
+  guard page after descriptor setup and before blocking signals; a failed
+  mmap/mprotect or clone unmaps it and returns through the existing partial
+  acquisition path. The parent unmaps it after clone returns, when the child has
+  exec'd or exited.
+- Child: runs on that stack through libc's clone wrapper, never returns, unwinds,
+  allocates, runs Drop glue or takes a lock. It shares the launching thread's TLS,
+  so libc wrappers write that thread's errno slot; CLONE_VFORK keeps the thread
+  suspended for the child's whole pre-exec life and the parent reads errno only
+  after its own later calls. All signals stay blocked until the mask restore
+  immediately before exec, so no parent handler runs on shared memory.
+- Deadline: CLONE_VFORK suspends the launching thread inside clone until exec or
+  child exit, and a timed run's monotonic budget starts when clone returns, so
+  the budget does not cover the pre-exec window. A stalled (for example
+  network-filesystem) executable lookup or a child externally stopped before
+  exec suspends the launching thread until exec or child exit instead of
+  reaching timeout cleanup, as with glibc/musl posix_spawn. After clone returns,
+  deadline semantics are unchanged.
+- TLS: glibc's cancellable wrappers also touch the suspended thread's
+  cancellation state; this is sound because the runtime never cancels a
+  launching thread and foreign code must not pthread_cancel one.
+- Owners: existing launch, partial-acquisition, closed-stream, descriptor,
+  scope and command owners; `child_setup_and_exec_errno_cross_the_error_frame`
+  (EACCES, exact ENOEXEC and a pre-exec ENOTDIR chdir failure on untimed, timed
+  and captured launches) and the Linux `child_signal_state_and_group_placement`
+  (executed-image SigBlk/SigIgn/SigCgt, inherited/forced group and new session,
+  restored parent mask). The manual `launch_resident_size_probe` records
+  start+reap latency against touched and locked resident size.
+- Measurement (2026-10-19, Docker Desktop linux/arm64 VM, kernel 6.11.11-linuxkit,
+  8 vCPU, ~7.6 GiB, Debian 12 glibc 2.36, test profile; median of 21 /bin/true
+  start+reap with MADV_NOHUGEPAGE pages touched and mlocked): fork-equivalent
+  0.82 / 14.8 / 43.4 ms at 0 / 1 / 4 GiB; shared address space 0.59 / 0.39 /
+  0.48 ms. The 16 GiB criterion and x86_64 were not measurable on that host.
 
 macOS's timed fork uses libSystem fork and its system-maintained fork machinery;
 foreign application pthread_atfork callbacks that perform unsafe work violate
