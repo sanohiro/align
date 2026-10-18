@@ -11873,7 +11873,8 @@ impl<'a> BodyValidator<'a> {
                     source.path.is_empty() && *base == source.root && *index == expected && actual == path,
                 (hir::ExprKind::ElemField { recv, index, path: actual, struct_id }, Some(expected)) =>
                     !source.path.is_empty() && BodyValidator::json_source_access_matches(recv, source)
-                    && recv.ty == source_ty && matches!(source_ty, Ty::StructArray(id, len) if id == *struct_id && expected < len)
+                    && validator.body_ty_matches(recv.ty, source_ty)
+                    && matches!(source_ty, Ty::StructArray(id, len) if id == *struct_id && expected < len)
                     && index.ty == i64_ty() && matches!(index.kind, hir::ExprKind::Int(value) if value == i128::from(expected))
                     && actual == path,
                 _ => false,
