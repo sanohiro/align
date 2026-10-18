@@ -516,3 +516,171 @@ fn main()->i32 {
         }
     });
 }
+
+// Request 153: one operation transfers a direct field while a sibling operand conditionally
+// transfers or replaces another field of the same owner. Each branch, operand order, direct and
+// imported helper, and whole/per-unit build releases every transferred or retained field once.
+const DISJOINT_MODEL: &str = r#"module model
+pub Source { first:string, second:string, ok:bool }
+pub Output { first:string, second:Option<string> }
+pub fn make(ok:bool)->Source = Source {first:"first".clone(),second:"second".clone(),ok:ok}
+pub fn forward(source:Source)->Output {
+  return Output {first:source.first, second:if source.ok {Some(source.second)} else {None}}
+}
+pub fn reverse(source:Source)->Output {
+  return Output {second:if source.ok {Some(source.second)} else {None}, first:source.first}
+}
+"#;
+const DISJOINT_MAIN: &str = r#"module main
+import model
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+S { first:string, second:string, ok:bool }
+O { first:string, second:Option<string> }
+fn make(ok:bool)->S = S {first:"first".clone(),second:"second".clone(),ok:ok}
+fn forward(source:S)->O = O {first:source.first, second:if source.ok {Some(source.second)} else {None}}
+fn reverse(source:S)->O = O {second:if source.ok {Some(source.second)} else {None}, first:source.first}
+fn matched(source:S)->O = O {first:source.first, second:match (if source.ok {1} else {0}) {1=>Some(source.second), _=>None}}
+fn replaced(ok:bool)->O {
+  mut source:=make(ok)
+  return O {first:source.first, second:if ok {source.second="third".clone(); Some(source.second)} else {None}}
+}
+I { name:string, values:array<i64> }
+P { inner:I, second:string, ok:bool }
+Q { inner:I, second:Option<string> }
+fn headers(ok:bool)->bool {
+  source:=P {inner:I {name:"first".clone(), values:[1,2].to_array()}, second:"second".clone(), ok:ok}
+  output:=Q {inner:source.inner, second:if source.ok {Some(source.second)} else {None}}
+  inner:=output.inner
+  if inner.values.len()!=2 || inner.values[1]!=2 {return false}
+  return verify(inner.name, output.second, ok, "second")
+}
+fn take(a:string, b:Option<string>)->i64 = a.len() + (b else {return a.len()}).len()
+fn call(source:S)->i64 = take(source.first, if source.ok {Some(source.second)} else {None})
+fn tuple(ok:bool)->i64 {
+  owner:=("first".clone(), "second".clone())
+  pair:=(owner.0, if ok {owner.1} else {"".clone()})
+  return pair.0.len() + pair.1.len()
+}
+fn verify(first:string, second:Option<string>, ok:bool, expected:str)->bool {
+  if first!="first" {return false}
+  return match second {Some(text)=>ok && text==expected, None=>!ok}
+}
+fn local(output:O, ok:bool, expected:str)->bool = verify(output.first, output.second, ok, expected)
+fn imported(output:model.Output, ok:bool)->bool = verify(output.first, output.second, ok, "second")
+fn round(ok:bool)->i32 {
+  if !local(forward(make(ok)), ok, "second") {return 1}
+  if !local(reverse(make(ok)), ok, "second") {return 2}
+  if !local(matched(make(ok)), ok, "second") {return 3}
+  if !local(replaced(ok), ok, "third") {return 4}
+  if call(make(ok))!=(if ok {11} else {5}) {return 5}
+  if tuple(ok)!=(if ok {11} else {5}) {return 6}
+  if !imported(model.forward(model.make(ok)), ok) {return 7}
+  if !imported(model.reverse(model.make(ok)), ok) {return 8}
+  if !headers(ok) {return 9}
+  return 0
+}
+fn main()->i32 {
+  unsafe {align_rt_requested_live_reset()}
+  a:=round(true)
+  if a!=0 {return a}
+  b:=round(false)
+  if b!=0 {return b+20}
+  if unsafe {align_rt_requested_live_bytes()}!=0 {return 40}
+  if unsafe {align_rt_alloc_count()}!=unsafe {align_rt_free_count()} {return 41}
+  return 0
+}
+"#;
+#[test]
+fn field_extraction_disjoint_conditional_siblings() {
+    owned_fixture::run("field_extraction_disjoint_conditional_siblings", |stage| {
+        let result = (|| -> TestResult {
+            std::fs::write(stage.join("model.align"), DISJOINT_MODEL)?;
+            for per_unit in [false, true] {
+                let built = programs(stage, DISJOINT_MAIN, per_unit)?;
+                execute(stage, &built, &format!("disjoint-{per_unit}"), false)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    });
+}
+
+// A view field or Copy record holding one may point into a sibling owned field of its owner.
+// Transferring, replacing or conditionally transferring that sibling must still invalidate the
+// view in either operand order, on whole-program and per-unit checks.
+#[test]
+fn field_extraction_rejects_sibling_self_views() {
+    owned_fixture::run("field_extraction_rejects_sibling_self_views", |stage| {
+        let mut source = String::from(
+            "module main\nV { text:str }\nW { part:slice<i64> }\n\
+             S { owned:string, items:array<i64>, view:str, part:slice<i64>, held:V, wrapped:W }\n\
+             fn eat(text:string)->i64 = text.len()\nfn eat_items(items:array<i64>)->i64 = items.len()\n\
+             fn make()->S = S {owned:\"abc\".clone(), items:[1,2].to_array(), view:\"\", part:[], held:V {text:\"\"}, wrapped:W {part:[]}}\n",
+        );
+        let views = [
+            ("str", "str", "s.view = s.owned[0..s.owned.len()]", "s.view", "owned"),
+            ("slice", "slice<i64>", "s.part = s.items[0..s.items.len()]", "s.part", "items"),
+            ("record_str", "V", "s.held = V {text:s.owned[0..1]}", "s.held", "owned"),
+            ("record_slice", "W", "s.wrapped = W {part:s.items[0..1]}", "s.wrapped", "items"),
+        ];
+        let mut lines = Vec::new();
+        for (name, ty, _, _, _) in views {
+            source.push_str(&format!(
+                "fn before_{name}(v:{ty}, n:i64)->i64 = n\nfn after_{name}(n:i64, v:{ty})->i64 = n\n"
+            ));
+        }
+        for (name, _, setup, read, field) in views {
+            let (eat, fresh) = if field == "owned" {
+                ("eat", "\"x\".clone()")
+            } else {
+                ("eat_items", "[3].to_array()")
+            };
+            for transfer in [
+                format!("{eat}(s.{field})"),
+                format!("{{s.{field} = {fresh}; 0}}"),
+                format!("if ok {{{eat}(s.{field})}} else {{0}}"),
+            ] {
+                for call in [
+                    format!("before_{name}({read}, {transfer})"),
+                    format!("after_{name}({transfer}, {read})"),
+                ] {
+                    lines.push(source.lines().count() + 1);
+                    source.push_str(&format!(
+                        "fn f{}(ok:bool)->i64 {{ mut s:=make(); {setup}; return {call} }}\n",
+                        lines.len()
+                    ));
+                }
+            }
+        }
+        source.push_str("fn main()->i32=0\n");
+        let path = stage.join("main.align");
+        std::fs::write(&path, &source).unwrap();
+        let entry = path.to_str().unwrap();
+        for per_unit in [false, true] {
+            let mut sources = SourceMap::new();
+            let diagnostics = if per_unit {
+                let built = align_driver::build_per_unit(&mut sources, entry, &source);
+                align_driver::format_diagnostics(&sources, &built.diags)
+            } else {
+                let checked = align_driver::check(&mut sources, entry, &source);
+                align_driver::format_diagnostics(&sources, &checked.diags)
+            };
+            for line in &lines {
+                assert!(
+                    diagnostics.lines().any(|text| text.contains(&format!("main.align:{line}:"))
+                        && text.contains("invalidated")),
+                    "per_unit={per_unit}: line {line} accepted\n{diagnostics}"
+                );
+            }
+            assert!(
+                !diagnostics.contains("expected") && !diagnostics.contains("unknown"),
+                "{diagnostics}"
+            );
+        }
+    });
+}

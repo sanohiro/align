@@ -96,3 +96,35 @@ proof must agree. A guard-only producer or nulling-only consumer would be dorman
 or unsafe, while separating layout from lifecycle repeats the same proof. One
 end-to-end PR provides the useful consumer boundary; deeper/indexed extraction
 and exclusive field authority are independently deferred failure domains.
+
+## Disjoint sibling snapshots (LLM R153)
+
+f5443b35 (#1310) made every loaded owned-string value a completed snapshot so a
+later eager operand cannot free its payload before the enclosing action. A
+string-like field has no generation header, so its snapshot observes the legacy
+`Local(owner)` root. Transferring or replacing any other direct field then ended
+that root and rejected `O {first:s.first, second:if c {Some(s.second)} else {None}}`
+even though the transfer nulls only `second`.
+
+A completed snapshot of a direct projection of an owner now records that source
+place (`expr_origin_place`) only when its type has no view leaves
+(`!ty_may_borrow`); views reached through another local record none. A `str`,
+slice, or Copy record/tuple holding one may point into a sibling owned field of
+the same owner (`s.view = s.owned[..]`). That dependency is carried only by the
+owner-wide root, so such a snapshot is never retained. An owned value with no
+view leaves cannot point into a sibling field, so retaining it is sound.
+A direct field transfer, tuple-element transfer or record field replacement still
+ends every observer of the owner except completed snapshots whose first projection
+is a different field or tuple element of the same owner. The selected field, its
+descendants, the whole owner, unknown places and reservation snapshots keep the
+existing conservative ending. Ownership, MIR nulling and cleanup are unchanged.
+
+| Axis | Closure | Owner |
+| --- | --- | --- |
+| Operand order / control | Sibling read before or after an `if`/`match`/block that transfers or replaces another field; both branches. | `align_sema --lib disjoint_field_transfer_retains_sibling_snapshots`; driver `field_extraction_disjoint_conditional_siblings` |
+| Constructor / call / tuple | Record and tuple constructors and by-value calls; a header-bearing sibling record (string plus dynamic array) keeps its value headers. | same two owners |
+| Cleanup | Selected field moves once on its taken branch; untaken sibling is dropped once by the owner; replaced old value dropped once. Live bytes zero and allocations equal frees. | driver lifecycle counters |
+| Imports / build mode | Imported helpers, whole-program and per-unit builds. | driver test, both `per_unit` modes |
+| Still rejected | Same field twice (either order), whole move or whole reassignment of the owner, replacement of the observed field. | sema case array negatives |
+| Sibling self-view | `str`/slice field or Copy record holding one that views a sibling owned field, under its move, replacement or conditional move, in both operand orders. A tuple cannot form a self-view (no element assignment); its view elements are never retained either. | `align_sema --lib field_transfer_rejects_sibling_self_views`; driver `field_extraction_rejects_sibling_self_views` (whole and per-unit) |
+| Deferred | A local view of a disjoint sibling (`view:str:=s.a; take(s.b)`) and pipeline snapshots keep the conservative owner ending; local origins are path-sensitive and were already rejected at 455d59c4, so this is not part of the regression. | `local-view-conservative` sema case |
