@@ -8707,7 +8707,13 @@ fn hir_body_validator_task_record_results() {
         Ty::Unit,
     ));
     assert!(body_core_metadata_is_valid(&placement));
-    for field in [Ty::Str, Ty::String, Ty::Raw, Ty::Array(Scalar::Str, 0), Ty::Struct(0)] {
+    // Owned fields now form valid task payloads; the constructor mismatch above still rejects.
+    for field in [Ty::String, Ty::Buffer, Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))] {
+        let mut owned = placement.clone();
+        owned.structs[0].fields[0].ty = field;
+        assert!(body_core_metadata_is_valid(&owned), "owned task local graph {field:?}");
+    }
+    for field in [Ty::Str, Ty::Raw, Ty::Array(Scalar::Str, 0), Ty::Struct(0)] {
         let mut invalid = placement.clone();
         invalid.structs[0].fields[0].ty = field;
         assert!(!body_core_metadata_is_valid(&invalid), "task local graph {field:?}");
@@ -21587,6 +21593,42 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
                 );
                 assert!(crate::lower_program_checked(&bad, false, None).is_err());
             }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn task_owned_hir_wait_move_and_payload_replay() -> Result<(), String> {
+    let valid=checked_source_program("fn main() {task_group {t:=spawn(fn {\"owned\".clone()});wait();t.get();()};()}\n");
+    lower_program_checked(&valid,false,None).map_err(|error|format!("{error:?}"))?;
+    for mutation in 0..4 {
+        let mut invalid=valid.clone();
+        let main=invalid.fns.iter_mut().find(|function|function.name=="main").ok_or("main")?;
+        let group=main.body.stmts.iter_mut().find_map(|statement|match statement {
+            hir::Stmt::Expr(hir::Expr {kind:hir::ExprKind::TaskGroup(group),..})=>Some(group),_=>None,
+        }).ok_or("group")?;
+        match mutation {
+            0=>{group.stmts.retain(|statement|!matches!(statement,hir::Stmt::Expr(hir::Expr {kind:hir::ExprKind::Wait,..})));},
+            1=>{
+                let get=group.stmts.iter().find(|statement|matches!(statement,hir::Stmt::Expr(hir::Expr {kind:hir::ExprKind::TaskGet(_),..}))).ok_or("get")?.clone();
+                group.stmts.push(get);
+            },
+            2=>{
+                let get=group.stmts.iter_mut().find_map(|statement|match statement {
+                    hir::Stmt::Expr(expr) if matches!(expr.kind,hir::ExprKind::TaskGet(_))=>Some(expr),_=>None,
+                }).ok_or("get")?;
+                get.ty=Ty::Bool;
+            },
+            3=>{
+                let spawn=group.stmts.iter_mut().find_map(|statement|match statement {hir::Stmt::Let {init,..}=>Some(init),_=>None}).ok_or("spawn")?;
+                let hir::ExprKind::Spawn {fallible,..}=&mut spawn.kind else {return Err("spawn kind".into())};
+                *fallible=true;
+            },
+            _=>{},
+        }
+        for per_unit in [false,true] {
+            assert!(lower_program_checked(&invalid,per_unit,None).is_err(),"{mutation}/{per_unit}");
         }
     }
     Ok(())

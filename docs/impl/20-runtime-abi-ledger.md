@@ -1630,7 +1630,7 @@ from the bodies. A merged body also carries no producer string attribute.
 | A78 | `void @SYM(ptr, ptr, i64, ptr, i64, i64)` | `align_rt_json_encode_struct_array` |
 | A79 | `void @SYM(ptr, ptr, ptr)` | `align_rt_json_encode_union` |
 | A80 | `void @SYM(ptr, ptr, ptr, i64)` | `align_rt_json_encode_object` |
-| A81 | `void @SYM(ptr, ptr, ptr, ptr, ptr, ptr)` | `align_rt_tg_register` |
+| A81 | `void @SYM(ptr, ptr, ptr, ptr, ptr, ptr, ptr)` | `align_rt_tg_register` |
 | A82 | `{ i64, i64 } @SYM(ptr, i64)` | `align_rt_hash128` |
 | A83 | `{ ptr, i64 } @SYM(ptr)` | `align_rt_run_output_stdout`, `align_rt_run_output_stderr`, `align_rt_array_builder_build`, `align_rt_array_builder_build_stack`, `align_rt_builder_finish`, `align_rt_builder_finish_stack`, `align_rt_cli_usage`, `align_rt_http_resp_body`, `align_rt_http_ctx_method`, `align_rt_http_ctx_path`, `align_rt_http_ctx_body`, `align_rt_builder_into_string`, `align_rt_builder_into_string_stack`, `align_rt_crypto_digest_finish` |
 | A84 | `{ ptr, i64 } @SYM(ptr, i64)` | `align_rt_str_clone`, `align_rt_base64_encode`, `align_rt_base64url_encode`, `align_rt_hex_encode`, `align_rt_percent_encode`, `align_rt_form_encode`, `align_rt_html_escape`, `align_rt_crypto_sha256`, `align_rt_crypto_sha512`, `align_rt_str_trim`, `align_rt_str_trim_start`, `align_rt_str_trim_end`, `align_rt_path_base`, `align_rt_path_dir`, `align_rt_path_ext`, `align_rt_path_normalize` |
@@ -2311,7 +2311,8 @@ source-export inventory include this literal native export.
 
 ## Structured task publication (plan180)
 
-TgBegin/TgAlloc/TgRegister/TgWait/TgEnd retain their existing C symbols and signatures.
+Plan180 retained the existing task C symbols and signatures; Plan228 extends
+TgRegister with the seventh cleanup pointer described below.
 The opaque group owns caller-only arena metadata plus a shared generation. Registration
 publishes each fully initialized descriptor before returning; workers claim it once.
 TgWait participates in claiming and joins completion before returning the lowest-index
@@ -2384,3 +2385,19 @@ Effects are IndirectStorage, ArgMem Unstated, params [], escapes [0], Release No
 fresh false, divergence false, with no added LLVM pointer attributes. Bounds
 failure remains observable even when the result is unused. This adds one keyed
 and base export; no shape, probe category or interface format is added.
+
+## Owned task results (plan228)
+
+A81 `TgRegister` is now `void(tg, tramp, thunk, env, slot, err_slot, cleanup)`,
+seven pointers. Effects remain Callback/ArgMem Unstated, params [], escapes
+[0,1,2,3,4,5,6], Release None, fresh false, diverges false. Cleanup is null for
+Copy R or a canonical generated `void(ptr)` thunk for owned R. Registration
+records cleanup before publication; the caller-owned list survives every wait.
+TgEnd joins, runs cleanup in spawn order, then frees group storage. Owned slots
+are target-layout `{R,i1 initialized}` with target/source alignment. Typed
+callbacks use ordinary Align DynamicBit return transport and publish the value
+before setting the slot flag; Err leaves it clear. TaskTake and cleanup clear
+the flag before transferring/dropping R. Cleanup delegates to canonical iterative
+Drop. Generated identity version2/tag5 carries the complete canonical R graph.
+No symbol/key count or interface record changes. [Plan228](228-task-owned-results.md)
+owns the lifecycle, unsafe native obligations and regression matrix.

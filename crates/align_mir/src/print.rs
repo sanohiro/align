@@ -439,6 +439,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::RawOffset { ptr, offset } => format!("raw_offset({}, {})", operand_str(ptr), operand_str(offset)),
         Rvalue::RawIsNull(pointer) => format!("raw_is_null({})", operand_str(pointer)),
+        Rvalue::TaskTake(op) => format!("task_take({})", operand_str(op)),
         Rvalue::BoxGet(op) => format!("box_get({})", operand_str(op)),
         Rvalue::BoxClone(h, src) => format!("box_clone({}, {})", operand_str(h), operand_str(src)),
         Rvalue::Index(slot, idx) => format!("_{slot}[{}]", operand_str(idx)),

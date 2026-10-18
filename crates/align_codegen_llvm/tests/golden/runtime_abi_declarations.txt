@@ -449,7 +449,7 @@ key|TemplateHtmlWrite|template_html_write|IndirectStorage|declare void @align_rt
 key|TgAlloc|tg_alloc|IndirectStorage|declare noalias ptr @align_rt_tg_alloc(ptr, i64, i64) #2
 key|TgBegin|tg_begin|AllocNew|declare noalias ptr @align_rt_tg_begin() #0
 key|TgEnd|tg_end|HostState|declare void @align_rt_tg_end(ptr) #2
-key|TgRegister|tg_register|Callback|declare void @align_rt_tg_register(ptr, ptr, ptr, ptr, ptr, ptr) #2
+key|TgRegister|tg_register|Callback|declare void @align_rt_tg_register(ptr, ptr, ptr, ptr, ptr, ptr, ptr) #2
 key|TgWait|tg_wait|IndirectStorage|declare ptr @align_rt_tg_wait(ptr) #2
 key|TimeFormat|time_format|HostState|declare i32 @align_rt_time_format(ptr, i64, i32) #2
 key|TimeInstant|time_instant|HostState|declare i64 @align_rt_time_instant() #2

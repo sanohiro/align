@@ -209,6 +209,7 @@ fn register_task(
             env,
             slot,
             err_slot,
+            None,
         );
     }
     slot.cast::<i64>()

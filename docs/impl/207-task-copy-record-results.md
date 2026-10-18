@@ -1,5 +1,10 @@
 # Independent Copy records as structured task results
 
+[Plan228](228-task-owned-results.md) extends this foundation with self-contained
+owned task results and conditional untaken cleanup; capture and wait authority
+remain unchanged. Its ledger supersedes the Copy-only result limit below.
+
+
 Media AM-R09 needs both encoder start and finish instants from one worker.
 Its two-i64 `Timing` witness currently fails the primitive-result admission.
 This capability extends the existing task result slot to ordinary independent

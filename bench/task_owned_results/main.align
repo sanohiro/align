@@ -1,0 +1,23 @@
+module main
+import kernel
+import std.env
+import std.time
+fn main()->Result<(),Error> {
+  mode:=env.get("ALIGN_TASK_MODE")? else "sequential".clone()
+  mut input:=buffer(4194307)
+  mut i:=0
+  loop {if i==4194307 {break};input.put_u8((i%251) as u8);i=i+1}
+  expected:=kernel.sequential(input.bytes())
+  actual:=kernel.parallel(input.bytes())
+  if actual.len()!=expected.len() {return Err(error(1))}
+  mut j:=0
+  loop {if j==actual.len() {break};if actual.bytes()[j]!=expected.bytes()[j] {return Err(error(2))};j=j+1}
+  start:=time.instant()
+  output:=if mode=="parallel" {kernel.parallel(input.bytes())} else {kernel.sequential(input.bytes())}
+  elapsed:=time.instant()-start
+  checksum:=output.bytes().map(fn value:u8 {value as i64}).sum()
+  print(elapsed)
+  print(output.len())
+  print(checksum)
+  Ok(())
+}

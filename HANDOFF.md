@@ -19,11 +19,20 @@ queue. [Plan51](docs/impl/51-package-composition-review-plan.md) closes the
 process, filesystem and CLI overlap assessment without selecting new exec,
 tree or CLI packages. Plans92, 93 and 95 record those dispositions.
 
-Align v0.9.0 is released; Requests138–141 are included. The workspace version and
-[release notes](RELEASE_NOTES_0.9.0.md) own that checkpoint. A release build does
+Align v0.10.2 is released with the task-callback and WebSocket fixes. The workspace
+version and [release notes](RELEASE_NOTES_0.10.2.md) own that checkpoint. The newer
+request capabilities below are delivered on main after that release. A release build does
 not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI state.
 
 ## Recent completed capabilities
+
+- [Plan228](docs/impl/228-task-owned-results.md) enables self-contained owned
+  task results for LLM Request152: string, buffer, ordinary dynamic arrays,
+  records, tuples and sums. Successful wait permits one consuming owned get;
+  Copy reads remain repeatable. Group exit joins all work and drops untaken
+  results across every wait generation. Shared capture restrictions remain.
+  The contiguous-band witness removes index arrays and packed output words;
+  consumer migration and product validation remain external.
 
 - [Plan227](docs/impl/227-json-field-encoding.md) composes both JSON encoders with
   stable nested record fields for media AM-R11. Selected values retain existing
@@ -93,8 +102,8 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 - [Plan207](docs/impl/207-task-copy-record-results.md) admits independent inline
   Copy record task results for media AM-R09. Successful wait authorizes repeated
   by-value reads; copied records outlive the group and captures. Typed result
-  slots preserve target/source alignment. Borrowed/owned results and exclusive
-  captures remain separate; consumer adoption remains external.
+  slots preserve target/source alignment. Plan228 supplies owned results; borrowed
+  results and exclusive captures remain separate; consumer adoption remains external.
 
 - [Plan206](docs/impl/206-cli-argument-slices.md) admits borrowed `slice<str>`
   arguments to the existing CLI parser for media AM-R10. The selected first

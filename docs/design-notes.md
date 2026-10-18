@@ -844,6 +844,15 @@ non-trapping/total execution.
 
 ---
 
+Owned structured-task results ([Plan228](impl/228-task-owned-results.md)) let a worker
+produce a contiguous output band with ordinary explicit allocation and sequential/SIMD work.
+The caller collects named handles in logical order. The complete result graph contains no
+borrowed authority, so it may outlive the group; this does not widen capture permissions.
+Copy get remains repeatable. Move get transfers once, while the group retains conditional
+cleanup for untaken results across waits. One canonical Drop plan handles both owners,
+and every error path joins before cleanup. This completes the reserved result lifecycle
+without introducing a second parallel model or hidden output copies.
+
 ## The loop philosophy
 
 Align has exactly one loop construct, and it is deliberately narrow: `loop { ... break value }`.

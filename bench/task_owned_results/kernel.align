@@ -1,0 +1,50 @@
+module kernel
+// A CPU pixel transform over actual byte input. Each sequential band has a
+// contiguous fused map loop; no index array or packed output words are formed.
+fn pixel(value:u8)->u8 {
+  mut x: f64 := (value as f64 + 0.5) / 256.0
+  mut step:=0
+  loop {
+    if step==48 {break}
+    x=3.75*x*(1.0-x)
+    step=step+1
+  }
+  (x*255.0) as u8
+}
+pub fn band(input:slice<u8>)->array<u8> = input.map(pixel).to_array()
+pub fn sequential(input:slice<u8>)->buffer {
+  values:=band(input)
+  mut output:=buffer(input.len())
+  output.append(values[..])
+  output
+}
+pub fn parallel(input:slice<u8>)->buffer = task_group {
+  width:=input.len()/8
+  t0:=spawn(fn {band(input[0*width..1*width])})
+  t1:=spawn(fn {band(input[1*width..2*width])})
+  t2:=spawn(fn {band(input[2*width..3*width])})
+  t3:=spawn(fn {band(input[3*width..4*width])})
+  t4:=spawn(fn {band(input[4*width..5*width])})
+  t5:=spawn(fn {band(input[5*width..6*width])})
+  t6:=spawn(fn {band(input[6*width..7*width])})
+  t7:=spawn(fn {band(input[7*width..input.len()])})
+  wait()
+  mut output:=buffer(input.len())
+  b0:=t0.get()
+  output.append(b0[..])
+  b1:=t1.get()
+  output.append(b1[..])
+  b2:=t2.get()
+  output.append(b2[..])
+  b3:=t3.get()
+  output.append(b3[..])
+  b4:=t4.get()
+  output.append(b4[..])
+  b5:=t5.get()
+  output.append(b5[..])
+  b6:=t6.get()
+  output.append(b6[..])
+  b7:=t7.get()
+  output.append(b7[..])
+  output
+}

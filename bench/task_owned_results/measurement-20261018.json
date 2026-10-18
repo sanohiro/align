@@ -1,0 +1,43 @@
+{
+  "bands": 8,
+  "base_commit": "6e6a50c896825d25971a4ad11951984d9e864a4d",
+  "bytes_checksum": [
+    4194307,
+    662099043
+  ],
+  "compiler_sha256": "e623c6c657c71af833fdc3b77e08be31b275b4e501efe645bfdf2dcca4553fbb",
+  "cpu": "Apple M1",
+  "date": "2026-10-18",
+  "generated_profile": "release",
+  "generated_target_cpu": "native",
+  "host": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "logical_cpus": 8,
+  "machine": "arm64",
+  "median_speedup": 4.027132719058679,
+  "runtime_allocation_probes": false,
+  "samples_ns": {
+    "parallel": [
+      48973750,
+      50935125,
+      51825542,
+      50075250,
+      45799000,
+      48587542,
+      42046250
+    ],
+    "sequential": [
+      203881917,
+      197223791,
+      200848916,
+      195099292,
+      198800583,
+      196822833,
+      195285750
+    ]
+  },
+  "source_sha256": {
+    "kernel.align": "4121c64a926c276e167881438c410adbbc036610e9e7e38c0167075d33304850",
+    "main.align": "f69ddd92ee31a4145665127f2e760918c770e2899d2897ada5bf9a7b4f631557",
+    "run.py": "4cc9a8cbba05fa02a4a7ceaaec54f4fcec97a8300536fe1ba0fd4147b2d94547"
+  }
+}

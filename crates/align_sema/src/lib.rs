@@ -903,8 +903,8 @@ pub enum Ty {
     /// A sum type, indexed into `Program.enums`. S1a: tag-only variants — a Copy/`Static` value
     /// represented as the variant tag (`i32`); constructed `Type.Variant`, consumed by `match`.
     Enum(u32),
-    /// A Move handle to a group-owned result slot. R is a primitive or independent Copy record;
-    /// successful wait authorizes repeated by-value reads without exposing the slot.
+    /// A Move handle to a group-owned result slot. R is self-contained data;
+    /// successful wait authorizes repeated Copy reads or one consuming owned extraction.
     Task(Scalar),
     /// A **dictionary-encoded** AoS struct array (`s.dict_encode(.key)`, the A2 reuse rail). Carries
     /// `(struct_id, key_field)`: the source struct and the interned `str` key field. A Move,
@@ -4865,8 +4865,8 @@ fn independent_builder_read(
                     == expand_tagged_ty(expression.ty, tagged_types)))
 }
 
-/// Structured task slots contain primitives or ordinary records with no retained authority.
-/// Root tuple/collection/sum admission remains separate from record field composition.
+/// A task result owns its complete graph independently of the worker and group.
+/// Dynamic headers break layout cycles; an inline cycle or any borrowed/native authority rejects.
 pub fn task_result_type(
     ty: Ty,
     structs: &[StructDef],
@@ -4874,8 +4874,79 @@ pub fn task_result_type(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Struct(_))
-        && independent_copy_type(ty, structs, tuples, enums, tagged_types)
+    if !matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit
+        | Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::String | Ty::Buffer
+        | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) || ty_to_scalar(ty).is_none() {
+        return false;
+    }
+    // First inspect the complete reachable graph, including pointees behind dynamic headers.
+    // Inline-cycle validation is separate: memoizing a node reached through a header can hide
+    // an inline cycle when that same node is also reached by an inline sibling edge.
+    let mut pending = vec![ty];
+    let mut inline_edges = HashMap::<Ty, Vec<Ty>>::new();
+    while let Some(ty) = pending.pop() {
+        if inline_edges.contains_key(&ty) { continue; }
+        let mut children = Vec::new();
+        let mut indirect = false;
+        match ty {
+            _ if independent_copy_leaf(ty) || matches!(ty, Ty::String | Ty::Buffer) => {},
+            Ty::Struct(id) => {
+                let Some(record) = structs.get(id as usize) else { return false };
+                children.extend(record.fields.iter().map(|field| field.ty));
+            }
+            Ty::Tuple(id) => {
+                let Some(tuple) = tuples.get(id as usize) else { return false };
+                children.extend(tuple.elems.iter().map(|element| scalar_to_ty(*element)));
+            }
+            Ty::Enum(id) => {
+                let Some(sum) = enums.get(id as usize) else { return false };
+                children.extend(sum.variants.iter().flat_map(|variant|
+                    variant.payload.iter().map(|payload| scalar_to_ty(*payload))));
+            }
+            Ty::Array(element, _) | Ty::Option(element) => children.push(scalar_to_ty(element)),
+            Ty::StructArray(id, _) => children.push(Ty::Struct(id)),
+            Ty::DynArray(element) if scalar_to_prim(element).is_some() => {
+                children.push(scalar_to_ty(element));
+                indirect = true;
+            }
+            Ty::DynStructArray(id, Layout::Aos) => {
+                children.push(Ty::Struct(id));
+                indirect = true;
+            }
+            Ty::Result(ok, error) => {
+                children.push(scalar_to_ty(ok));
+                children.push(scalar_to_ty(error));
+            }
+            Ty::Tagged(id) => match tagged_types.get(id as usize) {
+                Some(hir::TaggedType::Option(payload)) => children.push(scalar_to_ty(*payload)),
+                Some(hir::TaggedType::Result(ok, error)) => {
+                    children.push(scalar_to_ty(*ok));
+                    children.push(scalar_to_ty(*error));
+                }
+                None => return false,
+            },
+            _ => return false,
+        }
+        pending.extend(children.iter().copied());
+        inline_edges.insert(ty, if indirect { Vec::new() } else { children });
+    }
+    let mut active = HashSet::new();
+    let mut complete = HashSet::new();
+    for root in inline_edges.keys().copied() {
+        let mut work = vec![(root, false)];
+        while let Some((ty, exiting)) = work.pop() {
+            if exiting {
+                active.remove(&ty);
+                complete.insert(ty);
+            } else if !complete.contains(&ty) {
+                if !active.insert(ty) { return false; }
+                let Some(children) = inline_edges.get(&ty) else { return false };
+                work.push((ty, true));
+                work.extend(children.iter().map(|child| (*child, false)));
+            }
+        }
+    }
+    true
 }
 
 /// The immediate indexed-field read may copy only data independent of its parent storage.
@@ -24123,11 +24194,13 @@ impl<'a> EscapeCheck<'a> {
                         // turn that cleanup bit off merely because `from_raw_borrowed` names a
                         // frame-local parent.
                         ExprKind::ResourceFromRaw { .. } => values.push(true),
+                        // Admitted results contain no borrowed/region ownership, regardless of
+                        // the caller arena surrounding the group.
+                        ExprKind::TaskGet(_) => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
-                        | ExprKind::Try(inner)
-                        | ExprKind::TaskGet(inner) => {
+                        | ExprKind::Try(inner) => {
                             work.push(Work::Eval(inner, depth));
                         }
                         // `map_err` passes the Ok payload through and a callee-produced Move error is
@@ -24355,11 +24428,13 @@ impl<'a> EscapeCheck<'a> {
                         | ExprKind::CallFnValue { .. }
                         | ExprKind::RawCall { .. } => values.push(true),
                         ExprKind::ResourceFromRaw { .. } => values.push(true),
+                        // Admitted results contain no borrowed/region ownership, regardless of
+                        // the caller arena surrounding the group.
+                        ExprKind::TaskGet(_) => values.push(true),
                         ExprKind::OptionSome(inner)
                         | ExprKind::ResultOk(inner)
                         | ExprKind::ResultErr(inner)
-                        | ExprKind::Try(inner)
-                        | ExprKind::TaskGet(inner) => work.push(Work::Eval(inner, depth)),
+                        | ExprKind::Try(inner) => work.push(Work::Eval(inner, depth)),
                         ExprKind::ResultMapErr { result, .. } => {
                             if matches!(
                                 expression.ty,
@@ -49821,8 +49896,7 @@ impl<'a> MoveCheck<'a> {
                     self.parallel_transfer_roots.extend(self.borrows.expand_byte_validation_roots(roots));
                 }
             }
-            // Admitted task results are independent Copy values, so get retains the handle.
-            // Unsupported owning results stay conservative until their separate lifecycle exists.
+            // Copy results retain the handle; owned results consume it exactly once.
             ExprKind::TaskGet(inner) => {
                 let consuming =
                     is_owned_droppable(e.ty, self.structs, self.tuples, self.enums, self.tagged_types);
@@ -54707,7 +54781,7 @@ impl<'a, 't> Checker<'a, 't> {
                 Some(s) if admitted(s) => (s, false),
                 _ => {
                     self.diags.error(
-                        format!("a spawned task must return a primitive or independent Copy record, optionally in `Result<R, Error>`, got {}", ty_name(other)),
+                        format!("a spawned task must return self-contained data, optionally in `Result<R, Error>`, got {}", ty_name(other)),
                         arg.span,
                     );
                     return err;

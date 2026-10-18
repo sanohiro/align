@@ -239,11 +239,6 @@ fn task_records_reject_authority_and_invalid_waits() {
         let mut cases = Vec::new();
         for (name, declaration, value) in [
             ("view", "Bad { value: str }", "Bad { value: \"borrowed\" }"),
-            (
-                "owner",
-                "Bad { value: string }",
-                "Bad { value: \"owned\".clone() }",
-            ),
             ("empty-view", "Bad { value: [str; 0] }", "Bad { value: [] }"),
             (
                 "inactive-view",
@@ -261,7 +256,7 @@ fn task_records_reject_authority_and_invalid_waits() {
                 "unsafe { Bad { value: raw.null() } }",
             ),
         ] {
-            cases.push((name, format!("{declaration}\nfn main() {{ task_group {{ spawn(fn {{ {value} }}); wait() }} }}"), "primitive or independent Copy record"));
+            cases.push((name, format!("{declaration}\nfn main() {{ task_group {{ spawn(fn {{ {value} }}); wait() }} }}"), "self-contained data"));
         }
         for (name, body, diagnostic) in [
             ("early", "t:=spawn(fn { make() }); t.get(); wait()", "wait"),

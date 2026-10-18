@@ -1,5 +1,10 @@
 # Structured task progress during caller work
 
+[Plan228](228-task-owned-results.md) extends this foundation with self-contained
+owned task results and conditional untaken cleanup; capture and wait authority
+remain unchanged. Its ledger supersedes the Copy-only result limit below.
+
+
 AM-R08 in align-media selects complete SHA-256 verification concurrent with
 caller-owned GPU preparation. The provider assessment reproduced wait-only
 dispatch and a captured-string replacement use-after-free at aca32efd. This

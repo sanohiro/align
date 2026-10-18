@@ -272,3 +272,49 @@ fn producer_copy_record_authority_matrix() -> Result<(), Box<dyn std::error::Err
     }
     Ok(())
 }
+
+#[test]
+fn task_owned_complete_graph() -> Result<(), Box<dyn std::error::Error>> {
+    let mut program = lower("Plain { value:i64 }\nfn main() {}\n")?;
+    let plain = program.structs.iter().position(|s| s.name == "Plain").ok_or("Plain type")?;
+    let id = u32::try_from(plain)?;
+    let admitted = |program: &Program, root| align_sema::task_result_type(root,
+        &program.structs, &program.tuples, &program.enums, &program.tagged_types);
+    let int=Scalar::Int(IntTy {bits:64,signed:true});
+    for leaf in [Ty::String,Ty::Buffer,Ty::DynArray(int),Ty::DynArray(Scalar::String),
+        Ty::Option(Scalar::String),Ty::Result(Scalar::String,int),Ty::Array(Scalar::String,0),
+        Ty::Array(Scalar::String,2),Ty::DynStructArray(id,Layout::Aos)] {
+        program.structs.get_mut(plain).ok_or("record")?.fields.get_mut(0).ok_or("field")?.ty=leaf;
+        assert!(admitted(&program,Ty::Struct(id)),"{leaf:?}");
+        assert!(admitted(&program,Ty::DynStructArray(id,Layout::Aos)),"{leaf:?}");
+    }
+    for leaf in [Ty::Str,Ty::Raw,Ty::Slice(int),Ty::Fn(0),Ty::Box(int),Ty::Task(int),
+        Ty::ArenaHandle,Ty::Reader,Ty::Resource(0),Ty::ResourceRef(0),Ty::Error,
+        Ty::DynArray(Scalar::Str),Ty::DynArray(Scalar::Struct(id)),
+        Ty::DynArray(Scalar::DynArray(align_sema::PrimScalar::String)),Ty::Array(Scalar::Str,0),Ty::Option(Scalar::Str),
+        Ty::DynStructArray(id,Layout::Soa),Ty::Struct(u32::MAX),Ty::Tuple(u32::MAX),
+        Ty::Tagged(u32::MAX),Ty::Struct(id),Ty::StructArray(id,0)] {
+        program.structs.get_mut(plain).ok_or("record")?.fields.get_mut(0).ok_or("field")?.ty=leaf;
+        assert!(!admitted(&program,Ty::Struct(id)),"{leaf:?}");
+        assert!(!admitted(&program,Ty::DynStructArray(id,Layout::Aos)),"{leaf:?}");
+    }
+    for root in [Ty::Array(int,2),Ty::Vec(int,4),Ty::Mask(int,4),Ty::Rng,
+        Ty::Option(int),Ty::Result(int,int)] {
+        assert!(!admitted(&program,root),"root {root:?}");
+    }
+    // A header-reached node must not hide its inline cycle when an inline sibling reaches it.
+    let second_id=u32::try_from(program.structs.len())?;
+    let mut second=program.structs.get(plain).ok_or("record")?.clone();
+    second.fields.get_mut(0).ok_or("field")?.ty=Ty::Struct(id);
+    program.structs.push(second);
+    for reverse in [false,true] {
+        let record=program.structs.get_mut(plain).ok_or("record")?;
+        record.fields=vec![
+            align_sema::FieldDef {name:"inline".into(),ty:Ty::Struct(second_id)},
+            align_sema::FieldDef {name:"header".into(),ty:Ty::DynStructArray(second_id,Layout::Aos)},
+        ];
+        if reverse {record.fields.reverse();}
+        assert!(!admitted(&program,Ty::Struct(id)),"header-masked inline cycle/{reverse}");
+    }
+    Ok(())
+}
