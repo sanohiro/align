@@ -3,6 +3,10 @@
 //! elementwise `+`/`-`/`*`/`/`/`%` (lowered to LLVM vector arithmetic) and constant-lane read `v[i]`
 //! (extractelement). `mask`/comparisons/`select`/`dot`/broadcast are later slices.
 
+#[cfg(unix)]
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
+
 mod common;
 use common::*;
 
@@ -588,28 +592,213 @@ fn remainder_on_vectors_is_accepted() {
 }
 
 #[test]
-fn bitwise_and_shift_on_vectors_is_rejected() {
-    // Vectors carry only elementwise `+ - * / %` and comparisons — the bitwise/shift family
-    // (`& | ^ << >>`) is an explicit sema error (a clear vec-specific diagnostic, not a codegen
-    // crash and not the generic "expect integers" message). Guards self-review Gate 3 / #235.
+fn vector_bitwise_invalid_domain_is_rejected() {
     for op in ["&", "|", "^", "<<", ">>"] {
-        let src = format!(
-            concat!(
-                "fn main() -> i32 {{\n",
-                "  a: vec4<i32> := [1, 2, 3, 4]\n",
-                "  b: vec4<i32> := [5, 6, 7, 8]\n",
-                "  c := a {op} b\n",
-                "  return c[0]\n",
-                "}}\n",
-            ),
-            op = op,
-        );
-        let diags = check_diagnostics("vec-bitop", &src);
-        assert!(
-            diags.contains("vectors do not support bitwise or shift operators"),
-            "op `{op}` should give the vec-specific rejection, got:\n{diags}"
-        );
+        for (left, right) in [
+            ("vec4<f32>", "vec4<f32>"),
+            ("vec4<i32>", "vec2<i32>"),
+            ("vec4<i32>", "vec4<u32>"),
+            ("vec4<i32>", "vec4<i64>"),
+            ("vec4<i32>", "f32"),
+            ("mask4<i32>", "mask4<i32>"),
+        ] {
+            let source =
+                format!("fn bad(a:{left},b:{right}) {{ value := a {op} b }}\nfn main() {{}}\n");
+            assert!(check_errs("vector-bitwise-domain", &source), "{source}");
+        }
     }
+    for expression in [
+        "~floating",
+        "-integer",
+        "!integer",
+        "integer && integer",
+        "integer | missing()",
+    ] {
+        let source = format!(
+            "fn bad(integer:vec4<i32>,floating:vec4<f32>) {{ value := {expression} }}\nfn main() {{}}\n"
+        );
+        assert!(check_errs("vector-unary-domain", &source), "{source}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn integer_vector_broadcast_evaluates_operands_once_in_order() {
+    owned_fixture::run(
+        "integer_vector_broadcast_evaluates_operands_once_in_order",
+        |_| {
+            if !backend_available() {
+                return;
+            }
+            let source = r#"
+fn scalar() -> i32 { print(1); return 3 }
+fn vector() -> vec2<i32> { print(2); return [4, 5] }
+fn identity<T>(value:T) -> T = value
+fn left() -> vec2<i32> = scalar() | vector()
+fn right() -> vec2<i32> = vector() ^ scalar()
+fn nested() -> vec2<i32> = (scalar() + 1) << vector()
+fn generic(x:i32,v:vec2<i32>) -> vec2<i32> = identity(x) & identity(v)
+fn literal(v:vec2<i32>) -> vec2<i32> = [1, 2] | v
+fn arithmetic(x:i32,v:vec2<i32>) -> vec2<i32> = x + v
+fn main() -> i32 {
+  a := left()
+  b := right()
+  c := nested()
+  d := generic(3, a)
+  e := literal(b)
+  f := arithmetic(3, a)
+  print(a[0]); print(b[1]); print(c[0]); print(d[0]); print(e[1]); print(f[0])
+  return 0
+}
+
+"#;
+            let expected = "1\n2\n2\n1\n1\n2\n7\n6\n64\n3\n6\n10\n";
+            for result in [
+                build_and_run("vector-broadcast-order", source),
+                build_per_unit_multi(
+                    "vector-broadcast-order-units",
+                    &[("main.align", source)],
+                    "main.align",
+                )
+                .link_and_run(),
+            ] {
+                assert!(result.status.success(), "{result:?}");
+                assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
+            }
+        },
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn integer_vector_bitwise_shift_type_lane_matrix() {
+    owned_fixture::run("integer_vector_bitwise_shift_type_lane_matrix", |_| {
+        if !backend_available() {
+            return;
+        }
+        let mut source = String::new();
+        let mut calls = String::from("fn main() -> i32 {\n");
+        for signed in [false, true] {
+            for bits in [8u32, 16, 32, 64] {
+                let mask = (1i128 << bits) - 1;
+                let value = |raw: i128| {
+                    let raw = raw & mask;
+                    if signed && raw & (1i128 << (bits - 1)) != 0 {
+                        raw - (1i128 << bits)
+                    } else {
+                        raw
+                    }
+                };
+                let scalar = format!("{}{bits}", if signed { "i" } else { "u" });
+                for lanes in [2u8, 4, 8, 16] {
+                    let name = format!("check_{scalar}_{lanes}");
+                    let vector = format!("vec{lanes}<{scalar}>");
+                    let left: Vec<i128> = (0..lanes)
+                        .map(|lane| {
+                            value(match lane % 4 {
+                                0 => -7,
+                                1 => 5,
+                                2 => 1i128 << (bits - 1),
+                                _ => mask >> 1,
+                            })
+                        })
+                        .collect();
+                    let right: Vec<i128> = (0..lanes)
+                        .map(|lane| value(i128::from(lane) * 17 - 1))
+                        .collect();
+                    let literal = |values: &[i128]| {
+                        values
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    source.push_str(&format!("fn {name}() -> bool {{\n a:{vector}:=[{}]\n b:{vector}:=[{}]\n k:{scalar}:=3\n", literal(&left), literal(&right)));
+                    let mut ordinal = 0;
+                    for operator in ["&", "|", "^", "<<", ">>"] {
+                        for (lhs, rhs, scalar_left, scalar_right) in [
+                            ("a", "b", false, false),
+                            ("a", "k", false, true),
+                            ("k", "b", true, false),
+                        ] {
+                            source.push_str(&format!(
+                                " r{ordinal}:{vector}:={lhs} {operator} {rhs}\n"
+                            ));
+                            for lane in 0..lanes {
+                                let a = if scalar_left {
+                                    3
+                                } else {
+                                    left[usize::from(lane)]
+                                };
+                                let b = if scalar_right {
+                                    3
+                                } else {
+                                    right[usize::from(lane)]
+                                };
+                                let shift = b & i128::from(bits - 1);
+                                let expected = value(match operator {
+                                    "&" => a & b,
+                                    "|" => a | b,
+                                    "^" => a ^ b,
+                                    "<<" => (a & mask) << shift,
+                                    _ => a >> shift,
+                                });
+                                source.push_str(&format!(
+                                    " if r{ordinal}[{lane}] != {expected} {{ return false }}\n"
+                                ));
+                            }
+                            ordinal += 1;
+                        }
+                    }
+                    for count in [
+                        0,
+                        i128::from(bits - 1),
+                        i128::from(bits),
+                        i128::from(bits + 1),
+                        value(-1),
+                    ] {
+                        for operator in ["<<", ">>"] {
+                            source.push_str(&format!(" r{ordinal}:=a {operator} {count}\n"));
+                            let shift = count & i128::from(bits - 1);
+                            for (lane, input) in left.iter().enumerate() {
+                                let expected = value(if operator == "<<" {
+                                    (input & mask) << shift
+                                } else {
+                                    input >> shift
+                                });
+                                source.push_str(&format!(
+                                    " if r{ordinal}[{lane}] != {expected} {{ return false }}\n"
+                                ));
+                            }
+                            ordinal += 1;
+                        }
+                    }
+                    source.push_str(" complement:=~a\n");
+                    for (lane, input) in left.iter().enumerate() {
+                        source.push_str(&format!(
+                            " if complement[{lane}] != {} {{ return false }}\n",
+                            value(!input)
+                        ));
+                    }
+                    source.push_str(" return true\n}\n");
+                    calls.push_str(&format!(" if !{name}() {{ return 1 }}\n"));
+                }
+            }
+        }
+        calls.push_str(" return 0\n}\n");
+        source.push_str(&calls);
+        for result in [
+            build_and_run("integer-vector-matrix", &source),
+            build_per_unit_multi(
+                "integer-vector-matrix-units",
+                &[("main.align", &source)],
+                "main.align",
+            )
+            .link_and_run(),
+        ] {
+            assert!(result.status.success(), "{result:?}");
+        }
+    });
 }
 
 #[test]
@@ -1223,4 +1412,167 @@ fn a_widened_blend_emits_a_plain_select_with_no_conversion() {
             "a widened blend must introduce no `{conversion}` conversion:\n{ir}"
         );
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn integer_vector_ir_masks_shift_counts() {
+    owned_fixture::run("integer_vector_ir_masks_shift_counts", |_| {
+        if !backend_available() {
+            return;
+        }
+        let mut source = String::new();
+        for scalar in ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"] {
+            for lanes in [2, 4, 8, 16] {
+                let vector = format!("vec{lanes}<{scalar}>");
+                for (op_id, op) in ["&", "|", "^", "<<", ">>"].iter().enumerate() {
+                    for (order, lhs, rhs) in [("vv", "a", "b"), ("vs", "a", "k"), ("sv", "k", "b")]
+                    {
+                        source.push_str(&format!("pub fn op_{scalar}_{lanes}_{op_id}_{order}(a:{vector},b:{vector},k:{scalar}) -> {vector} = {lhs} {op} {rhs}\n"));
+                    }
+                }
+            }
+        }
+        source.push_str("fn main() {}\n");
+        let mut sm = SourceMap::new();
+        let checked = check(&mut sm, "integer-vector-mask-ir", &source);
+        assert!(
+            !checked.diags.has_errors(),
+            "{}",
+            align_driver::format_diagnostics(&sm, &checked.diags)
+        );
+        let mir = lower_to_mir(&checked.hir);
+        let ir = emit_llvm_ir(
+            &mir,
+            BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &[],
+            false,
+        )
+        .expect("emit integer vector IR");
+        let mut shifts = 0;
+        for function in ir.split("define ").skip(1) {
+            let mut definitions = std::collections::HashMap::new();
+            for line in function.lines() {
+                if line.trim() == "}" {
+                    break;
+                }
+                let Some((name, instruction)) = line.trim().split_once(" = ") else {
+                    continue;
+                };
+                definitions.insert(name, instruction);
+                if !["shl <", "ashr <", "lshr <"]
+                    .iter()
+                    .any(|prefix| instruction.starts_with(prefix))
+                {
+                    continue;
+                }
+                shifts += 1;
+                let (_, shape) = instruction.split_once('<').expect("vector shift type");
+                let (lanes, rest) = shape.split_once(" x i").expect("integer vector shift type");
+                let bits: u32 = rest
+                    .split('>')
+                    .next()
+                    .expect("vector type end")
+                    .parse()
+                    .expect("integer bits");
+                let lanes: usize = lanes.parse().expect("vector lanes");
+                let count = instruction.rsplit(", ").next().expect("shift count");
+                let mask = definitions
+                    .get(count)
+                    .expect("shift must consume its width-mask result");
+                assert!(
+                    mask.starts_with(&format!("and <{lanes} x i{bits}>"))
+                        && mask.ends_with(&format!("splat (i{bits} {})", bits - 1)),
+                    "{instruction}\n{mask}"
+                );
+            }
+        }
+        assert_eq!(shifts, 8 * 4 * 2 * 3);
+        for op in ["and", "or", "xor", "shl", "ashr", "lshr"] {
+            assert!(ir.contains(&format!(" = {op} <")), "missing vector {op}");
+        }
+    });
+}
+
+#[test]
+#[cfg(unix)]
+fn scalar_left_vector_division_preserves_lane_guards() {
+    owned_fixture::run("scalar_left_vector_division_preserves_lane_guards", |_| {
+        if !backend_available() {
+            return;
+        }
+        let mut source = String::new();
+        let mut calls = String::from("fn main()->i32 {\n");
+        for signed in [false, true] {
+            for bits in [8, 16, 32, 64] {
+                let ty = format!("{}{bits}", if signed { "i" } else { "u" });
+                let minimum = if signed { -(1i128 << (bits - 1)) } else { 0 };
+                let maximum = (1i128 << (bits - if signed { 1 } else { 0 })) - 1;
+                for lanes in [2, 4, 8, 16] {
+                    for (case, numerator) in [minimum, maximum].into_iter().enumerate() {
+                        let name = format!("check_{ty}_{lanes}_{case}");
+                        source.push_str(&format!("fn {name}(x:{ty},v:vec{lanes}<{ty}>)->bool {{\n q:vec{lanes}<{ty}>:=x/v\n r:vec{lanes}<{ty}>:=x%v\n"));
+                        let mut divisors = Vec::new();
+                        for lane in 0..lanes {
+                            let divisor = if signed && lane % 2 == 0 {
+                                -1
+                            } else {
+                                1 + lane % 3
+                            };
+                            divisors.push(divisor.to_string());
+                            let quotient = numerator / i128::from(divisor);
+                            let quotient = if quotient > maximum {
+                                minimum
+                            } else {
+                                quotient
+                            };
+                            let remainder = numerator % i128::from(divisor);
+                            source.push_str(&format!(" if q[{lane}]!={quotient} || r[{lane}]!={remainder} {{ return false }}\n"));
+                        }
+                        source.push_str(" return true\n}\n");
+                        calls.push_str(&format!(
+                            " if !{name}({numerator},[{}]) {{ return 1 }}\n",
+                            divisors.join(",")
+                        ));
+                    }
+                }
+            }
+        }
+        calls.push_str(" return 0\n}\n");
+        source.push_str(&calls);
+        for output in [
+            build_and_run("scalar-left-vector-div", &source),
+            build_per_unit_multi(
+                "scalar-left-vector-div-units",
+                &[("main.align", &source)],
+                "main.align",
+            )
+            .link_and_run(),
+        ] {
+            assert!(output.status.success(), "{output:?}");
+        }
+        for operator in ["/", "%"] {
+            let source = format!(
+                "fn divide(x:i32,v:vec2<i32>)->vec2<i32> = x{operator}v\nfn main()->i32 {{\n v:vec2<i32>:=[1,0]\n result:=divide(7,v)\n return result[0]\n}}\n"
+            );
+            for output in [
+                build_and_run("scalar-left-vector-zero", &source),
+                build_per_unit_multi(
+                    "scalar-left-vector-zero-units",
+                    &[("main.align", &source)],
+                    "main.align",
+                )
+                .link_and_run(),
+            ] {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stderr).contains("division by zero"),
+                    "{output:?}"
+                );
+            }
+        }
+    });
 }

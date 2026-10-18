@@ -6445,6 +6445,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     UnOp::Not => result_ty == Ty::Bool,
                     UnOp::BitNot => {
                         matches!(result_ty, Ty::Int(_)) && xml_numeric_scalar_ty(result_ty)
+                            || xml_numeric_vector_shape(result_ty)
+                                .is_some_and(|(element, _)| matches!(element, Scalar::Int(_)))
                     }
                 };
                 if !path.is_empty()
@@ -6472,7 +6474,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 let right_ty = xml_operand_base_ty(self.graph.function, &right);
                 // Sema and gen_bin retain the scalar operand for broadcasts in either order.
                 // The vector fixes both the numeric element and lane count; masks are results
-                // of comparisons only, never numeric operands or bitwise/logical vectors.
+                // of comparisons only, never numeric operands or logical vectors.
                 if matches!(left_ty, Some(Ty::Vec(..)))
                     || matches!(right_ty, Some(Ty::Vec(..)))
                 {
@@ -6492,7 +6494,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                                     result_ty == Ty::Mask(element, lanes)
                                 }
                                 BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor
-                                | BinOp::Shl | BinOp::Shr | BinOp::And | BinOp::Or => false,
+                                | BinOp::Shl | BinOp::Shr => {
+                                    matches!(element, Scalar::Int(_)) && result_ty == vector_ty
+                                }
+                                BinOp::And | BinOp::Or => false,
                             }
                     });
                     if !path.is_empty() || !relation_matches {
@@ -13081,6 +13086,7 @@ mod tests {
             (Floor, 1),
             (Ceil, 1),
             (Round, 1),
+            (RoundEven, 1),
             (Trunc, 1),
             (Pow, 2),
             (Fma, 3),
@@ -13214,7 +13220,7 @@ mod tests {
                 let scalar = Scalar::Float(FloatTy { bits });
                 let vector = Ty::Vec(scalar, lanes);
                 for operation in [
-                    Abs, Sqrt, Floor, Ceil, Round, Trunc, Exp, Exp2, Log, Log2, Log10,
+                    Abs, Sqrt, Floor, Ceil, Round, RoundEven, Trunc, Exp, Exp2, Log, Log2, Log10,
                 ] {
                     assert_eq!(operation.result_type(&[vector]), Some(vector));
                 }

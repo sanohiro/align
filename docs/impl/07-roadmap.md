@@ -988,12 +988,14 @@ packed-bool columns, and the arena/heap `align(N)` over-alignment gaps.
   - **scalar-on-the-left broadcast slice 9 — DONE.** A scalar on the **left** of a vector op
     broadcasts too (`10 + a`, `2 < scores`), completing the broadcast symmetry (slice 3 did vector-on-
     the-left). The operand order is preserved for the non-commutative ops (`20 - a` = `[20-a0, …]`).
-    The one-pass checker handles it via a **speculative rhs check with diagnostic rollback**
-    (`check_binop_rhs`): the rhs is hinted with the lhs type as usual, but if the lhs is a scalar and
-    the rhs is a vector, that hint is rolled back (`Diagnostics::truncate`) and the rhs re-checked
-    unhinted, so the scalar broadcasts — no regression to ordinary scalar arithmetic (a generic-call
-    rhs still gets the lhs hint). `vec_binop` gained the `(scalar, vec)` case; codegen detects the
-    vector in either operand (`operand_as_vector` already splats the scalar). (`examples/vec_broadcast.align`.)
+    Plan 225 replaces speculative diagnostic rollback with separate numeric operand
+    context: each operand is checked once, while the result and control joins retain
+    exact types. `vec_binop` validates both directions and codegen splats the scalar. (`examples/vec_broadcast.align`.)
+  - **integer vector and ties-even completion — DONE (plan 225).** All integer
+    vectors support `& | ^ << >> ~`, preserving scalar masked-shift semantics and
+    both broadcast directions. Scalar/vector floats support `round_even()`;
+    `round()` remains ties-away. HIR/MIR relation, native lane/IEEE, imported and
+    persistent-cache owners cover the complete family.
   - **written `maskN<T>` annotation slice 10 — DONE.** A comparison mask is now a **nameable type**
     `maskN<T>` (spelled like `vecN<T>` — `mask4<i32>` is the result of comparing `vec4<i32>`s), so a
     mask can be a `let` annotation, a **function parameter**, or a return type — threading a mask

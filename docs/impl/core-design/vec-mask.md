@@ -24,7 +24,7 @@ v[i]                             -> T            // lane read, constant index
 v[i] = x                                          // lane write (mut binding)
 v.min() / v.max()                -> T            // horizontal reduce
 a.min(b) / a.max(b)              -> vecN<T>      // element-wise
-v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
+v.sqrt()/abs()/floor()/ceil()/round()/round_even()/trunc()    // per-lane float math
 v.exp()/exp2()/log()/log2()/log10()             // per-lane float math; may scalarize
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
@@ -57,6 +57,21 @@ The five elementary functions above reach LLVM as vector intrinsics. Use
 `emit-llvm --stage optimized` and `explain-opt` to inspect their disposition before instruction
 selection; retained vector IR without a provider can still scalarize later. Inspect the emitted
 object to establish final machine SIMD. [Plan 75](../75-portable-math-plan.md) owns this boundary.
+
+Integer vectors also support lane-wise `&`, `|`, `^`, `<<`, `>>` and unary `~` for
+all signed/unsigned 8/16/32/64-bit elements and all four vector widths. Binary
+operands are equal vector types or one vector and its exact element scalar in
+either order. Each shift count is masked modulo the element bit width, including
+negative counts; signed right shift sign-extends, unsigned right shift zero-fills.
+Masks and floats do not support this family; unary vector `-` and `!`, and
+vector logical `&&` and `||`, remain unavailable. These operations are Pure Copy values and allocate nothing.
+
+`round_even()` is a zero-argument method on `f32`, `f64` and their float vectors.
+It returns the same type, rounding to the nearest integral floating value with
+ties to the even integer. It preserves signed zero (including `-0.5 -> -0.0`),
+infinities and integral finite values. NaN remains NaN; its payload, sign and
+quieting are unspecified. It never aborts or allocates. `round()` continues to
+round ties away from zero. Vector semantics apply independently to every lane.
 
 ## Effects
 

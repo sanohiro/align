@@ -947,7 +947,7 @@ section is a reservation and changes no checked-HIR contract.
 | `ArithMode::Checked` | Used only by `IntArith` with `Add`, `Sub`, or `Mul`; result is `Option<IS(T)>` for common integer operand type `T`. |
 | `UnOp::Neg` | One operand/result of the same concrete signed integer or float type. Unsigned integers, vectors, generic parameters, and every nonnumeric type reject. |
 | `UnOp::Not` | One `Bool` operand and `Bool` result. |
-| `UnOp::BitNot` | One operand/result of the same concrete signed or unsigned integer type. Vectors and generic parameters reject. |
+| `UnOp::BitNot` | One operand/result of the same concrete signed or unsigned integer type or valid integer vector V(IS,n). Floats, masks and generic parameters reject. |
 | `BinOp::Add` | Two equal concrete numeric scalars, two equal numeric vectors, or one numeric vector plus an exactly matching element scalar in either order; result is that scalar or vector type. |
 | `BinOp::Sub` | Same operand/result domain as `Add`; scalar/vector order is preserved and scalar broadcast is permitted in either position. |
 | `BinOp::Mul` | Same operand/result domain as `Add`. |
@@ -961,10 +961,10 @@ section is a reservation and changes no checked-HIR contract.
 | `BinOp::Ge` | Same operand/result domain as `Lt`. |
 | `BinOp::And` | Two `Bool` operands produce `Bool`; the right operand is evaluated only on a true left operand. |
 | `BinOp::Or` | Two `Bool` operands produce `Bool`; the right operand is evaluated only on a false left operand. |
-| `BinOp::BitAnd` | Two equal concrete signed or unsigned integer operands produce that integer type; vectors and generic parameters reject. |
+| `BinOp::BitAnd` | Two equal concrete signed or unsigned integers, two equal valid integer vectors, or an integer vector plus its exact element scalar in either order produce that scalar/vector type. Floats, masks and generic parameters reject. |
 | `BinOp::BitOr` | Same operand/result domain as `BitAnd`. |
 | `BinOp::BitXor` | Same operand/result domain as `BitAnd`. |
-| `BinOp::Shl` | Two equal concrete signed or unsigned integer operands produce the left integer type; the shift count deliberately has the same type. Vectors and generic parameters reject. |
+| `BinOp::Shl` | Same operand/result domain as BitAnd. Counts share the exact element type and are masked modulo its bit width in every lane, including negative counts. |
 | `BinOp::Shr` | Same operand/result domain as `Shl`; signedness selects arithmetic versus logical right shift during lowering. |
 | `MathFn::Abs` | One operand. Scalar `N` or vector `V(IS\|FS,n)`; result equals operand type. |
 | `MathFn::Min` | Two operands of one exact type. Scalar `N` or vector `V(IS\|FS,n)`; result equals operand type. |
@@ -973,6 +973,7 @@ section is a reservation and changes no checked-HIR contract.
 | `MathFn::Floor` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MathFn::Ceil` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MathFn::Round` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
+| `MathFn::RoundEven` | Exactly one scalar F or valid vector V(FS,n); exact same result type. Nearest integral value, ties-even; signed zeros/infinities/integral values preserved; NaN remains NaN without payload/sign/quieting guarantees. |
 | `MathFn::Trunc` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MathFn::Pow` | Two operands of one exact scalar `F`; vectors reject; result is that `F`. |
 | `MathFn::Exp`, `Exp2`, `Log`, `Log2`, `Log10` (plan 75) | Exactly one operand. Scalar `F` or vector `V(FS,n)`; result equals the exact operand type. Integers, masks, arrays and unresolved numeric variables reject. No accuracy, target-identity or machine-SIMD fact is stored in HIR. |
@@ -1013,9 +1014,9 @@ The result formula in every row is followed by the universal
 | `Str` | `env[UTF-8 bytes]`; embedded NUL is permitted. `child[]; post[result(Str),view(Static)]`. |
 | `Bool` | `env[value]; child[]; post[result(Bool),copy]`. |
 | `Local` | `env[id]`: `LV(id)`. `child[]; post[result(LT(id)); Copy reads borrow, Move reads follow the producer's move/borrow use classification]`. |
-| `Unary` | `env[op]`; `child[expr]`; `post[Neg: expr/result same signed Int or Float; Not: expr/result Bool; BitNot: expr/result concrete signed or unsigned Int; copy]`. |
+| `Unary` | `env[op]`; `child[expr]`; `post[Neg: expr/result same signed Int or Float; Not: expr/result Bool; BitNot: expr/result concrete signed or unsigned Int or valid V(IS,n); copy]`. |
 | `Cast` | `env[]`; `child[expr]`; `post[source/result pair is Int→Int/Float/Char, Float→Int/Float, or Char→Int/Char; Float↔Char and every generic/composite pair reject; copy]`. |
-| `Binary` | `env[op]`; `child[lhs,rhs]`; `post[Add/Sub/Mul/Div/Rem: same numeric scalar result or valid scalar-broadcast/vector pair producing V(s,n); Eq/Ne: same Eq scalar/Str gives Bool or valid vector/broadcast pair gives K(s,n); Lt/Le/Gt/Ge: same Ord scalar/Str gives Bool or vector/broadcast pair gives K(s,n); And/Or: Bool×Bool→Bool with short-circuit control; BitAnd/BitOr/BitXor/Shl/Shr: same concrete I→I; no structural, owned-string, generic-param, vector-bitwise, or mismatched-lane case; copy]`. |
+| `Binary` | `env[op]`; `child[lhs,rhs]`; `post[Add/Sub/Mul/Div/Rem: same numeric scalar result or valid scalar-broadcast/vector pair producing V(s,n); Eq/Ne: same Eq scalar/Str gives Bool or valid vector/broadcast pair gives K(s,n); Lt/Le/Gt/Ge: same Ord scalar/Str gives Bool or vector/broadcast pair gives K(s,n); And/Or: Bool×Bool→Bool with short-circuit control; BitAnd/BitOr/BitXor/Shl/Shr: same concrete I→I or valid integer vector/broadcast pair producing V(IS,n); no structural, owned-string, generic-param, float-bitwise, mask-bitwise, or mismatched-lane case; copy]`. |
 | `IntArith` | `env[op,mode]`: op is Add/Sub/Mul only. `child[lhs,rhs]`: same concrete I. `post[Saturating→I; Checked→Option<IS(I)>; copy]`. |
 | `MathOp` | `env[fn_,operands.len]`; `child[operands in order]`; `post[the exact MathFn row above; copy]`. |
 | `FnValue` | `env[name]`: non-empty NUL-free exact bytes and one non-extern `SIG(name)`. Outside `SPAWN`, the target is stored `Source`, `Monomorph`, or `Lifted { capture_count: 0 }`, or imported; its exact concrete scalar modes/parameters/return map to the in-range stored `FnTy`. In `SPAWN(fallible,ok)`, the target is stored `Lifted { capture_count: 0 }` and obeys the contextual signature rule above. A local binding may receive a fresh `FnTy` ordinal; its initializer and local type correlate by `FABI`, while effect/borrow/region cells remain am-b4 facts. `child[]; post[result(Fn(id)),copy; callable fact belongs to am-b3 and is consumed by am-c]`. |

@@ -18,9 +18,24 @@ fn main() -> i32 {
 }
 ```
 
-`vec2` / `vec4` / `vec8` / `vec16` of a numeric scalar. Arithmetic is lane-wise; the number of machine instructions depends on the operation and target. Scalars broadcast; `v[i]` reads a lane; `mut` vectors allow lane writes (`v[1] = 99`). Element-wise `a.min(b)` / `a.max(b)`, and float math — `sqrt`, `abs`, `floor`, `ceil`, `round`, `trunc` — apply per lane. Two free functions cover the classic kernels: `dot(a, b)` and `fma(a, b, c)` (fused multiply-add, one rounding).
+`vec2` / `vec4` / `vec8` / `vec16` of a numeric scalar. Arithmetic is lane-wise; the number of machine instructions depends on the operation and target. Scalars broadcast; `v[i]` reads a lane; `mut` vectors allow lane writes (`v[1] = 99`). Element-wise `a.min(b)` / `a.max(b)`, and float math — `sqrt`, `abs`, `floor`, `ceil`, `round`, `round_even`, `trunc` — apply per lane. Two free functions cover the classic kernels: `dot(a, b)` and `fma(a, b, c)` (fused multiply-add, one rounding).
 
 Integer lane semantics match the scalar language exactly: overflow wraps, division by zero aborts — no lane is ever undefined behavior.
+
+Integer vectors also support lane-wise `&`, `|`, `^`, `<<`, `>>` and unary `~` for
+all signed/unsigned 8/16/32/64-bit elements and all four vector widths. Binary
+operands are equal vector types or one vector and its exact element scalar in
+either order. Each shift count is masked modulo the element bit width, including
+negative counts; signed right shift sign-extends, unsigned right shift zero-fills.
+Masks and floats do not support this family; unary vector `-` and `!`, and
+vector logical `&&` and `||`, remain unavailable. These operations are Pure Copy values and allocate nothing.
+
+`round_even()` is a zero-argument method on `f32`, `f64` and their float vectors.
+It returns the same type, rounding to the nearest integral floating value with
+ties to the even integer. It preserves signed zero (including `-0.5 -> -0.0`),
+infinities and integral finite values. NaN remains NaN; its payload, sign and
+quieting are unspecified. It never aborts or allocates. `round()` continues to
+round ties away from zero. Vector semantics apply independently to every lane.
 
 ## Masks and `select` — choosing each lane
 

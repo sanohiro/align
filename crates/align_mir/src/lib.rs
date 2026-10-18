@@ -10098,8 +10098,9 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 // Integer `/` / `%` need a divisor guard: division by zero aborts, and signed
                 // `INT_MIN / -1` (LLVM UB) wraps to the defined two's-complement result. `float`
                 // division is IEEE (no guard).
-                if matches!(op, BinOp::Div | BinOp::Rem) && matches!(lhs.ty, Ty::Int(_)) {
-                    return lower_int_div(b, *op, l, r, lhs.ty);
+                // The result shape chooses the guard: a scalar lhs can broadcast over a vector.
+                if matches!(op, BinOp::Div | BinOp::Rem) && matches!(e.ty, Ty::Int(_)) {
+                    return lower_int_div(b, *op, l, r, e.ty);
                 }
                 // A `vecN<T>` `/` / `%` carries the same divisor guard, lane-wise: any zero lane aborts,
                 // and a signed `INT_MIN / -1` lane wraps. Float vectors are IEEE (no guard).
