@@ -12596,6 +12596,7 @@ fn run_body_analysis_passes(
             mutable_call_argument_snapshots: std::collections::HashSet::new(),
             borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
+            value_snapshot_places: std::collections::HashMap::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
@@ -14603,6 +14604,7 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             mutable_call_argument_snapshots: std::collections::HashSet::new(),
             borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
+            value_snapshot_places: std::collections::HashMap::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
@@ -31038,6 +31040,10 @@ struct MoveCheck<'a> {
     /// Eager operations validate these snapshots at their action boundary; transparent/control
     /// containers defer validation to the operation that consumes their selected result.
     value_snapshot_frames: Vec<MoveTransientFrame>,
+    /// Stable source place of each completed value snapshot, when the value is a projection of
+    /// one owner. A direct field transfer ends only snapshots that overlap the selected field;
+    /// a completed disjoint sibling keeps observing storage the transfer neither nulls nor frees.
+    value_snapshot_places: std::collections::HashMap<usize, (LocalId, StoragePath)>,
     /// Loop refinement may revisit the same action. Emit one invalid-snapshot diagnostic per
     /// checked parent/child identity pair.
     reported_invalid_value_actions: std::collections::HashSet<(usize, usize)>,
@@ -35139,6 +35145,36 @@ impl BorrowState {
         self.invalidate_matching(how, |root| {
             matches!(root, BorrowRoot::Local(local) if *local == owner)
         });
+    }
+
+    /// End `owner`'s legacy roots everywhere except in the named completed value snapshots.
+    /// Their observations are left exactly as they were before this ending.
+    fn invalidate_owner_retaining_value_sources(
+        &mut self,
+        owner: LocalId,
+        how: BorrowEnd,
+        retained: &[usize],
+    ) {
+        let saved = retained
+            .iter()
+            .map(|key| {
+                (
+                    *key,
+                    self.invalid_value_sources.get(key).cloned(),
+                    self.value_headers.get(key).cloned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_owner(owner, how);
+        for (key, invalid, headers) in saved {
+            match invalid {
+                Some(invalid) => self.invalid_value_sources.insert(key, invalid),
+                None => self.invalid_value_sources.remove(&key),
+            };
+            if let Some(headers) = headers {
+                self.value_headers.insert(key, headers);
+            }
+        }
     }
 
     fn invalidate_roots(&mut self, roots: &BorrowRoots, how: BorrowEnd) {
@@ -40684,6 +40720,33 @@ impl<'a> MoveCheck<'a> {
         }
         self.borrows.begin_value_source(key, completion_roots);
         self.borrows.begin_value_headers(key, headers);
+        // Only a direct projection of the owner itself names its source place. Views reached
+        // through another local keep the owner-wide ending.
+        let mut direct = expression;
+        let direct_root = loop {
+            if let Some(inner) = borrow_transparent_value(direct) {
+                direct = inner;
+                continue;
+            }
+            match &direct.kind {
+                ExprKind::Field { root, .. } => break Some(*root),
+                ExprKind::Local(local) => break Some(*local),
+                ExprKind::TupleIndex { recv: inner, .. }
+                | ExprKind::BufferBytes { buffer: inner }
+                | ExprKind::StrBytes { inner }
+                | ExprKind::StrBorrow(inner)
+                | ExprKind::ArrayToSlice(inner)
+                | ExprKind::SliceRange { recv: inner, .. } => direct = inner,
+                _ => break None,
+            }
+        };
+        match self
+            .expr_origin_place(expression)
+            .filter(|(root, _)| direct_root == Some(*root))
+        {
+            Some(place) => self.value_snapshot_places.insert(key, place),
+            None => self.value_snapshot_places.remove(&key),
+        };
         if let ExprKind::BorrowedIndex { base, .. } = &expression.kind
             && let Some(place) = self.borrowed_index_view_place(base)
         {
@@ -43767,6 +43830,33 @@ impl<'a> MoveCheck<'a> {
         self.borrows.invalidate_owner(owner, BorrowEnd::Consumed);
     }
 
+    /// A direct field transfer nulls exactly `selected`; the owner and its siblings stay live.
+    /// Legacy owner roots carry no field path, so retain the completed snapshots whose stable
+    /// source place is a disjoint sibling of the same record or tuple. Every other observer of
+    /// the owner, including the selected field, its descendants and the whole owner, still ends.
+    fn invalidate_owner_for_field_transfer(&mut self, owner: LocalId, selected: BorrowProjection) {
+        let retained = self
+            .value_snapshot_places
+            .iter()
+            .filter(|(key, (root, path))| {
+                *root == owner
+                    && path.first().is_some_and(|first| {
+                        *first != selected
+                            && matches!(
+                                (*first, selected),
+                                (BorrowProjection::StructField(_), BorrowProjection::StructField(_))
+                                    | (BorrowProjection::TupleElement(_), BorrowProjection::TupleElement(_))
+                            )
+                    })
+                    && (self.borrows.value_sources.contains_key(key)
+                        || self.borrows.value_headers.contains_key(key))
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        self.borrows
+            .invalidate_owner_retaining_value_sources(owner, BorrowEnd::Consumed, &retained);
+    }
+
     fn invalidate_collection_content_owner(&mut self, collection: LocalId) {
         let roots = self.local_storage_roots(collection);
         self.borrows.invalidate_roots(&roots, BorrowEnd::Consumed);
@@ -44872,7 +44962,17 @@ impl<'a> MoveCheck<'a> {
                     // emits no code for this exact place identity, so do not invalidate borrows.
                     if !self_assign && self.is_move_ty(value.ty) {
                         self.reject_live_resource_dependents(*root, moved, value.span);
-                        self.invalidate_owner(*root);
+                        // Replacement drops only the old value below the first selected field.
+                        match path.first() {
+                            Some(&field) if matches!(
+                                expand_tagged_ty(self.f.locals[*root as usize].ty, self.tagged_types),
+                                Ty::Struct(_)
+                            ) => self.invalidate_owner_for_field_transfer(
+                                *root,
+                                BorrowProjection::StructField(field),
+                            ),
+                            _ => self.invalidate_owner(*root),
+                        }
                     }
                     if !self_assign {
                         self.mark_borrow_mut_modified(*root);
@@ -45199,7 +45299,10 @@ impl<'a> MoveCheck<'a> {
                         self.reject_live_resource_dependents(*root, moved, expression.span);
                         self.invalidate_mutable_place(*root, &[field]);
                         if !self.completed_value_transfers_storage(expression) {
-                            self.invalidate_owner(*root);
+                            self.invalidate_owner_for_field_transfer(
+                                *root,
+                                BorrowProjection::StructField(field),
+                            );
                         }
                         moved.insert(MovedKey::Field(*root, field));
                     } else if self.is_move_ty(expression.ty) {
@@ -45233,7 +45336,10 @@ impl<'a> MoveCheck<'a> {
                         self.reject_live_resource_dependents(root, moved, expression.span);
                         self.invalidate_mutable_place(root, &[*index]);
                         if !self.completed_value_transfers_storage(expression) {
-                            self.invalidate_owner(root);
+                            self.invalidate_owner_for_field_transfer(
+                                root,
+                                BorrowProjection::TupleElement(*index),
+                            );
                         }
                         moved.insert(MovedKey::Field(root, *index));
                     }
@@ -49065,7 +49171,10 @@ impl<'a> MoveCheck<'a> {
                         self.reject_live_resource_dependents(*base, moved, e.span);
                         self.invalidate_mutable_place(*base, &[fld]);
                         if !self.completed_value_transfers_storage(e) {
-                            self.invalidate_owner(*base);
+                            self.invalidate_owner_for_field_transfer(
+                                *base,
+                                BorrowProjection::StructField(fld),
+                            );
                         }
                         moved.insert(MovedKey::Field(*base, fld));
                     } else if consuming && self.is_move_ty(e.ty) {
@@ -78471,6 +78580,7 @@ mod tests {
             mutable_call_argument_snapshots: std::collections::HashSet::new(),
             borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
+            value_snapshot_places: std::collections::HashMap::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
@@ -79007,6 +79117,48 @@ mod tests {
                         }
                     },
                 );
+            }
+        }
+    }
+
+    /// Request 153: transferring or replacing one direct field ends only completed snapshots that
+    /// overlap it. Disjoint siblings stay valid in either operand order and through any control.
+    #[test]
+    fn disjoint_field_transfer_retains_sibling_snapshots() {
+        const SNAPSHOT: &str = "value snapshot was invalidated before the enclosing operation: owner";
+        const DUPLICATE: &str = "the same owned source cannot be moved into multiple operands";
+        let cases: [(&str, &str, Option<&str>); 15] = [
+            ("if-after", "fn f(source:S)->O = O {first:source.first, second:if source.ok {Some(source.second)} else {None}}", None),
+            ("if-before", "fn f(source:S)->O = O {second:if source.ok {Some(source.second)} else {None}, first:source.first}", None),
+            ("match", "fn f(source:S)->O = O {first:source.first, second:match (if source.ok {1} else {0}) {1=>Some(source.second), _=>None}}", None),
+            ("call", "fn take(a:string, b:Option<string>)->i64 = a.len()\nfn f(source:S)->i64 = take(source.first, if source.ok {Some(source.second)} else {None})", None),
+            ("local", "fn f()->O {source:=S {first:\"a\".clone(), second:\"b\".clone(), ok:true}; return O {first:source.first, second:if source.ok {Some(source.second)} else {None}}}", None),
+            ("tuple", "fn f(ok:bool)->i64 {owner:=(\"a\".clone(), \"b\".clone()); pair:=(owner.0, if ok {owner.1} else {\"\".clone()}); return pair.0.len()}", None),
+            ("header-sibling", "I {name:string, values:array<i64>}\nP {inner:I, second:string, ok:bool}\nQ {inner:I, second:Option<string>}\nfn f(source:P)->Q = Q {inner:source.inner, second:if source.ok {Some(source.second)} else {None}}", None),
+            ("sibling-replacement", "fn f()->O {mut source:=S {first:\"a\".clone(), second:\"b\".clone(), ok:true}; return O {first:source.first, second:{source.second=\"c\".clone(); None}}}", None),
+            ("same-field", "fn f(source:S)->O = O {first:source.first, second:if source.ok {Some(source.first)} else {None}}", Some(SNAPSHOT)),
+            ("same-field-before", "fn f(source:S)->O = O {second:if source.ok {Some(source.first)} else {None}, first:source.first}", Some("use of moved field 'first' of 'source'")),
+            ("same-field-tuple", "fn f(ok:bool)->i64 {owner:=(\"a\".clone(), \"b\".clone()); pair:=(owner.0, if ok {owner.0} else {\"\".clone()}); return pair.0.len()}", Some(DUPLICATE)),
+            ("whole-move", "fn consume(source:S) {}\nfn f(source:S)->O = O {first:source.first, second:{consume(source); None}}", Some(SNAPSHOT)),
+            ("whole-reassignment", "fn f()->O {mut source:=S {first:\"a\".clone(), second:\"b\".clone(), ok:true}; return O {first:source.first, second:{source=S {first:\"c\".clone(), second:\"d\".clone(), ok:false}; None}}}", Some(SNAPSHOT)),
+            ("same-field-replacement", "fn f()->O {mut source:=S {first:\"a\".clone(), second:\"b\".clone(), ok:true}; return O {first:source.first, second:{source.first=\"c\".clone(); None}}}", Some(SNAPSHOT)),
+            ("local-view-conservative", "fn take(text:string)->i64 = text.len()\nfn f(source:S)->i64 {view:str:=source.first; n:=take(source.second); return view.len()+n}", Some("use of invalidated borrow 'view'")),
+        ];
+        for (name, body, expected) in cases {
+            let source = format!(
+                "S {{ first:string, second:string, ok:bool }}\nO {{ first:string, second:Option<string> }}\n{body}\nfn main()->i32=0\n"
+            );
+            let (program, diagnostics) = check(&source);
+            let messages = diagnostics.iter().map(|diagnostic| diagnostic.message.clone()).collect::<Vec<_>>();
+            match expected {
+                None => {
+                    assert!(!diagnostics.has_errors(), "{name}: {messages:?}");
+                    assert!(checked_hir_body_facts_are_valid(&program), "{name}: semantic replay");
+                }
+                Some(expected) => assert!(
+                    messages.iter().any(|message| message.contains(expected)),
+                    "{name}: expected {expected:?}, got {messages:?}"
+                ),
             }
         }
     }
@@ -82340,6 +82492,7 @@ fn main() -> i32 = 0
                     mutable_call_argument_snapshots: std::collections::HashSet::new(),
                     borrow_mut_place_snapshots: std::collections::HashSet::new(),
                     value_snapshot_frames: Vec::new(),
+                    value_snapshot_places: std::collections::HashMap::new(),
                     reported_invalid_value_actions: std::collections::HashSet::new(),
                     loop_iter_drops: Vec::new(),
                     arena_depth: 0,
@@ -88642,6 +88795,7 @@ fn main() -> i32 = 0
             mutable_call_argument_snapshots: std::collections::HashSet::new(),
             borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
+            value_snapshot_places: std::collections::HashMap::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,
@@ -89107,6 +89261,7 @@ fn main() -> i32 = 0
             mutable_call_argument_snapshots: std::collections::HashSet::new(),
             borrow_mut_place_snapshots: std::collections::HashSet::new(),
             value_snapshot_frames: Vec::new(),
+            value_snapshot_places: std::collections::HashMap::new(),
             reported_invalid_value_actions: std::collections::HashSet::new(),
             loop_iter_drops: Vec::new(),
             arena_depth: 0,

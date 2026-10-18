@@ -516,3 +516,96 @@ fn main()->i32 {
         }
     });
 }
+
+// Request 153: one operation transfers a direct field while a sibling operand conditionally
+// transfers or replaces another field of the same owner. Each branch, operand order, direct and
+// imported helper, and whole/per-unit build releases every transferred or retained field once.
+const DISJOINT_MODEL: &str = r#"module model
+pub Source { first:string, second:string, ok:bool }
+pub Output { first:string, second:Option<string> }
+pub fn make(ok:bool)->Source = Source {first:"first".clone(),second:"second".clone(),ok:ok}
+pub fn forward(source:Source)->Output {
+  return Output {first:source.first, second:if source.ok {Some(source.second)} else {None}}
+}
+pub fn reverse(source:Source)->Output {
+  return Output {second:if source.ok {Some(source.second)} else {None}, first:source.first}
+}
+"#;
+const DISJOINT_MAIN: &str = r#"module main
+import model
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+S { first:string, second:string, ok:bool }
+O { first:string, second:Option<string> }
+fn make(ok:bool)->S = S {first:"first".clone(),second:"second".clone(),ok:ok}
+fn forward(source:S)->O = O {first:source.first, second:if source.ok {Some(source.second)} else {None}}
+fn reverse(source:S)->O = O {second:if source.ok {Some(source.second)} else {None}, first:source.first}
+fn matched(source:S)->O = O {first:source.first, second:match (if source.ok {1} else {0}) {1=>Some(source.second), _=>None}}
+fn replaced(ok:bool)->O {
+  mut source:=make(ok)
+  return O {first:source.first, second:if ok {source.second="third".clone(); Some(source.second)} else {None}}
+}
+I { name:string, values:array<i64> }
+P { inner:I, second:string, ok:bool }
+Q { inner:I, second:Option<string> }
+fn headers(ok:bool)->bool {
+  source:=P {inner:I {name:"first".clone(), values:[1,2].to_array()}, second:"second".clone(), ok:ok}
+  output:=Q {inner:source.inner, second:if source.ok {Some(source.second)} else {None}}
+  inner:=output.inner
+  if inner.values.len()!=2 || inner.values[1]!=2 {return false}
+  return verify(inner.name, output.second, ok, "second")
+}
+fn take(a:string, b:Option<string>)->i64 = a.len() + (b else {return a.len()}).len()
+fn call(source:S)->i64 = take(source.first, if source.ok {Some(source.second)} else {None})
+fn tuple(ok:bool)->i64 {
+  owner:=("first".clone(), "second".clone())
+  pair:=(owner.0, if ok {owner.1} else {"".clone()})
+  return pair.0.len() + pair.1.len()
+}
+fn verify(first:string, second:Option<string>, ok:bool, expected:str)->bool {
+  if first!="first" {return false}
+  return match second {Some(text)=>ok && text==expected, None=>!ok}
+}
+fn local(output:O, ok:bool, expected:str)->bool = verify(output.first, output.second, ok, expected)
+fn imported(output:model.Output, ok:bool)->bool = verify(output.first, output.second, ok, "second")
+fn round(ok:bool)->i32 {
+  if !local(forward(make(ok)), ok, "second") {return 1}
+  if !local(reverse(make(ok)), ok, "second") {return 2}
+  if !local(matched(make(ok)), ok, "second") {return 3}
+  if !local(replaced(ok), ok, "third") {return 4}
+  if call(make(ok))!=(if ok {11} else {5}) {return 5}
+  if tuple(ok)!=(if ok {11} else {5}) {return 6}
+  if !imported(model.forward(model.make(ok)), ok) {return 7}
+  if !imported(model.reverse(model.make(ok)), ok) {return 8}
+  if !headers(ok) {return 9}
+  return 0
+}
+fn main()->i32 {
+  unsafe {align_rt_requested_live_reset()}
+  a:=round(true)
+  if a!=0 {return a}
+  b:=round(false)
+  if b!=0 {return b+20}
+  if unsafe {align_rt_requested_live_bytes()}!=0 {return 40}
+  if unsafe {align_rt_alloc_count()}!=unsafe {align_rt_free_count()} {return 41}
+  return 0
+}
+"#;
+#[test]
+fn field_extraction_disjoint_conditional_siblings() {
+    owned_fixture::run("field_extraction_disjoint_conditional_siblings", |stage| {
+        let result = (|| -> TestResult {
+            std::fs::write(stage.join("model.align"), DISJOINT_MODEL)?;
+            for per_unit in [false, true] {
+                let built = programs(stage, DISJOINT_MAIN, per_unit)?;
+                execute(stage, &built, &format!("disjoint-{per_unit}"), false)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    });
+}
