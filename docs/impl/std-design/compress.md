@@ -5,7 +5,7 @@ These specifications define the contract for each module's implementation.
 
 > 🌐 **English** · [Japanese](./ja/compress.md)
 
-> **Status:** complete in M11. gzip and zstd compression/decompression are shipped.
+> **Status:** complete in M11. gzip, zlib, raw DEFLATE and zstd compression/decompression are shipped.
 
 ## Overview
 
@@ -21,6 +21,10 @@ compress.gzip_compress(data: bytes, level: i64) -> Result<buffer, Error>    // o
 compress.gzip_decompress(data: bytes) -> Result<buffer, Error>
 compress.zstd_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.zstd_decompress(data: bytes) -> Result<buffer, Error>
+compress.zlib_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.zlib_decompress(data: bytes) -> Result<buffer, Error>
+compress.deflate_raw_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.deflate_raw_decompress(data: bytes) -> Result<buffer, Error>
 ```
 
 ## Type & ownership classification
@@ -43,7 +47,7 @@ OOM policy.
 
 ## Complete-input decompression
 
-Both decoders borrow the binary input only for the call and publish one independent owned buffer
+All decoders borrow the binary input only for the call and publish one independent owned buffer
 only after consuming all input successfully. No partial output escapes a later failure.
 
 - gzip accepts one or more complete RFC 1952 members and concatenates their outputs in order,
@@ -52,10 +56,10 @@ only after consuming all input successfully. No partial output escapes a later f
   the little-endian magic must be `0xFD2FB528` or `0x184D2A50..=0x184D2A5F`; pre-1.0 legacy formats
   are rejected regardless of native build flags. Ordinary outputs are concatenated in order;
   skippable payloads contribute no output. Skippable-only input succeeds with an empty buffer.
-- Empty input, incomplete/corrupt members or frames (including later checksums), other formats,
+- Empty input, incomplete/corrupt members or frames (including later checksums),
   and trailing bytes (including gzip zero padding) return `Error.Invalid`.
 - The aggregate decoded payload has an inclusive hard cap of 1 GiB across all members/frames.
-  Exceeding it returns `Error.Invalid`. At exactly the cap, further valid empty/skippable frames
+  Exceeding it returns `Error.Invalid`. For gzip/zstd at exactly the cap, further valid empty/skippable frames
   remain valid. This bounds the returned payload, not native workspace or process RSS.
 
 Reuse one native stream and one growing output vector per call. At the cap, a one-byte stack
@@ -64,6 +68,17 @@ probe permits metadata progress without growing the returned storage; any produc
 releases native state and partial output. Compression still produces one member/frame. No
 streaming source API, dictionary support, configurable limit, or partial-decode API is added.
 [Plan 124](../124-complete-decompression.md) owns the exact contract and closure.
+
+Zlib and raw DEFLATE use `libz` with window bits 15 and -15 respectively.
+Each decompressor requires exactly one complete stream and all input consumed;
+a second stream or any trailing byte is `Error.Invalid`. Raw final-byte padding
+bits remain part of that byte; raw DEFLATE has no checksum or identifying magic.
+Zlib rejects bad Adler-32 and preset dictionaries. Both keep the inclusive 1 GiB
+output cap, atomic owned output, Impure effect and existing error mapping.
+Compression emits one stream, even for empty input. Levels are `i64` 0..=9;
+out-of-range levels abort before native initialization, as for gzip. The source
+arguments evaluate in order. No streaming API, configurable cap, dictionary API
+or PNG policy is added. [Plan226](../226-deflate-framing.md) owns this completion.
 
 ## New machinery required
 

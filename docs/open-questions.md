@@ -22,9 +22,20 @@ receiver rule. Existing collection, C/FFI, JSON, SoA, RegionPlain and heap build
 shape restrictions remain. [Plan175](impl/175-rng-record-composition.md) fixes the
 32-byte internal layout and the source/native acceptance boundary.
 
+### Complete DEFLATE framing (SETTLED 2026-10-18)
+
+The existing compression family includes zlib (RFC1950) and raw DEFLATE (RFC1951)
+with the same owned buffer, Impure effect, level 0..=9 programmer-error policy
+and inclusive 1 GiB cap as gzip. Unlike gzip concatenation, each new decoder
+consumes exactly one complete stream and rejects trailing bytes or another
+stream. Raw final-byte padding is admitted; no format-identification promise is
+made for raw bytes. Zlib checksum/dictionary errors reject. The existing libz
+memory/cleanup wrapper is shared; PNG parsing and consumer adoption remain
+external. [Plan226](impl/226-deflate-framing.md) owns the exact contract.
+
 ### Complete-input decompression (SETTLED 2026-10-06)
 
-`std.compress` consumes all borrowed input, concatenating complete gzip members or current
+The gzip/zstd decoders consume all borrowed input, concatenating complete gzip members or current
 ordinary/skippable zstd frames into one independently owned buffer. Empty input, legacy zstd,
 corrupt/truncated later input, and trailing bytes (including gzip zero padding) are Invalid;
 partial output never escapes. The inclusive 1 GiB aggregate payload cap allows further empty or

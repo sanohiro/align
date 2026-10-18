@@ -3006,9 +3006,12 @@ fn capabilities_captured_per_unit() {
                pub fn csize(s: str) -> Result<i64, Error> {\n\
                \x20 c := compress.gzip_compress(s, 6)?\n\
                \x20 return Ok(c.len())\n}\n";
-    let sums = summaries(&[unit("main", true, main), unit("zip", false, zip)]);
+    for codec in ["gzip", "zlib", "deflate_raw"] {
+        let zip = zip.replace("gzip_compress", &format!("{codec}_compress"));
+    let sums = summaries(&[unit("main", true, main), unit("zip", false, &zip)]);
     assert_eq!(find(&sums, "zip").capabilities, vec!["Zlib".to_string()], "compress unit shows Zlib");
     assert!(find(&sums, "main").capabilities.is_empty(), "pure-numeric entry unit has no capabilities");
+    }
 }
 
 #[test]

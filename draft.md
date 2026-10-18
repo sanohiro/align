@@ -4424,17 +4424,32 @@ compress.gzip_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.gzip_decompress(data: bytes) -> Result<buffer, Error>
 compress.zstd_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.zstd_decompress(data: bytes) -> Result<buffer, Error>
+compress.zlib_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.zlib_decompress(data: bytes) -> Result<buffer, Error>
+compress.deflate_raw_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.deflate_raw_decompress(data: bytes) -> Result<buffer, Error>
 ```
 
 Inputs are borrowed binary views; successful output is an independent owned buffer. Calls are
-Impure. Decompression consumes one or more complete gzip members or current ordinary/skippable
+Impure. Gzip and zstd decompression consumes one or more complete gzip members or current ordinary/skippable
 zstd frames and concatenates their outputs; skippable frames contribute no bytes. Empty input,
 legacy zstd, corrupt/truncated later frames, and trailing bytes (including gzip zero padding)
 return `Error.Invalid`, with no partial output. The inclusive 1 GiB limit applies to aggregate
-output; exact-limit empty/skippable suffixes remain valid. Native resource/output allocation
+output; gzip/zstd exact-limit empty/skippable suffixes remain valid. Native resource/output allocation
 failures retain `Error.Code`; final header OOM retains terminal runtime policy. The limit does not
 bound native workspace or RSS. See `docs/impl/std-design/compress.md` for exact format admission,
 error precedence, and allocation rules.
+
+Zlib and raw DEFLATE use `libz` with window bits 15 and -15 respectively.
+Each decompressor requires exactly one complete stream and all input consumed;
+a second stream or any trailing byte is `Error.Invalid`. Raw final-byte padding
+bits remain part of that byte; raw DEFLATE has no checksum or identifying magic.
+Zlib rejects bad Adler-32 and preset dictionaries. Both keep the inclusive 1 GiB
+output cap, atomic owned output, Impure effect and existing error mapping.
+Compression emits one stream, even for empty input. Levels are `i64` 0..=9;
+out-of-range levels abort before native initialization, as for gzip. The source
+arguments evaluate in order. No streaming API, configurable cap, dictionary API
+or PNG policy is added. [Plan226](docs/impl/226-deflate-framing.md) owns this completion.
 
 ### std.rand
 

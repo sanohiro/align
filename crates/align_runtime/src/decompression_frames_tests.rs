@@ -204,7 +204,7 @@ impl Drop for ZstdOwner {
 fn limited(data: &[u8], cap: usize, gzip_chunk: Option<usize>) -> Result<Vec<u8>, i32> {
     if let Some(chunk) = gzip_chunk {
         let mut stream = InflateOwner::new()?;
-        inflate_run_with_chunk(stream.0.as_mut(), data, cap, chunk)
+        inflate_run_with_chunk(stream.0.as_mut(), data, cap, chunk, true)
     } else {
         let stream = ZstdOwner::new()?;
         zstd_decompress_stream(stream.0, data, cap)

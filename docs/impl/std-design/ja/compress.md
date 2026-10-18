@@ -5,7 +5,7 @@
 
 > 🌐 [English](../compress.md) · **日本語**
 
-> **ステータス:** M11 で完了済みです。gzip と zstd の圧縮・展開は実装済みです。
+> **ステータス:** M11 で完了済みです。gzip・zlib・raw DEFLATE・zstd の圧縮・展開は実装済みです。
 
 ## Overview
 
@@ -18,6 +18,10 @@ compress.gzip_compress(data: bytes, level: i64) -> Result<buffer, Error>    // o
 compress.gzip_decompress(data: bytes) -> Result<buffer, Error>
 compress.zstd_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.zstd_decompress(data: bytes) -> Result<buffer, Error>
+compress.zlib_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.zlib_decompress(data: bytes) -> Result<buffer, Error>
+compress.deflate_raw_compress(data: bytes, level: i64) -> Result<buffer, Error>
+compress.deflate_raw_decompress(data: bytes) -> Result<buffer, Error>
 ```
 
 ## Type & ownership classification
@@ -34,14 +38,25 @@ C エンジンのエラーコードは `Error.Invalid`（破損・切り詰め�
 
 ## Complete-input decompression
 
-両デコーダーはバイナリ入力を呼び出し中だけ借用し、入力全体の処理に成功した後で独立した所有 buffer を一つ返す。後続部分が失敗した場合、途中までの出力は返さない。
+すべてのデコーダーはバイナリ入力を呼び出し中だけ借用し、入力全体の処理に成功した後で独立した所有 buffer を一つ返す。後続部分が失敗した場合、途中までの出力は返さない。
 
 - gzip は一つ以上の完全な RFC 1952 メンバーを受け入れ、空メンバーも含めて出力を順番に連結する。
 - zstd は一つ以上の現行 RFC 8878 通常フレームまたはスキップ可能フレームを受け入れる。各フレーム境界のリトルエンディアン magic は `0xFD2FB528` または `0x184D2A50..=0x184D2A5F` に限定し、1.0 より前の形式はネイティブのビルド設定に関係なく拒否する。通常フレームの出力を順番に連結し、スキップ可能フレームは出力に加えない。スキップ可能フレームだけの入力は空 buffer として成功する。
-- 空入力、不完全・破損したメンバーやフレーム（後続のチェックサムも含む）、別形式、末尾の余分なバイト（gzip のゼロパディングも含む）は `Error.Invalid` となる。
-- 展開後の合計ペイロードは全メンバー・フレームを通じて **1 GiB 以下** とする。超過は `Error.Invalid`。上限ちょうどでも後続の正常な空メンバーやスキップ可能フレームは許可する。この制限は返却ペイロードに対するものであり、ネイティブ作業領域やプロセス RSS の上限ではない。
+- 空入力、不完全・破損したメンバーやフレーム（後続のチェックサムも含む）、末尾の余分なバイト（gzip のゼロパディングも含む）は `Error.Invalid` となる。
+- 展開後の合計ペイロードは全メンバー・フレームを通じて **1 GiB 以下** とする。超過は `Error.Invalid`。gzip/zstd は上限ちょうどでも後続の正常な空メンバーやスキップ可能フレームを許可する。この制限は返却ペイロードに対するものであり、ネイティブ作業領域やプロセス RSS の上限ではない。
 
 一つのネイティブストリームと伸長する出力ベクターを呼び出し中に再利用する。上限ではスタック上の 1 バイトを出力先としてメタデータの処理を進め、実データが出力された場合は `Error.Invalid` とする。ネイティブエラーはこの判定より優先する。失敗時はネイティブ状態と部分出力を解放する。圧縮は引き続き一つのメンバー・フレームを生成する。ストリーミング入力 API、辞書、設定可能な上限、部分展開 API は追加しない。正確な契約と検証範囲は [Plan 124](../../124-complete-decompression.md) に定める。
+
+zlib と raw DEFLATE はそれぞれ window bits 15・-15 で `libz` を利用する。
+各デコーダーは完全な1ストリームで入力全体を消費し、後続ストリームや余分な
+バイトは `Error.Invalid` にする。raw の最終バイト内のパディングビットは
+そのバイトの一部であり、raw にはチェックサムや形式を識別するマジック値はない。
+zlib は不正な Adler-32 とプリセット辞書を拒否する。1 GiB の上限、成功時だけの
+独立した所有出力、Impure 効果、既存のエラー対応を共有する。
+圧縮は空入力でも1ストリームを生成する。level は `i64` の 0..=9 で、範囲外は
+ネイティブ初期化前に abort する。引数はソース順に評価する。
+ストリーミング API・設定可能な上限・辞書 API・PNG 方針は追加しない。
+[Plan226](../../226-deflate-framing.md) が正確な契約を定める。
 
 ## New machinery required
 

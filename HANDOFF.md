@@ -25,6 +25,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan226](docs/impl/226-deflate-framing.md) completes `std.compress` with zlib
+  and raw DEFLATE framing. Both require one complete stream, reject trailing
+  bytes and preserve the inclusive output cap and independent owned buffer.
+  Existing gzip/zstd concatenation remains; PNG policy and consumer adoption
+  remain external.
+
 - [Plan225](docs/impl/225-integer-vector-round-even.md) completes integer vector
   bitwise/shift operations and scalar/vector `round_even()` for LLM Request151
   and media AM-R13. Both broadcast directions use single-check numeric context;

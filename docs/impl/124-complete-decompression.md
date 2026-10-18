@@ -70,3 +70,7 @@ followed by the bounded gate and Clippy.
 Before implementation: complete the author contract/matrix pass and one fresh
 independent adversarial strategy review of the whole-input/cap/cleanup boundary.
 After implementation: one fresh full-diff review and normal preflight/PR flow.
+
+[Plan226](226-deflate-framing.md) completes zlib/raw DEFLATE framing with one
+stream per call, reusing this output-cap and cleanup strategy. The gzip/zstd
+concatenation contract above remains unchanged.

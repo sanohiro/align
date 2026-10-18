@@ -18112,6 +18112,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CompressCompress { kind, data, level, out } => {
                 let key = match kind {
                     align_sema::hir::CompressKind::Gzip => RuntimeKey::CompressGzipCompress,
+                    align_sema::hir::CompressKind::Zlib => RuntimeKey::CompressZlibCompress,
+                    align_sema::hir::CompressKind::DeflateRaw => RuntimeKey::CompressDeflateRawCompress,
                     align_sema::hir::CompressKind::Zstd => RuntimeKey::CompressZstdCompress,
                 };
                 let out_ptr = self.slots[out];
@@ -18128,6 +18130,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CompressDecompress { kind, data, out } => {
                 let key = match kind {
                     align_sema::hir::CompressKind::Gzip => RuntimeKey::CompressGzipDecompress,
+                    align_sema::hir::CompressKind::Zlib => RuntimeKey::CompressZlibDecompress,
+                    align_sema::hir::CompressKind::DeflateRaw => RuntimeKey::CompressDeflateRawDecompress,
                     align_sema::hir::CompressKind::Zstd => RuntimeKey::CompressZstdDecompress,
                 };
                 let out_ptr = self.slots[out];
@@ -42209,5 +42213,65 @@ fn main() -> i32 = 0
         let ir = module.print_to_string().to_string();
         assert!(!ir.contains("!dbg !{}"), "module contains invalid empty !dbg attachment:\n{ir}");
         assert!(module.verify().is_ok());
+    }
+    #[test]
+    fn deflate_codec_mir_signature_matrix() {
+        for codec in ["gzip", "zlib", "deflate_raw", "zstd"] {
+            for compress in [false, true] {
+                let method = if compress { "compress" } else { "decompress" };
+                let arguments = if compress { "data,level" } else { "data" };
+                let source = format!(
+                    "import std.compress\nfn use_codec(data:slice<u8>,level:i64)->Result<buffer,Error> = compress.{codec}_{method}({arguments})\nfn main() {{}}\n"
+                );
+                let valid = mir(&source);
+                assert!(validate_resource_rvalues(&valid).is_ok());
+                assert!(validate_thin_partition_program(&valid, &[]).is_ok());
+                for mutation in 0..if compress { 6 } else { 4 } {
+                    let mut bad = valid.clone();
+                    let mut changed = 0;
+                    for function in &mut bad.fns {
+                        for block in &mut function.blocks {
+                            for statement in &mut block.stmts {
+                                let Stmt::Let(id, value) = statement else {
+                                    continue;
+                                };
+                                let (data, out, level) = match value {
+                                    Rvalue::CompressCompress {
+                                        data, out, level, ..
+                                    } => (data, out, Some(level)),
+                                    Rvalue::CompressDecompress { data, out, .. } => (data, out, None),
+                                    _ => continue,
+                                };
+                                changed += 1;
+                                match mutation {
+                                    0 => *data = Operand::Const(Const::Bool(false)),
+                                    1 => *out = u32::MAX,
+                                    2 => function.value_tys[*id as usize] = Ty::Bool,
+                                    3 => function.slots[*out as usize] = Ty::String,
+                                    4 => {
+                                        if let Some(level) = level {
+                                            *level = Operand::Const(Const::Bool(false));
+                                        }
+                                    }
+                                    _ => {
+                                        if let Some(level) = level {
+                                            *level = Operand::Const(Const::Int(
+                                                1,
+                                                Ty::Int(IntTy {
+                                                    bits: 32,
+                                                    signed: true,
+                                                }),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(changed, 1);
+                    assert_xml_producer_rejected(&bad, &format!("{codec}/{compress}/{mutation}"));
+                }
+            }
+        }
     }
 }

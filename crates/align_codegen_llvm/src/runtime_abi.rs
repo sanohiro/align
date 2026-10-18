@@ -449,7 +449,11 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::CommandStdoutTo) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CommandTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CompressGzipCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressZlibCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressDeflateRawCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CompressGzipDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressZlibDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressDeflateRawDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CompressZstdCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CompressZstdDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CryptoAesGcmOpen) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8], releases: Release::None, returns_fresh: false, diverges: false },
@@ -1613,9 +1617,29 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_compress_gzip_compress",
             shape: RuntimeAbiShape::A07,
         },
+        RuntimeKey::CompressZlibCompress => RuntimeAbi {
+            key,
+            symbol: "align_rt_compress_zlib_compress",
+            shape: RuntimeAbiShape::A07,
+        },
+        RuntimeKey::CompressDeflateRawCompress => RuntimeAbi {
+            key,
+            symbol: "align_rt_compress_deflate_raw_compress",
+            shape: RuntimeAbiShape::A07,
+        },
         RuntimeKey::CompressGzipDecompress => RuntimeAbi {
             key,
             symbol: "align_rt_compress_gzip_decompress",
+            shape: RuntimeAbiShape::A08,
+        },
+        RuntimeKey::CompressZlibDecompress => RuntimeAbi {
+            key,
+            symbol: "align_rt_compress_zlib_decompress",
+            shape: RuntimeAbiShape::A08,
+        },
+        RuntimeKey::CompressDeflateRawDecompress => RuntimeAbi {
+            key,
+            symbol: "align_rt_compress_deflate_raw_decompress",
             shape: RuntimeAbiShape::A08,
         },
         RuntimeKey::CompressZstdCompress => RuntimeAbi {
@@ -3189,15 +3213,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 470 || keyed_runtime_abis().len() != 470 {
+    if RuntimeKey::ALL.len() != 474 || keyed_runtime_abis().len() != 474 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 488 {
+    if runtime_abis().count() != 492 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(488);
+    let mut symbols = HashSet::with_capacity(492);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -4539,17 +4563,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 488);
+        assert_eq!(rows.len(), 492);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            488
+            492
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            488
+            492
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4599,7 +4623,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 488);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 492);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4726,7 +4750,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 488);
+        assert_eq!(rows.len(), 492);
 
         for row in rows {
             let symbol = row.symbol;
