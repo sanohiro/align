@@ -609,3 +609,78 @@ fn field_extraction_disjoint_conditional_siblings() {
         }
     });
 }
+
+// A view field or Copy record holding one may point into a sibling owned field of its owner.
+// Transferring, replacing or conditionally transferring that sibling must still invalidate the
+// view in either operand order, on whole-program and per-unit checks.
+#[test]
+fn field_extraction_rejects_sibling_self_views() {
+    owned_fixture::run("field_extraction_rejects_sibling_self_views", |stage| {
+        let mut source = String::from(
+            "module main\nV { text:str }\nW { part:slice<i64> }\n\
+             S { owned:string, items:array<i64>, view:str, part:slice<i64>, held:V, wrapped:W }\n\
+             fn eat(text:string)->i64 = text.len()\nfn eat_items(items:array<i64>)->i64 = items.len()\n\
+             fn make()->S = S {owned:\"abc\".clone(), items:[1,2].to_array(), view:\"\", part:[], held:V {text:\"\"}, wrapped:W {part:[]}}\n",
+        );
+        let views = [
+            ("str", "str", "s.view = s.owned[0..s.owned.len()]", "s.view", "owned"),
+            ("slice", "slice<i64>", "s.part = s.items[0..s.items.len()]", "s.part", "items"),
+            ("record_str", "V", "s.held = V {text:s.owned[0..1]}", "s.held", "owned"),
+            ("record_slice", "W", "s.wrapped = W {part:s.items[0..1]}", "s.wrapped", "items"),
+        ];
+        let mut lines = Vec::new();
+        for (name, ty, _, _, _) in views {
+            source.push_str(&format!(
+                "fn before_{name}(v:{ty}, n:i64)->i64 = n\nfn after_{name}(n:i64, v:{ty})->i64 = n\n"
+            ));
+        }
+        for (name, _, setup, read, field) in views {
+            let (eat, fresh) = if field == "owned" {
+                ("eat", "\"x\".clone()")
+            } else {
+                ("eat_items", "[3].to_array()")
+            };
+            for transfer in [
+                format!("{eat}(s.{field})"),
+                format!("{{s.{field} = {fresh}; 0}}"),
+                format!("if ok {{{eat}(s.{field})}} else {{0}}"),
+            ] {
+                for call in [
+                    format!("before_{name}({read}, {transfer})"),
+                    format!("after_{name}({transfer}, {read})"),
+                ] {
+                    lines.push(source.lines().count() + 1);
+                    source.push_str(&format!(
+                        "fn f{}(ok:bool)->i64 {{ mut s:=make(); {setup}; return {call} }}\n",
+                        lines.len()
+                    ));
+                }
+            }
+        }
+        source.push_str("fn main()->i32=0\n");
+        let path = stage.join("main.align");
+        std::fs::write(&path, &source).unwrap();
+        let entry = path.to_str().unwrap();
+        for per_unit in [false, true] {
+            let mut sources = SourceMap::new();
+            let diagnostics = if per_unit {
+                let built = align_driver::build_per_unit(&mut sources, entry, &source);
+                align_driver::format_diagnostics(&sources, &built.diags)
+            } else {
+                let checked = align_driver::check(&mut sources, entry, &source);
+                align_driver::format_diagnostics(&sources, &checked.diags)
+            };
+            for line in &lines {
+                assert!(
+                    diagnostics.lines().any(|text| text.contains(&format!("main.align:{line}:"))
+                        && text.contains("invalidated")),
+                    "per_unit={per_unit}: line {line} accepted\n{diagnostics}"
+                );
+            }
+            assert!(
+                !diagnostics.contains("expected") && !diagnostics.contains("unknown"),
+                "{diagnostics}"
+            );
+        }
+    });
+}

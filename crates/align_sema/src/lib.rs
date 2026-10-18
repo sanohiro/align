@@ -40721,7 +40721,9 @@ impl<'a> MoveCheck<'a> {
         self.borrows.begin_value_source(key, completion_roots);
         self.borrows.begin_value_headers(key, headers);
         // Only a direct projection of the owner itself names its source place. Views reached
-        // through another local keep the owner-wide ending.
+        // through another local keep the owner-wide ending. A value that may hold a view can
+        // point into a sibling field of the same owner (`s.view = s.owned[..]`); that dependency
+        // is carried only by the owner-wide root, so such a snapshot is never retained.
         let mut direct = expression;
         let direct_root = loop {
             if let Some(inner) = borrow_transparent_value(direct) {
@@ -40742,7 +40744,16 @@ impl<'a> MoveCheck<'a> {
         };
         match self
             .expr_origin_place(expression)
-            .filter(|(root, _)| direct_root == Some(*root))
+            .filter(|(root, _)| {
+                direct_root == Some(*root)
+                    && !ty_may_borrow(
+                        expression.ty,
+                        self.structs,
+                        self.tuples,
+                        self.enums,
+                        self.tagged_types,
+                    )
+            })
         {
             Some(place) => self.value_snapshot_places.insert(key, place),
             None => self.value_snapshot_places.remove(&key),
@@ -79159,6 +79170,54 @@ mod tests {
                     messages.iter().any(|message| message.contains(expected)),
                     "{name}: expected {expected:?}, got {messages:?}"
                 ),
+            }
+        }
+    }
+
+    /// A view field (or a Copy record holding one) may point into a sibling owned field of the
+    /// same owner. Its snapshot is never retained across that sibling's transfer or replacement.
+    #[test]
+    fn field_transfer_rejects_sibling_self_views() {
+        let views = [
+            ("str", "str", "s.view = s.owned[0..s.owned.len()]", "s.view", "owned"),
+            ("slice", "slice<i64>", "s.part = s.items[0..s.items.len()]", "s.part", "items"),
+            ("record_str", "V", "s.held = V {text:s.owned[0..1]}", "s.held", "owned"),
+            ("record_slice", "W", "s.wrapped = W {part:s.items[0..1]}", "s.wrapped", "items"),
+        ];
+        for (name, ty, setup, read, field) in views {
+            let (eat, fresh) = if field == "owned" {
+                ("eat", "\"x\".clone()")
+            } else {
+                ("eat_items", "[3].to_array()")
+            };
+            for (transfer_name, transfer) in [
+                ("move", format!("{eat}(s.{field})")),
+                ("replace", format!("{{s.{field} = {fresh}; 0}}")),
+                ("conditional", format!("if ok {{{eat}(s.{field})}} else {{0}}")),
+            ] {
+                for view_first in [true, false] {
+                    let call = if view_first {
+                        format!("before({read}, {transfer})")
+                    } else {
+                        format!("after({transfer}, {read})")
+                    };
+                    let source = format!(
+                        "V {{ text:str }}\nW {{ part:slice<i64> }}\n\
+                         S {{ owned:string, items:array<i64>, view:str, part:slice<i64>, held:V, wrapped:W }}\n\
+                         fn eat(text:string)->i64 = text.len()\n\
+                         fn eat_items(items:array<i64>)->i64 = items.len()\n\
+                         fn before(v:{ty}, n:i64)->i64 = n\nfn after(n:i64, v:{ty})->i64 = n\n\
+                         fn f(ok:bool)->i64 {{ mut s:=S {{owned:\"abc\".clone(), items:[1,2].to_array(), view:\"\", part:[], held:V {{text:\"\"}}, wrapped:W {{part:[]}}}}; {setup}; return {call} }}\n\
+                         fn main()->i32=0\n"
+                    );
+                    let (_, diagnostics) = check(&source);
+                    let messages = diagnostics.iter().map(|diagnostic| diagnostic.message.clone()).collect::<Vec<_>>();
+                    assert!(
+                        diagnostics.has_errors()
+                            && messages.iter().all(|message| message.contains("invalidated")),
+                        "{name}/{transfer_name}/view_first={view_first}: {messages:?}"
+                    );
+                }
             }
         }
     }

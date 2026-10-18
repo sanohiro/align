@@ -107,7 +107,12 @@ that root and rejected `O {first:s.first, second:if c {Some(s.second)} else {Non
 even though the transfer nulls only `second`.
 
 A completed snapshot of a direct projection of an owner now records that source
-place (`expr_origin_place`); views reached through another local record none.
+place (`expr_origin_place`) only when its type has no view leaves
+(`!ty_may_borrow`); views reached through another local record none. A `str`,
+slice, or Copy record/tuple holding one may point into a sibling owned field of
+the same owner (`s.view = s.owned[..]`). That dependency is carried only by the
+owner-wide root, so such a snapshot is never retained. An owned value with no
+view leaves cannot point into a sibling field, so retaining it is sound.
 A direct field transfer, tuple-element transfer or record field replacement still
 ends every observer of the owner except completed snapshots whose first projection
 is a different field or tuple element of the same owner. The selected field, its
@@ -121,4 +126,5 @@ existing conservative ending. Ownership, MIR nulling and cleanup are unchanged.
 | Cleanup | Selected field moves once on its taken branch; untaken sibling is dropped once by the owner; replaced old value dropped once. Live bytes zero and allocations equal frees. | driver lifecycle counters |
 | Imports / build mode | Imported helpers, whole-program and per-unit builds. | driver test, both `per_unit` modes |
 | Still rejected | Same field twice (either order), whole move or whole reassignment of the owner, replacement of the observed field. | sema case array negatives |
+| Sibling self-view | `str`/slice field or Copy record holding one that views a sibling owned field, under its move, replacement or conditional move, in both operand orders. A tuple cannot form a self-view (no element assignment); its view elements are never retained either. | `align_sema --lib field_transfer_rejects_sibling_self_views`; driver `field_extraction_rejects_sibling_self_views` (whole and per-unit) |
 | Deferred | A local view of a disjoint sibling (`view:str:=s.a; take(s.b)`) and pipeline snapshots keep the conservative owner ending; local origins are path-sensitive and were already rejected at 455d59c4, so this is not part of the regression. | `local-view-conservative` sema case |
