@@ -3312,7 +3312,7 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
     match rv {
         Rvalue::CompressCompress { kind, .. } | Rvalue::CompressDecompress { kind, .. } => {
             Some(match kind {
-                hir::CompressKind::Gzip => Capability::Zlib,
+                hir::CompressKind::Gzip | hir::CompressKind::Zlib | hir::CompressKind::DeflateRaw => Capability::Zlib,
                 hir::CompressKind::Zstd => Capability::Zstd,
             })
         }

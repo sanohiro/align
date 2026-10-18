@@ -2684,7 +2684,7 @@ pub enum AeadDir {
 /// Which cryptographic hash an [`ExprKind::CryptoHash`] computes (M11 Slice 2). One node kind serves
 /// both — the algorithm is this `algo`, param-swapping the EVP digest name and the fixed output
 /// length (mirroring [`EncodingKind`] / [`CompressKind`]). The HIR-walking passes treat it opaquely
-/// (they match `..`); only sema dispatch, codegen, and the runtime distinguish the two.
+/// (they match `..`); only sema dispatch, capability collection, codegen and the runtime distinguish formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum HashAlgo {
     /// SHA-1 interoperability digest: 20 bytes via EVP.
@@ -2764,11 +2764,15 @@ pub enum EncodingKind {
 /// Which `std.compress` codec an [`ExprKind::Compress`] / [`ExprKind::Decompress`] uses. gzip (libz)
 /// is the M11 Slice 1 codec; zstd (libzstd) is Slice 2 — the direction is the node kind, the codec
 /// is this `kind` (mirroring [`EncodingKind`]). The HIR-walking passes treat the codec opaquely
-/// (they match `..`); only sema dispatch, codegen, and the runtime distinguish the two.
+/// (they match `..`); only sema dispatch, capability collection, codegen and the runtime distinguish formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum CompressKind {
     /// gzip framing (RFC 1952) over DEFLATE, via `libz` — windowBits 15+16 (the gzip wrapper).
     Gzip,
+    /// zlib framing (RFC 1950) over DEFLATE, via `libz` — windowBits 15.
+    Zlib,
+    /// Raw DEFLATE (RFC 1951), via `libz` — windowBits -15.
+    DeflateRaw,
     /// zstd framing (RFC 8878) via `libzstd` — one-shot `ZSTD_compress` / streaming decompress.
     Zstd,
 }

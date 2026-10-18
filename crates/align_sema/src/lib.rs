@@ -56708,7 +56708,8 @@ impl<'a, 't> Checker<'a, 't> {
             // byte→byte codecs (owned `buffer` output) wrapping the tuned C engines (draft §15
             // keystone strategy). The codec is the method prefix; the direction is the suffix.
             if module == "compress"
-                && matches!(method, "gzip_compress" | "gzip_decompress" | "zstd_compress" | "zstd_decompress")
+                && matches!(method, "gzip_compress" | "gzip_decompress" | "zstd_compress" | "zstd_decompress"
+                    | "zlib_compress" | "zlib_decompress" | "deflate_raw_compress" | "deflate_raw_decompress")
             {
                 self.require_import("std.compress", &format!("compress.{method}"), span);
                 return self.check_compress_op(method, args, span);
@@ -66919,23 +66920,21 @@ impl<'a, 't> Checker<'a, 't> {
         Some(data)
     }
 
-    /// `std.compress` — gzip via libz / zstd via libzstd (M11). The keystone-library strategy
-    /// (draft §15): own the memory (Align allocates the owned `buffer` output), borrow the engine
-    /// (zlib's DEFLATE / zstd). The codec is the method prefix (`gzip_` → [`hir::CompressKind::Gzip`],
-    /// `zstd_` → [`hir::CompressKind::Zstd`]); the direction is the suffix (`_compress` / `_decompress`).
-    /// Both codecs are byte→byte and yield `Result<buffer, Error>`:
-    /// - `*_compress(data, level)` — compress the byte view `data` (`str` / owned `string`
-    ///   auto-borrowed / `slice<u8>`) at `level` (an `i64`; the runtime aborts on an out-of-range
-    ///   level — `0..=9` for gzip, `0..=22` for zstd — a programmer error like `rand.range`'s `lo >= hi`).
-    /// - `*_decompress(data)` — inflate a byte view; corrupt/truncated input or a decompress-bomb
-    ///   over the runtime output cap → `Error.Invalid`.
-    ///
-    /// Builtins, dispatched like the other `std` namespaces.
+    /// `std.compress` delegates gzip/zlib/raw DEFLATE to libz and zstd to libzstd.
+    /// All directions borrow a byte view and return an independent owned buffer.
+    /// Compression levels are exact i64; the runtime enforces each codec's range.
     fn check_compress_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        // Codec = method prefix. The dispatcher only routes the four `{gzip,zstd}_{compress,decompress}`
-        // names here, so a `zstd_` prefix is the only non-gzip case.
-        let kind = if method.starts_with("zstd_") { hir::CompressKind::Zstd } else { hir::CompressKind::Gzip };
+        let kind = match method {
+            "gzip_compress" | "gzip_decompress" => hir::CompressKind::Gzip,
+            "zlib_compress" | "zlib_decompress" => hir::CompressKind::Zlib,
+            "deflate_raw_compress" | "deflate_raw_decompress" => hir::CompressKind::DeflateRaw,
+            "zstd_compress" | "zstd_decompress" => hir::CompressKind::Zstd,
+            _ => {
+                self.diags.error(format!("unknown std.compress operation '{method}'"), span);
+                return err;
+            }
+        };
         let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
         let what = format!("compress.{method}");
         if method.ends_with("_decompress") {

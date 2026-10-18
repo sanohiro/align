@@ -57,6 +57,8 @@ mod utf8_lossy_tests;
 #[cfg(test)]
 mod decompression_frames_tests;
 #[cfg(test)]
+mod deflate_framing_tests;
+#[cfg(test)]
 mod base64_quantum_tests;
 #[cfg(test)]
 mod hex_group_tests;
@@ -14841,6 +14843,25 @@ const Z_DEFAULT_STRATEGY: c_int = 0;
 /// DEFLATE (`-15`) or zlib (`15`). Used for both `deflateInit2_` and `inflateInit2_` so decompress
 /// accepts only gzip streams (a zlib/raw input → `Z_DATA_ERROR` → `Error.Invalid`).
 const GZIP_WINDOW_BITS: c_int = 15 + 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeflateFormat { Gzip, Zlib, Raw }
+fn zlib_input_chunk() -> usize {
+    usize::try_from(c_uint::MAX).unwrap_or(usize::MAX)
+}
+impl DeflateFormat {
+    fn window_bits(self) -> c_int {
+        match self { Self::Gzip => GZIP_WINDOW_BITS, Self::Zlib => 15, Self::Raw => -15 }
+    }
+    fn invalid_level(self) -> &'static str {
+        match self {
+            Self::Gzip => "compress.gzip_compress: level out of range (must be 0..=9)",
+            Self::Zlib => "compress.zlib_compress: level out of range (must be 0..=9)",
+            Self::Raw => "compress.deflate_raw_compress: level out of range (must be 0..=9)",
+        }
+    }
+}
+
 /// zlib's default `memLevel` (memory/speed tradeoff for the internal state).
 const GZIP_MEM_LEVEL: c_int = 8;
 
@@ -14917,9 +14938,14 @@ fn grow_output(out: &mut Vec<u8>, max_cap: usize) -> Result<bool, i32> {
 /// status. An out-of-range `level` is a **programmer error** (not attacker input), so it aborts with
 /// a clear message — the `rand.range` total-or-abort policy (#345), never a silent clamp / `Error`.
 fn gzip_deflate(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
+    zlib_deflate(data, level, DeflateFormat::Gzip, zlib_input_chunk())
+}
+
+fn zlib_deflate(data: &[u8], level: i64, format: DeflateFormat, input_chunk: usize) -> Result<Vec<u8>, i32> {
     if !(0..=9).contains(&level) {
-        panic_abort("compress.gzip_compress: level out of range (must be 0..=9)");
+        panic_abort(format.invalid_level());
     }
+    if input_chunk == 0 || c_uint::try_from(input_chunk).is_err() { return Err(AL_INVALID); }
     let level = level as c_int;
     let mut strm = ZStream::zeroed();
     let ret = unsafe {
@@ -14927,7 +14953,7 @@ fn gzip_deflate(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
             &mut strm,
             level,
             Z_DEFLATED,
-            GZIP_WINDOW_BITS,
+            format.window_bits(),
             GZIP_MEM_LEVEL,
             Z_DEFAULT_STRATEGY,
             ZLIB_VERSION.as_ptr() as *const c_char,
@@ -14939,22 +14965,22 @@ fn gzip_deflate(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
         return Err(zlib_error_to_status(ret));
     }
     // From here `deflateEnd` must run on every path (it frees the internal state).
-    let result = deflate_run(&mut strm, data);
+    let result = deflate_run(&mut strm, data, input_chunk);
     unsafe { deflateEnd(&mut strm) };
     result
 }
 
-/// Drive `deflate` to completion over `input`, appending the gzip output to a fresh `Vec`. Input is
+/// Drive `deflate` to completion over `input`, appending the selected-format output to a fresh `Vec`. Input is
 /// fed in `u32`-sized chunks (`avail_in` is a `uInt`); output space is grown via [`grow_output`].
 /// Compression of any bytes always succeeds barring OOM, so the only `Err` is an allocation failure
 /// or an unexpected engine code.
-fn deflate_run(strm: &mut ZStream, input: &[u8]) -> Result<Vec<u8>, i32> {
+fn deflate_run(strm: &mut ZStream, input: &[u8], input_chunk: usize) -> Result<Vec<u8>, i32> {
     let mut out: Vec<u8> = Vec::new();
     let mut pos: usize = 0; // input bytes already handed to zlib
     loop {
         // Refill the input window once zlib has drained it (chunked so `avail_in` fits a `uInt`).
         if strm.avail_in == 0 && pos < input.len() {
-            let take = (input.len() - pos).min(c_uint::MAX as usize);
+            let take = (input.len() - pos).min(input_chunk);
             strm.next_in = input[pos..].as_ptr();
             strm.avail_in = take as c_uint;
             pos += take;
@@ -14971,15 +14997,17 @@ fn deflate_run(strm: &mut ZStream, input: &[u8]) -> Result<Vec<u8>, i32> {
             strm.avail_out = spare as c_uint;
         }
         let before = strm.avail_out;
+        let input_before = strm.avail_in;
         let ret = unsafe { deflate(strm, flush) };
         let produced = (before - strm.avail_out) as usize;
         // SAFETY: zlib wrote `produced` bytes into the spare capacity we just pointed it at.
         unsafe { out.set_len(out.len() + produced) };
         match ret {
             Z_STREAM_END => return Ok(out),
-            // Z_OK: more work to do. Z_BUF_ERROR under Z_FINISH means "needs more output room" — the
-            // loop grows `out` and retries; progress is guaranteed because we always add spare space.
-            Z_OK | Z_BUF_ERROR => {}
+            Z_OK | Z_BUF_ERROR => {
+                // A nonempty output span was provided; reject a stalled engine rather than spin.
+                if input_before == strm.avail_in && produced == 0 { return Err(AL_CODE); }
+            }
             other => return Err(zlib_error_to_status(other)),
         }
     }
@@ -14989,11 +15017,15 @@ fn deflate_run(strm: &mut ZStream, input: &[u8]) -> Result<Vec<u8>, i32> {
 /// Aggregate output is capped at [`GZIP_MAX_OUTPUT`] (the bomb guard): exceeding it → `AL_INVALID`.
 /// Truncated input (zlib needs more but none remains) and corrupt input both map to `AL_INVALID`.
 fn gzip_inflate(data: &[u8]) -> Result<Vec<u8>, i32> {
+    zlib_inflate(data, DeflateFormat::Gzip, GZIP_MAX_OUTPUT, zlib_input_chunk())
+}
+
+fn zlib_inflate(data: &[u8], format: DeflateFormat, max_cap: usize, input_chunk: usize) -> Result<Vec<u8>, i32> {
     let mut strm = ZStream::zeroed();
     let ret = unsafe {
         inflateInit2_(
             &mut strm,
-            GZIP_WINDOW_BITS,
+            format.window_bits(),
             ZLIB_VERSION.as_ptr() as *const c_char,
             core::mem::size_of::<ZStream>() as c_int,
         )
@@ -15001,18 +15033,19 @@ fn gzip_inflate(data: &[u8]) -> Result<Vec<u8>, i32> {
     if ret != Z_OK {
         return Err(zlib_error_to_status(ret));
     }
-    let result = inflate_run(&mut strm, data, GZIP_MAX_OUTPUT);
+    let result = inflate_run_with_chunk(&mut strm, data, max_cap, input_chunk, format == DeflateFormat::Gzip);
     unsafe { inflateEnd(&mut strm) };
     result
 }
 
 /// Decode every gzip member, enforcing one inclusive aggregate output cap. The native owners
 /// use small caps and input windows to exercise the same loop without multi-gigabyte fixtures.
+#[cfg(test)]
 fn inflate_run(strm: &mut ZStream, data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
-    inflate_run_with_chunk(strm, data, max_cap, c_uint::MAX as usize)
+    inflate_run_with_chunk(strm, data, max_cap, c_uint::MAX as usize, true)
 }
 
-fn inflate_run_with_chunk(strm: &mut ZStream, data: &[u8], max_cap: usize, input_chunk: usize) -> Result<Vec<u8>, i32> {
+fn inflate_run_with_chunk(strm: &mut ZStream, data: &[u8], max_cap: usize, input_chunk: usize, concatenated: bool) -> Result<Vec<u8>, i32> {
     if input_chunk == 0 || c_uint::try_from(input_chunk).is_err() || data.is_empty() {
         return Err(AL_INVALID);
     }
@@ -15061,6 +15094,7 @@ fn inflate_run_with_chunk(strm: &mut ZStream, data: &[u8], max_cap: usize, input
             let consumed = pos.checked_sub(remaining).ok_or(AL_CODE)?;
             if consumed <= member_start { return Err(AL_INVALID); }
             if remaining == 0 && pos == data.len() { return Ok(out); }
+            if !concatenated { return Err(AL_INVALID); }
             // Reset keeps the gzip-only mode and reuses native storage. Preserve the unread
             // input window explicitly; total_in/total_out are member-local, not aggregate counts.
             let next_in = strm.next_in;
@@ -15122,6 +15156,50 @@ pub unsafe extern "C" fn align_rt_compress_gzip_compress(ptr: *const u8, len: i6
 pub unsafe extern "C" fn align_rt_compress_gzip_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
     let data = unsafe { bytes_view(ptr, len) };
     unsafe { publish_buffer(gzip_inflate(data), out) }
+}
+
+/// `compress.zlib_compress(data, level)` returns one owned complete stream.
+/// Invalid levels abort before stream initialization; ordinary errors publish null.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must be a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zlib_compress(ptr: *const u8, len: i64, level: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(zlib_deflate(data, level, DeflateFormat::Zlib, zlib_input_chunk()), out) }
+}
+
+/// `compress.zlib_decompress(data)` requires one complete stream and no trailing bytes.
+/// The inclusive output cap is 1 GiB. No partial output is published on failure.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must be a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zlib_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(zlib_inflate(data, DeflateFormat::Zlib, GZIP_MAX_OUTPUT, zlib_input_chunk()), out) }
+}
+
+/// `compress.deflate_raw_compress(data, level)` returns one owned complete stream.
+/// Invalid levels abort before stream initialization; ordinary errors publish null.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must be a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_deflate_raw_compress(ptr: *const u8, len: i64, level: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(zlib_deflate(data, level, DeflateFormat::Raw, zlib_input_chunk()), out) }
+}
+
+/// `compress.deflate_raw_decompress(data)` requires one complete stream and no trailing bytes.
+/// The inclusive output cap is 1 GiB. No partial output is published on failure.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid byte range; `out` must be a writable handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_deflate_raw_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+    let data = unsafe { bytes_view(ptr, len) };
+    unsafe { publish_buffer(zlib_inflate(data, DeflateFormat::Raw, GZIP_MAX_OUTPUT, zlib_input_chunk()), out) }
 }
 
 // ---------------------------------------------------------------------------------------------

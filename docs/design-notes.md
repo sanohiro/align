@@ -2493,3 +2493,12 @@ graph, reusing Plan182/205's authority rather than treating all Copy views as
 independent. Reading the result copies bits and detaches the copied value from
 the group; it neither transfers ownership nor invents shared mutable results.
 Target layout and explicit alignment govern the same typed slot and trampoline.
+
+### Complete DEFLATE framing
+
+Zlib and raw DEFLATE complete the standard compression family using the same
+libz engine and Align-owned memory wrapper. PNG clients should not each declare
+an ABI-dependent uncompress2 binding. Their image parsing stays in the client;
+framing validation, full-input consumption, bounded output and cleanup belong
+to the shared codec. [Plan226](impl/226-deflate-framing.md) fixes the single-stream
+contract without changing gzip/zstd concatenation or adding a configurable cap.

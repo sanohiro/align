@@ -1631,6 +1631,16 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::CompressCompress { data, level, out, .. } => {
+            contract.result = i32_ty;
+            contract.outputs = vec![(*out, Ty::Buffer)];
+            contract.operands = vec![(data, byte_view(data), read), (level, i64_ty, read)];
+        }
+        Rvalue::CompressDecompress { data, out, .. } => {
+            contract.result = i32_ty;
+            contract.outputs = vec![(*out, Ty::Buffer)];
+            contract.operands = vec![(data, byte_view(data), read)];
+        }
         Rvalue::JsonDocCollect { kind, doc, arena, out } => {
             contract.outputs = vec![(*out, Ty::Slice(kind.element()))];
             contract.operands = vec![(doc, Ty::JsonDoc, read), (arena, Ty::ArenaHandle, read)];

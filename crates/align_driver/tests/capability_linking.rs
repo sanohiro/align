@@ -153,6 +153,11 @@ fn pure_program_argv_carries_no_gated_library() {
 fn gated_feature_argv_is_exactly_its_capability_closure() {
     let gzip = "import std.compress\nfn main() -> Result<(), Error> {\n  c := compress.gzip_compress(\"aaaaaaaa\", 6)?\n  print(c.len() as i64)\n  return Ok(())\n}\n";
     assert_eq!(gated_link_argv("argv-gzip", gzip, ObjectFormat::Elf), ["-lz"]);
+    for codec in ["zlib", "deflate_raw"] {
+        let source = gzip.replace("gzip_compress", &format!("{codec}_compress"));
+        assert_eq!(gated_link_argv("argv-deflate-framing", &source, ObjectFormat::Elf), ["-lz"]);
+    }
+
 
     let zstd = "import std.compress\nfn main() -> Result<(), Error> {\n  c := compress.zstd_compress(\"aaaaaaaa\", 6)?\n  print(c.len() as i64)\n  return Ok(())\n}\n";
     assert_eq!(gated_link_argv("argv-zstd", zstd, ObjectFormat::Elf), ["-lzstd"]);

@@ -105,8 +105,12 @@ key|CommandStartScope|command_start_scope|HostState|declare i32 @align_rt_comman
 key|CommandStderrTo|command_stderr_to|HostState|declare i32 @align_rt_command_stderr_to(ptr, ptr) #2
 key|CommandStdoutTo|command_stdout_to|HostState|declare i32 @align_rt_command_stdout_to(ptr, ptr) #2
 key|CommandTimeout|command_timeout|HostState|declare void @align_rt_command_timeout(ptr, i64) #2
+key|CompressDeflateRawCompress|compress_deflate_raw_compress|Foreign|declare i32 @align_rt_compress_deflate_raw_compress(ptr, i64, i64, ptr) #2
+key|CompressDeflateRawDecompress|compress_deflate_raw_decompress|Foreign|declare i32 @align_rt_compress_deflate_raw_decompress(ptr, i64, ptr) #2
 key|CompressGzipCompress|compress_gzip_compress|Foreign|declare i32 @align_rt_compress_gzip_compress(ptr, i64, i64, ptr) #2
 key|CompressGzipDecompress|compress_gzip_decompress|Foreign|declare i32 @align_rt_compress_gzip_decompress(ptr, i64, ptr) #2
+key|CompressZlibCompress|compress_zlib_compress|Foreign|declare i32 @align_rt_compress_zlib_compress(ptr, i64, i64, ptr) #2
+key|CompressZlibDecompress|compress_zlib_decompress|Foreign|declare i32 @align_rt_compress_zlib_decompress(ptr, i64, ptr) #2
 key|CompressZstdCompress|compress_zstd_compress|Foreign|declare i32 @align_rt_compress_zstd_compress(ptr, i64, i64, ptr) #2
 key|CompressZstdDecompress|compress_zstd_decompress|Foreign|declare i32 @align_rt_compress_zstd_decompress(ptr, i64, ptr) #2
 key|CryptoAesGcmOpen|crypto_aes_gcm_open|Foreign|declare i32 @align_rt_crypto_aes_gcm_open(ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr) #2

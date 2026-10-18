@@ -21463,3 +21463,66 @@ fn builder_copy_read_hir_matrix() -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+#[test]
+fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
+    for kind in [
+        hir::CompressKind::Gzip,
+        hir::CompressKind::Zlib,
+        hir::CompressKind::DeflateRaw,
+        hir::CompressKind::Zstd,
+    ] {
+        for compress in [false, true] {
+            let mut program = baseline_program();
+            let error = push_builtin_error(&mut program);
+            let result = Ty::Result(Scalar::Buffer, Scalar::Enum(error));
+            let expression = if compress {
+                hir::ExprKind::Compress {
+                    kind,
+                    data: Box::new(native_str()),
+                    level: Box::new(native_i64()),
+                }
+            } else {
+                hir::ExprKind::Decompress {
+                    kind,
+                    data: Box::new(native_str()),
+                }
+            };
+            program.fns.push(body_native_case(
+                "framing",
+                body_test_expr(expression, result),
+                result,
+            ));
+            assert!(body_core_metadata_is_valid(&program));
+            for mutation in 0..if compress { 3 } else { 2 } {
+                let mut bad = program.clone();
+                let expression = body_statement_expression_mut(&mut bad, "framing");
+                let hir::ExprKind::Try(inner) = &mut expression.kind else {
+                    return Err("fixture Try".into());
+                };
+                match mutation {
+                    0 => match &mut inner.kind {
+                        hir::ExprKind::Compress { data, .. }
+                        | hir::ExprKind::Decompress { data, .. } => {
+                            **data = body_test_expr(hir::ExprKind::Bool(false), Ty::Bool)
+                        }
+                        _ => return Err("fixture codec".into()),
+                    },
+                    1 => inner.ty = Ty::Result(Scalar::String, Scalar::Enum(error)),
+                    _ => match &mut inner.kind {
+                        hir::ExprKind::Compress { level, .. } => {
+                            **level = body_test_expr(hir::ExprKind::Int(1), int(32))
+                        }
+                        _ => return Err("fixture compressor".into()),
+                    },
+                }
+                assert!(
+                    !body_core_metadata_is_valid(&bad),
+                    "{kind:?}/{compress}/{mutation}"
+                );
+                assert!(crate::lower_program_checked(&bad, false, None).is_err());
+            }
+        }
+    }
+    Ok(())
+}

@@ -1984,10 +1984,18 @@ reproducibility. `lo >= hi` (`range`) and `k < 0` or
 Calls are Impure. Concatenated gzip members and current ordinary/skippable zstd frames are accepted;
 skippable frames contribute no output. Empty input, legacy zstd, corrupt/truncated later data and
 trailing bytes (including gzip zero padding) return `Error.Invalid` without partial output.
-The inclusive 1 GiB aggregate payload cap permits exact-cap empty/skippable suffixes and does not
+The inclusive 1 GiB aggregate payload cap permits gzip/zstd exact-cap empty/skippable suffixes and does not
 bound native workspace or RSS. Native resource/output allocation failures retain `Error.Code`;
 final header OOM retains terminal runtime policy. Exact admission and error precedence are in
 [the compression design](impl/std-design/compress.md).
+
+`zlib_compress` / `zlib_decompress` and `deflate_raw_compress` /
+`deflate_raw_decompress` complete the same family. Compression takes `(data: bytes,
+level: i64)`; decompression takes `(data: bytes)`; all return `Result<buffer, Error>`.
+The libz modes are 15 and -15. Both decoders require exactly one complete stream,
+reject trailing bytes or a second stream, and share the cap/ownership/error rules.
+Zlib checksum or dictionary failures are Invalid; final raw-byte padding is allowed.
+Levels 0..=9 are accepted; other levels abort before native initialization.
 
 Incremental SHA-256 uses `crypto.sha256_stream() -> crypto.digest`,
 `d.update(data: bytes) -> ()`, and consuming `d.finish() -> array<u8>`.
