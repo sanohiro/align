@@ -53057,7 +53057,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.float_mode = saved_mode;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53079,7 +53079,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.arena_depth -= 1;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53098,7 +53098,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.scope.truncate(scope_mark);
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53116,7 +53116,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.unsafe_depth -= 1;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53137,7 +53137,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.task_group_depth -= 1;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53163,7 +53163,7 @@ impl<'a, 't> Checker<'a, 't> {
                 let syntax_diverges = ast_block_diverges(b);
                 let block = self.check_block_context(b, if syntax_diverges { None } else { expected }, if syntax_diverges { NumericOperandContext::default() } else { numeric });
                 if hir_block_diverges(&block) {
-                    let ty = diverging_block_result_ty(&block, expected);
+                    let ty = diverging_block_result_ty(&block, expected.or(numeric.preferred()));
                     return Expr { kind: ExprKind::Block(block), ty, span: e.span };
                 }
                 let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
@@ -71640,7 +71640,11 @@ impl<'a, 't> Checker<'a, 't> {
                     .error(format!("non-exhaustive `match` on '{type_name}': missing {}", missing.join(", ")), span);
             }
         }
-        let ty = result_ty.unwrap_or(Ty::Unit);
+        // A proven non-fallthrough result may use the soft numeric candidate. Do not
+        // seed arm checking: unreachable children keep their own structural types.
+        let diverges = scrutinee_diverges || checked.iter().all(|arm| hir_expr_diverges(&arm.body));
+        let completion_context = if diverges { numeric.preferred() } else { None };
+        let ty = result_ty.or(completion_context).unwrap_or(Ty::Unit);
         for index in unconstrained_diverging_arms {
             self.reconcile_diverging_completion_expr(&checked[index].body, ty);
         }
@@ -71904,7 +71908,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
 
-        let ty = result_ty.unwrap_or(Ty::Unit);
+        // A proven non-fallthrough result may use the soft numeric candidate. Do not
+        // seed arm checking: unreachable children keep their own structural types.
+        let diverges = scrutinee_diverges || checked.iter().all(|arm| hir_expr_diverges(&arm.body));
+        let completion_context = if diverges { numeric.preferred() } else { None };
+        let ty = result_ty.or(completion_context).unwrap_or(Ty::Unit);
         for index in unconstrained_diverging_arms {
             self.reconcile_diverging_completion_expr(&checked[index].body, ty);
         }
@@ -71974,7 +71982,7 @@ impl<'a, 't> Checker<'a, 't> {
         let else_ty = (!else_diverges)
             .then_some(els_b.value.as_deref().map(|value| value.ty).unwrap_or(Ty::Unit));
         let ty = if always_diverges {
-            expected.unwrap_or(Ty::Unit)
+            expected.or(numeric.preferred()).unwrap_or(Ty::Unit)
         } else {
             match (then_ty, else_ty) {
                 (Some(then_ty), Some(else_ty)) => self.unify(then_ty, else_ty, span),
@@ -72033,7 +72041,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.loop_fallthrough.remove(&span);
             // No `break`: the loop diverges. It yields no value, so it takes the expected type (like
             // a diverging `match`) — the code after it is unreachable.
-            let ty = expected.unwrap_or(Ty::Unit);
+            let ty = expected.or(numeric.preferred()).unwrap_or(Ty::Unit);
             Expr { kind: ExprKind::Loop { body, diverges: true, body_locals }, ty, span }
         }
     }

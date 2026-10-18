@@ -283,3 +283,127 @@ fn numeric_operand_context_checks_each_source_once() {
         }
     });
 }
+
+#[test]
+fn numeric_diverging_completion_preserves_context() {
+    owned_fixture::run("numeric_diverging_completion_preserves_context", |stage| {
+        let result = (|| -> TestResult {
+            let wrappers = [
+                "{ return a }",
+                "{ return a; \"dead tail\" }",
+                "float(reassoc) { return a }",
+                "arena { return a }",
+                "arena scratch { return a }",
+                "unsafe { return a }",
+                "task_group { return a }",
+                "loop { return a }",
+                "if flag { return a } else { return a }",
+                "if { return a; true } { \"dead\" } else { false }",
+                "match tag { 0 => { return a }, _ => { return a } }",
+                "match option { Some(value) => { return a }, None => { return a } }",
+                "match { return a; tag } { 0 => \"dead\", _ => false }",
+                "match { return a; option } { Some(value) => \"dead\", None => false }",
+            ];
+            let mut source = String::from("fn identity<T>(value:T)->T=value\n");
+            let mut main = String::from("fn main()->i32 {\n vector:vec2<i32>:=[7,9]\n");
+            for (shape, ty, input) in [(0, "i32", "7"), (1, "vec2<i32>", "vector")] {
+                for (index, wrapper) in wrappers.iter().enumerate() {
+                    for generic in [false, true] {
+                        let operand = if generic {
+                            format!("identity({wrapper})")
+                        } else {
+                            wrapper.to_string()
+                        };
+                        for (order, expression) in [
+                            (0, format!("a + ({operand})")),
+                            (1, format!("({operand}) + a")),
+                        ] {
+                            let name = format!("case_{shape}_{index}_{generic}_{order}");
+                            source.push_str(&format!("fn {name}(a:{ty},flag:bool,tag:i32,option:Option<i32>)->{ty} = {expression}\n"));
+                            for (choice, flag, tag, option) in
+                                [(0, "true", 0, "Some(1)"), (1, "false", 1, "None")]
+                            {
+                                let local = format!("r_{name}_{choice}");
+                                main.push_str(&format!(
+                                    " {local}:={name}({input},{flag},{tag},{option})\n"
+                                ));
+                                let condition = if shape == 0 {
+                                    format!("{local} != 7")
+                                } else {
+                                    format!("{local}[0] != 7 || {local}[1] != 9")
+                                };
+                                main.push_str(&format!(" if {condition} {{ return 1 }}\n"));
+                            }
+                        }
+                    }
+                }
+            }
+            // These loops are type checked and emitted but never executed.
+            source.push_str(
+                "pub fn forever_right()->i32=1+loop {}\npub fn forever_left()->i32=loop {}+1\n",
+            );
+            // Without an enclosing result hint, a typed left operand still supplies context.
+            source.push_str("fn inferred(a:i32)->i32 { value:=a+{ return a }; return value }\n");
+            main.push_str(" if inferred(7)!=7 { return 1 }\n return 0\n}\n");
+            source.push_str(&main);
+            for per_unit in [false, true] {
+                execute(
+                    stage,
+                    &programs(stage, &source, per_unit)?,
+                    if per_unit {
+                        "diverging-units"
+                    } else {
+                        "diverging-whole"
+                    },
+                    false,
+                )?;
+            }
+
+            for expression in [
+                "process.abort()",
+                "process.exit(0)",
+                "{}",
+                "loop { break }",
+                "if flag {} else {}",
+            ] {
+                for (left, right) in [("1", expression), (expression, "1")] {
+                    let source = format!(
+                        "import std.process\nfn bad(flag:bool)->i32=({left})+({right})\nfn main() {{}}\n"
+                    );
+                    let mut sources = SourceMap::new();
+                    let checked =
+                        align_driver::check(&mut sources, "numeric-completion-negative", &source);
+                    assert!(checked.diags.has_errors(), "accepted eager Unit: {source}");
+                }
+            }
+            for wrapper in wrappers {
+                let invalid = wrapper.replace("return a", "return missing");
+                let source = format!(
+                    "fn bad(a:i32,flag:bool,tag:i32,option:Option<i32>)->i32=1+({invalid})\nfn main() {{}}\n"
+                );
+                let mut sources = SourceMap::new();
+                let checked =
+                    align_driver::check(&mut sources, "numeric-completion-invalid", &source);
+                let diagnostics = align_driver::format_diagnostics(&sources, &checked.diags);
+                assert_eq!(
+                    diagnostics.matches("undefined name: 'missing'").count(),
+                    invalid.matches("missing").count(),
+                    "{diagnostics}"
+                );
+            }
+            // A left operand without either enclosing context or a retained typed tail
+            // remains untyped Unit; numeric context is not a new Never type.
+            let mut sources = SourceMap::new();
+            let checked = align_driver::check(
+                &mut sources,
+                "numeric-completion-absent",
+                "fn bad()->i32 { x := { return 7 } + 1; return x }\nfn main() {}\n",
+            );
+            assert!(checked.diags.has_errors());
+            Ok(())
+        })();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    });
+}

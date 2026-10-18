@@ -136,3 +136,20 @@ result. Select scalar versus vector guards by the exact result shape.
 `vec_simd::scalar_left_vector_division_preserves_lane_guards` closes signed and
 unsigned extrema, all element/lane widths, / and %, INT_MIN/-1 wrapping, and
 whole/per-unit zero-lane aborts. The existing vector guard itself is unchanged.
+
+## Completion-context review closure
+
+F1: soft numeric context must also supply the structural result type of a proven
+non-fallthrough control expression. Plain/float/arena/named-arena/unsafe/task-group
+blocks, if (including a diverging condition), both match forms (including a
+diverging scrutinee), and loops without reachable breaks use the candidate only
+when forming that result. Dead children remain independently checked; no source
+is replayed. Direct process termination remains Unit in eager operands, and
+fallthrough Unit or mixed branch/break result types still reject. No Never type,
+IR shape or ownership policy is introduced.
+
+`numeric_completion_cache::numeric_diverging_completion_preserves_context` owns
+both operand positions, scalar/vector contexts, generic identity, absent versus
+available context and invalid children. Terminating-return cases execute whole
+and per-unit; infinite loops are checked/emitted but not run. This extends the
+existing values/control matrix cell and closes the review finding in one fix.
