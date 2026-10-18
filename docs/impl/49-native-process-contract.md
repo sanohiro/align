@@ -268,14 +268,22 @@ child creation changes. Closure:
   returned on clone failure. Signal subscriptions need no exclusion across the
   wait: clone copies the signal actions atomically and the child inspects and
   resets its own copy, while the launching thread keeps every signal blocked.
-  The macOS path is unchanged; its native spawn does not wait for a stalled
-  child under the lock.
+  The macOS path is unchanged and keeps the guard from admission through
+  darwin::spawn. Its timed path forks and returns the PID without waiting for
+  setup, but untimed posix_spawn performs the executable lookup inside the call,
+  so a stalled lookup (for example on a network filesystem) still blocks other
+  threads on the creation lock. That is an existing macOS limit, not changed here.
+- Clone failure: the pending reservation is returned and the stack unmapped;
+  `failed_clone_returns_pending_reservation` forces a real EINVAL clone through
+  a test-only CLONE_THREAD flag and checks the count, descriptors, no child, and
+  a following successful launch.
 - glibc floor: before glibc 2.24 (BZ #19957) the clone wrapper made a CLONE_VM,
   non-CLONE_THREAD child store -1 into the cached PID/TID of the thread control
   block it shares with the launching thread; 2.24 removed that store and 2.25
   removed the PID cache. Rust's linux-gnu floor is 2.17 and no Align document
   names a higher one, so the runtime checks gnu_get_libc_version once and refuses Linux launch with Code(ENOSYS) below
-  2.24. musl's clone wrapper never wrote the thread control block.
+  2.24. A process scope checks the same floor before arming the subreaper or
+  scope mode. musl's clone wrapper never wrote the thread control block.
 - TLS: glibc's cancellable wrappers also touch the suspended thread's
   cancellation state; this is sound because the runtime never cancels a
   launching thread and foreign code must not pthread_cancel one.
@@ -284,9 +292,10 @@ child creation changes. Closure:
   (EACCES, exact ENOEXEC and a pre-exec ENOTDIR chdir failure on untimed, timed
   and captured launches) and the Linux `child_signal_state_and_group_placement`
   (executed-image SigBlk/SigIgn/SigCgt, inherited/forced group and new session,
-  restored parent mask, and in the parent afterwards the caught handler, ignored
-  disposition, cwd, group/session and stdout identity unchanged after a cwd and
-  new-session launch); `vfork_wait_holds_no_creation_lock` (a test-only gate
+  restored parent mask, and in the parent afterwards the caught handler and
+  ignored disposition (CLONE_SIGHAND), cwd (CLONE_FS) and stdout identity
+  (CLONE_FILES) unchanged after a cwd and new-session launch, plus its
+  group/session, which detects CLONE_THREAD); `vfork_wait_holds_no_creation_lock` (a test-only gate
   blocks the child before exec: another thread acquires the creation lock and
   reaps while the pending launch stays counted); `glibc_clone_vm_floor` (version
   boundary). The manual `launch_resident_size_probe` records

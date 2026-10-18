@@ -332,7 +332,7 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
             libc::clone(
                 enter_bootstrap,
                 stack.top(),
-                libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD,
+                libc::CLONE_VM | libc::CLONE_VFORK | libc::SIGCHLD | forced_clone_failure(),
                 (&raw mut entry).cast(),
             )
         }
@@ -551,7 +551,7 @@ impl Drop for SignalMask {
 /// launching thread. 2.24 removed that store and 2.25 removed the PID cache. Refuse
 /// the shared-address-space launch on an older runtime glibc instead of corrupting it.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn shared_clone_supported() -> bool {
+pub(crate) fn shared_clone_supported() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
     static STATE: AtomicU8 = AtomicU8::new(0);
     match STATE.load(Relaxed) {
@@ -615,6 +615,20 @@ impl Drop for PendingChild {
                 .unwrap_or_else(|| super::panic_abort("process owner count underflow"));
         }
     }
+}
+#[cfg(all(test, target_os = "linux"))]
+std::thread_local! {
+    static FORCE_CLONE_FAILURE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+/// Test-only: CLONE_THREAD without CLONE_SIGHAND makes the real clone call fail with EINVAL.
+#[cfg(target_os = "linux")]
+#[inline]
+fn forced_clone_failure() -> i32 {
+    #[cfg(test)]
+    if FORCE_CLONE_FAILURE.with(|value| value.replace(false)) {
+        return libc::CLONE_THREAD;
+    }
+    0
 }
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) static PRE_EXEC_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1482,8 +1496,10 @@ pub(crate) mod tests {
             // The launching thread's own mask is restored after launch.
             let after = std::fs::read_to_string("/proc/thread-self/status").unwrap();
             assert_eq!(field(&after, "SigBlk:"), field(&parent, "SigBlk:"));
-            // The child's disposition reset, chdir, session/group change and stdout remap
-            // stayed private (no CLONE_SIGHAND, CLONE_FS or CLONE_FILES).
+            // The child's disposition reset, chdir and stdout remap stayed private: the
+            // handler checks detect CLONE_SIGHAND, cwd detects CLONE_FS and stdout identity
+            // detects CLONE_FILES. The group/session check detects only CLONE_THREAD, which
+            // would make setsid/setpgid act on this process.
             let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
             assert_eq!(unsafe { libc::sigaction(libc::SIGUSR2, core::ptr::null(), &mut action) }, 0);
             assert_eq!(action.sa_sigaction, caught as extern "C" fn(i32) as libc::sighandler_t);
@@ -1534,6 +1550,35 @@ pub(crate) mod tests {
         assert_eq!(unsafe { libc::write(gate_write.as_raw_fd(), (&raw const byte).cast(), 1) }, 1);
         assert_eq!(launcher.join().unwrap(), 0);
         assert_eq!(creation().children, 0);
+        std::process::exit(0);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_clone_returns_pending_reservation() {
+        const NAME: &str = "process_launch::tests::failed_clone_returns_pending_reservation";
+        const MARKER: &str = "ALIGN_R154_FAILED_CLONE";
+        if std::env::var_os(MARKER).is_none() {
+            isolated(NAME, MARKER);
+            return;
+        }
+        let descriptors = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+        let baseline = descriptors();
+        for (capture, timeout) in [(false, 0), (true, 0), (true, 1_000_000_000)] {
+            let mut configuration = command("exit 0");
+            configuration.timeout_ns = timeout;
+            FORCE_CLONE_FAILURE.with(|value| value.set(true));
+            assert_eq!(launch(&configuration, capture, false).err(), Some(AL_INVALID));
+            assert!(!FORCE_CLONE_FAILURE.with(core::cell::Cell::get), "clone was reached");
+            assert_eq!(creation().children, 0);
+            assert_eq!(descriptors(), baseline);
+            assert_eq!(unsafe { libc::waitpid(-1, core::ptr::null_mut(), libc::WNOHANG) }, -1);
+            let mut child = launch(&configuration, capture, false).unwrap();
+            assert_eq!(creation().children, 1);
+            child.stdout.fd.take();
+            child.stderr.fd.take();
+            assert_eq!(child.wait().unwrap().termination.value, 0);
+            assert_eq!(creation().children, 0);
+        }
         std::process::exit(0);
     }
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
