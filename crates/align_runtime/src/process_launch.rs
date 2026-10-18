@@ -257,8 +257,15 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
     {
         return Err(AL_INVALID);
     }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    if !shared_clone_supported() {
+        return Err(io_error_to_status(&std::io::Error::from_raw_os_error(libc::ENOSYS)));
+    }
     acquisition()?;
     let prepared = Prepared::new(command)?;
+    #[cfg(target_os = "linux")]
+    let reservation = creation();
+    #[cfg(target_os = "macos")]
     let mut reservation = creation();
     if reservation.scope != scoped {
         return Err(AL_INVALID);
@@ -303,6 +310,10 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
     let stack = ChildStack::new()?;
     let mask = SignalMask::block()?;
     acquisition()?;
+    // The CLONE_VFORK wait is unbounded (a child stopped before exec, a stalled
+    // executable lookup), so it must not hold the process-wide creation lock.
+    #[cfg(target_os = "linux")]
+    let pending = PendingChild::reserve(reservation, scoped);
     #[cfg(target_os = "linux")]
     let pid = {
         let mut entry = Bootstrap {
@@ -344,6 +355,11 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
     drop(stack);
     child.started = std::time::Instant::now();
     child.pid = pid;
+    #[cfg(target_os = "linux")]
+    {
+        child.tracked = pending.commit();
+    }
+    #[cfg(target_os = "macos")]
     if !scoped {
         reservation.children = reservation.children.checked_add(1)
             .unwrap_or_else(|| super::panic_abort("process owner count overflow"));
@@ -361,6 +377,7 @@ fn launch_inner(command: &Command, capture: bool, force_group: bool, scoped: boo
         });
     }
     drop(mask);
+    #[cfg(target_os = "macos")]
     drop(reservation);
     drop(error_write);
     drop(stdin);
@@ -529,6 +546,78 @@ impl Drop for SignalMask {
         }
     }
 }
+/// glibc before 2.24 (BZ #19957) made a CLONE_VM, non-CLONE_THREAD clone child store
+/// -1 into the cached PID/TID of the thread control block it shares with the
+/// launching thread. 2.24 removed that store and 2.25 removed the PID cache. Refuse
+/// the shared-address-space launch on an older runtime glibc instead of corrupting it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn shared_clone_supported() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let version = unsafe { core::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) };
+            let supported = glibc_fixes_clone_vm_tcb(version.to_bytes());
+            STATE.store(if supported { 1 } else { 2 }, Relaxed);
+            supported
+        }
+    }
+}
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn glibc_fixes_clone_vm_tcb(version: &[u8]) -> bool {
+    let number = |part: Option<&[u8]>| -> Option<u32> {
+        let digits = part?;
+        let digits = &digits[..digits.iter().position(|b| !b.is_ascii_digit()).unwrap_or(digits.len())];
+        std::str::from_utf8(digits).ok()?.parse().ok()
+    };
+    let mut parts = version.split(|byte| *byte == b'.');
+    match (number(parts.next()), number(parts.next())) {
+        (Some(major), Some(minor)) => (major, minor) >= (2, 24),
+        _ => false,
+    }
+}
+/// A Linux launch admitted under the creation lock. Before the CLONE_VFORK wait it
+/// converts the lock into a counted reservation and releases it: the reservation
+/// keeps scope exclusion (a scope starts only with zero tracked children, and an
+/// active scope already rejects ordinary admission), while reaping, scope checks
+/// and signal subscriptions on other threads proceed. The child's inherited
+/// signal actions are copied atomically by clone and inspected in the child, so
+/// no subscription change needs to be excluded across the wait.
+#[cfg(target_os = "linux")]
+struct PendingChild(bool);
+#[cfg(target_os = "linux")]
+impl PendingChild {
+    fn reserve(mut state: std::sync::MutexGuard<'static, CreationState>, scoped: bool) -> Self {
+        if !scoped {
+            state.children = state
+                .children
+                .checked_add(1)
+                .unwrap_or_else(|| super::panic_abort("process owner count overflow"));
+        }
+        drop(state);
+        Self(!scoped)
+    }
+    /// Transfers the counted reservation to the published child owner.
+    fn commit(mut self) -> bool {
+        core::mem::replace(&mut self.0, false)
+    }
+}
+#[cfg(target_os = "linux")]
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        if self.0 {
+            let mut state = creation();
+            state.children = state
+                .children
+                .checked_sub(1)
+                .unwrap_or_else(|| super::panic_abort("process owner count underflow"));
+        }
+    }
+}
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) static PRE_EXEC_GATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Private stack for the shared-address-space launch child: a lowest guard page plus
 /// fixed bootstrap storage (the /proc/self/fd fallback uses an 8 KiB stack buffer).
 #[cfg(target_os = "linux")]
@@ -779,6 +868,19 @@ unsafe fn bootstrap(
     force_group: bool,
     scoped: bool,
 ) -> ! {
+    // Test-only pre-exec stall: announce on the ready fd, then block on the gate fd.
+    #[cfg(test)]
+    {
+        let gate = PRE_EXEC_GATE.load(std::sync::atomic::Ordering::SeqCst);
+        if gate != 0 {
+            let (ready, wait) = ((gate >> 32) as i32, (gate & 0xffff_ffff) as i32);
+            let mut byte = 0u8;
+            unsafe {
+                libc::write(ready, (&raw const byte).cast(), 1);
+                while libc::read(wait, (&raw mut byte).cast(), 1) < 0 && native_error() == libc::EINTR {}
+            }
+        }
+    }
     if scoped && unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         unsafe { report_and_exit(error_fd, native_error()) }
     }
@@ -1278,13 +1380,20 @@ pub(crate) mod tests {
     #[test]
     fn child_setup_and_exec_errno_cross_the_error_frame() {
         use std::os::unix::fs::PermissionsExt;
-        let directory = std::env::temp_dir().join(format!("align-launch-errno-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let plain = directory.join("plain");
-        std::fs::write(&plain, b"not executable").unwrap();
-        let garbage = directory.join("garbage");
-        std::fs::write(&garbage, [0x7f, b'E', b'L', b'F', 0, 0, 0, 0]).unwrap();
-        std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o755)).unwrap();
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Exclusively created, removed by Drop on every path.
+        let directory = crate::tests::FileFixtureDir::new("launch-errno");
+        let create = |name: &str, mode: u32, bytes: &[u8]| {
+            let path = directory.0.join(name);
+            let mut file = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&path).unwrap();
+            file.write_all(bytes).unwrap();
+            // mode() is filtered by the umask; set the exact bits.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let plain = create("plain", 0o644, b"not executable");
+        let garbage = create("garbage", 0o755, &[0x7f, b'E', b'L', b'F', 0, 0, 0, 0]);
         let code = |errno: i32| io_error_to_status(&std::io::Error::from_raw_os_error(errno));
         let path = |path: &std::path::Path| CString::new(path.as_os_str().as_bytes()).unwrap();
         for capture in [false, true] {
@@ -1303,7 +1412,6 @@ pub(crate) mod tests {
                 assert_eq!(launch(&configuration, capture, true).err(), Some(code(libc::ENOTDIR)));
             }
         }
-        std::fs::remove_dir_all(&directory).unwrap();
     }
     #[cfg(target_os = "linux")]
     #[test]
@@ -1329,15 +1437,25 @@ pub(crate) mod tests {
             assert_ne!(libc::signal(libc::SIGHUP, libc::SIG_IGN), libc::SIG_ERR);
         }
         let parent = std::fs::read_to_string("/proc/thread-self/status").unwrap();
-        let output = std::env::temp_dir().join(format!("align-launch-signal-{}", std::process::id()));
-        for (force_group, new_session) in [(false, false), (true, false), (false, true)] {
-            let file = std::fs::File::create(&output).unwrap();
+        let directory = crate::tests::FileFixtureDir::new("launch-signal");
+        let parent_cwd = std::env::current_dir().unwrap();
+        let parent_group = unsafe { (libc::getpgrp(), libc::getsid(0)) };
+        let stdout_identity = || {
+            let mut metadata: libc::stat = unsafe { core::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(1, &mut metadata) }, 0);
+            (metadata.st_dev, metadata.st_ino)
+        };
+        let parent_stdout = stdout_identity();
+        for (index, (force_group, new_session)) in [(false, false), (true, false), (false, true)].into_iter().enumerate() {
+            let output = directory.0.join(format!("status-{index}"));
+            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&output).unwrap();
             let mut configuration = command("exit 0");
             configuration.target = super::super::CommandTarget::Path(CString::new("/bin/cat").unwrap());
             configuration.argv = ["cat", "/proc/self/status", "/proc/self/stat"]
                 .map(|s| CString::new(s).unwrap())
                 .to_vec();
             configuration.new_session = new_session;
+            configuration.cwd = Some(CString::new("/").unwrap());
             configuration.stdout_binding = Some(file.into());
             let mut child = launch(&configuration, false, force_group).unwrap();
             let pid = child.pid;
@@ -1364,9 +1482,71 @@ pub(crate) mod tests {
             // The launching thread's own mask is restored after launch.
             let after = std::fs::read_to_string("/proc/thread-self/status").unwrap();
             assert_eq!(field(&after, "SigBlk:"), field(&parent, "SigBlk:"));
+            // The child's disposition reset, chdir, session/group change and stdout remap
+            // stayed private (no CLONE_SIGHAND, CLONE_FS or CLONE_FILES).
+            let mut action: libc::sigaction = unsafe { core::mem::zeroed() };
+            assert_eq!(unsafe { libc::sigaction(libc::SIGUSR2, core::ptr::null(), &mut action) }, 0);
+            assert_eq!(action.sa_sigaction, caught as extern "C" fn(i32) as libc::sighandler_t);
+            assert_eq!(unsafe { libc::sigaction(libc::SIGHUP, core::ptr::null(), &mut action) }, 0);
+            assert_eq!(action.sa_sigaction, libc::SIG_IGN);
+            assert_eq!(field(&after, "SigCgt:"), field(&parent, "SigCgt:"));
+            assert_eq!(std::env::current_dir().unwrap(), parent_cwd);
+            assert_eq!(unsafe { (libc::getpgrp(), libc::getsid(0)) }, parent_group);
+            assert_eq!(stdout_identity(), parent_stdout);
         }
-        std::fs::remove_file(&output).unwrap();
+        // exit() skips Drop; release the fixture first.
+        drop(directory);
         std::process::exit(0);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn vfork_wait_holds_no_creation_lock() {
+        const NAME: &str = "process_launch::tests::vfork_wait_holds_no_creation_lock";
+        const MARKER: &str = "ALIGN_R154_VFORK_WAIT_LOCK";
+        if std::env::var_os(MARKER).is_none() {
+            isolated(NAME, MARKER);
+            return;
+        }
+        let pipe = || {
+            let mut fds = [-1; 2];
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            fds.map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        };
+        let mut other = launch(&command("exit 3"), false, false).unwrap();
+        let [ready_read, ready_write] = pipe();
+        let [gate_read, gate_write] = pipe();
+        let gate = (u64::try_from(ready_write.as_raw_fd()).unwrap() << 32)
+            | u64::try_from(gate_read.as_raw_fd()).unwrap();
+        PRE_EXEC_GATE.store(gate, std::sync::atomic::Ordering::SeqCst);
+        let launcher = std::thread::spawn(|| {
+            let mut child = launch(&command("exit 0"), false, false).unwrap();
+            child.wait().unwrap().termination.value
+        });
+        let mut byte = 0u8;
+        assert_eq!(unsafe { libc::read(ready_read.as_raw_fd(), (&raw mut byte).cast(), 1) }, 1);
+        PRE_EXEC_GATE.store(0, std::sync::atomic::Ordering::SeqCst);
+        // The launcher is suspended in clone(CLONE_VFORK) behind a child blocked before exec.
+        assert!(CREATION.try_lock().is_ok(), "the vfork wait holds the creation lock");
+        // Another thread can reap (release_tracking) while the pending launch stays counted,
+        // which keeps a process scope from starting.
+        assert_eq!(other.wait().unwrap().termination.value, 3);
+        assert_eq!(creation().children, 1);
+        assert_eq!(unsafe { libc::write(gate_write.as_raw_fd(), (&raw const byte).cast(), 1) }, 1);
+        assert_eq!(launcher.join().unwrap(), 0);
+        assert_eq!(creation().children, 0);
+        std::process::exit(0);
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn glibc_clone_vm_floor() {
+        for (version, supported) in [
+            (&b"2.17"[..], false), (b"2.23", false), (b"2.23.90", false), (b"2.24", true),
+            (b"2.25", true), (b"2.39", true), (b"2.40.9000", true), (b"3.0", true),
+            (b"1.99", false), (b"", false), (b"2", false), (b"x.y", false),
+        ] {
+            assert_eq!(glibc_fixes_clone_vm_tcb(version), supported, "{version:?}");
+        }
+        assert!(shared_clone_supported());
     }
     // Manual launch-latency probe (plan 49, Linux shared-address-space launch):
     // ALIGN_LAUNCH_PROBE_MIB=4096 scripts/cargo.sh test -p align_runtime --lib \

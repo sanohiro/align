@@ -187,7 +187,10 @@ prepare cleanup authority before publishing a child, and the owner injects
 termination at each startup boundary.
 
 Synchronous run/run_bytes start their existing monotonic timeout immediately
-when the parent obtains the forked PID, before reading the exec-error channel.
+when the native launch call returns the child PID, before reading the
+exec-error channel. On macOS's timed fork path that is the forked PID, before
+the child's setup; on Linux, clone(CLONE_VFORK) returns only after the child has
+exec'd or exited.
 Poll that channel nonblocking with the remaining budget. At each checkpoint,
 an expired deadline wins over a newly readable error frame or EOF; an already
 selected earlier error is preserved during cleanup. Timeout closes capture and
@@ -195,9 +198,10 @@ control reads, signals only the owned PID/group whose formation is confirmed,
 and kills/reaps the direct child before returning Timeout. No blocking handshake
 read or wait precedes the deadline check. On macOS's timed fork path a stopped
 pre-exec child and an executable lookup that stalls therefore reach the same
-cleanup path as a running timeout. On Linux the parent obtains the PID only
-after the CLONE_VFORK child has exec'd or exited, so the budget does not cover
-the pre-exec window (see "Linux shared-address-space launch"). Untimed start retains no launch-duration promise. Neither path
+cleanup path as a running timeout. On Linux the budget does not cover the
+pre-exec window: such a child suspends only the launching thread, without any
+runtime lock (see "Linux shared-address-space launch"). Untimed start retains
+no launch-duration promise. Neither path
 promises a bound on kernel scheduling or uninterruptible termination/reaping.
 
 Before fork, save and block all blockable signals in the calling thread; restore
@@ -251,8 +255,27 @@ child creation changes. Closure:
   the budget does not cover the pre-exec window. A stalled (for example
   network-filesystem) executable lookup or a child externally stopped before
   exec suspends the launching thread until exec or child exit instead of
-  reaching timeout cleanup, as with glibc/musl posix_spawn. After clone returns,
-  deadline semantics are unchanged.
+  reaching timeout cleanup. glibc/musl posix_spawn suspend the caller the same
+  way. After clone returns, deadline semantics are unchanged.
+- Lock: the creation mutex admits the launch (scope mode, SIGCHLD disposition)
+  and is held through descriptor and stack setup. Immediately before clone it is
+  converted into a counted pending reservation and released, so the unbounded
+  vfork wait blocks no other thread's reap/release_tracking, timed-run cleanup,
+  process-scope checks or signal-subscription create/close. The reservation
+  preserves the one invariant that spans the clone, scope exclusion: a scope
+  starts only with zero tracked children, and an active scope already rejects
+  ordinary admission. It becomes the child's tracking on success and is
+  returned on clone failure. Signal subscriptions need no exclusion across the
+  wait: clone copies the signal actions atomically and the child inspects and
+  resets its own copy, while the launching thread keeps every signal blocked.
+  The macOS path is unchanged; its native spawn does not wait for a stalled
+  child under the lock.
+- glibc floor: before glibc 2.24 (BZ #19957) the clone wrapper made a CLONE_VM,
+  non-CLONE_THREAD child store -1 into the cached PID/TID of the thread control
+  block it shares with the launching thread; 2.24 removed that store and 2.25
+  removed the PID cache. Rust's linux-gnu floor is 2.17 and no Align document
+  names a higher one, so the runtime checks gnu_get_libc_version once and refuses Linux launch with Code(ENOSYS) below
+  2.24. musl's clone wrapper never wrote the thread control block.
 - TLS: glibc's cancellable wrappers also touch the suspended thread's
   cancellation state; this is sound because the runtime never cancels a
   launching thread and foreign code must not pthread_cancel one.
@@ -261,7 +284,12 @@ child creation changes. Closure:
   (EACCES, exact ENOEXEC and a pre-exec ENOTDIR chdir failure on untimed, timed
   and captured launches) and the Linux `child_signal_state_and_group_placement`
   (executed-image SigBlk/SigIgn/SigCgt, inherited/forced group and new session,
-  restored parent mask). The manual `launch_resident_size_probe` records
+  restored parent mask, and in the parent afterwards the caught handler, ignored
+  disposition, cwd, group/session and stdout identity unchanged after a cwd and
+  new-session launch); `vfork_wait_holds_no_creation_lock` (a test-only gate
+  blocks the child before exec: another thread acquires the creation lock and
+  reaps while the pending launch stays counted); `glibc_clone_vm_floor` (version
+  boundary). The manual `launch_resident_size_probe` records
   start+reap latency against touched and locked resident size.
 - Measurement (2026-10-19, Docker Desktop linux/arm64 VM, kernel 6.11.11-linuxkit,
   8 vCPU, ~7.6 GiB, Debian 12 glibc 2.36, test profile; median of 21 /bin/true
@@ -518,7 +546,7 @@ semantic cases; refusal on macOS does not satisfy a common-capability owner.
 | Axis | Required owner and failure detector |
 | --- | --- |
 | Type formation, mutability, purity, Send, carriers | formation_and_carriers, including malformed builtin lookalikes and imported signatures without any live operation. |
-| Launch and every partial acquisition | launch_matrix; runtime fault injection for allocation/fd/actions/fork/exec boundaries; external observer detects any unreaped child or leaked fd. Actual exit127 differs from exec failure; stopped-before-exec timed launches, zero/short/exact/excess error frames and signal-mask restoration cover both paths. |
+| Launch and every partial acquisition | launch_matrix; runtime fault injection for allocation/fd/actions/fork/exec boundaries; external observer detects any unreaped child or leaked fd. Actual exit127 differs from exec failure; zero/short/exact/excess error frames and signal-mask restoration cover both paths; stopped-before-exec timed launches reach timeout cleanup on the macOS timed fork path, while on Linux a pre-exec stall is outside the budget and holds no runtime lock (vfork_wait_holds_no_creation_lock). |
 | Move-in/out, nulling, Drop, replacement and return | owned_control_flow through structs/sums/Option/Result, helpers and allowed arrays, both compilation modes, positive native lifetime witnesses and omitted-Drop negative controls. |
 | if/match/else/?/map_err, joins, loops, early exits | Same owned_control_flow owner; terminating eager arguments never call native code or invalidate a live receiver. |
 | Dual output, caller-buffer bounds, EOF, EINTR | pipe_matrix and wait_under_pipe_pressure; simultaneous full pipes, one-byte reads, destination canaries, zero/absent buffer, readonly literal/mmap/shared-borrow origins, aliased destination, forged writable HIR, readable bytes after reap, pending wait rejection. |
