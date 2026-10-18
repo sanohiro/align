@@ -14609,8 +14609,8 @@ fn infer_return_provenance(program: &mut Program) -> BorrowMutRetentionMap {
             indirect_parallel_changed |= parallel_changed || access_changed || callback_changed;
             named_callback_contracts.insert(function.name.clone(), callback_contract);
             if callback_changed {
-                for caller in 0..function_count {
-                    if !queued[caller] { queued[caller] = true; worklist.push_back(caller); }
+                for (caller, is_queued) in queued.iter_mut().enumerate() {
+                    if !*is_queued { *is_queued = true; worklist.push_back(caller); }
                 }
             }
             named_mutable_access.insert(function.name.clone(), access_summary);

@@ -967,8 +967,8 @@ mod tests {
     fn golden_vector_semantic_to_byte() {
         assert_eq!(
             align_interface::FORMAT_VERSION,
-            20,
-            "the golden vector transcribes frontend_schema = 20; re-transcribe it if the interface \
+            21,
+            "the golden vector transcribes frontend_schema = 21; re-transcribe it if the interface \
              codec version moves"
         );
         let prefix = from_hex(GOLDEN_PREFIX_HEX);
