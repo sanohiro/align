@@ -138,6 +138,11 @@ fn start(command: &Command) -> Result<Box<Scope>, i32> {
     }
     #[cfg(target_os = "linux")]
     {
+        // Refuse an unsupported glibc before arming the subreaper or scope mode.
+        #[cfg(target_env = "gnu")]
+        if !super::process_launch::shared_clone_supported() {
+            return Err(status(libc::ENOSYS));
+        }
         let mut state = super::process_launch::creation();
         if state.scope || state.children != 0 {
             return Err(AL_INVALID);
