@@ -8707,7 +8707,13 @@ fn hir_body_validator_task_record_results() {
         Ty::Unit,
     ));
     assert!(body_core_metadata_is_valid(&placement));
-    for field in [Ty::Str, Ty::String, Ty::Raw, Ty::Array(Scalar::Str, 0), Ty::Struct(0)] {
+    // Owned fields now form valid task payloads; the constructor mismatch above still rejects.
+    for field in [Ty::String, Ty::Buffer, Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))] {
+        let mut owned = placement.clone();
+        owned.structs[0].fields[0].ty = field;
+        assert!(body_core_metadata_is_valid(&owned), "owned task local graph {field:?}");
+    }
+    for field in [Ty::Str, Ty::Raw, Ty::Array(Scalar::Str, 0), Ty::Struct(0)] {
         let mut invalid = placement.clone();
         invalid.structs[0].fields[0].ty = field;
         assert!(!body_core_metadata_is_valid(&invalid), "task local graph {field:?}");

@@ -21,9 +21,12 @@ sequential output, warms both arms, and times one complete arm. Timing includes
 output allocation, computation, join and ordered assembly; input creation,
 parity checks, checksum and printing are outside the interval. Samples alternate
 arm order. The script reports every sample, output length/checksum, host, CPU
-count and exact compiler hash. Temporary native artifacts are removed even on
-failure; compiler/native diagnostics survive in the raised error. Each subprocess
-has a 60-second limit and owns a process group. No timing threshold runs in CI;
+count and exact compiler hash. The shared `native_probe` supervisor retires each complete process group on
+success, failure, timeout and HUP/INT/TERM, then removes temporary native artifacts.
+A failed child retirement preserves scratch and reports its path; diagnostics
+inherit stderr. Each subprocess has a 60-second budget.
+`python3 bench/task_owned_results/test_run.py` checks both entrypoint phases with
+actual signal-resistant descendants and already-exited leaders. No timing threshold runs in CI;
 `task_owned_bands_match_every_sequential_byte` is the whole/per-unit correctness
 owner. Consumer adoption and `test-vision-prepare` remain separate.
 
@@ -32,3 +35,7 @@ On 2026-10-18, the 8-core Apple M1 measured a **4.03x median speedup** for
 samples per arm. [The measurement record](measurement-20261018.json) retains
 every sample, host/compiler identity and workload source hashes. This is the
 provider kernel above; no consumer resize implementation was changed.
+
+The recorded `run.py` hash identifies the original successful measurement. The
+subsequent review fix replaced only the Python child-process supervisor; kernel,
+generated-program source and measured scope are unchanged.
