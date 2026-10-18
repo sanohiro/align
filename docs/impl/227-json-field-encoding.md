@@ -31,7 +31,7 @@ The web/ws v0.10.2 release is verified; this capability preserves its callback a
 | Whole/per-unit/generic/cache | `json_field_encode::owned_sources_keep_distinct_eager_identity` covers local/field/shared-projection roots, record/AoS schemas and every encoder pair inside equality and consuming call arguments. No transient expression address may enter eager memoization. `json_field_encode::imported_generic_field_whole_per_unit_cache` uses concrete generic record fields and imported shared helpers, cold/hit execution and byte equality. No consumer code/pin/test is edited. |
 | Compiler sweep and malformed producer | Update all JsonEncode construction, clone/remap/canonical consumers and body walkers; path is data, not an unvisited expression. Existing MIR typed JSON pieces authenticate their selected operand/graph and prohibit ownership laundering. Retain `align_mir::tests::owned_json_encoders_use_stack_safe_dispatch`; extend `producer::tests::producer_json_borrowed_root_requires_initialized_exact_place` with field-selected shared-match sources; `validate_hir_tests::json_field_source_and_piece_identity_matrix` supplies malformed borrowed-source twins. Retain `r63_json_sequence_is_checked_by_every_body_emitter` and `malformed_borrowed_place_type_fails_before_llvm_call_emission` as existing MIR/LLVM authority; add a field-selected operand mutation to the former only if its current cases cannot discriminate the new route. |
 | Fixed-array formation and addressing | Preserve the existing initialized-slot lowering. `json_field_encode::borrowed_fixed_record_array_field_matrix` covers local records, shared parameters and Copy match payloads, including a sibling admissible Move payload, nested element fields, both encoders and whole/per-unit native execution. Retain formation negatives for shared Move payloads containing fixed arrays in Option, Result and user sums. The unchanged checked-HIR borrowed-binding validator independently enforces that formation boundary. `producer::tests::fixed_record_field_slice_producer_matrix` closes exact initialized root/path/type/length and nested element ownership forwarding. |
-| Existing family | Run `m5_json_bounded`, `mixed_json`, and `client_admission_composition` focused JSON source/reservation/cleanup owners alongside new `json_field_encode`. Existing descriptor/runtime ABI owners need no rerun unless their production code changes. |
+| Existing family and diagnostic parity | Run `m5_owned_json`, `m5_json_bounded`, `mixed_json`, and `client_admission_composition` focused JSON source/reservation/cleanup owners alongside new `json_field_encode`. The existing `m5_owned_json::owned_json_encoders_reject_moved_sources` owns both encoders, string/record-array payloads, whole/field moves, branches, loops and Option extraction in whole/per-unit compilation. Live-source twins must pass with the same valid imported schema; moved local roots retain the ordinary moved-value diagnostic, while selected-field failures identify the JSON source. Existing descriptor/runtime ABI owners need no rerun unless their production code changes. |
 
 Author extraction must bind every unchanged claim to current code before the
 fresh strategy inspection. In particular fixed record arrays are valid record
@@ -97,3 +97,17 @@ source expressions persist in checked HIR and are unaffected. The parameterized
 eager-identity owner covers both encoders, all source positions, record/AoS routes,
 equality and consuming arguments in whole/per-unit native execution. No ownership
 or source-domain strategy changes. The review found no other P1/P2 issue.
+
+## Reopened axis: existing local-source diagnostic parity
+
+The first PR CI exposed an omitted existing-family owner: `m5_owned_json`
+was not in the local owner bundle. Moved local roots were still rejected, but
+the source-place extension had unnecessarily replaced their established
+diagnostic. Restore the local diagnostic without changing move predicates or
+reservation order. The existing matrix above now explicitly includes this
+owner for both encoders and all its control-flow/move cases. Its imported
+schema also needs the required module declaration; live-source twins prevent
+unrelated import errors from masking a malformed negative fixture. The complete
+owned-JSON target and the new field target run locally before the next push.
+This closes the missing existing-source axis without widening the capability,
+changing its ownership strategy, or treating CI as the normal discovery loop.

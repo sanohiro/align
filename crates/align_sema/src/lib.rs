@@ -49866,7 +49866,12 @@ impl<'a> MoveCheck<'a> {
                 if unavailable {
                     let name = self.f.locals.get(*base as usize)
                         .map_or("<unknown>", |local| local.name.as_str());
-                    self.diags.error(format!("use of moved JSON source in '{name}'"), e.span);
+                    let message = if source.path.is_empty() {
+                        format!("use of moved value '{name}'")
+                    } else {
+                        format!("use of moved JSON source in '{name}'")
+                    };
+                    self.diags.error(message, e.span);
                 } else if source.path.is_empty() {
                     self.check_borrow_use(*base, e.span);
                 } else {
