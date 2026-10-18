@@ -1167,6 +1167,15 @@ Malformed UTF-8/strings, other JSON shapes and trailing input return
 outlive input/arena; views of it retain its owner's lifetime. Bare `str` and
 `char` remain separate. Plan203 owns exact validation, publication and cleanup.
 
+**Stable field sources (AM-R11).** Both encoders accept a named local or a nested
+record-field path rooted in one, including already-admitted shared parameters
+and match bindings. Only the selected type must satisfy the existing complete
+JSON schema; nonselected fields do not participate. The call borrows that place
+without moving or cloning it and returns an independent owned string. The eager
+byte limit conservatively reserves the enclosing root and transitive backing
+through completion. Temporaries, indexed roots and existing schema/payload
+exclusions remain unchanged. Plan227 owns exact source identity and validation.
+
 **Dynamic array roots (R87).** Both encoders borrow a dynamic array using the same
 existing element grammar as its JSON record field: supported integers, floats,
 bool, str, string, and accepted AoS record schemas. Root bytes equal the embedded

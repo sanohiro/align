@@ -117,9 +117,12 @@ fn main() -> Result<(), Error> {
 #[test]
 fn owned_json_encoders_reject_moved_sources() {
     let declarations =
-        "pub Item { text: string }\npub Row<T> { value: T, name: string, count: Option<i64> }\n";
+        "module schema\npub Item { text: string }\npub Row<T> { value: T, name: string, count: Option<i64> }\n";
     for encoder in ["json.encode(row)?", "json.encode_bounded(row, 1024)"] {
         for (payload, input, action) in [
+            // Live twins prove the schema and import are valid before testing moves.
+            ("string", "\"one\"", ""),
+            ("array<schema.Item>", "[{\"text\":\"one\"}]", ""),
             ("string", "\"one\"", "taken := row"),
             ("string", "\"one\"", "taken := row.name"),
             (
@@ -152,6 +155,15 @@ fn owned_json_encoders_reject_moved_sources() {
                 &[("main.align", &source), ("schema.align", declarations)],
                 "main.align",
             );
+            if action.is_empty() {
+                assert!(
+                    !checked.whole_errors && !checked.per_unit_errors,
+                    "live {payload} must encode: whole:\n{}\nper-unit:\n{}",
+                    checked.whole_diags,
+                    checked.per_unit_diags
+                );
+                continue;
+            }
             for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
                 assert!(
                     diagnostics.contains("use of moved value 'row'"),

@@ -13,6 +13,24 @@ types are carried by **inference, never a written type argument** (settled: Alig
 expression-position type-argument syntax / no turbofish). Requires `import core.json` (the
 capability-header rule applies to core.json exactly like std modules).
 
+## Stable encoder sources
+
+`json.encode(value)` and `json.encode_bounded(value, max_bytes)` accept a named
+local or a nested record-field path rooted in one, including already-admitted
+shared parameters and match bindings. The selected type passes the same complete
+schema predicate as a local; nonselected fields may be unencodable owners.
+The selected field stays borrowed, reusable and subject to ordinary move/lifetime
+checks. Output is an independent owned string, including inside arenas. No input
+copy, temporary owner or descriptor allocation is introduced.
+
+The eager exact-i64 limit runs once after source/schema checking and conservatively
+reserves the complete enclosing root and transitive backing through completion;
+mutation of an unrelated sibling during that evaluation remains rejected. Earlier
+independent sibling moves follow ordinary partial-move rules. Error precedence,
+exact-fit caps, canonical bytes and failure cleanup are unchanged. Temporary and
+indexed roots, existing schema exclusions and shared Move payloads containing
+fixed arrays remain excluded. Plan227 records the exact checked source identity.
+
 ## Escaped strings (Request 7)
 
 Typed JSON accepts the RFC 8259 string grammar on every string token: declared and undeclared
@@ -263,7 +281,7 @@ element struct's sub-schema), decoding into an owned AoS the enum's tag-switched
 writes it as a bare JSON array. The full `Content { Text(str), Parts(array<Part>) }` round-trips. The
 element struct must be non-owned (Slice-C rule; `array<string>` / `array<Move-struct>` deferred), and
 an `array<scalar>` union payload has no descriptor arm yet (J3). `json.encode` of a top-level union
-needs a local binding (like struct encode). **Union as a struct field (J1b-2b / J3a, SHIPPED):** a struct field may be a union
+needs a local binding or stable record-field path (like struct encode). **Union as a struct field (J1b-2b / J3a, SHIPPED):** a struct field may be a union
 (`Message { content: Content }`) — a descriptor **kind 6** whose `sub` is the `JsonUnion` (reused for
 both decode and encode); `field_width`/`write_value` (all decode paths — slow + Mison speculative +
 fallback) and `json_encode_value` grow a kind-6 arm, so a union field composes with nested structs,

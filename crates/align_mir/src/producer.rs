@@ -4114,6 +4114,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                             || align_sema::fixed_owned_header_scalar(scalar_to_ty(element)).is_some())
                             && u32::try_from(length) == Ok(actual)
                     }
+                    (Ty::StructArray(id, actual), Ty::Slice(Scalar::Struct(view))) => {
+                        xml_source_ty_matches(self.graph.program, Ty::Struct(id), Ty::Struct(view))
+                            && u32::try_from(length) == Ok(actual)
+                    }
                     _ => false,
                 };
                 if fields.is_empty() || !view_matches {
@@ -4130,11 +4134,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         OperandRequirement::READ,
                     );
                     equation.seed = Some(XmlAccessProvenance::Shared);
-                } else if path.as_slice() == [XmlAccessPathSegment::Element]
-                    && xml_inline_array_element(self.graph.program, field_ty) == Some(selected_ty)
-                {
+                } else if let Some(remaining) = path.strip_prefix(&[XmlAccessPathSegment::Element]) {
                     let mut source_path = field_path;
                     source_path.push(XmlAccessPathSegment::Element);
+                    source_path.extend_from_slice(remaining);
+                    if !xml_selected_ty(self.graph.program, slot_ty, &source_path)
+                        .is_some_and(|source| xml_source_ty_matches(self.graph.program, source, selected_ty))
+                    {
+                        equation.invalid = true;
+                        return equation;
+                    }
                     Self::add_source(
                         &mut equation,
                         self.queue(XmlAccessNode::Slot(slot, source_path)),
@@ -13603,8 +13612,48 @@ mod tests {
     }
 
     #[test]
+    fn fixed_record_field_slice_producer_matrix() -> Result<(), Box<dyn std::error::Error>> {
+        let source = r#"import core.json
+Leaf {value:i64}
+Row {leaf:Leaf}
+Holder {rows:[Row;2]}
+fn encode(borrow input:Holder)->Result<string,Error> = json.encode(input.rows)
+fn main() {}
+"#;
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+        let program = crate::lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?;
+        validate_mir_producers(&program)?;
+        for mutation in 0..5 {
+            let mut bad = program.clone();
+            let function = bad.fns.iter_mut().find(|f| f.name.as_str() == "encode").ok_or("encode fixture")?;
+            let empty = u32::try_from(function.slots.len())?;
+            function.slots.push(function.slots[function.params[0] as usize]);
+            function.slot_align.push(None);
+            let (value, slot, path, length) = function.blocks.iter_mut()
+                .flat_map(|block| &mut block.stmts).find_map(|statement| match statement {
+                    Stmt::Let(value, Rvalue::MakeFieldSlice(slot, path, length)) => Some((*value, slot, path, length)),
+                    _ => None,
+                }).ok_or("fixed field slice")?;
+            match mutation {
+                0 => *slot = empty,
+                1 => path.push(u32::MAX),
+                2 => path.clear(),
+                3 => *length += 1,
+                _ => function.value_tys[value as usize] = Ty::Slice(Scalar::Bool),
+            }
+            assert!(validate_mir_producers(&bad).is_err(), "mutation {mutation}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn producer_json_borrowed_root_requires_initialized_exact_place() -> Result<(), &'static str> {
         for array in [false, true] {
+        for field in [false, true] {
         let source = r#"import core.json
 Record { text: string }
 Carrier { record: Option<Record> }
@@ -13614,6 +13663,12 @@ fn encode(borrow input: Carrier) -> Result<string, Error> {
 fn main() {}
 "#;
         let source = if array { source.replace("Option<Record>", "Option<array<Record>>") } else { source.to_owned() };
+        let source = if field {
+            let ty = if array { "array<Record>" } else { "Record" };
+            source.replace(&format!("Option<{ty}>"), "Option<Selected>")
+                .replace("Carrier { record:", &format!("Selected {{ selected:{ty} }}\nCarrier {{ record:"))
+                .replace("json.encode(value)", "json.encode(value.selected)")
+        } else { source };
         let mut diagnostics = align_diag::Diagnostics::new();
         let tokens = align_lexer::tokenize(0, &source, &mut diagnostics);
         let ast = align_parser::parse_file(tokens, &mut diagnostics);
@@ -13651,6 +13706,7 @@ fn main() {}
             }
             assert!(changed, "owner must mutate the actual JSON projection");
             assert!(validate_mir_producers(&malformed).is_err(), "accepted mutation {mutation}");
+        }
         }
         }
         Ok(())

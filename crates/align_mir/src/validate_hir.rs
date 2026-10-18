@@ -3324,9 +3324,9 @@ impl<'a> LocalScopeValidator<'a> {
             | hir::ExprKind::Field { root: local, .. }
             | hir::ExprKind::SoaColumn { base: local, .. }
             | hir::ExprKind::IndexField { base: local, .. }
-            | hir::ExprKind::JsonEncode { base: local, plan: align_sema::hir::JsonEncodePlan::Pieces(_), .. }
-            | hir::ExprKind::JsonEncode { base: local, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. }
-            | hir::ExprKind::JsonEncode { base: local, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(_), .. }
+            | hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: local, .. }, plan: align_sema::hir::JsonEncodePlan::Pieces(_), .. }
+            | hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: local, .. }, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. }
+            | hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: local, .. }, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: Some(_), .. }
             | hir::ExprKind::ArrayGroupAgg { base: local, .. }
             | hir::ExprKind::ArrayGroupAggMulti { base: local, .. }
             | hir::ExprKind::ArrayDictEncode { base: local, .. }
@@ -4680,14 +4680,14 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Template(parts) => {
                 !parts.is_empty() && self.template_parts_envelope_ok(parts)
             }
-            hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None } => {
-                self.owned_json_source_ok(*base, plan, context)
+            hir::ExprKind::JsonEncode { source, plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None } => {
+                self.owned_json_source_ok(source, plan, context)
             }
             hir::ExprKind::JsonEncode { plan: align_sema::hir::JsonEncodePlan::Pieces(parts), .. } => {
                 !parts.is_empty() && self.json_encode_parts_envelope_ok(parts)
             }
-            hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(_), .. } => {
-                self.owned_json_source_ok(*base, plan, context)
+            hir::ExprKind::JsonEncode { source, plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(_), .. } => {
+                self.owned_json_source_ok(source, plan, context)
             }
             hir::ExprKind::JsonDecode { struct_id, .. }
             | hir::ExprKind::JsonDecodeStructArray { struct_id, .. }
@@ -6055,15 +6055,32 @@ impl<'a> BodyValidator<'a> {
             }
     }
 
+    fn json_encode_source_ty(&self, source: &hir::JsonEncodeSource, context: &BodyContext) -> Option<Ty> {
+        if !self.local_ok(context, source.root) { return None; }
+        let mut ty = self.local_type(context, source.root)?;
+        for field in &source.path {
+            let Ty::Struct(id) = ty else { return None; };
+            ty = self.program.structs.get(id as usize)?.fields.get(*field as usize)?.ty;
+        }
+        Some(ty)
+    }
+
+    fn json_source_access_matches(expression: &hir::Expr, source: &hir::JsonEncodeSource) -> bool {
+        match &expression.kind {
+            hir::ExprKind::Local(local) => source.path.is_empty() && *local == source.root,
+            hir::ExprKind::Field { root, path } => !source.path.is_empty() && *root == source.root && *path == source.path,
+            _ => false,
+        }
+    }
+
     fn owned_json_source_ok(
         &self,
-        base: hir::LocalId,
+        source: &hir::JsonEncodeSource,
         plan: &hir::OwnedJsonGraphPlanV4,
         context: &BodyContext,
     ) -> bool {
-        self.local_ok(context, base)
-            && matches!(self.local_type(context, base),
-                Some(Ty::Struct(id) | Ty::DynStructArray(id, align_sema::Layout::Aos)) if id == plan.root)
+        matches!(self.json_encode_source_ty(source, context),
+            Some(Ty::Struct(id) | Ty::DynStructArray(id, align_sema::Layout::Aos)) if id == plan.root)
             && self.owned_json_plan_ok(plan)
     }
 
@@ -11467,10 +11484,10 @@ impl<'a> BodyValidator<'a> {
                 if !parts.iter().all(|part| matches!(part, hir::TemplatePart::Text(_) | hir::TemplatePart::Hole(_))) { return None; }
                 self.derive_template_expression(parts, context)
             },
-            hir::ExprKind::JsonEncode { base, plan, max_bytes } => {
+            hir::ExprKind::JsonEncode { source, plan, max_bytes } => {
                 let (template_ty, template_falls, template_breaks) = match plan {
-                    hir::JsonEncodePlan::Pieces(parts) => self.derive_json_encode_expression(*base, parts, context)?,
-                    hir::JsonEncodePlan::Owned(plan) => self.derive_owned_json_encode_expression(*base, plan, context)?,
+                    hir::JsonEncodePlan::Pieces(parts) => self.derive_json_encode_expression(source, parts, context)?,
+                    hir::JsonEncodePlan::Owned(plan) => self.derive_owned_json_encode_expression(source, plan, context)?,
                 };
                 if template_ty != Ty::Str { return None; }
                 let mut flows = vec![BodyFlow { ty: template_ty, falls: template_falls, breaks: template_breaks }];
@@ -11814,7 +11831,7 @@ impl<'a> BodyValidator<'a> {
     /// substitutions are not sufficient: they could pair one JSON key with another field's value.
     fn json_encode_parts_match_source(
         &self,
-        base: hir::LocalId,
+        source: &hir::JsonEncodeSource,
         parts: &[hir::TemplatePart],
         context: &BodyContext,
     ) -> bool {
@@ -11845,50 +11862,46 @@ impl<'a> BodyValidator<'a> {
         }
 
         fn access_matches(
-            validator: &BodyValidator<'_>,
-            expression: &hir::Expr,
-            base: hir::LocalId,
-            elem: Option<u32>,
-            path: &[u32],
-            ty: Ty,
+            validator: &BodyValidator<'_>, expression: &hir::Expr,
+            source: &hir::JsonEncodeSource, source_ty: Ty,
+            elem: Option<u32>, path: &[u32], ty: Ty,
         ) -> bool {
-            validator.body_ty_matches(expression.ty, ty)
-                && match (&expression.kind, elem) {
-                    (hir::ExprKind::Field { root, path: actual }, None) => {
-                        *root == base && actual == path
-                    }
-                    (
-                        hir::ExprKind::IndexField {
-                            base: actual_base,
-                            index,
-                            path: actual,
-                        },
-                        Some(expected_index),
-                    ) => *actual_base == base && *index == expected_index && actual == path,
-                    _ => false,
-                }
+            validator.body_ty_matches(expression.ty, ty) && match (&expression.kind, elem) {
+                (hir::ExprKind::Field { root, path: actual }, None) =>
+                    *root == source.root && actual.iter().copied().eq(source.path.iter().chain(path).copied()),
+                (hir::ExprKind::IndexField { base, index, path: actual }, Some(expected)) =>
+                    source.path.is_empty() && *base == source.root && *index == expected && actual == path,
+                (hir::ExprKind::ElemField { recv, index, path: actual, struct_id }, Some(expected)) =>
+                    !source.path.is_empty() && BodyValidator::json_source_access_matches(recv, source)
+                    && validator.body_ty_matches(recv.ty, source_ty)
+                    && matches!(source_ty, Ty::StructArray(id, len) if id == *struct_id && expected < len)
+                    && index.ty == i64_ty() && matches!(index.kind, hir::ExprKind::Int(value) if value == i128::from(expected))
+                    && actual == path,
+                _ => false,
+            }
         }
 
         fn expected_matches(
             validator: &BodyValidator<'_>,
             expected: Expected,
             actual: &hir::TemplatePart,
-            base: hir::LocalId,
+            source: &hir::JsonEncodeSource,
+            source_ty: Ty,
         ) -> bool {
             match (expected, actual) {
                 (Expected::Text(expected), hir::TemplatePart::Text(actual)) => expected == *actual,
                 (Expected::Hole { elem, path, ty }, hir::TemplatePart::Hole(expression)) => {
-                    access_matches(validator, expression, base, elem, &path, ty)
+                    access_matches(validator, expression, source, source_ty, elem, &path, ty)
                 }
                 (Expected::JsonStr { elem, path }, hir::TemplatePart::JsonStr(expression)) => {
-                    access_matches(validator, expression, base, elem, &path, Ty::Str)
+                    access_matches(validator, expression, source, source_ty, elem, &path, Ty::Str)
                 }
                 (
                     Expected::OptionField { elem, path, name, ty },
                     hir::TemplatePart::OptionField { access, name: actual_name },
                 ) => {
                     name == *actual_name
-                        && access_matches(validator, access, base, elem, &path, ty)
+                        && access_matches(validator, access, source, source_ty, elem, &path, ty)
                 }
                 (
                     Expected::OptionStructField { elem, path, name, struct_id },
@@ -11903,7 +11916,7 @@ impl<'a> BodyValidator<'a> {
                         && access_matches(
                             validator,
                             access,
-                            base,
+                            source, source_ty,
                             elem,
                             &path,
                             Ty::Option(Scalar::Struct(struct_id)),
@@ -11915,7 +11928,7 @@ impl<'a> BodyValidator<'a> {
                     hir::TemplatePart::StructArrayField { access, struct_id: actual_id },
                 ) => {
                     struct_id == *actual_id
-                        && access_matches(validator, access, base, elem, &path, ty)
+                        && access_matches(validator, access, source, source_ty, elem, &path, ty)
                 }
                 (
                     Expected::ScalarArrayField { elem, path, scalar },
@@ -11925,7 +11938,7 @@ impl<'a> BodyValidator<'a> {
                         && access_matches(
                             validator,
                             access,
-                            base,
+                            source, source_ty,
                             elem,
                             &path,
                             Ty::DynArray(scalar),
@@ -11939,7 +11952,7 @@ impl<'a> BodyValidator<'a> {
                         && access_matches(
                             validator,
                             access,
-                            base,
+                            source, source_ty,
                             elem,
                             &path,
                             Ty::Enum(enum_id),
@@ -11951,26 +11964,26 @@ impl<'a> BodyValidator<'a> {
                 ) => {
                     enum_id == *actual
                         && access.ty == Ty::Enum(enum_id)
-                        && matches!(access.kind, hir::ExprKind::Local(local) if local == base)
+                        && BodyValidator::json_source_access_matches(access, source)
                 }
                 _ => false,
             }
         }
 
-        let Some(root) = self.local_type(context, base) else {
+        let Some(root) = self.json_encode_source_ty(source, context) else {
             return false;
         };
         match root {
             Ty::DynStructArray(id, align_sema::Layout::Aos) => {
                 return matches!(parts, [hir::TemplatePart::StructArrayField { access, struct_id }]
                     if *struct_id == id && self.body_ty_matches(access.ty, root)
-                    && matches!(access.kind, hir::ExprKind::Local(local) if local == base));
+                    && BodyValidator::json_source_access_matches(access, source));
             }
             Ty::DynArray(element) => {
                 return align_sema::json_encode_array_element(element)
                     && matches!(parts, [hir::TemplatePart::ScalarArrayField { access, elem }]
                         if self.body_scalar_matches(*elem, element) && self.body_ty_matches(access.ty, root)
-                        && matches!(access.kind, hir::ExprKind::Local(local) if local == base));
+                        && BodyValidator::json_source_access_matches(access, source));
             }
             _ => {}
         }
@@ -11987,7 +12000,7 @@ impl<'a> BodyValidator<'a> {
                     let Some(actual) = parts.get(part) else {
                         return false;
                     };
-                    if !expected_matches(self, expected, actual, base) {
+                    if !expected_matches(self, expected, actual, source, root) {
                         return false;
                     }
                     part += 1;
@@ -12120,12 +12133,12 @@ impl<'a> BodyValidator<'a> {
 
     fn derive_json_encode_expression(
         &self,
-        base: hir::LocalId,
+        source: &hir::JsonEncodeSource,
         parts: &[hir::TemplatePart],
         context: &BodyContext,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
         if !Self::json_encode_parts_syntax_ok(parts)
-            || !self.json_encode_parts_match_source(base, parts, context)
+            || !self.json_encode_parts_match_source(source, parts, context)
         {
             return None;
         }
@@ -12214,11 +12227,11 @@ impl<'a> BodyValidator<'a> {
 
     fn derive_owned_json_encode_expression(
         &self,
-        base: hir::LocalId,
+        source: &hir::JsonEncodeSource,
         plan: &hir::OwnedJsonGraphPlanV4,
         context: &BodyContext,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
-        if !self.owned_json_source_ok(base, plan, context) {
+        if !self.owned_json_source_ok(source, plan, context) {
             return None;
         }
         Some((Ty::Str, true, Vec::new()))

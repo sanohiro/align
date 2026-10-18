@@ -11964,7 +11964,7 @@ fn hir_body_validator_pipeline_template_json_group() {
         "b2b2_json_encode_bounded",
         vec![local(0, "record", Ty::Struct(0))],
         body_test_expr(
-            hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Pieces(vec![
+            hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: 0, path: Vec::new() }, plan: align_sema::hir::JsonEncodePlan::Pieces(vec![
                     hir::TemplatePart::Text("{".to_string()),
                     hir::TemplatePart::Text("\"key\":".to_string()),
                     hir::TemplatePart::JsonStr(body_test_expr(
@@ -12384,10 +12384,10 @@ fn hir_body_validator_pipeline_template_json_group() {
 
     let mut reject = program.clone();
     let expression = body_value_expression_mut(&mut reject, "b2b2_json_encode_bounded");
-    let hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Pieces(_), .. } = &mut expression.kind else {
+    let hir::ExprKind::JsonEncode { source, plan: align_sema::hir::JsonEncodePlan::Pieces(_), .. } = &mut expression.kind else {
         panic!("bounded encoder fixture lost its discriminator")
     };
-    *base = u32::MAX;
+    source.root = u32::MAX;
     assert!(!body_core_metadata_is_valid(&reject));
 
     let mut reject = program.clone();
@@ -12641,10 +12641,10 @@ fn main() -> i32 = 0
 
     assert_owned_json_body_mutation(&base, "owned-encode-unknown-base", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
-        let hir::ExprKind::JsonEncode { base, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } = &mut expression.kind else {
+        let hir::ExprKind::JsonEncode { source, plan: align_sema::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } = &mut expression.kind else {
             panic!("owned encode fixture lost its discriminator")
         };
-        *base = u32::MAX;
+        source.root = u32::MAX;
     });
     assert_owned_json_body_mutation(&base, "owned-encode-empty-plan", |program| {
         let expression = body_first_let_init_mut(program, "owned_encode");
@@ -20334,10 +20334,10 @@ fn json_array_root_checked_hir_requires_exact_source_and_element() {
         for mutation in 0..4 {
             assert_owned_json_body_mutation(&base, "array-root-source", |program| {
                 let expression = body_first_let_init_mut(program, "encode");
-                let hir::ExprKind::JsonEncode { base, plan: hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
+                let hir::ExprKind::JsonEncode { source, plan: hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else {
                     panic!("array root fixture plan")
                 };
-                if mutation == 0 { *base = u32::MAX; return; }
+                if mutation == 0 { source.root = u32::MAX; return; }
                 if mutation == 1 { parts.insert(0, hir::TemplatePart::Text("[".to_owned())); return; }
                 match &mut parts[0] {
                     hir::TemplatePart::ScalarArrayField { access, elem } => {
@@ -21459,6 +21459,71 @@ fn builder_copy_read_hir_matrix() -> Result<(), &'static str> {
             assert_body_entrypoints_empty(&format!("builder-copy-read-{element}-{mutation}"), &bad);
             discard(&mut bad)?;
             assert_body_entrypoints_empty(&format!("discarded-builder-copy-read-{element}-{mutation}"), &bad);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn json_field_source_and_piece_identity_matrix() -> Result<(), Box<dyn std::error::Error>> {
+    for (declarations, selected) in [
+        ("", "array<i64>"),
+        ("Row { value:i64 }", "Row"),
+        ("Row { value:string }", "Row"),
+        ("Row { value:i64 }", "[Row;2]"),
+        ("Choice { Number(i64), Text(str) }", "Choice"),
+    ] {
+        for bounded in [false, true] {
+            let call = if bounded { "json.encode_bounded(input.nested.selected,100)" } else { "json.encode(input.nested.selected)" };
+            let text = format!("import core.json\n{declarations}\nInner {{ selected:{selected}, sibling:{selected} }}\nOuter {{ nested:Inner, owner:buffer }}\nfn encode(borrow input:Outer)->Result<string,Error> {{ result:={call}\nresult }}\nfn main() {{}}\n");
+            let base = checked_source_program(&text);
+            assert!(body_core_metadata_is_valid(&base));
+            lower_program_checked(&base, false, None).map_err(|error| format!("{error:?}"))?;
+            if selected == "[Row;2]" {
+                for mutation in 0..3 {
+                    let mut bad = base.clone();
+                    let expression = body_first_let_init_mut(&mut bad, "encode");
+                    let hir::ExprKind::JsonEncode { plan: hir::JsonEncodePlan::Pieces(parts), .. } = &mut expression.kind else { return Err("fixed pieces".into()); };
+                    let access = parts.iter_mut().find_map(|part| match part {
+                        hir::TemplatePart::Hole(access) => Some(access), _ => None,
+                    }).ok_or("fixed piece")?;
+                    let hir::ExprKind::ElemField { index, path, struct_id, .. } = &mut access.kind else { return Err("fixed field access".into()); };
+                    match mutation {
+                        0 => index.kind = hir::ExprKind::Int(2),
+                        1 => path.push(u32::MAX),
+                        _ => *struct_id = u32::MAX,
+                    }
+                    assert!(!body_core_metadata_is_valid(&bad), "fixed piece {mutation}");
+                    assert!(lower_program_checked(&bad, false, None).is_err());
+                }
+            }
+            for mutation in 0..7 {
+                let mut bad = base.clone();
+                let expression = body_first_let_init_mut(&mut bad, "encode");
+                let hir::ExprKind::JsonEncode { source, plan, max_bytes } = &mut expression.kind else {
+                    return Err("JSON field fixture".into());
+                };
+                match mutation {
+                    0 => source.root = u32::MAX,
+                    1 => source.path.push(u32::MAX),
+                    2 => source.path.clear(),
+                    3 => expression.ty = Ty::Bool,
+                    4 => match plan {
+                        hir::JsonEncodePlan::Pieces(parts) => parts.push(hir::TemplatePart::Text(" ".to_owned())),
+                        hir::JsonEncodePlan::Owned(plan) => plan.root = u32::MAX,
+                    },
+                    5 => match plan {
+                        hir::JsonEncodePlan::Pieces(_) => *source.path.last_mut().ok_or("source path")? = 1,
+                        hir::JsonEncodePlan::Owned(plan) => plan.records.clear(),
+                    },
+                    _ => {
+                        if let Some(limit) = max_bytes { limit.ty = Ty::Bool; }
+                        else { source.path.insert(0, 1); }
+                    }
+                }
+                assert!(!body_core_metadata_is_valid(&bad), "{selected} bounded={bounded} mutation={mutation}");
+                assert!(lower_program_checked(&bad, false, None).is_err());
+            }
         }
     }
     Ok(())
