@@ -25,6 +25,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan224](docs/impl/224-task-callback-access.md) restores `pkg.web` and `pkg.ws`
+  through producer-owned callback access requirements and return-flow facts.
+  Shared task writes remain rejected; interface21 preserves the proof across
+  unit/cache boundaries. Both packages rejoin the release cache corpus, and
+  WebSocket reset failures retain their native transport error on macOS.
+
 - [Plan223](docs/impl/223-copy-record-scan.md) composes prefix `scan` with Copy
   record inputs and independent Copy record accumulator arrays. Complete AoS
   prefix states retain ordinary allocation/cleanup; independent contents shed

@@ -20,33 +20,31 @@ independent Copy records without changing this scheduler/capture contract.
 | `wait()` / `wait()?` | Join every task registered since the preceding wait and read completion with an acquire edge. Preserve lowest-spawn-index error selection, ordinary-error all-task completion, empty-wait behavior, generation-specific success proofs, and repeated primitive `get()`. Completing a wait ends captured-backing protection even when its Result is Err; result-slot authorization still requires the existing success proof. New spawns establish new pending captures. |
 | Nested progress | Wait retains caller participation in claiming its own group's tasks, so nested groups and mixed task_group/par_map workloads do not require a free helper to finish their own pending work. No guarantee covers arbitrary user-created cross-task blocking cycles. Queued helpers after join must not touch freed environments/slots. |
 | Allocation and lifetime | Retain explicit group-region ownership of environments/slots and bounded process-pool ownership. Runtime bookkeeping may allocate per task/group; no zero-allocation or throughput promise. Registration while tasks run cannot relocate worker-observed task records or mutate shared arena metadata. Group end frees only after joining all live tasks. |
-| ABI / identity | Keep existing TgBegin/TgAlloc/TgRegister/TgWait/TgEnd symbols and C signatures; the opaque runtime layout may change. Compiler/runtime implementation hashes invalidate affected objects. The mandatory mutable-access record described below is producer-checked, replay-validated and serialized in interface format 18; an unavailable record never means no writes. No new source API, CLI flag, environment variable, package or digest format. |
+| ABI / identity | Keep existing TgBegin/TgAlloc/TgRegister/TgWait/TgEnd symbols and C signatures; the opaque runtime layout may change. Compiler/runtime implementation hashes invalidate affected objects. The mandatory mutable-access record described below is producer-checked, replay-validated and serialized in interface format 21; an unavailable record never means no writes. No new source API, CLI flag, environment variable, package or digest format. |
 | Ownership of the change | Sema owns capture lifetime/access refusal and wait coverage; MIR owns cleanup order; LLVM remains pure lowering; runtime owns publication, claiming and completion. `std.crypto` keeps the existing EVP SHA-256 contract and full input verification. |
 | Documentation | Synchronize draft.md §11, language-spec.md, design-notes.md, open-questions.md's structured-concurrency entry, guide/10-closures-and-parallelism.md and its Japanese mirror, plan11, and HIR/runtime ledgers. Synchronize the interface-format ledger and independent codec goldens. |
 
 ## Access record and pending storage authority
 
-`MutableAccessSummary = Option<Vec<MutableAccessRoot>>` records may-access effects
-on every reachable invocation path, including paths that later diverge or return
-an error. `MutableAccessRoot` has `Contained(u32)` and `Storage(u32)` variants;
-the index is the logical parameter position, including lifted captures after
-explicit parameters. `Some([])` proves no access to input backing; `None` is
-unavailable and conservatively reaches both kinds for every argument/environment.
-The record does not authorize exclusive captures or change general mutable-view
-admission. Explicit `borrow mut`/`out` access conflicts even for an empty callee
-write set. Direct, indirect, imported, generic, pipeline and error callbacks use
-the same action authority, once all eager arguments complete, even when the
-invocation itself cannot return. An argument that diverges prevents invocation.
+`MutableAccessSummary = Option<MutableAccessEffects>` records unconditional and
+conditional may-access effects on every reachable invocation path, including paths
+that later diverge or return an error. `MutableAccessRoot` retains `Contained(u32)`
+and `Storage(u32)` logical parameter positions, with lifted captures after explicit
+parameters. A present empty record proves no input access; None is unavailable.
+Explicit `borrow mut`/`out` conflicts even for an empty callee write set. Direct,
+indirect, imported, generic, pipeline and error callbacks use the same action
+authority after all eager arguments complete, including non-returning invocations.
+An argument that diverges prevents invocation.
 
-The format-18 function record inserts the optional access list immediately after
-`parallel_transfer_params`. The presence tag is u8 (0 unavailable, 1 present),
-followed when present by a u32-LE count and pairs of u8 kind (0 Contained,
-1 Storage) and u32-LE parameter index. Canonical order is kind then index;
-duplicates, unknown tags, out-of-range indices and records on generic templates
-are rejected. Concrete producers certify/replay the record; generic templates
-carry None and concrete instantiations recompute it. Codec encode/decode,
-function identity and checked-HIR replay include the record. Independent byte
-vectors and malformed controls own the exact field placement and rejection.
+[Plan224](224-task-callback-access.md) owns the exact conditional records, callback
+input requirements and returned callable-source mappings. It replaces the original
+format-18 access vector with direct/conditional rows in interface21 and places the
+optional callback contract immediately afterward. Concrete producers certify and
+replay both records; generic templates carry None and instances recompute them.
+Unproved callbacks retain conservative access. Read-only proof may permit shared
+callbacks without granting mutable authority over captured backing or immutable
+text. Taking a function value with requirements on its explicit callback-bearing
+parameters is rejected; direct calls discharge or forward those requirements.
 
 A captured function value also borrows its frame environment, including environments containing
 only scalar captures. That environment is distinct from each captured value: a nonserialized

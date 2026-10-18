@@ -57,12 +57,12 @@ installed real compiler with the warmed binary byte-for-byte, and requires
 packaged hits; a formula that rewrites or strips the compiler after warming
 cannot ship.
 
-The corpus is the byte-exact first-party `pkg.db`, `pkg.frame`,
-`pkg.auth`, `pkg.kv`, `pkg.csv`, `pkg.template`, and `pkg.s3` source at the
-release tag (21 package modules plus the generated entry). `pkg.web` and
-`pkg.ws` are excluded while the documented structured-task callback
-compatibility gap remains unresolved. Every selected unit must compile and
-produce the exact verified cache inventory; failures are not skipped.
+The corpus is the byte-exact first-party `pkg.web`, `pkg.frame`, `pkg.auth`,
+`pkg.db`, `pkg.kv`, `pkg.csv`, `pkg.ws`, `pkg.template`, and `pkg.s3` source at
+the release tag (29 package modules plus the generated entry). Plan224 restores
+web and WebSocket task callbacks and their complete cache graph after the
+v0.10.1 compatibility gap. Every selected unit must compile and produce the
+exact verified cache inventory; failures are not skipped.
 Those source trees remain separately vendored by
 users and are not added to compiler import search or to the release archive.
 Compiler-provided `core` and `std` imports have no file-backed compilation unit,

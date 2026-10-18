@@ -5148,9 +5148,9 @@ handling. Extern C declarations acquire
 no new authority. No new runtime ABI, source syntax, type ownership, allocation,
 Drop, or lifetime rule is introduced.
 
-Interface format20 retains format19 field order and replaces each mutable-retention
-row with a canonical bool byte followed by its root sequence. The field remains
-after `mutable_access`, which follows `parallel_transfer_params`: None is u8 0; Some is u8 1, outer u32 LE length,
+Interface format21 retains format20 mutable-retention rows: a canonical bool byte
+followed by its root sequence. The field follows `callback_contract`, after
+`mutable_access` and `parallel_transfer_params` (Plan224): None is u8 0; Some is u8 1, outer u32 LE length,
 then parameter-ordered rows of u8 bool (0/1), u32 LE root count, and
 (u8 tag, u32 LE ordinal) roots. Plan199 specifies rejection precedence and literal
 goldens. Unknown versions reject before records; there is no compatibility path.
@@ -5170,7 +5170,7 @@ ambient options, error variants exposed to Align programs, or platform APIs.
 Independent semantic-to-byte and byte-to-semantic vectors are authoritative in
 Plan199. Codec owners cover None, no parameters, empty rows, both root kinds,
 both flag values, malformed records and every truncated prefix. Full-interface
-owners cover format20 and changes to public roots or mutation flags.
+owners cover format21 and changes to public roots or mutation flags.
 
 ### Implementation closure matrix
 

@@ -19,7 +19,7 @@ use crate::{
 /// The interface-artifact format version. Bump on ANY encoding change; a bump invalidates every
 /// cached summary (an old version fails closed on read) and changes `interface_hash` (the version is
 /// part of the hashed surface).
-pub const FORMAT_VERSION: u32 = 20;
+pub const FORMAT_VERSION: u32 = 21;
 
 const MAX_TYPE_DEPTH: u32 = 128;
 
@@ -183,39 +183,126 @@ fn write_producer_certification(w: &mut Writer, value: crate::ProducerCertificat
     });
 }
 
-fn write_mutable_access(w: &mut Writer, summary: &align_sema::hir::MutableAccessSummary) {
-    use align_sema::hir::MutableAccessRoot;
-    match summary {
+fn write_callback_path(w: &mut Writer, path: &[align_sema::hir::CallbackProjection]) {
+    use align_sema::hir::CallbackProjection as P;
+    w.seq(path, |w, p| match p {
+        P::StructField(i) => { w.u8(0); w.u32(*i); }
+        P::TupleElement(i) => { w.u8(1); w.u32(*i); }
+        P::EnumPayload { variant, index } => { w.u8(2); w.u32(*variant); w.u32(*index); }
+        P::OptionSome => w.u8(3), P::ResultOk => w.u8(4), P::ResultErr => w.u8(5),
+        P::ArrayElement => w.u8(6),
+    });
+}
+fn read_callback_path(r: &mut Reader<'_>) -> Result<Vec<align_sema::hir::CallbackProjection>, DecodeError> {
+    use align_sema::hir::CallbackProjection as P;
+    r.seq(|r| Ok(match r.u8()? {
+        0 => P::StructField(r.u32()?), 1 => P::TupleElement(r.u32()?),
+        2 => P::EnumPayload { variant: r.u32()?, index: r.u32()? },
+        3 => P::OptionSome, 4 => P::ResultOk, 5 => P::ResultErr, 6 => P::ArrayElement,
+        tag => return Err(DecodeError::BadTag { what: "callback projection", tag }),
+    }))
+}
+fn write_callback_input(w: &mut Writer, input: &align_sema::hir::CallbackInput) {
+    w.u32(input.parameter); write_callback_path(w, &input.path);
+}
+fn read_callback_input(r: &mut Reader<'_>) -> Result<align_sema::hir::CallbackInput, DecodeError> {
+    Ok(align_sema::hir::CallbackInput { parameter: r.u32()?, path: read_callback_path(r)? })
+}
+fn write_callback_requirement(w: &mut Writer, row: &align_sema::hir::CallbackRequirement) {
+    write_callback_input(w, &row.input);
+    match row.read {
+        align_sema::hir::CallbackRead::Environment => w.u8(0),
+        align_sema::hir::CallbackRead::Argument(i) => { w.u8(1); w.u32(i); }
+    }
+}
+fn read_callback_requirement(r: &mut Reader<'_>) -> Result<align_sema::hir::CallbackRequirement, DecodeError> {
+    let input = read_callback_input(r)?;
+    let read = match r.u8()? {
+        0 => align_sema::hir::CallbackRead::Environment,
+        1 => align_sema::hir::CallbackRead::Argument(r.u32()?),
+        tag => return Err(DecodeError::BadTag { what: "callback read", tag }),
+    };
+    Ok(align_sema::hir::CallbackRequirement { input, read })
+}
+fn write_callback_source(w: &mut Writer, source: &align_sema::hir::CallbackSource) {
+    use align_sema::hir::CallbackSource as S;
+    match source {
+        S::Parameter(input) => { w.u8(0); write_callback_input(w, input); }
+        S::Known(effects) => {
+            w.u8(1); w.bool(effects.environment_write);
+            w.seq(&effects.argument_writes, |w, i| w.u32(*i));
+        }
+        S::Unknown => w.u8(2),
+    }
+}
+fn read_callback_source(r: &mut Reader<'_>) -> Result<align_sema::hir::CallbackSource, DecodeError> {
+    use align_sema::hir::{CallbackSource as S, CallbackEffects};
+    Ok(match r.u8()? {
+        0 => S::Parameter(read_callback_input(r)?),
+        1 => S::Known(CallbackEffects { environment_write: r.bool()?, argument_writes: r.seq(|r| r.u32())? }),
+        2 => S::Unknown,
+        tag => return Err(DecodeError::BadTag { what: "callback source", tag }),
+    })
+}
+fn write_callback_contract(w: &mut Writer, contract: &Option<align_sema::hir::CallbackContract>) {
+    match contract {
         None => w.u8(0),
-        Some(roots) => {
-            w.u8(1);
-            w.seq(roots, |w, root| {
-                let (tag, index) = match root {
-                    MutableAccessRoot::Contained(index) => (0, *index),
-                    MutableAccessRoot::Storage(index) => (1, *index),
-                };
-                w.u8(tag);
-                w.u32(index);
+        Some(contract) => {
+            w.u8(1); w.seq(&contract.requirements, write_callback_requirement);
+            w.seq(&contract.returns, |w, row| {
+                write_callback_path(w, &row.path); w.seq(&row.sources, write_callback_source);
             });
         }
     }
 }
-
-fn read_mutable_access(
-    r: &mut Reader<'_>, parameter_count: usize, generic: bool,
-) -> Result<align_sema::hir::MutableAccessSummary, DecodeError> {
-    use align_sema::hir::MutableAccessRoot;
+fn read_callback_contract(r: &mut Reader<'_>) -> Result<Option<align_sema::hir::CallbackContract>, DecodeError> {
+    Ok(match r.u8()? {
+        0 => None,
+        1 => Some(align_sema::hir::CallbackContract {
+            requirements: r.seq(read_callback_requirement)?,
+            returns: r.seq(|r| Ok(align_sema::hir::CallbackReturn {
+                path: read_callback_path(r)?, sources: r.seq(read_callback_source)?,
+            }))?,
+        }),
+        tag => return Err(DecodeError::BadTag { what: "callback contract", tag }),
+    })
+}
+fn write_access_root(w: &mut Writer, root: &align_sema::hir::MutableAccessRoot) {
+    use align_sema::hir::MutableAccessRoot as R;
+    match root { R::Contained(i) => { w.u8(0); w.u32(*i); }, R::Storage(i) => { w.u8(1); w.u32(*i); } }
+}
+fn read_access_root(r: &mut Reader<'_>) -> Result<align_sema::hir::MutableAccessRoot, DecodeError> {
+    use align_sema::hir::MutableAccessRoot as R;
+    match r.u8()? {
+        0 => Ok(R::Contained(r.u32()?)), 1 => Ok(R::Storage(r.u32()?)),
+        tag => Err(DecodeError::BadTag { what: "mutable-access root", tag }),
+    }
+}
+fn write_mutable_access(w: &mut Writer, summary: &align_sema::hir::MutableAccessSummary) {
+    match summary {
+        None => w.u8(0),
+        Some(effects) => {
+            w.u8(1); w.seq(&effects.direct, write_access_root);
+            w.seq(&effects.conditional, |w, row| {
+                write_callback_requirement(w, &row.requirement); w.seq(&row.roots, write_access_root);
+            });
+        }
+    }
+}
+fn read_mutable_access(r: &mut Reader<'_>, parameter_count: usize, generic: bool)
+    -> Result<align_sema::hir::MutableAccessSummary, DecodeError>
+{
     let summary = match r.u8()? {
         0 => None,
-        1 => Some(r.seq(|r| match r.u8()? {
-            0 => Ok(MutableAccessRoot::Contained(r.u32()?)),
-            1 => Ok(MutableAccessRoot::Storage(r.u32()?)),
-            tag => Err(DecodeError::BadTag { what: "mutable-access root", tag }),
-        })?),
+        1 => Some(align_sema::hir::MutableAccessEffects {
+            direct: r.seq(read_access_root)?,
+            conditional: r.seq(|r| Ok(align_sema::hir::ConditionalAccess {
+                requirement: read_callback_requirement(r)?, roots: r.seq(read_access_root)?,
+            }))?,
+        }),
         tag => return Err(DecodeError::BadTag { what: "mutable-access option", tag }),
     };
-    align_sema::hir::validate_mutable_access(&summary, parameter_count, generic)
-        .map_err(DecodeError::InvalidSummary)?;
+    align_sema::hir::validate_mutable_access(&summary, parameter_count, generic).map_err(DecodeError::InvalidSummary)?;
     Ok(summary)
 }
 
@@ -416,6 +503,7 @@ fn write_fn(w: &mut Writer, f: &IFnSig) {
     write_effect(w, f.effect);
     w.seq(&f.parallel_transfer_params, |w, root| w.u32(*root));
     write_mutable_access(w, &f.mutable_access);
+    write_callback_contract(w, &f.callback_contract);
     write_mutable_retention(w, &f.mutable_retention);
     write_mutable_view_effect(w, &f.mutable_view_effect);
     w.bool(f.resource_hook_body);
@@ -863,6 +951,8 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
     let parallel_transfer_params = r.seq(|r| r.u32())?;
     validate_transfer_roots(&parallel_transfer_params, params.len())?;
     let mutable_access = read_mutable_access(r, params.len(), !type_params.is_empty())?;
+    let callback_contract = read_callback_contract(r)?;
+    align_sema::hir::validate_callback_record_order(&callback_contract, params.len(), !type_params.is_empty()).map_err(DecodeError::InvalidSummary)?;
     let mutable_retention = read_mutable_retention(r, &params, !type_params.is_empty())?;
     let mutable_view_effect = read_mutable_view_effect(r, params.len(), !type_params.is_empty())?;
     let resource_hook_body = r.bool()?;
@@ -893,6 +983,7 @@ fn read_fn(r: &mut Reader<'_>) -> Result<IFnSig, DecodeError> {
         effect,
         parallel_transfer_params,
         mutable_access,
+        callback_contract,
         mutable_retention,
         mutable_view_effect,
         resource_hook_body,
@@ -1299,10 +1390,27 @@ mod tests {
     #[test]
     fn mutable_access_has_independent_bytes_and_malformed_controls() {
         use align_sema::hir::MutableAccessRoot::{Contained, Storage};
+        use align_sema::hir::{CallbackInput, CallbackProjection, CallbackRead,
+            CallbackRequirement, ConditionalAccess, MutableAccessEffects};
         let vectors = [
             (None, vec![0]),
-            (Some(vec![]), vec![1, 0, 0, 0, 0]),
-            (Some(vec![Contained(2), Storage(0)]), vec![1, 2, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0]),
+            (Some(Default::default()), vec![1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (Some(align_sema::hir::MutableAccessEffects { direct: vec![Contained(2), Storage(0)], conditional: vec![] }), vec![1, 2, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+            (Some(MutableAccessEffects {
+                direct: vec![Contained(0)],
+                conditional: vec![ConditionalAccess {
+                    requirement: CallbackRequirement {
+                        input: CallbackInput { parameter: 2, path: vec![CallbackProjection::StructField(1)] },
+                        read: CallbackRead::Argument(0),
+                    }, roots: vec![Storage(1)],
+                }],
+            }), vec![
+                1, 1, 0, 0, 0, 0, 0, 0, 0, 0, // present, one direct Contained(0)
+                1, 0, 0, 0, // one conditional
+                2, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, // parameter 2, field 1
+                1, 0, 0, 0, 0, // Argument(0)
+                1, 0, 0, 0, 1, 1, 0, 0, 0, // one Storage(1)
+            ]),
         ];
         for (record, bytes) in vectors {
             let mut writer = Writer::new();
@@ -1329,6 +1437,49 @@ mod tests {
     }
 
     #[test]
+    fn callback_contract_has_independent_bytes_and_canonical_controls() {
+        use align_sema::hir::{CallbackContract, CallbackEffects, CallbackInput, CallbackProjection as P,
+            CallbackRead, CallbackRequirement, CallbackReturn, CallbackSource as S};
+        let record = Some(CallbackContract {
+            requirements: vec![CallbackRequirement { input: CallbackInput {
+                parameter: 2, path: vec![P::ArrayElement, P::StructField(1)],
+            }, read: CallbackRead::Environment }],
+            returns: vec![CallbackReturn { path: vec![P::StructField(1)], sources: vec![
+                S::Parameter(CallbackInput { parameter: 1, path: vec![] }),
+                S::Known(CallbackEffects { environment_write: false, argument_writes: vec![0] }), S::Unknown,
+            ] }],
+        });
+        let bytes = vec![
+            1, // present
+            1, 0, 0, 0, // requirements
+            2, 0, 0, 0, 2, 0, 0, 0, // input ordinal and path count
+            6, 0, 1, 0, 0, 0, 0, // array element, field 1, environment
+            1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, // return count, path, field 1
+            3, 0, 0, 0, // sources
+            0, 1, 0, 0, 0, 0, 0, 0, 0, // parameter 1, root path
+            1, 0, 1, 0, 0, 0, 0, 0, 0, 0, // Known false, argument 0
+            2, // Unknown must survive the known join
+        ];
+        for (record, bytes) in [(None, vec![0]), (Some(CallbackContract::default()), vec![1,0,0,0,0,0,0,0,0]), (record, bytes)] {
+            let mut writer = Writer::new(); write_callback_contract(&mut writer, &record);
+            assert_eq!(writer.buf, bytes);
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(read_callback_contract(&mut reader), Ok(record.clone()));
+            assert!(reader.finish().is_ok());
+            assert!(align_sema::hir::validate_callback_record_order(&record, 3, false).is_ok());
+            for end in 0..bytes.len() { assert!(read_callback_contract(&mut Reader::new(&bytes[..end])).is_err()); }
+            if let Some(mut changed) = record.filter(|r| !r.requirements.is_empty()) {
+                changed.requirements.push(changed.requirements[0].clone());
+                assert!(align_sema::hir::validate_callback_record_order(&Some(changed), 3, false).is_err());
+            }
+        }
+        for bytes in [vec![3], vec![1,2,0,0,0,0], vec![1,0,1,0,0,0,0,0,0]] {
+            assert!(read_callback_source(&mut Reader::new(&bytes)).is_err());
+        }
+        assert!(align_sema::hir::validate_callback_record_order(&Some(CallbackContract::default()), 0, true).is_err());
+    }
+
+    #[test]
     fn function_record_pins_mutable_access_field_placement() {
         let function = IFnSig {
             name: "x".to_owned(), type_params: vec![], params: vec![],
@@ -1339,10 +1490,11 @@ mod tests {
             drop_state_effects: vec![],
             producer_certification: crate::ProducerCertification::ValidatedBody,
             effect: Effect::Pure, parallel_transfer_params: vec![],
-            mutable_access: Some(vec![]), mutable_retention: None, mutable_view_effect: None,
+            mutable_access: Some(Default::default()),
+            callback_contract: None, mutable_retention: None, mutable_view_effect: None,
             resource_hook_body: false, body: IFnBody::Absent,
         };
-        // Transcribed independently from the format-18 function table, including both neighbors.
+        // Transcribed independently from the format-21 function table, including both neighbors.
         let bytes = [
             1, 0, 0, 0, b'x', // name
             0, 0, 0, 0, // type parameters
@@ -1352,7 +1504,8 @@ mod tests {
             0, 0, 0, 0, // drop effects
             1, 0, // validated producer, pure
             0, 0, 0, 0, // parallel transfer
-            1, 0, 0, 0, 0, // present empty mutable access
+            1, 0, 0, 0, 0, 0, 0, 0, 0, // present empty direct and conditional access
+            0, // unavailable callback contract
             0, 0, // unavailable retention and view effects
             0, 0, // resource hook and absent body
         ];
@@ -1528,6 +1681,7 @@ mod tests {
                 effect: Effect::Impure,
                 parallel_transfer_params: Vec::new(),
                 mutable_access: None,
+                callback_contract: None,
                 mutable_retention: Some(vec![align_sema::hir::MutableRetentionDestination::default()]),
                 mutable_view_effect: Some(vec![Some(MutableViewEffect::default())]),
                 resource_hook_body: false,

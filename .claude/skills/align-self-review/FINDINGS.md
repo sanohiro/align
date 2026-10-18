@@ -67,7 +67,7 @@ invented exact counts here.
 | `review-checkpoint-completeness` | 1 | 1 | Watch; only a wrapper-owned cycle verdict recorded after successful reviewer exit and result validation may authorize changed-slice continuation. |
 | `hot-path-scan-regression` | 1 | 1 | Watch; incremental boundary discovery must retain the established bulk-search primitive rather than regress to a byte-at-a-time scan. |
 | `native-thread-state-scope` | 1 | 1 | Watch; a constructor-scoped native thread-state guard does not cover delayed stream I/O or Drop. Establish the guard at every operation that can invoke the guarded native API, and pin read plus teardown with thread-local counter owners. |
-| `failure-evidence-preservation` | 1 | 1 | Watch; bounded live progress must survive temporary-log cleanup, and interruption paths must replay or preserve every completed and partial failure log before removal. |
+| `failure-evidence-preservation` | 2 | 2 | Promoted: bounded live progress and failure diagnostics must survive every phase, including timed benchmark subprocesses. Preserve captured stderr and replay it before cleanup; test a late invocation after successful correctness checks as well as the first failure. |
 
 | `inference-finalization-scope` | 1 | 1 | Watch; propagate numeric relations without defaulting unrelated enclosing components at a lambda boundary. The whole/per-unit float-inspection inference matrix covers unrelated lambdas, boundary-required captures/parameters, and unconstrained defaults. |
 
@@ -698,3 +698,5 @@ explicit `let Some` fixture assertion closes it without changing production
 behavior or raising the limit. The completed native owner separately fails on
 the old production implementation with the capture-SSA defect and passes after
 restoring the reviewed candidate; both negative and positive evidence are retained.
+
+| #1383 | `b5bef530` | P2 | `failure-evidence-preservation` | Benchmark timing discarded stderr after earlier correctness checks passed, so the cleanup replay had no diagnostic to show. Capture each timed compiler invocation and add a later-invocation failure control asserting the exact exit status and diagnostic alongside warm/hot/layout failures. |

@@ -2895,7 +2895,15 @@ pkg.kv.internal.resource
 pkg.s3
 pkg.template
 pkg.template.internal.descriptor
-pkg.template.internal.resource""".splitlines())
+pkg.template.internal.resource
+pkg.web
+pkg.web.cookie
+pkg.web.cors
+pkg.web.internal.query
+pkg.web.internal.router
+pkg.web.multipart
+pkg.web.types
+pkg.ws""".splitlines())
 observed = {}
 for source in project.rglob("*.align"):
     modules = [line.split()[1] for line in source.read_text().splitlines()
@@ -2903,7 +2911,7 @@ for source in project.rglob("*.align"):
     assert len(modules) == 1 and modules[0] not in observed, source
     observed[modules[0]] = source
 assert set(observed) == expected, (set(observed) - expected, expected - set(observed))
-for tree in ("auth", "csv", "db", "frame", "kv", "s3", "template"):
+for tree in ("auth", "csv", "db", "frame", "kv", "s3", "template", "web", "ws"):
     for source in (repo / "apps" / tree / "pkg").rglob("*.align"):
         destination = project / "pkg" / source.relative_to(repo / "apps" / tree / "pkg")
         assert destination.read_bytes() == source.read_bytes(), source
