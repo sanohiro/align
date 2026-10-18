@@ -882,7 +882,8 @@ unsafe fn bootstrap(
     force_group: bool,
     scoped: bool,
 ) -> ! {
-    // Test-only pre-exec stall: announce on the ready fd, then block on the gate fd.
+    // Test-only pre-exec stall: announce on the ready fd, then block on the gate fd. The gate packs
+    // two non-negative descriptors as `ready << 32 | wait`, so each half round-trips losslessly.
     #[cfg(test)]
     {
         let gate = PRE_EXEC_GATE.load(std::sync::atomic::Ordering::SeqCst);
