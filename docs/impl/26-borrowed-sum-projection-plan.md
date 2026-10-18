@@ -37,7 +37,7 @@ integration risk.
 `BorrowedSumPayload` is the complete admissibility rule for the new projection path. It contains
 Copy scalars and views, `string`, and finite acyclic structs, `Option`, `Result`, and user sums whose
 reachable leaves recursively belong to this same set. It deliberately excludes tuples, fixed and
-dynamic arrays, struct arrays, buffers, builders, boxes, resources, and every other opaque or
+dynamic arrays, struct arrays, buffers, builders, boxes, owned resources, and every other opaque or
 collection Move shape, even when that shape has an existing `DropPlan`. Those shapes remain valid in
 owning matches; this plan does not add a partial-array or handle projection ABI.
 
@@ -217,7 +217,7 @@ parity and pointer-vs-copy assertions are correctness evidence, not a performanc
 - No new pattern syntax, destructuring syntax, reference type, lifetime annotation, trait, macro,
   or implicit clone.
 - No recursive/boxed sum types, borrowed projection through tuples, fixed/dynamic arrays, struct arrays,
-  buffers, builders, boxes, resources, opaque handles, or other collection Move shapes. Owning matches
+  buffers, builders, boxes, owned resources, opaque handles, or other collection Move shapes. Owning matches
   still use the existing supported recursive Drop graph; this extension does not narrow that path.
 - No nested borrowed `match` whose scrutinee is an outer borrowed arm binding, and no aggregate or
   nested-sum `.clone()` operation. A separate direct borrowed stable place may still be matched by

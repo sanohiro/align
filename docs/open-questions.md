@@ -5330,9 +5330,9 @@ The exact surface and compiler contract are in
 An exhaustive `match` over a stable place whose exact root/path pair has a direct `borrow` or
 `borrow mut` fact may inspect an owned `Option<T>`, `Result<T,E>`, or user sum without consuming it;
 a descendant field fact never promotes an owning parent or mixed-provenance local. Borrowed mode
-admits Copy scalars/views, `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+admits Copy scalars/views (including `resource_ref<R>`), `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
 structs and tagged values built recursively from those forms. Array elements obey the same closed
-grammar. Fixed and specialized arrays, tuples, other collections, resources, other opaque handles, and
+grammar. Fixed and specialized arrays, tuples, other collections, owned resources, other opaque handles, and
 other unsupported Move shapes retain the borrowed-place diagnostic. The tag and active admitted
 payload are read in place, and a non-Copy arm binding is a caller-owned read-only projection with the original static payload
 type, source owner generation, and no independent `Drop` or cleanup bit. Copy fields remain readable;

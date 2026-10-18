@@ -1710,9 +1710,9 @@ fn materializes_fresh_soa_storage(expression: &Expr) -> bool {
 /// Whether a sum payload may be exposed as a read-only projection from a stable borrowed place.
 ///
 /// This is deliberately a closed, cycle-safe classifier. It admits primitive values and views,
-/// owned `string`, `buffer`, `writer`, shared `process.member` authority, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+/// owned `string`, `buffer`, `writer`, shared `process.member` authority, `resource_ref` views, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
 /// structs/sums whose reachable payload graph stays within the same set. Fixed/specialized arrays, aggregate buffers,
-/// builders, boxes, resources, and other opaque handles remain outside because their projection/drop/
+/// builders, boxes, owned resources, and other opaque handles remain outside because their projection/drop/
 /// escape contracts are not defined.
 pub fn borrowed_sum_payload_is_admissible(
     ty: Ty,
@@ -1733,6 +1733,10 @@ pub fn borrowed_sum_payload_is_admissible(
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
             | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember
             | Ty::ProcessUserNamespace | Ty::FsDirectory | Ty::FsDirCursor | Ty::Command => true,
+            // `resource_ref<R>` is a Copy view tied to the owner generation, admitted like `str`:
+            // a read through the projection copies the reference while its provenance stays on
+            // the borrowed root. The owning `resource` handle remains excluded.
+            Ty::ResourceRef(_) => true,
             Ty::Struct(id) => {
                 if !active_structs.insert(id) {
                     return false;
@@ -91078,6 +91082,15 @@ fn exit_branch(flag: bool) -> i64 {
                 )],
             ),
             structure("Specialized", vec![("rows", Ty::Soa(0))]),
+            structure(
+                "ResourceRecord",
+                vec![
+                    ("owner", Ty::ResourceRef(0)),
+                    ("text", Ty::String),
+                    ("values", Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true }))),
+                ],
+            ),
+            structure("OwnedResource", vec![("owner", Ty::Resource(0)), ("text", Ty::String)]),
         ];
         let variants = vec![hir::EnumDef {
             name: "Choice".to_string(),
@@ -91107,6 +91120,10 @@ fn exit_branch(flag: bool) -> i64 {
             }))),
             Ty::Result(Scalar::DynStructArray(0), Scalar::Bool),
             Ty::Enum(0),
+            Ty::ResourceRef(0),
+            Ty::Struct(3),
+            Ty::Option(Scalar::Struct(3)),
+            Ty::Result(Scalar::Struct(3), Scalar::Bool),
         ] {
             assert!(
                 borrowed_sum_payload_is_admissible(admitted, &records, &variants, &[]),
@@ -91130,6 +91147,9 @@ fn exit_branch(flag: bool) -> i64 {
             }))),
             Ty::DynStructArray(2, Layout::Aos),
             Ty::DynStructArray(99, Layout::Aos),
+            Ty::Resource(0),
+            Ty::Struct(4),
+            Ty::Option(Scalar::Struct(4)),
         ] {
             assert!(
                 !borrowed_sum_payload_is_admissible(excluded, &records, &[], &[]),

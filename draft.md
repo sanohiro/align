@@ -402,10 +402,10 @@ common unwrap / propagate cases.
 When the scrutinee is a stable place whose complete root/path pair has a direct shared or exclusive
 borrow fact — either the borrowed parameter itself or a checked struct-field path below it — `match`
 performs a read-only projection. A descendant field's borrow fact does not promote an owning parent
-or a mixed-provenance local. The selected payload must be a Copy scalar/view, `string`, `buffer`, `writer`, `command`, an ordinary
+or a mixed-provenance local. The selected payload must be a Copy scalar/view (including `resource_ref<R>`), `string`, `buffer`, `writer`, `command`, an ordinary
 dynamic scalar/AoS-record array, or a finite acyclic struct, `Option`, `Result`, or user sum whose
 reachable leaves recursively have those forms. The array element must satisfy the same closed
-grammar. Fixed and specialized arrays, tuples, other collections, resources, other opaque handles, and
+grammar. Fixed and specialized arrays, tuples, other collections, owned resources, other opaque handles, and
 other unsupported Move shapes keep the ordinary borrowed-place diagnostic. The match reads the tag
 in place and binds an admitted active payload as a caller-owned borrow projection. The binding retains the payload's static type for field
 and method checking, but it receives no independent `Drop` or cleanup bit, does not move or null the
