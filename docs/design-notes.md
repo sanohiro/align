@@ -484,9 +484,9 @@ before the current header is read, preserving replacement and termination semant
 must inspect an owned `Option`, `Result`, or user sum without taking it from its caller. A match over
 a stable place whose exact root/path pair is directly shared- or exclusively-borrowed reads the tag
 and active payload in place; a descendant field fact never promotes an owning parent. The new path
-admits Copy scalars/views, `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
+admits Copy scalars/views (including `resource_ref<R>`), `string`, `buffer`, `writer`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic
 structs and tagged values built recursively from those forms; an array element obeys the same
-closed grammar. Fixed and specialized arrays, other collections, resources, other opaque handles, and
+closed grammar. Fixed and specialized arrays, other collections, owned resources, other opaque handles, and
 other unsupported Move shapes remain on the existing borrowed-place diagnostic. The arm binding is
 a read-only projection with the original static payload type, source generation, and no independent cleanup bit. Copy fields and
 borrowed text leaves remain cheap reads, while an owned text leaf can use the existing explicit

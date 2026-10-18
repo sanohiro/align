@@ -1998,7 +1998,9 @@ fn shared_resource_sum_graph_keeps_sibling_proof() {
 
 /// Request 155: a record that combines a `resource_ref` with owned fields is a Move payload whose
 /// every leaf is individually borrow-bindable, so a borrowed `match` projects it in place. The
-/// matrix covers the field kinds and sum carriers named by the request; `run_cases` constructs the
+/// matrix covers the field kinds and sum carriers named by the request, plus the whole-element
+/// indexed shared borrow of a fixed record array, which shares the payload classifier. `run_cases`
+/// constructs the
 /// owner and every carrier, then matches each twice: the matches must allocate and free nothing,
 /// and every owned byte is released once the carriers and the owner drop.
 const BORROWED_RESOURCE_RECORD_MATCH: &str = "\
@@ -2017,6 +2019,7 @@ PSA { owner: resource_ref<pkg.db.conn>, path: string, values: array<i64> }
 Plain { s: string, values: array<i64> }
 Outer { inner: PS, extra: array<string> }
 Choice { Full(PSA), Empty }
+Rows { rows: [PS; 2] }
 fn present(reference: resource_ref<pkg.db.conn>) -> i64 = if pkg.db.present(reference) { 1 } else { 100 }
 fn fc(borrow v: Option<PC>) -> i64 = match v { Some(x) => present(x.owner) + x.n, None => 0 }
 fn fs(borrow v: Option<PS>) -> i64 = match v { Some(x) => present(x.owner) + x.s.len(), None => 0 }
@@ -2028,6 +2031,10 @@ fn fo(borrow v: Option<Outer>) -> i64 = match v { Some(x) => present(x.inner.own
 fn fres(borrow v: Result<PSA, Error>) -> i64 = match v { Ok(x) => present(x.owner) + x.path.len(), Err(_) => 0 }
 fn fsum(borrow v: Choice) -> i64 = match v { Full(x) => present(x.owner) + x.values.len(), Empty => 0 }
 fn reference_of(borrow v: Option<PS>) -> Option<resource_ref<pkg.db.conn>> = match v { Some(x) => Some(x.owner), None => None }
+fn inspect(borrow p: PS) -> i64 = present(p.owner) + p.s.len()
+fn element_owner(borrow p: PS) -> resource_ref<pkg.db.conn> = p.owner
+fn fixed(borrow v: Rows) -> i64 = inspect(v.rows[1])
+fn fixed_owner(borrow v: Rows) -> resource_ref<pkg.db.conn> = element_owner(v.rows[0])
 fn rows() -> array<Row> {
   mut values: array_builder<Row> := array_builder()
   values.push(Row { label: \"xy\".clone(), n: 3 })
@@ -2052,6 +2059,7 @@ fn run_cases() -> i32 {
   vres: Result<PSA, Error> := Ok(PSA { owner: r, path: \"zz\".clone(), values: [1].to_array() })
   vsum := Choice.Full(PSA { owner: r, path: \"z\".clone(), values: [1, 2].to_array() })
   none: Option<PS> := None
+  fixed_rows := Rows { rows: [PS { owner: r, s: \"one\".clone() }, PS { owner: r, s: \"five!\".clone() }] }
   before := unsafe { align_rt_alloc_count() }
   before_free := unsafe { align_rt_free_count() }
   if fc(vc) != 5 || fc(vc) != 5 { return 1 }
@@ -2064,6 +2072,8 @@ fn run_cases() -> i32 {
   if fres(vres) != 3 || fres(vres) != 3 { return 8 }
   if fsum(vsum) != 3 || fsum(vsum) != 3 { return 9 }
   if fs(none) != 0 { return 10 }
+  if fixed(fixed_rows) != 6 || fixed(fixed_rows) != 6 || inspect(fixed_rows.rows[0]) != 4 { return 13 }
+  if present(fixed_owner(fixed_rows)) != 1 || present(element_owner(fixed_rows.rows[1])) != 1 { return 14 }
   reference := match reference_of(vs) { Some(found) => present(found), None => 0 }
   if reference != 1 { return 11 }
   if fs(vs) != 4 || fo(vo) != 4 { return 12 }
@@ -2090,6 +2100,16 @@ fn borrowed_match_projects_records_mixing_resource_references_and_owned_fields()
         differential.per_unit_diags
     );
     let rendered = whole_mir_multi("borrowed-resource-record-mir", &project, "main.align");
+    let fixed = rendered
+        .split("fn fixed_owner(")
+        .nth(1)
+        .and_then(|body| body.split("\nfn ").next())
+        .unwrap_or_else(|| panic!("MIR for fixed_owner:\n{rendered}"));
+    assert!(
+        fixed.contains("borrow-element borrow slot0.0[0_i64]") && fixed.contains("borrow=Roots { params: [0]"),
+        "the fixed element must be borrowed in place and the returned reference rooted in the holder:\n{fixed}"
+    );
+    assert!(!fixed.contains("drop "), "the fixed element borrow must not gain cleanup:\n{fixed}");
     for function in ["fs", "fsa", "fo", "fres", "fsum"] {
         let body = rendered
             .split(&format!("fn {function}("))
@@ -2123,7 +2143,7 @@ fn borrowed_match_projects_records_mixing_resource_references_and_owned_fields()
 
 #[test]
 fn borrowed_resource_record_projection_keeps_ownership_and_provenance_rules() {
-    const DECLS: &str = "module main\nimport pkg.db\nPS { owner: resource_ref<pkg.db.conn>, s: string }\nHolder { item: PS }\nfn take(value: PS) -> i64 = 1\nfn reference_of(borrow v: Option<PS>) -> Option<resource_ref<pkg.db.conn>> = match v { Some(x) => Some(x.owner), None => None }\n";
+    const DECLS: &str = "module main\nimport pkg.db\nPS { owner: resource_ref<pkg.db.conn>, s: string }\nHolder { item: PS }\nRows { rows: [PS; 1] }\nfn take(value: PS) -> i64 = 1\nfn sink(owner: pkg.db.conn) {}\nfn consume(rows: Rows) {}\nfn element_owner(borrow p: PS) -> resource_ref<pkg.db.conn> = p.owner\nfn reference_of(borrow v: Option<PS>) -> Option<resource_ref<pkg.db.conn>> = match v { Some(x) => Some(x.owner), None => None }\n";
     for (name, body, needle) in [
         (
             "consume",
@@ -2157,8 +2177,33 @@ fn borrowed_resource_record_projection_keeps_ownership_and_provenance_rules() {
         ),
         (
             "owner-invalidation",
-            "fn sink(owner: pkg.db.conn) {}\nfn main() -> i32 { owner := pkg.db.open(); v: Option<PS> := Some(PS { owner: resource.borrow(owner), s: \"a\".clone() }); found := reference_of(v); sink(owner); return match found { Some(_) => 1, None => 0 } }\n",
+            "fn main() -> i32 { owner := pkg.db.open(); v: Option<PS> := Some(PS { owner: resource.borrow(owner), s: \"a\".clone() }); found := reference_of(v); sink(owner); return match found { Some(_) => 1, None => 0 } }\n",
             "while dependent resource/reference",
+        ),
+        (
+            "fixed-element-local-escape",
+            "fn bad() -> resource_ref<pkg.db.conn> { owner := pkg.db.open(); held := Rows { rows: [PS { owner: resource.borrow(owner), s: \"a\".clone() }] }; return element_owner(held.rows[0]) }\nfn main() {}\n",
+            "borrows local storage",
+        ),
+        (
+            "fixed-element-owner-invalidation",
+            "fn main() -> i32 { owner := pkg.db.open(); held := Rows { rows: [PS { owner: resource.borrow(owner), s: \"a\".clone() }] }; found := element_owner(held.rows[0]); sink(owner); return if pkg.db.present(found) { 1 } else { 0 } }\n",
+            "resource owner 'owner' while dependent resource/reference 'found' is live",
+        ),
+        (
+            "fixed-element-holder-invalidation",
+            "fn main() -> i32 { owner := pkg.db.open(); held := Rows { rows: [PS { owner: resource.borrow(owner), s: \"a\".clone() }] }; found := element_owner(held.rows[0]); consume(held); return if pkg.db.present(found) { 1 } else { 0 } }\n",
+            "resource owner 'held' while dependent resource/reference 'found' is live",
+        ),
+        (
+            "heap-array-element",
+            "fn main() { owner := pkg.db.open(); mut values: array_builder<PS> := array_builder(); values.push(PS { owner: resource.borrow(owner), s: \"a\".clone() }) }\n",
+            "field 'owner' has excluded type resource_ref",
+        ),
+        (
+            "region-array-element",
+            "fn main() { owner := pkg.db.open(); arena out { mut values: array_builder<PS> := array_builder(out); values.push(PS { owner: resource.borrow(owner), s: \"a\".clone() }) } }\n",
+            "field 'owner' is a native resource",
         ),
         (
             "owned-resource-field",

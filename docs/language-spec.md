@@ -508,9 +508,9 @@ For a borrowed-place `match`, the exact stable root/path pair must have a direct
 borrow fact; a descendant field fact does not promote an owning parent or mixed-provenance local.
 An admitted non-Copy/Move payload is a read-only projection with the source's owner generation and
 no independent cleanup bit; the source is neither copied nor nulled. Admitted payloads are Copy
-scalars/views, `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic structs and
+scalars/views (including `resource_ref<R>`), `string`, ordinary dynamic scalar/AoS-record arrays, and finite acyclic structs and
 tagged values built recursively from those forms; array elements follow the same closed grammar.
-Fixed and specialized arrays, tuples, other collections, resources, opaque handles, and other
+Fixed and specialized arrays, tuples, other collections, owned resources, opaque handles, and other
 unsupported Move shapes retain the borrowed-place diagnostic. Derived views follow the ordinary
 borrow summary and region checks, while existing Copy/view matching retains its current result behavior. An owning-place
 `match` keeps the consuming extraction and source-clearing rule.
