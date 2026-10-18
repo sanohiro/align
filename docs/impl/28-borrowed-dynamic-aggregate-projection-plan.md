@@ -96,7 +96,7 @@ same grammar. This admits the C6 graph's arrays of owned strings, arrays of reco
 that themselves contain optional records and further ordinary dynamic arrays.
 
 Fixed arrays, dynamic arrays of slices, opaque response arrays, dynamic vector/mask/fixed-aggregate
-arrays, SoA, buffers, builders, boxes, resources, resource references, raw owning handles, and every
+arrays, SoA, buffers, builders, boxes, owned resources, raw owning handles, and every
 other specialized collection or opaque Move shape remain excluded. `array<Option<T>>` and
 `array<array<T>>` remain outside the language's current dynamic-array element representation rather
 than becoming representable through this projection. A future new dynamic-array representation is
@@ -478,6 +478,24 @@ while retaining the forged view type and requires rejection before LLVM GEP/load
 The existing checked-HIR and MIR representation, public contract, interface, cache, and runtime ABI
 are unchanged; no benchmark or target-local qualification is required.
 
+### Closure matrix reopened: resource-reference leaves (Request 155)
+
+align-llm Request 155 found that a record holding a `resource_ref<R>` together with an owned
+`string` or dynamic array could not be matched through a borrowed `Option`. The record alone is
+Copy when its other fields are Copy, so binding copied it; adding an owned field made it Move and
+sent it through this closed classifier, which did not list `resource_ref<R>` as a leaf even though
+the language specification already defines it as a Copy view tied to the owner generation. The
+classifier now admits `resource_ref<R>` as a Copy view leaf; the owning `resource` handle remains
+excluded. No path segment, checked-HIR field, MIR operand, LLVM lowering, runtime helper,
+interface field, or ABI changes: the leaf is read through the existing in-place borrowed path.
+
+| Cell | Evidence |
+| --- | --- |
+| Formation and field-kind matrix | `borrowed_match_projects_records_mixing_resource_references_and_owned_fields` (whole and per-unit check) over `resource_ref` + scalar, strings + arrays without a reference, `resource_ref` + `string`, + `array<i64>`, + `array<Record>`, + `string` + array, nested record, `Option`, `Result`, and user sum; classifier unit owner `borrowed_payload_classifier_admits_only_ordinary_dynamic_array_graphs`. |
+| Projection and cleanup | Same driver owner: MIR has an in-place `borrow slot` path and no `enum_payload(`, `null `, or `drop ` in each projecting function; whole and per-unit executables match every carrier twice and prove allocation/free parity with zero live bytes. |
+| Ownership and provenance | `borrowed_resource_record_projection_keeps_ownership_and_provenance_rules`: consuming call, rebinding, whole return, storing, and moving the owned field reject; a `resource_ref` read through the projection keeps the borrowed root, so returning it from a function whose owner is local rejects and moving the owner while a derived reference is live rejects, matching the Copy-record twin. A record holding an owned `resource` still rejects. |
+| Indexed shared borrow | The classifier is shared, but a heap `array<Record>` cannot contain a `resource_ref` field, so no new indexed form is reachable; N/A. |
+
 ## 6. PR boundaries and gates
 
 The design lands first. Its independent adversarial review must resolve the public grammar,
@@ -498,7 +516,7 @@ implementation merge is pinned.
   borrow.
 - No by-value Move-element indexing, partial element move, element replacement, element
   `borrow mut`, disjoint-index proof, mutable iterator, or Move-element pipeline callback.
-- No fixed-array, SoA, array-of-slice, response-array, vector/mask/fixed-aggregate-array, resource,
+- No fixed-array, SoA, array-of-slice, response-array, vector/mask/fixed-aggregate-array, owned resource,
   box, builder, buffer, or opaque-handle projection.
 - No nested borrowed `match` over an outer arm binding; pass a complete indexed element to an
   explicit borrowed helper when its own options need inspection.
