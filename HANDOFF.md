@@ -25,6 +25,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan227](docs/impl/227-json-field-encoding.md) composes both JSON encoders with
+  stable nested record fields for media AM-R11. Selected values retain existing
+  schema, borrowing and owned-output rules; checked HIR authenticates the exact
+  source, and eager byte limits preserve the conservative root reservation.
+
 - [Plan226](docs/impl/226-deflate-framing.md) completes `std.compress` with zlib
   and raw DEFLATE framing. Both require one complete stream, reject trailing
   bytes and preserve the inclusive output cap and independent owned buffer.

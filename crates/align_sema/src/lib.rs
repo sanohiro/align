@@ -49856,16 +49856,22 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonEncode { base, plan, max_bytes } => {
+            ExprKind::JsonEncode { source, plan, max_bytes } => {
                 // Reserve the source place and its transitive backing generations before the
                 // eager limit runs. Finish validates and retires this reservation even when the
                 // limit diverges; output completion must never inherit the source provenance.
-                if whole_moved(moved, *base) {
+                let base = &source.root;
+                let unavailable = source.path.first().map_or_else(
+                    || whole_moved(moved, *base), |field| field_moved(moved, *base, *field));
+                if unavailable {
                     let name = self.f.locals.get(*base as usize)
                         .map_or("<unknown>", |local| local.name.as_str());
-                    self.diags.error(format!("use of moved value '{name}'"), e.span);
-                } else {
+                    self.diags.error(format!("use of moved JSON source in '{name}'"), e.span);
+                } else if source.path.is_empty() {
                     self.check_borrow_use(*base, e.span);
+                } else {
+                    let path = source.path.iter().copied().map(BorrowProjection::StructField).collect::<Vec<_>>();
+                    self.check_borrow_projection_use(*base, &path, e.span);
                 }
                 let reservation = Self::expr_key(e);
                 let mut roots = self.borrowed_element_roots(*base);
@@ -64257,12 +64263,12 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'json.encode' expects 1 argument, got {}", args.len()), span);
             return err;
         }
-        let Some((parts, base, _, route)) = self.json_encode_parts(&args[0], JsonDir::Encode) else {
+        let Some((parts, source, _, route)) = self.json_encode_parts(&args[0], JsonDir::Encode) else {
             return err;
         };
         let kind = match route {
-            OwnedJsonRoute::Existing => ExprKind::JsonEncode { base, plan: hir::JsonEncodePlan::Pieces(parts), max_bytes: None },
-            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: None },
+            OwnedJsonRoute::Existing => ExprKind::JsonEncode { source, plan: hir::JsonEncodePlan::Pieces(parts), max_bytes: None },
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: None },
         };
         Expr { kind, ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)), span }
     }
@@ -64274,12 +64280,13 @@ impl<'a, 't> Checker<'a, 't> {
         &mut self,
         value: &ast::Expr,
         dir: JsonDir,
-    ) -> Option<(Vec<TemplatePart>, LocalId, Ty, OwnedJsonRoute)> {
-        let Some((base, ty)) = self.place_local(value) else {
+    ) -> Option<(Vec<TemplatePart>, hir::JsonEncodeSource, Ty, OwnedJsonRoute)> {
+        let Some((base, path, ty)) = self.resolve_place(value) else {
             self.diags
-                .error(format!("'{}' expects an encodable record, array or sum value (a local binding)", dir.name()), value.span);
+                .error(format!("'{}' expects an encodable record, array or sum value (a local binding or record field)", dir.name()), value.span);
             return None;
         };
+        let source = hir::JsonEncodeSource { root: base, path };
         let route = match ty {
             Ty::Struct(sid) | Ty::DynStructArray(sid, Layout::Aos) => self.owned_json_route(sid, value.span, dir)?,
             _ => OwnedJsonRoute::Existing,
@@ -64291,7 +64298,7 @@ impl<'a, 't> Checker<'a, 't> {
             Ty::Struct(sid) => match &route {
                 OwnedJsonRoute::Existing => {
                     self.json_object_parts(
-                        base,
+                        &source,
                         sid,
                         None,
                         &[],
@@ -64309,12 +64316,12 @@ impl<'a, 't> Checker<'a, 't> {
                     if !self.json_struct_fields_ok(sid, value.span, dir) {
                         return None;
                     }
-                    let access = Expr { kind: ExprKind::Local(base), ty, span: value.span };
+                    let access = source.expression(ty, value.span);
                     parts.push(TemplatePart::StructArrayField { access, struct_id: sid });
                 }
             }
             Ty::DynArray(elem) if json_encode_array_element(elem) => {
-                let access = Expr { kind: ExprKind::Local(base), ty, span: value.span };
+                let access = source.expression(ty, value.span);
                 parts.push(TemplatePart::ScalarArrayField { access, elem });
             }
             // A fixed struct-array → a JSON array of objects (unrolled; length is static).
@@ -64324,7 +64331,7 @@ impl<'a, 't> Checker<'a, 't> {
                     if i > 0 {
                         parts.push(TemplatePart::Text(",".to_string()));
                     }
-                    self.json_object_parts(base, sid, Some(i), &[], &[], &mut parts, value.span, &mut ok, dir);
+                    self.json_object_parts(&source, sid, Some(i), &[], &[], &mut parts, value.span, &mut ok, dir);
                 }
                 parts.push(TemplatePart::Text("]".to_string()));
             }
@@ -64335,7 +64342,7 @@ impl<'a, 't> Checker<'a, 't> {
                 if !self.check_union_decodable(eid, value.span, dir) {
                     return None;
                 }
-                let access = Expr { kind: ExprKind::Local(base), ty, span: value.span };
+                let access = source.expression(ty, value.span);
                 parts.push(TemplatePart::UnionValue { access, enum_id: eid });
             }
             _ => {
@@ -64349,7 +64356,7 @@ impl<'a, 't> Checker<'a, 't> {
         if !ok {
             return None;
         }
-        Some((parts, base, ty, route))
+        Some((parts, source, ty, route))
     }
 
     fn check_json_encode_bounded(&mut self, args: &[ast::Expr], span: Span) -> Expr {
@@ -64359,7 +64366,7 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'json.encode_bounded' expects 2 arguments, got {}", args.len()), span);
             return err;
         }
-        let Some((parts, base, _, route)) = self.json_encode_parts(&args[0], JsonDir::EncodeBounded) else {
+        let Some((parts, source, _, route)) = self.json_encode_parts(&args[0], JsonDir::EncodeBounded) else {
             return err;
         };
         // Check without a hint, then bind an untyped integer literal through the one exact-i64
@@ -64377,8 +64384,8 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let kind = match route {
-            OwnedJsonRoute::Existing => ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes: Some(Box::new(max_bytes)) },
-            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { base, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(Box::new(max_bytes)) },
+            OwnedJsonRoute::Existing => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes: Some(Box::new(max_bytes)) },
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(Box::new(max_bytes)) },
         };
         Expr {
             kind,
@@ -65011,7 +65018,7 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// Emit the `{"field":value,...}` template parts for one struct value: either the struct
-    /// local `base` itself (`elem` = None) or element `elem` of the struct-array local `base`.
+    /// selected source itself (`elem` = None) or element `elem` of its fixed record array.
     /// `path_prefix` is the chain of logical field indices from the root struct to `sid` (empty at
     /// the top level); a **nested-struct field** recurses with its index appended, emitting a nested
     /// `{...}` object (the REST-gateway runway, Slice A). Sets `*ok = false` (and reports) on a field
@@ -65019,7 +65026,7 @@ impl<'a, 't> Checker<'a, 't> {
     #[allow(clippy::too_many_arguments)]
     fn json_object_parts(
         &mut self,
-        base: LocalId,
+        source: &hir::JsonEncodeSource,
         sid: u32,
         elem: Option<u32>,
         path_prefix: &[u32],
@@ -65029,6 +65036,15 @@ impl<'a, 't> Checker<'a, 't> {
         ok: &mut bool,
         dir: JsonDir,
     ) {
+        let source_ty = source.path.iter().fold(
+            self.locals.get(source.root as usize).map_or(Ty::Error, |local| local.ty),
+            |ty, field| match ty {
+                Ty::Struct(id) => self.structs.get(id as usize)
+                    .and_then(|def| def.fields.get(*field as usize))
+                    .map_or(Ty::Error, |field| field.ty),
+                _ => Ty::Error,
+            },
+        );
         enum Work {
             Enter {
                 id: u32,
@@ -65108,13 +65124,21 @@ impl<'a, 't> Checker<'a, 't> {
                     let access = |ty: Ty| Expr {
                         kind: match elem {
                             None => ExprKind::Field {
-                                root: base,
-                                path: full.clone(),
+                                root: source.root,
+                                path: source.path.iter().chain(&full).copied().collect(),
                             },
-                            Some(index) => ExprKind::IndexField {
-                                base,
-                                index,
+                            Some(index) if source.path.is_empty() => ExprKind::IndexField {
+                                base: source.root, index, path: full.clone(),
+                            },
+                            Some(index) => ExprKind::ElemField {
+                                recv: Box::new(source.expression(source_ty, span)),
+                                index: Box::new(Expr {
+                                    kind: ExprKind::Int(i128::from(index)),
+                                    ty: Ty::Int(IntTy { bits: 64, signed: true }),
+                                    span,
+                                }),
                                 path: full.clone(),
+                                struct_id: sid,
                             },
                         },
                         ty,

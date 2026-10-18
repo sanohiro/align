@@ -9,6 +9,22 @@
 
 JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §14）。表面は、型付きの `encode` / `encode_bounded` / `decode`、遅延スキーマ未知ビューの `doc`、型付き行をストリーム処理する `scan` の5操作である。対象型と行型は **明示的な型引数ではなく型推論によって** 決定される（決定済: Align には式位置での型引数構文、つまり turbofish のような記法は存在しない）。使用には `import core.json` が必要である（capability-header のルールは `core.json` に対しても std モジュールと全く同様に適用される）。
 
+## エンコーダーの安定した入力参照
+
+`json.encode(value)` と `json.encode_bounded(value, max_bytes)` は、名前付きローカルと、
+それを起点とする入れ子のレコードフィールド参照を受理する。既存の規則で受理される共有
+パラメーターと match 束縛も含む。選択した型にローカルと同じ完全なスキーマ検査を行い、
+選択していないフィールドはエンコード不能な所有値でもよい。選択フィールドは借用され、
+通常の移動・寿命検査に従って再利用できる。出力は arena 内でも独立した所有 string となる。
+入力コピー、一時的な所有値、descriptor の割り当ては追加しない。
+
+exact-i64 の上限は入力とスキーマの検査後に一度だけ評価し、完了まで外側の root 全体と
+推移的な backing を保守的に予約する。その評価中の無関係な兄弟フィールドの変更も拒否する。
+それ以前の独立した兄弟フィールドの移動には通常の部分移動規則を適用する。エラー順序、
+上限の完全一致、正規化バイト列、失敗時の解放は変わらない。一時値と添字付き root、既存の
+スキーマ除外、固定長配列を含む共有 Move payload は引き続き除外する。Plan227 が検査済み
+入力参照の正確な identity を規定する。
+
 ## エスケープ文字列（Request 7）
 
 型付き JSON は、宣言されたキー・未宣言キー、宣言された値・未宣言値、ネストした値、union payload、
@@ -239,7 +255,7 @@ SHIPPED — OpenAI マルチモーダル `content: str | array<Part>` union）:*
 所有 AoS に decode、encode は bare な JSON 配列として出力。完全な `Content { Text(str), Parts(array<Part>) }`
 がラウンドトリップする。要素構造体は非所有でなければならない（Slice-C ルール。`array<string>` /
 `array<Move-struct>` は延期）。`array<scalar>` union payload はまだ descriptor アームがない（J3）。
-トップレベル union の `json.encode` はローカル束縛が必要（struct encode と同様）。**構造体フィールドとしての union（J1b-2b / J3a,
+トップレベル union の `json.encode` はローカル束縛または安定したレコードフィールド参照が必要（struct encode と同様）。**構造体フィールドとしての union（J1b-2b / J3a,
 SHIPPED）:** 構造体フィールドは union であってよい（`Message { content: Content }`）— descriptor
 **kind 6**（`sub` は `JsonUnion`、decode/encode で共有）。`field_width`/`write_value`（全 decode パス
 = slow + Mison speculative + fallback）と `json_encode_value` に kind-6 アームが加わり、union

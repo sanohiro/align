@@ -2176,6 +2176,15 @@ Nonblocking open precedes descriptor metadata so a FIFO cannot wait for a writer
 The filesystem operation supplies safe fd ownership; application command policy remains in Align.
 See [plan 58](impl/58-r84-r88-client-batch-plan.md).
 
+### JSON field sources (AM-R11)
+
+A stable field's JSON schema and ownership are properties of the selected value,
+not its spelling as a whole local. Plan227 carries one canonical local-plus-field
+path through schema construction and independent checked-HIR validation. Existing
+borrowed reads preserve its address, while the eager limit retains the existing
+conservative root reservation. This removes the consumer's field-moving workaround
+without adding a wrapper allocation, temporary owner or new schema family.
+
 ### JSON owned-record array decoding (R133)
 
 Root position adds no ownership distinction to an accepted V4 record graph.

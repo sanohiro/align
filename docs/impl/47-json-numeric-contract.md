@@ -227,7 +227,8 @@ Replace HIR `JsonOwnedEncode`, `JsonEncodeBounded` and
 `JsonOwnedEncodeBounded` with:
 
 ```text
-JsonEncode { base: LocalId, plan: JsonEncodePlan, max_bytes: Option<Box<Expr>> }
+JsonEncode { source: JsonEncodeSource, plan: JsonEncodePlan, max_bytes: Option<Box<Expr>> }
+JsonEncodeSource { root: LocalId, path: Vec<u32> } // Plan227: local or record-field path
 JsonEncodePlan = Pieces(Vec<TemplatePart>) | Owned(OwnedJsonGraphPlanV3)
 ```
 
@@ -240,7 +241,7 @@ V2 graph plan/record/field types to V3 atomically; no compatibility aliases.
 Checked HIR independently reconstructs the source root domain, plan and limit
 mode. Pieces must exactly match the canonical source plan, not merely form some
 JSON-looking syntax; Owned must equal the reconstructed V3 graph. Each plan
-borrows the same base; no field may introduce unrelated roots. Validate result,
+borrows the same selected source (Plan227); no field may introduce unrelated roots. Validate result,
 source liveness, exact Error identity, limit type and all eager operands before
 lowering. The operation is Pure (joined with argument effects), output storage is freshly owned/Static, and source
 borrow retention lasts only through the call. Visit limit once and all plan

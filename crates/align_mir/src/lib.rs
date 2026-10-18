@@ -7938,23 +7938,32 @@ fn lower_local(b: &mut Builder, id: hir::LocalId, requested_ty: Ty) -> Operand {
 
 fn owned_json_piece(
     b: &mut Builder,
-    base: hir::LocalId,
+    source: &hir::JsonEncodeSource,
     plan: &hir::OwnedJsonGraphPlanV4,
+    span: Span,
 ) -> TemplatePiece {
-    // A shared match binding is a projection into its source, not an initialized local slot.
-    // Use the ordinary local read so JSON and every other borrowed consumer select the same place.
-    let source_ty = b.slots.get(base as usize).copied().unwrap_or(Ty::Error);
-    let value = lower_local(b, base, source_ty);
+    // Ordinary borrowed field lowering preserves shared match projections as well as locals.
+    let source_ty = source.path.iter().fold(
+        b.slots.get(source.root as usize).copied().unwrap_or(Ty::Error),
+        |ty, field| match ty {
+            Ty::Struct(id) => b.structs.get(id as usize)
+                .and_then(|def| def.fields.get(*field as usize))
+                .map_or(Ty::Error, |field| field.ty),
+            _ => Ty::Error,
+        },
+    );
+    let value = lower_expr_for_borrow(b, &source.expression(source_ty, span));
     TemplatePiece::OwnedJsonRecords { value, plan: plan.clone() }
 }
 
 #[inline(never)]
 fn lower_json_encode(
     b: &mut Builder,
-    base: hir::LocalId,
+    source: &hir::JsonEncodeSource,
     plan: &hir::JsonEncodePlan,
     max_bytes: Option<&hir::Expr>,
     result_ty: Ty,
+    span: Span,
 ) -> Operand {
     let limit = max_bytes.map(|limit| lower_expr(b, limit));
     if !lowering_continues(b) { return terminated_operand(); }
@@ -7963,7 +7972,7 @@ fn lower_json_encode(
             let Some(pieces) = lower_template_parts(b, parts) else { return terminated_operand(); };
             pieces
         }
-        hir::JsonEncodePlan::Owned(plan) => vec![owned_json_piece(b, base, plan)],
+        hir::JsonEncodePlan::Owned(plan) => vec![owned_json_piece(b, source, plan, span)],
     };
     let out = b.new_slot(Ty::String);
     let code = b.fresh_value(status_ty());
@@ -8502,7 +8511,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
-        hir::ExprKind::JsonEncode { base, plan, max_bytes } => lower_json_encode(b, *base, plan, max_bytes.as_deref(), e.ty),
+        hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty, e.span),
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
@@ -8902,7 +8911,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
             hir::ExprKind::Template(_) => lower_template_spine(b, e),
-            hir::ExprKind::JsonEncode { base, plan, max_bytes } => lower_json_encode(b, *base, plan, max_bytes.as_deref(), e.ty),
+            hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty, e.span),
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 lower_json_decode_declared(b, *struct_id, input, e.ty, None)
             }
@@ -26727,7 +26736,7 @@ mod tests {
             };
         }
         let owned = hir::Expr {
-            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
+            kind: hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: 0, path: Vec::new() }, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
                     root: 0,
                     records: Vec::new(),
                 }), max_bytes: None },
@@ -26735,7 +26744,7 @@ mod tests {
             span,
         };
         let bounded = hir::Expr {
-            kind: hir::ExprKind::JsonEncode { base: 0, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
+            kind: hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: 0, path: Vec::new() }, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
                     root: 0,
                     records: Vec::new(),
                 }), max_bytes: Some(Box::new(max_bytes)) },

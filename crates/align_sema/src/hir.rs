@@ -1541,7 +1541,7 @@ pub enum ExprKind {
     Template(Vec<TemplatePart>),
     /// Both JSON encoders borrow a canonical source plan and return owned Result<string, Error>.
     JsonEncode {
-        base: LocalId,
+        source: JsonEncodeSource,
         plan: JsonEncodePlan,
         max_bytes: Option<Box<Expr>>,
     },
@@ -2939,6 +2939,26 @@ pub struct OwnedJsonGraphRecordV4 {
 pub struct OwnedJsonGraphFieldV4 {
     pub name: String,
     pub ty: crate::Ty,
+}
+
+/// Canonical stable JSON input; an empty field path denotes the root local.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct JsonEncodeSource {
+    pub root: LocalId,
+    pub path: Vec<u32>,
+}
+impl JsonEncodeSource {
+    pub fn expression(&self, ty: Ty, span: Span) -> Expr {
+        Expr {
+            kind: if self.path.is_empty() {
+                ExprKind::Local(self.root)
+            } else {
+                ExprKind::Field { root: self.root, path: self.path.clone() }
+            },
+            ty,
+            span,
+        }
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
