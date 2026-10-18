@@ -580,3 +580,77 @@ fn main()->Result<(),Error> {
         assert!(result.is_ok(), "{result:?}");
     });
 }
+
+#[test]
+fn owned_sources_keep_distinct_eager_identity() {
+    owned_fixture::run("owned_sources_keep_distinct_eager_identity", |stage| {
+        let result = (|| -> TestResult {
+            for array in [false, true] {
+                let ty = if array { "array<Row>" } else { "Row" };
+                let make = if array {
+                    "mut builder:array_builder<Row>:=array_builder();builder.push(Row {value:text.clone()});builder.build()"
+                } else {
+                    "Row {value:text.clone()}"
+                };
+                let checks = |left: &str, right: &str| {
+                    let mut result = String::new();
+                    for a in [false, true] {
+                        for b in [false, true] {
+                            let call = |source: &str, bounded| {
+                                if bounded {
+                                    format!("json.encode_bounded({source},100)")
+                                } else {
+                                    format!("json.encode({source})")
+                                }
+                            };
+                            let a = call(left, a);
+                            let b = call(right, b);
+                            result.push_str(&format!(
+                                "if {a}?=={b}? {{return Err(Error.Invalid)}}\n"
+                            ));
+                            result.push_str(&format!(
+                                "if !distinct({a}?,{b}?) {{return Err(Error.Invalid)}}\n"
+                            ));
+                        }
+                    }
+                    result
+                };
+                let source = format!(
+                    r#"import core.json
+Row {{value:string}}
+Holder {{left:{ty},right:{ty}}}
+Choice {{Full(Holder),Empty}}
+fn make(text:str)->{ty} {{{make}}}
+fn distinct(left:string,right:string)->bool=left!=right
+fn shared(borrow input:Choice)->Result<(),Error> {{
+  match input {{Full(holder)=>{{
+    {field_checks}
+    Ok(())
+  }},Empty=>Err(Error.Invalid)}}
+}}
+fn main()->Result<(),Error> {{
+  left:=make("left")
+  right:=make("right")
+  {local_checks}
+  holder:=Holder {{left:left,right:right}}
+  {field_checks}
+  choice:=Choice.Full(holder)
+  shared(choice)?
+  shared(choice)?
+  Ok(())
+}}
+"#,
+                    field_checks = checks("holder.left", "holder.right"),
+                    local_checks = checks("left", "right")
+                );
+                run_both(
+                    stage,
+                    &source,
+                    if array { "eager-array" } else { "eager-record" },
+                )?;
+            }
+            Ok(())
+        })();
+        assert!(result.is_ok(), "{result:?}");
+    });
+}

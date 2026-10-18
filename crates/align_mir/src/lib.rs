@@ -7936,11 +7936,24 @@ fn lower_local(b: &mut Builder, id: hir::LocalId, requested_ty: Ty) -> Operand {
     Operand::Value(v)
 }
 
+/// Read a stable record field without inventing an expression identity. Shared match
+/// bindings are projections into their source storage, not initialized local slots.
+fn lower_record_field(b: &mut Builder, root: hir::LocalId, path: &[u32], ty: Ty) -> Operand {
+    if let Some(place) = b.borrowed_bindings.get(&root) {
+        let mut place = place.clone();
+        place.path.extend(path.iter().copied().map(hir::BorrowedPathSegment::StructField));
+        place.ty = ty;
+        return Operand::BorrowedPlace(Box::new(place));
+    }
+    let value = b.fresh_value(ty);
+    b.push(Stmt::Let(value, Rvalue::Field(root, path.to_vec())));
+    Operand::Value(value)
+}
+
 fn owned_json_piece(
     b: &mut Builder,
     source: &hir::JsonEncodeSource,
     plan: &hir::OwnedJsonGraphPlanV4,
-    span: Span,
 ) -> TemplatePiece {
     // Ordinary borrowed field lowering preserves shared match projections as well as locals.
     let source_ty = source.path.iter().fold(
@@ -7952,7 +7965,13 @@ fn owned_json_piece(
             _ => Ty::Error,
         },
     );
-    let value = lower_expr_for_borrow(b, &source.expression(source_ty, span));
+    // Eager memoization keys only persistent HIR nodes. A synthesized Expr here would reuse
+    // its stack address across sibling encodes and select the first source a second time.
+    let value = if source.path.is_empty() {
+        lower_local(b, source.root, source_ty)
+    } else {
+        lower_record_field(b, source.root, &source.path, source_ty)
+    };
     TemplatePiece::OwnedJsonRecords { value, plan: plan.clone() }
 }
 
@@ -7963,7 +7982,6 @@ fn lower_json_encode(
     plan: &hir::JsonEncodePlan,
     max_bytes: Option<&hir::Expr>,
     result_ty: Ty,
-    span: Span,
 ) -> Operand {
     let limit = max_bytes.map(|limit| lower_expr(b, limit));
     if !lowering_continues(b) { return terminated_operand(); }
@@ -7972,7 +7990,7 @@ fn lower_json_encode(
             let Some(pieces) = lower_template_parts(b, parts) else { return terminated_operand(); };
             pieces
         }
-        hir::JsonEncodePlan::Owned(plan) => vec![owned_json_piece(b, source, plan, span)],
+        hir::JsonEncodePlan::Owned(plan) => vec![owned_json_piece(b, source, plan)],
     };
     let out = b.new_slot(Ty::String);
     let code = b.fresh_value(status_ty());
@@ -8511,7 +8529,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
-        hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty, e.span),
+        hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty),
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
@@ -8911,7 +8929,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
             hir::ExprKind::Template(_) => lower_template_spine(b, e),
-            hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty, e.span),
+            hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty),
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 lower_json_decode_declared(b, *struct_id, input, e.ty, None)
             }
@@ -10233,21 +10251,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             hir::ExprKind::Match { .. } => lower_wildcard_match_spine(b, e),
             hir::ExprKind::ResultMapErr { result, f } => lower_map_err(b, result, f, e.ty),
-            hir::ExprKind::Field { root, path } => {
-                if let Some(place) = b.borrowed_bindings.get(root) {
-                    let mut place = place.clone();
-                    place.path.extend(
-                        path.iter()
-                            .copied()
-                            .map(hir::BorrowedPathSegment::StructField),
-                    );
-                    place.ty = e.ty;
-                    return Operand::BorrowedPlace(Box::new(place));
-                }
-                let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::Field(*root, path.clone())));
-                Operand::Value(v)
-            }
+            hir::ExprKind::Field { root, path } => lower_record_field(b, *root, path, e.ty),
             hir::ExprKind::SoaColumn {
                 base,
                 struct_id,
