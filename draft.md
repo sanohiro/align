@@ -2027,21 +2027,25 @@ Local moves, reassignment, block tails, and value-producing control flow preserv
 calls, returns, captures, imports, and aggregate reconstruction do not transport it. `get()` checks
 the originating group, not merely the innermost active group. Entering a nested group preserves
 outer group facts: an inner `wait()` cannot authorize an outer Task, while handling an outer
-fallible Wait Result inside the inner group updates the outer group's success fact. Task result R
-may be a primitive Int/Float/Bool/Char/Unit or an ordinary record containing only independent inline
-Copy data: numeric/bool/char/unit/RNG leaves, valid numeric vectors/masks, and existing record,
-tuple, fixed-array, Option/Result and sum fields containing only those leaves. Every reachable
-field and payload participates, including inactive variants and zero-length array elements.
-Views, raw pointers, callables, task/region/native/heap owners and recursive inline cycles are
-excluded. Root tuple/sum/tagged/array/vector results retain their existing restrictions. A task
-may instead return `Result<R, Error>` through the same successful-wait boundary.
-`get()` copies the complete R without consuming the Task handle, exposing the slot or allocating
-an additional buffer, and may be repeated. This copied value may outlive the task group and its
-captured backing. Result slots honor the target layout and any existing source `align(N)`;
-ordinary field/payload type-formation restrictions still apply.
+fallible Wait Result inside the inner group updates the outer group's success fact. Task result R is self-contained data: primitive Int/Float/Bool/Char/Unit,
+string, buffer, ordinary dynamic scalar arrays, AoS record arrays, records, tuples or sums.
+Every reachable field and payload participates, including inactive variants and zero-length
+array elements. Their complete already-formed graphs may compose independent Copy data and
+owned string/buffer/array storage through records, tuples, sums, Option/Result and fixed arrays.
+Views, raw pointers, callables, boxes, task/region/native/resource handles and inline cycles reject;
+dynamic array headers may break recursive layout cycles. Root fixed arrays, vectors/masks, RNG,
+Option and arbitrary Result remain excluded. A task may instead return `Result<R, Error>` through
+the same successful-wait boundary. Ordinary field/payload formation restrictions still apply.
+For Copy R, `get()` copies R and may repeat without consuming the Task handle. For Move R, it
+consumes the handle and transfers R exactly once without cloning its storage. The result may
+outlive the worker, group, captures and surrounding arena; worker-local arena owners cannot escape.
+After joining every task, group exit drops each initialized, untaken owned result in spawn order,
+including after errors and across multiple waits, before releasing group storage. A taken value
+follows ordinary ownership and Drop. Slots honor target layout and existing source alignment.
+[Plan228](docs/impl/228-task-owned-results.md) owns the complete transfer and cleanup contract.
 Leaving a nested group removes proofs that name that group, including proof on its block result;
 handling that Result outside cannot authorize an enclosing Task. Proofs for still-active outer
-groups remain. Owned task results remain a future extension.
+groups remain.
 
 Unlike a `par_map` lambda (which must be Pure), a spawned task **may** be impure — that is the
 point: it performs I/O. Captures are snapshots of Copy values. A copied view descriptor still

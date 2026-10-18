@@ -792,7 +792,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::TgAlloc) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TgBegin) => RuntimeEffects { class: EffectClass::AllocNew, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: true, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TgEnd) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::Region, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::TgRegister) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2, 3, 4, 5], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TgRegister) => RuntimeEffects { class: EffectClass::Callback, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2, 3, 4, 5, 6], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TgWait) => RuntimeEffects { class: EffectClass::IndirectStorage, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TimeFormat) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TimeInstant) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
@@ -4178,6 +4178,7 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
         RuntimeAbiShape::A81 => RuntimeAbiShapeSpec {
             ret: NativeReturn::Void,
             params: &[
+                NativeType::Ptr,
                 NativeType::Ptr,
                 NativeType::Ptr,
                 NativeType::Ptr,

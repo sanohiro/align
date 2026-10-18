@@ -6681,6 +6681,20 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                 }
             }
+            Rvalue::TaskTake(task) => {
+                let program = self.graph.program;
+                if xml_operand_base_ty(self.graph.function, &task) != align_sema::ty_to_scalar(result_ty).map(Ty::Task)
+                    || !align_sema::task_result_type(result_ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types)
+                    || !align_sema::needs_drop_flag(result_ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types)
+                {
+                    equation.invalid = true;
+                } else {
+                    // Every selected payload belongs to this fresh owner; the admitted complete
+                    // graph contains no borrowed/native authority. Wait/move replay and callable
+                    // preflight independently authenticate the Task producer and extraction.
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
             // Exhaustive non-protected producers. Keeping this in the equation match
             // makes a missing semantic producer arm a compiler error, not a fallback.
             Rvalue::SqliteCallbackDescriptor(..)
@@ -11045,8 +11059,8 @@ fn validate_tagged_program_inner(
                         Ty::Box(Scalar::Tuple(_)) | Ty::Slice(Scalar::Tuple(_))
                         | Ty::DynArray(Scalar::Tuple(_)) | Ty::Array(Scalar::Tuple(_), _)
                         | Ty::Vec(Scalar::Tuple(_), _) | Ty::Mask(Scalar::Tuple(_), _)
-                        | Ty::Task(Scalar::Tuple(_)) | Ty::ArrayBuilder(Scalar::Tuple(_)) => {
-                            return Err(Self::invalid("a tuple is not a collection, box, or task element".into()));
+                        | Ty::ArrayBuilder(Scalar::Tuple(_)) => {
+                            return Err(Self::invalid("a tuple is not a collection or box element".into()));
                         }
                         Ty::Option(payload)
                         | Ty::Array(payload, _)
@@ -11061,8 +11075,15 @@ fn validate_tagged_program_inner(
                         Ty::StructArray(id, _) => self.enter_struct(id, &mut work)?,
                         Ty::Box(payload)
                         | Ty::Slice(payload)
-                        | Ty::DynArray(payload)
-                        | Ty::Task(payload) => self.check_scalar_reference(payload)?,
+                        | Ty::DynArray(payload) => self.check_scalar_reference(payload)?,
+                        Ty::Task(payload) => {
+                            let program = self.program;
+                            if !align_sema::task_result_type(scalar_to_ty(payload), &program.structs,
+                                &program.tuples, &program.enums, &program.tagged_types) {
+                                return Err(Self::invalid("invalid task result graph".into()));
+                            }
+                            self.check_scalar_reference(payload)?;
+                        }
                         Ty::ArrayBuilder(payload) => {
                             self.check_scalar_reference(payload)?
                         }

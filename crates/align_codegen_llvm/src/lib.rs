@@ -4574,6 +4574,12 @@ fn lower_prepared_module<'c>(
         let env = tramp.get_nth_param(1).unwrap();
         let slot = tramp.get_nth_param(2).unwrap().into_pointer_value();
         let err_slot = tramp.get_nth_param(3).unwrap().into_pointer_value();
+        let owned = task_result_owned(*r, program);
+        let cleanup = if owned { hir::ReturnCleanupAbi::DynamicBit } else { hir::ReturnCleanupAbi::None };
+        let result_llvm = abi_map_ty(ctx, *r, &struct_types, &enum_types, tagged_types, &tuple_types);
+        let flag = if owned {
+            Some(tb.build_struct_gep(task_slot_type(ctx, result_llvm), slot, 1, "initialized").map_err(lower)?)
+        } else { None };
         if *fallible {
             // The closure returns `Result<R, Error>` = `{ i8 tag, R ok, Error err }` (tag 0 = Ok).
             // On `Err`, write the full `Error` value to `err_slot` and return 1; on `Ok`, write R.
@@ -4593,13 +4599,14 @@ fn lower_prepared_module<'c>(
                 ],
                 &target_data,
             )?;
-            let call = return_transport::build_indirect_call(ctx, &tb, result_ty.fn_type(&[ptr.into()], false), thunk, &[env.into()], "r", false)
+            let call = return_transport::build_indirect_call(ctx, &tb, align_return_type(ctx, result_ty.into(), cleanup).fn_type(&[ptr.into()], false), thunk, &[env.into()], "r", owned)
                 .map_err(lower)?;
             call.set_tail_call_kind(inkwell::values::LLVMTailCallKind::LLVMTailCallKindNoTail);
             let agg = call.try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?
                 .into_struct_value();
+            let agg = if owned { tb.build_extract_value(agg, 0, "value").map_err(lower)?.into_struct_value() } else { agg };
             let tag = tb.build_extract_value(agg, 0, "tag").map_err(lower)?.into_int_value();
             let is_err = tb
                 .build_int_compare(IntPredicate::EQ, tag, ctx.i8_type().const_int(1, false), "iserr")
@@ -4614,6 +4621,7 @@ fn lower_prepared_module<'c>(
             tb.position_at_end(ok_bb);
             let ok = extract_union_payload(ctx, &tb, agg, result_shape.payload(0, 0)?, "ok")?;
             tb.build_store(slot, ok).map_err(lower)?;
+            if let Some(flag) = flag { tb.build_store(flag, ctx.bool_type().const_int(1, false)).map_err(lower)?; }
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else if *r == Ty::Unit {
             // A `()`-returning closure is `void(ptr)` in LLVM (not `i32(ptr)`); call it with a void
@@ -4624,7 +4632,7 @@ fn lower_prepared_module<'c>(
             tb.build_store(slot, i32t.const_zero()).map_err(lower)?;
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         } else {
-            let rt = scalar_type(ctx, *r, &struct_types, &enum_types, tagged_types);
+            let rt = align_return_type(ctx, result_llvm, cleanup);
             let call = return_transport::build_indirect_call(
                 ctx,
                 &tb,
@@ -4632,7 +4640,7 @@ fn lower_prepared_module<'c>(
                 thunk,
                 &[env.into()],
                 "r",
-                false,
+                owned,
             )
             .map_err(lower)?;
             // This callback converts R into the runtime's status and cannot forward R as its
@@ -4645,14 +4653,16 @@ fn lower_prepared_module<'c>(
                 &[],
                 &[],
                 *r,
-                hir::ReturnCleanupAbi::None,
+                cleanup,
                 1,
             )?;
             let res = call
                 .try_as_basic_value()
                 .basic()
                 .ok_or_else(|| CodegenError::Lowering("spawn closure returned no value".into()))?;
+            let res = if owned { tb.build_extract_value(res.into_struct_value(), 0, "value").map_err(lower)? } else { res };
             tb.build_store(slot, res).map_err(lower)?;
+            if let Some(flag) = flag { tb.build_store(flag, ctx.bool_type().const_int(1, false)).map_err(lower)?; }
             tb.build_return(Some(&i32t.const_zero())).map_err(lower)?;
         }
         generated_funcs.insert(id.clone(), tramp);
@@ -5572,6 +5582,7 @@ fn generated_stem(id: &GeneratedId) -> Result<String, CodegenError> {
         GeneratedId::Closure { lifted, .. } => {
             format!("align_gen$clos${}", callable_hex(lifted))
         }
+        GeneratedId::TaskDrop { result } => format!("align_gen$task_drop${}", lowercase_hex(result.as_bytes())),
         GeneratedId::Task { fallible, result } => {
             let fallible_byte = u8::from(*fallible);
             let result_hex = lowercase_hex(result.as_bytes());
@@ -5723,6 +5734,14 @@ fn callable_declarations(
     Ok(declarations)
 }
 
+fn task_result_owned(ty: Ty, program: &Program) -> bool {
+    align_sema::needs_drop_flag(ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types)
+}
+
+fn task_slot_type<'c>(ctx: &'c Context, result: BasicTypeEnum<'c>) -> inkwell::types::StructType<'c> {
+    ctx.struct_type(&[result, ctx.bool_type().into()], false)
+}
+
 // Spawn consumes one freshly lowered literal closure in the current block. Authenticate its
 // actual callable ABI, not merely the repr-only Fn tag whose return is the successful payload.
 fn task_request_is_valid(
@@ -5773,7 +5792,7 @@ fn task_request_is_valid(
     };
     Ok(declaration.signature.params == *capture_tys
         && declaration.signature.modes.iter().all(|mode| *mode == align_ast::ParamMode::ByValue)
-        && declaration.signature.cleanup == hir::ReturnCleanupAbi::None
+        && declaration.signature.cleanup == if task_result_owned(*r, program) { hir::ReturnCleanupAbi::DynamicBit } else { hir::ReturnCleanupAbi::None }
         && source_ty_matches(declaration.signature.ret, expected, program)?)
 }
 
@@ -6107,6 +6126,9 @@ fn callable_preflight(
                         )? {
                             return Err(CodegenError::Lowering("spawn result/callable metadata invalid".into()));
                         }
+                        if task_result_owned(*r, program) {
+                            generated.push(GeneratedId::TaskDrop { result: canonical_ty(*r, program)? });
+                        }
                         generated.push(GeneratedId::Task {
                             fallible: *fallible,
                             result: canonical_metadata(CanonicalTy::from_program(*r, program))?,
@@ -6117,18 +6139,25 @@ fn callable_preflight(
                     {
                         return Err(CodegenError::Lowering("task result requires spawn producer".into()));
                     }
-                    Rvalue::BoxGet(task)
-                        if matches!(preflight_operand_ty(function, task), Some(Ty::Task(_))) =>
-                    {
-                        let Some(Ty::Task(payload)) = preflight_operand_ty(function, task) else {
-                            return Err(callable_metadata_error().into());
-                        };
-                        let result = function.value_tys.get(*value as usize).copied();
-                        let ty = scalar_to_ty(payload);
-                        if !align_sema::task_result_type(
-                            ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types,
-                        ) || !result.is_some_and(|result| result == ty) {
-                            return Err(CodegenError::Lowering("task get payload metadata invalid".into()));
+                    Rvalue::BoxGet(task) | Rvalue::TaskTake(task) => {
+                        let result = function.value_tys.get(*value as usize).copied()
+                            .ok_or_else(callable_metadata_error)?;
+                        match preflight_operand_ty(function, task) {
+                            Some(Ty::Task(payload)) => {
+                                let ty = scalar_to_ty(payload);
+                                if !align_sema::task_result_type(
+                                    ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types,
+                                ) || task_result_owned(ty, program) != matches!(rvalue, Rvalue::TaskTake(_))
+                                    || !source_ty_matches(result, ty, program)? {
+                                    return Err(CodegenError::Lowering("task get payload metadata invalid".into()));
+                                }
+                            }
+                            Some(Ty::Box(payload)) if matches!(rvalue, Rvalue::BoxGet(_)) => {
+                                if !source_ty_matches(result, scalar_to_ty(payload), program)? {
+                                    return Err(CodegenError::Lowering("box get payload metadata invalid".into()));
+                                }
+                            }
+                            _ => return Err(CodegenError::Lowering("box/task get operand metadata invalid".into())),
                         }
                     }
                     Rvalue::ParMapParallel {
@@ -14701,8 +14730,11 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // The result slot (a `box<R>` in the region — the `Task<R>` handle).
                 // Preflight authenticates R and its callable before any LLVM construction.
                 let result_type = self.llvm_type(*r);
-                let rbytes = self.target_data.get_store_size(&result_type);
-                let ralign = u64::from(self.type_align(*r));
+                let owned = task_result_owned(*r, self.program);
+                let slot_type = if owned { task_slot_type(self.ctx, result_type).into() } else { result_type };
+                let rbytes = self.target_data.get_store_size(&slot_type);
+                let ralign = u64::from(self.type_align(*r).max(self.target_data.get_abi_alignment(&slot_type)));
+                let cleanup = if owned { self.task_drop_helper(*r)? } else { self.ctx.ptr_type(AddressSpace::default()).const_null() };
                 let slot = self
                     .builder
                     .build_call(self.runtime(RuntimeKey::TgAlloc), &[tgv.into(), i64t.const_int(rbytes, false).into(), i64t.const_int(ralign, false).into()], "slot")
@@ -14742,7 +14774,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .as_global_value()
                     .as_pointer_value();
                 self.builder
-                    .build_call(self.runtime(RuntimeKey::TgRegister), &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into(), err_slot.into()], "")
+                    .build_call(self.runtime(RuntimeKey::TgRegister), &[tgv.into(), tramp.into(), thunk.into(), env.into(), slot.into(), err_slot.into(), cleanup.into()], "")
                     .map_err(|e| self.err(e))?;
                 slot.into()
             }
@@ -15216,18 +15248,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 option.add_incoming(&[(&some, some_end), (&none, none_end)]);
                 option.as_basic_value()
             }
+            Rvalue::TaskTake(op) => {
+                let slot = self.operand(op)?.into_pointer_value();
+                let ty = self.llvm_type(result_ty);
+                let flag = self.builder.build_struct_gep(task_slot_type(self.ctx, ty), slot, 1, "task.live").map_err(|e| self.err(e))?;
+                let live = self.builder.build_load(self.ctx.bool_type(), flag, "task.initialized").map_err(|e| self.err(e))?.into_int_value();
+                self.xml_abort_unless(live, "task.take")?;
+                let result = self.builder.build_load(ty, slot, "task.result").map_err(|e| self.err(e))?;
+                self.builder.build_store(flag, self.ctx.bool_type().const_zero()).map_err(|e| self.err(e))?;
+                result
+            }
             Rvalue::BoxGet(op) => {
-                let ty = scalar_type(
-                    self.ctx,
-                    result_ty,
-                    self.struct_types,
-                    self.enum_types,
-                    self.tagged_types,
-                );
+                let ty = self.llvm_type(result_ty);
                 let ptr = self.operand(op)?.into_pointer_value();
-                self.builder
-                    .build_load(ty, ptr, "boxget")
-                    .map_err(|e| self.err(e))?
+                self.builder.build_load(ty, ptr, "boxget").map_err(|e| self.err(e))?
             }
             Rvalue::Index(slot, idx) => {
                 let ep = self.elem_ptr(*slot, idx)?;
@@ -20876,6 +20910,45 @@ impl<'c, 'a> FnGen<'c, 'a> {
             };
         }
         Err(self.err("DropField path is incomplete"))
+    }
+
+    /// Drop one initialized, untaken result using the same canonical Drop plan as its caller.
+    fn task_drop_helper(&self, ty: Ty) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        let id = GeneratedId::TaskDrop { result: canonical_ty(ty, self.program)? };
+        let name = self.callable_preflight.generated_names.get(&id)
+            .ok_or_else(|| self.err("task cleanup identity was not collected"))?;
+        if let Some(helper) = self.module.get_function(name) {
+            return Ok(helper.as_global_value().as_pointer_value());
+        }
+        let helper = self.module.add_function(name, self.ctx.void_type().fn_type(
+            &[self.ctx.ptr_type(AddressSpace::default()).into()], false), None);
+        mark_nounwind(self.ctx, helper);
+        mark_private_helper(helper);
+        let saved = self.builder.get_insert_block();
+        let saved_debug = self.dibuilder.is_some().then(|| self.current_debug_location()).flatten();
+        if self.dibuilder.is_some() { self.builder.unset_current_debug_location(); }
+        let emitted = (|| -> Result<(), CodegenError> {
+            let entry = self.ctx.append_basic_block(helper, "entry");
+            let drop = self.ctx.append_basic_block(helper, "drop");
+            let done = self.ctx.append_basic_block(helper, "done");
+            self.builder.position_at_end(entry);
+            let slot = helper.get_nth_param(0).ok_or_else(|| self.err("task cleanup missing slot"))?.into_pointer_value();
+            let flag = self.builder.build_struct_gep(task_slot_type(self.ctx, self.llvm_type(ty)), slot, 1, "live").map_err(|e| self.err(e))?;
+            let live = self.builder.build_load(self.ctx.bool_type(), flag, "initialized").map_err(|e| self.err(e))?.into_int_value();
+            self.builder.build_conditional_branch(live, drop, done).map_err(|e| self.err(e))?;
+            self.builder.position_at_end(drop);
+            self.builder.build_store(flag, self.ctx.bool_type().const_zero()).map_err(|e| self.err(e))?;
+            self.emit_drop_at_iterative_in(helper, slot, ty)?;
+            self.builder.build_unconditional_branch(done).map_err(|e| self.err(e))?;
+            self.builder.position_at_end(done);
+            self.builder.build_return(None).map_err(|e| self.err(e))?;
+            Ok(())
+        })();
+        match saved { Some(block) => self.builder.position_at_end(block), None => self.builder.clear_insertion_position() }
+        if let Some(location) = saved_debug { self.restore_debug_location(Some(location)); }
+        else if self.dibuilder.is_some() { self.set_line(self.fn_line, 0); }
+        emitted?;
+        Ok(helper.as_global_value().as_pointer_value())
     }
 
     /// Call the module's one private iterative destructor for a Move struct at `base`.
@@ -38140,6 +38213,51 @@ fn main() -> i32 = 0
                 _ => "spawn result/callable metadata invalid",
             }), "{mutation}: {error}");
         }
+    }
+
+    #[test]
+    fn task_owned_metadata_rejects_reader_and_callback_forgery() -> Result<(), String> {
+        for (owned, source) in [
+            (true, "fn main() {task_group {t:=spawn(fn {\"owned\".clone()});wait();v:=t.get();print(v)}}"),
+            (false, "fn main() {task_group {t:=spawn(fn {19});wait();print(t.get())}}"),
+        ] {
+            let valid = mir(source);
+            emit_llvm_ir(&valid, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|error| error.to_string())?;
+            for mutation in 0..5 {
+                let mut invalid=valid.clone();
+                let mut changed=false;
+                for function in &mut invalid.fns {
+                    for block in &mut function.blocks {
+                        for statement in &mut block.stmts {
+                            let Stmt::Let(value,request)=statement else {continue};
+                            match request {
+                                Rvalue::TaskTake(task) | Rvalue::BoxGet(task) => {
+                                    match mutation {
+                                        0 => *request=if owned {Rvalue::BoxGet(task.clone())} else {Rvalue::TaskTake(task.clone())},
+                                        1 => *task=Operand::Const(Const::Unit),
+                                        2 => *function.value_tys.get_mut(usize::try_from(*value).map_err(|error|error.to_string())?).ok_or("get type")?=Ty::Bool,
+                                        _ => continue,
+                                    }
+                                    changed=true;
+                                }
+                                Rvalue::SpawnTask {tg,fallible,..} => {
+                                    match mutation {
+                                        3 => *fallible=!*fallible,
+                                        4 => *request=Rvalue::HeapAlloc(tg.clone(),Operand::Const(Const::Unit)),
+                                        _ => continue,
+                                    }
+                                    changed=true;
+                                }
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+                assert!(changed);
+                assert!(emit_llvm_ir(&invalid,&BuildTarget::Baseline,Profile::Release,false,&[],None).is_err(),"{owned}/{mutation}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

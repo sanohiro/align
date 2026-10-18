@@ -118,6 +118,7 @@ fn tiny_par_map_skips_pool_and_registered_tasks_use_workers() {
             env,
             slot,
             std::ptr::null_mut(),
+            None,
         )
     };
     let err = unsafe { align_runtime::align_rt_tg_wait(tg) };

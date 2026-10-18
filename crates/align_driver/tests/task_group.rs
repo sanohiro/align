@@ -270,10 +270,9 @@ fn fallible_bare_wait_then_get_rejected() {
 }
 
 #[test]
-fn owned_payload_task_rejected() {
-    // Task results contain independent Copy bits. An owned result (`string`) still needs
-    // a separate result ownership/drop contract.
-    assert!(check_errs(
+fn owned_payload_task_can_be_left_untaken() {
+    // Plan228: the group cleans untaken owned results after joining.
+    assert!(!check_errs(
         "tg-owned",
         "fn main() -> Result<(), Error> {\n  task_group {\n    s := spawn(fn { \"hi\".clone() })\n    wait()\n    return Ok(())\n  }\n}\n"
     ));

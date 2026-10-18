@@ -89,6 +89,7 @@ pub enum GeneratedId {
         fallible: bool,
         result: CanonicalTy,
     },
+    TaskDrop { result: CanonicalTy },
     SqliteScalarCallback {
         target: ProgramCall,
         signature: CanonicalFnAbi,
@@ -128,6 +129,10 @@ impl GeneratedId {
             Self::Task { fallible, result } => {
                 out.push(2);
                 out.push(u8::from(*fallible));
+                out.extend(result.as_bytes());
+            }
+            Self::TaskDrop { result } => {
+                out.push(5);
                 out.extend(result.as_bytes());
             }
             Self::Parallel(parallel) => {
@@ -180,6 +185,7 @@ impl GeneratedId {
                 fallible: cursor.boolean()?,
                 result: cursor.ty()?,
             },
+            5 => Self::TaskDrop { result: cursor.ty()? },
             3 => Self::Parallel(cursor.parallel()?),
             4 => Self::SqliteScalarCallback {
                 target: cursor.call()?,
@@ -303,7 +309,7 @@ fn validate_generated(value: &GeneratedId) -> Result<(), CanonicalCodecError> {
             validate_call(lifted)?;
             validate_drop_state_tags(drop_state_effects)
         }
-        GeneratedId::Task { .. } => Ok(()),
+        GeneratedId::Task { .. } | GeneratedId::TaskDrop { .. } => Ok(()),
         GeneratedId::SqliteScalarCallback {
             target,
             effect,
@@ -678,6 +684,7 @@ mod tests {
         let i64_abi = abi("01010000000003000000000001400300000000000140000000");
 
         let goldens = [
+            (GeneratedId::TaskDrop { result: i64_ty.clone() }, "02050300000000000140"),
             (
                 GeneratedId::FnValue {
                     target: call("f"),

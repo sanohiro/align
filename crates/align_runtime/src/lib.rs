@@ -17709,6 +17709,8 @@ impl TgGeneration {
 
 pub struct TaskGroup {
     arena: Arena,
+    // Caller-owned records survive waits; workers only touch the separately allocated slots.
+    result_cleanup: Vec<(extern "C" fn(*mut u8), *mut u8)>,
     generation: Option<std::sync::Arc<TgGeneration>>,
 }
 
@@ -17718,6 +17720,7 @@ pub extern "C" fn align_rt_tg_begin() -> *mut TaskGroup {
     Box::into_raw(Box::new(TaskGroup {
         arena: Arena { chunks: Vec::new(), off: 0, maps: Vec::new() },
         generation: None,
+        result_cleanup: Vec::new(),
     }))
 }
 
@@ -17742,7 +17745,9 @@ pub unsafe extern "C" fn align_rt_tg_alloc(tg: *mut TaskGroup, size: i64, align:
 /// environment/result/error storage must be private, correctly initialized/aligned for `tramp`,
 /// and valid through the next join. Shared capture backing must remain live and unmodified until
 /// that join. `tramp`/`thunk` must obey the compiler's task ABI; only an infallible task may omit
-/// `err_slot`. A task must not unwind through its C ABI.
+/// `err_slot`. An owned result supplies a non-unwinding cleanup thunk; its slot must remain
+/// valid until group end, including across waits. Cleanup must test/clear the initialized flag
+/// before dropping the result. A task must not unwind through its C ABI.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tg_register(
     tg: *mut TaskGroup,
@@ -17751,8 +17756,10 @@ pub unsafe extern "C" fn align_rt_tg_register(
     env: *mut u8,
     slot: *mut u8,
     err_slot: *mut u8,
+    cleanup: Option<extern "C" fn(*mut u8)>,
 ) {
     let tg = unsafe { &mut *tg };
+    if let Some(cleanup) = cleanup { tg.result_cleanup.push((cleanup, slot)); }
     let generation = tg.generation.get_or_insert_with(Default::default);
     let (pool, workers) = par_pool();
     if generation.register(TgTask { tramp, thunk, env, slot, err_slot }, workers) {
@@ -17786,7 +17793,9 @@ pub unsafe extern "C" fn align_rt_tg_wait(tg: *mut TaskGroup) -> *mut u8 {
 pub unsafe extern "C" fn align_rt_tg_end(tg: *mut TaskGroup) {
     if !tg.is_null() {
         unsafe { align_rt_tg_wait(tg) };
-        drop(unsafe { Box::from_raw(tg) });
+        let mut group = unsafe { Box::from_raw(tg) };
+        for (cleanup, slot) in group.result_cleanup.drain(..) { cleanup(slot); }
+        drop(group);
     }
 }
 
@@ -37838,7 +37847,7 @@ mod tests {
             let env = unsafe { align_rt_tg_alloc(tg, 8, 8) };
             unsafe { *(env as *mut i64) = i };
             let slot = unsafe { align_rt_tg_alloc(tg, 8, 8) };
-            unsafe { align_rt_tg_register(tg, double_tramp, std::ptr::null(), env, slot, std::ptr::null_mut()) };
+            unsafe { align_rt_tg_register(tg, double_tramp, std::ptr::null(), env, slot, std::ptr::null_mut(), None) };
             slots.push(slot);
         }
         (tg, slots)
@@ -37865,7 +37874,7 @@ mod tests {
             let (sender, receiver) = std::sync::mpsc::channel::<()>();
             unsafe {
                 align_rt_tg_register(tg, signal, std::ptr::null(),
-                    (&raw const sender).cast_mut().cast(), std::ptr::null_mut(), std::ptr::null_mut());
+                    (&raw const sender).cast_mut().cast(), std::ptr::null_mut(), std::ptr::null_mut(), None);
             }
             // Timeout bounds a broken scheduler; receipt, not elapsed time, proves worker progress.
             let started = receiver.recv_timeout(std::time::Duration::from_secs(10));
@@ -37915,10 +37924,76 @@ mod tests {
         let tg = align_rt_tg_begin();
         unsafe {
             align_rt_tg_register(tg, double_tramp, std::ptr::null(),
-                (&raw mut input).cast(), (&raw mut output).cast(), std::ptr::null_mut());
+                (&raw mut input).cast(), (&raw mut output).cast(), std::ptr::null_mut(), None);
             align_rt_tg_end(tg);
         }
         assert_eq!(output, 14);
+    }
+
+    #[test]
+    fn tg_owned_cleanup_survives_waits_and_follows_join_in_spawn_order() {
+        use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
+        struct Slot {
+            index: usize,
+            initialized: bool,
+            completed: Arc<AtomicUsize>,
+            drops: Arc<Mutex<Vec<usize>>>,
+        }
+        extern "C" fn fill(_: *const u8, _: *mut u8, slot: *mut u8, _: *mut u8) -> i32 {
+            let slot = unsafe { &mut *slot.cast::<Slot>() };
+            // One failed result never initializes its payload.
+            slot.initialized = slot.index != 13;
+            slot.completed.fetch_add(1, Ordering::Release);
+            i32::from(!slot.initialized)
+        }
+        extern "C" fn cleanup(slot: *mut u8) {
+            let slot = unsafe { &mut *slot.cast::<Slot>() };
+            // Every task, including the final un-waited generation, finishes before any Drop.
+            assert_eq!(slot.completed.load(Ordering::Acquire), 257);
+            if slot.initialized {
+                slot.initialized = false;
+                slot.drops.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(slot.index);
+            }
+        }
+        let completed = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(Mutex::new(Vec::new()));
+        let mut slots = (0..257).map(|index| Box::new(Slot {
+            index, initialized: false, completed: completed.clone(), drops: drops.clone(),
+        })).collect::<Vec<_>>();
+        let group = align_rt_tg_begin();
+        let mut error = 0u8;
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if index == 256 {
+                // Keep the final generation caller-only: no worker can accidentally complete
+                // it before TgEnd. Reordering cleanup before join must fail deterministically.
+                let generation = Arc::new(TgGeneration::default());
+                let pointer = (&raw mut **slot).cast();
+                assert!(!generation.register(TgTask { tramp: fill, thunk: std::ptr::null(),
+                    env: std::ptr::null_mut(), slot: pointer, err_slot: &raw mut error }, 0));
+                let state = unsafe { &mut *group };
+                state.generation = Some(generation);
+                state.result_cleanup.push((cleanup, pointer));
+            } else {
+                unsafe {
+                    align_rt_tg_register(group, fill, std::ptr::null(), std::ptr::null_mut(),
+                        (&raw mut **slot).cast(), &raw mut error, Some(cleanup));
+                }
+            }
+            if index == 15 {
+                assert_eq!(unsafe { align_rt_tg_wait(group) }, &raw mut error);
+                assert!(drops.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty(), "wait must preserve result owners");
+                // Simulate a successful take after this generation's join.
+                // The pointer is private and no worker accesses it after completion.
+                slot.initialized = false;
+            }
+            if index == 255 {
+                assert!(unsafe { align_rt_tg_wait(group) }.is_null());
+                assert!(drops.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).is_empty());
+            }
+        }
+        unsafe { align_rt_tg_end(group) };
+        assert_eq!(*drops.lock().unwrap_or_else(|poisoned| poisoned.into_inner()), (0..257).filter(|i| *i != 13 && *i != 15).collect::<Vec<_>>());
+        assert!(slots.iter().all(|slot| !slot.initialized));
     }
 
     #[test]
@@ -37948,7 +38023,7 @@ mod tests {
             let (tramp, code): (extern "C" fn(*const u8, *mut u8, *mut u8, *mut u8) -> i32, i64) =
                 if i == 3 || i == 7 { (err_tramp, i * 10) } else { (double_tramp, 0) };
             unsafe { *(env as *mut i64) = code };
-            unsafe { align_rt_tg_register(tg, tramp, std::ptr::null(), env, slot, err_slot) };
+            unsafe { align_rt_tg_register(tg, tramp, std::ptr::null(), env, slot, err_slot, None) };
             err_slots.push(err_slot);
         }
         let err = unsafe { align_rt_tg_wait(tg) };
@@ -37968,7 +38043,7 @@ mod tests {
             let e = unsafe { align_rt_tg_alloc(sub, 8, 8) };
             unsafe { *(e as *mut i64) = base + j };
             let s = unsafe { align_rt_tg_alloc(sub, 8, 8) };
-            unsafe { align_rt_tg_register(sub, double_tramp, std::ptr::null(), e, s, std::ptr::null_mut()) };
+            unsafe { align_rt_tg_register(sub, double_tramp, std::ptr::null(), e, s, std::ptr::null_mut(), None) };
             subslots.push(s);
         }
         let err = unsafe { align_rt_tg_wait(sub) };
@@ -37992,7 +38067,7 @@ mod tests {
             let env = unsafe { align_rt_tg_alloc(tg, 8, 8) };
             unsafe { *(env as *mut i64) = base };
             let slot = unsafe { align_rt_tg_alloc(tg, 8, 8) };
-            unsafe { align_rt_tg_register(tg, nested_tramp, std::ptr::null(), env, slot, std::ptr::null_mut()) };
+            unsafe { align_rt_tg_register(tg, nested_tramp, std::ptr::null(), env, slot, std::ptr::null_mut(), None) };
             slots.push(slot);
         }
         let err = unsafe { align_rt_tg_wait(tg) };
@@ -38460,6 +38535,7 @@ mod tests {
                     env,
                     slot,
                     std::ptr::null_mut(),
+                    None,
                 )
             };
             slots.push(slot);

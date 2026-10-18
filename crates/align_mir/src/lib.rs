@@ -1216,6 +1216,8 @@ pub enum Rvalue {
     },
     /// Read (copy) the value out of a `box` operand.
     BoxGet(Operand),
+    /// Transfer a joined owned task result and clear its group-owned initialized flag.
+    TaskTake(Operand),
     /// Deep-copy a `box` into a fresh allocation. First operand is the arena handle,
     /// second is the source box.
     BoxClone(Operand, Operand),
@@ -6394,9 +6396,8 @@ fn source_move_statements(b: &Builder, e: &hir::Expr, out: &mut Vec<Stmt>) {
                 source_move_statements(b, v, out);
             }
         }
-        // `t.get()` moves an owned result out of the task; null the task slot so its exit `Drop`
-        // doesn't double-free the buffer the gotten value now owns.
-        hir::ExprKind::TaskGet(inner) => source_move_statements(b, inner, out),
+        // TaskTake clears the group slot at extraction, including non-consuming result uses.
+        hir::ExprKind::TaskGet(_) => {},
         // Structural constructors commit their own recorded transfers. Never replay their
         // payload syntax here: a completed child action may have consumed a different generation.
         // A partial field move (`a := t.0`) took the owned element's buffer; null that one field of
@@ -6458,8 +6459,8 @@ fn moved_drop_flag(b: &mut Builder, e: &hir::Expr) -> Option<Operand> {
             hir::ExprKind::OptionSome(inner)
             | hir::ExprKind::ResultOk(inner)
             | hir::ExprKind::ResultErr(inner)
-            | hir::ExprKind::Try(inner)
-            | hir::ExprKind::TaskGet(inner) => moved_drop_flag(b, inner),
+            | hir::ExprKind::Try(inner) => moved_drop_flag(b, inner),
+            hir::ExprKind::TaskGet(_) => Some(Operand::Const(Const::Bool(true))),
             _ => None,
         }
     };
@@ -10609,11 +10610,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 Operand::Value(v)
             }
-            // `t.get()` reads the result out of the task's slot.
+            // Owned extraction is an effectful transfer, even for an unused or borrowed result.
             hir::ExprKind::TaskGet(inner) => {
-                lower_required_binding!(b, bx = lower_expr(b, inner), Operand::Const(Const::Unit));
+                lower_required_binding!(b, task = lower_expr(b, inner), Operand::Const(Const::Unit));
                 let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::BoxGet(bx)));
+                let owned = needs_drop_flag(e.ty, &b.structs, &b.tuples, &b.enums, &b.tagged_types);
+                b.push(Stmt::Let(v, if owned { Rvalue::TaskTake(task) } else { Rvalue::BoxGet(task) }));
                 Operand::Value(v)
             }
             // `wait()` — join pending tasks of the enclosing task_group.
