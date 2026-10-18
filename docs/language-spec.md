@@ -171,7 +171,8 @@ Integers have `&` `|` `^` `~` and the shifts `<<` / `>>` (integer-only — `bool
 no implicit coercion, so the shift amount shares the value's type). Precedence is Go's: `<< >> &`
 bind like `*`, `| ^` like `+`, so all of them bind tighter than comparison (`a & b == c` is
 `(a & b) == c`). A shift amount is masked mod the bit width (defined, zero-cost); `>>` is arithmetic
-on a signed value, logical on an unsigned one. The `bitset` type is built on these. The logical
+on a signed value, logical on an unsigned one. The same operations apply lane-wise to integer
+vectors, with scalar broadcast in either binary operand (see SIMD below). The `bitset` type is built on these. The logical
 `&&` / `||` **short-circuit** (the right operand runs only when the left doesn't decide the result),
 so a guard like `i < xs.len() && xs[i] > 0` never indexes out of range; the bitwise `& | ` always
 evaluate both operands. (`draft.md` §4 "Bitwise and Shift Operators".)
@@ -816,6 +817,21 @@ for hand-written register kernels.
 
 The register layer's surface: a vector is built from an array literal under a `vecN<T>` annotation;
 elementwise `+ - * / %` and directly supported unary float math operate lane-wise.
+Integer vectors also support lane-wise `&`, `|`, `^`, `<<`, `>>` and unary `~` for
+all signed/unsigned 8/16/32/64-bit elements and all four vector widths. Binary
+operands are equal vector types or one vector and its exact element scalar in
+either order. Each shift count is masked modulo the element bit width, including
+negative counts; signed right shift sign-extends, unsigned right shift zero-fills.
+Masks and floats do not support this family; unary vector `-` and `!`, and
+vector logical `&&` and `||`, remain unavailable. These operations are Pure Copy values and allocate nothing.
+
+`round_even()` is a zero-argument method on `f32`, `f64` and their float vectors.
+It returns the same type, rounding to the nearest integral floating value with
+ties to the even integer. It preserves signed zero (including `-0.5 -> -0.0`),
+infinities and integral finite values. NaN remains NaN; its payload, sign and
+quieting are unspecified. It never aborts or allocates. `round()` continues to
+round ties away from zero. Vector semantics apply independently to every lane.
+
 The target, lane type and width determine whether an operation uses one or more
 vector instructions or scalar instructions. `exp`, `exp2`, `log`, `log2`, and `log10` are zero-argument methods on `f32`, `f64`,
 and the corresponding `vec2/4/8/16` types. They lower to matching LLVM intrinsics and vector

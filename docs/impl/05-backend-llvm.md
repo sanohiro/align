@@ -668,3 +668,12 @@ but this capability adds no declaration-side `nounwind` and does not mutate a sh
 fingerprint. rt-LTO
 on/off, whole/per-unit, extern-collision, declaration/export, and malformed-MIR owners are fixed in
 `pkg-design/ws.md`. A124 remains unused. This lowering is active.
+
+## Integer vector shifts and ties-even rounding (plan 225)
+
+Integer vector bit operations lower to LLVM vector and/or/xor/shl/ashr/lshr.
+Both scalar broadcast positions preserve operand order. Before every vector
+shift, mask each count with the element-width-minus-one splat; signedness
+selects ashr versus lshr. Vector complement is xor with all ones.
+`round_even()` lowers through the exact scalar/vector `llvm.roundeven` overload.
+These operations introduce no runtime ABI, allocation or fast-math permission.

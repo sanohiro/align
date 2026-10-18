@@ -25,6 +25,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan225](docs/impl/225-integer-vector-round-even.md) completes integer vector
+  bitwise/shift operations and scalar/vector `round_even()` for LLM Request151
+  and media AM-R13. Both broadcast directions use single-check numeric context;
+  scalar shift semantics and existing ties-away `round()` remain unchanged.
+
 - [Plan224](docs/impl/224-task-callback-access.md) restores `pkg.web` and `pkg.ws`
   through producer-owned callback access requirements and return-flow facts.
   Shared task writes remain rejected; interface21 preserves the proof across

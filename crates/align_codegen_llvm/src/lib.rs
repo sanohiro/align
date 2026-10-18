@@ -14154,6 +14154,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let a = self.operand(a)?.into_int_value();
                     self.builder.build_int_neg(a, "neg").map_err(|e| self.err(e))?.into()
                 }
+                UnOp::BitNot if matches!(self.f.operand_ty(a), Ty::Vec(Scalar::Int(_), _)) => {
+                    let a = self.operand(a)?.into_vector_value();
+                    self.builder.build_not(a, "vnot").map_err(|e| self.err(e))?.into()
+                }
                 // `!` (boolean, i1) and `~` (integer bitwise complement) are both LLVM `not`.
                 UnOp::Not | UnOp::BitNot => {
                     let a = self.operand(a)?.into_int_value();
@@ -14374,6 +14378,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::MathFn::Floor => self.call_intrinsic("llvm.floor", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::Ceil => self.call_intrinsic("llvm.ceil", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::Round => self.call_intrinsic("llvm.round", &[overload], &[ops[0].into()])?,
+                    align_sema::MathFn::RoundEven => self.call_intrinsic("llvm.roundeven", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::Trunc => self.call_intrinsic("llvm.trunc", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::Exp => self.call_elementary_math_intrinsic("llvm.exp", overload, ops[0], *fn_, *ty)?,
                     align_sema::MathFn::Exp2 => self.call_elementary_math_intrinsic("llvm.exp2", overload, ops[0], *fn_, *ty)?,
@@ -25131,34 +25136,44 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     fn gen_vec_bin(&mut self, op: BinOp, a: &Operand, b: &Operand, elem: Ty, n: u32) -> Result<BasicValueEnum<'c>, CodegenError> {
         let l = self.operand_as_vector(a, elem, n)?;
-        let r = self.operand_as_vector(b, elem, n)?;
-        let bld = self.builder;
-        // sema restricts vector ops to elementwise arithmetic `+`/`-`/`*`/`/`/`%`; guard here too so
-        // any future sema hole is a clean codegen error, never a panic. The `/`/`%` divisor guard
-        // (any zero lane aborts, signed `INT_MIN/-1` lane wraps) is emitted in MIR (`lower_vec_div`),
-        // so the raw `sdiv`/`udiv`/`srem`/`urem` below is already fed a UB-free divisor.
-        if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem) {
-            return Err(self.err("unsupported vector operator (only + - * / % are lowered)"));
+        let mut r = self.operand_as_vector(b, elem, n)?;
+        // Division/remainder guards are MIR semantics. Shift masking preserves the settled
+        // scalar rule lane-wise: LLVM must never receive an out-of-width shift count.
+        if matches!(op, BinOp::Shl | BinOp::Shr) {
+            let Ty::Int(align_sema::IntTy { bits: bits @ (8 | 16 | 32 | 64), .. }) = elem else {
+                return Err(self.err("vector shifts require integer elements"));
+            };
+            let mask = self.operand_as_vector(
+                &Operand::Const(Const::Int(i128::from(bits - 1), elem)), elem, n,
+            )?;
+            r = self.builder.build_and(r, mask, "vshift.count").map_err(|e| self.err(e))?;
         }
-        let v = if matches!(elem, Ty::Float(_)) {
-            match op {
+        let bld = self.builder;
+        let v = match elem {
+            Ty::Float(_) => match op {
+                BinOp::Add => bld.build_float_add(l, r, "vfadd"),
                 BinOp::Sub => bld.build_float_sub(l, r, "vfsub"),
                 BinOp::Mul => bld.build_float_mul(l, r, "vfmul"),
                 BinOp::Div => bld.build_float_div(l, r, "vfdiv"),
                 BinOp::Rem => bld.build_float_rem(l, r, "vfrem"),
-                _ => bld.build_float_add(l, r, "vfadd"),
-            }
-        } else {
-            let signed = is_signed(elem);
-            match op {
+                _ => return Err(self.err("unsupported floating vector operator")),
+            },
+            Ty::Int(integer) => match op {
+                BinOp::Add => bld.build_int_add(l, r, "vadd"),
                 BinOp::Sub => bld.build_int_sub(l, r, "vsub"),
                 BinOp::Mul => bld.build_int_mul(l, r, "vmul"),
-                BinOp::Div if signed => bld.build_int_signed_div(l, r, "vsdiv"),
+                BinOp::Div if integer.signed => bld.build_int_signed_div(l, r, "vsdiv"),
                 BinOp::Div => bld.build_int_unsigned_div(l, r, "vudiv"),
-                BinOp::Rem if signed => bld.build_int_signed_rem(l, r, "vsrem"),
+                BinOp::Rem if integer.signed => bld.build_int_signed_rem(l, r, "vsrem"),
                 BinOp::Rem => bld.build_int_unsigned_rem(l, r, "vurem"),
-                _ => bld.build_int_add(l, r, "vadd"),
-            }
+                BinOp::BitAnd => bld.build_and(l, r, "vand"),
+                BinOp::BitOr => bld.build_or(l, r, "vor"),
+                BinOp::BitXor => bld.build_xor(l, r, "vxor"),
+                BinOp::Shl => bld.build_left_shift(l, r, "vshl"),
+                BinOp::Shr => bld.build_right_shift(l, r, integer.signed, "vshr"),
+                _ => return Err(self.err("unsupported integer vector operator")),
+            },
+            _ => return Err(self.err("vector operators require numeric elements")),
         };
         Ok(v.map_err(|e| self.err(e))?.into())
     }
@@ -27009,10 +27024,13 @@ fn main() -> i32 = 0
                      fn scalar_label(value: {scalar}) -> str = \"scalar\"\n\
                      fn bool_label(value: bool) -> str = \"bool\"\n"
                 );
-                for (index, operator) in ["+", "-", "*", "/", "%"].into_iter().enumerate() {
-                    // An enclosing vector expectation currently rejects scalar-left
-                    // arithmetic in sema; test admitted source without widening it.
-                    for (order, left, right) in [("vv", "a", "b"), ("vs", "a", "scalar")] {
+                let operators: &[&str] = if scalar.starts_with('f') {
+                    &["+", "-", "*", "/", "%"]
+                } else {
+                    &["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>"]
+                };
+                for (index, operator) in operators.iter().enumerate() {
+                    for (order, left, right) in [("vv", "a", "b"), ("vs", "a", "scalar"), ("sv", "scalar", "b")] {
                         source.push_str(&format!(
                             "fn arithmetic_{index}_{order}(a: {vector}, b: {vector}, scalar: {scalar}) -> str = vector_label({left} {operator} {right})\n"
                         ));
@@ -27035,7 +27053,7 @@ fn main() -> i32 = 0
                 }
                 if !scalar.starts_with('f') {
                     source.push_str(&format!(
-                        "fn complement(value: {scalar}) -> str = scalar_label(~value)\n"
+                        "fn complement(value: {scalar}) -> str = scalar_label(~value)\nfn vector_complement(value:{vector})->str=vector_label(~value)\n"
                     ));
                 }
                 source.push_str("fn logical(value: bool) -> str = bool_label(!value)\nfn main() -> i32 = 0\n");
@@ -27086,22 +27104,51 @@ fn main() -> i32 = 0
                 assert!(result.is_ok(), "valid vector select condition {condition}: {result:?}");
             }
         }
-        for (left, right) in [(0, 1), (0, 4), (4, 0)] {
-            let valid = replace(Rvalue::Bin(BinOp::Add, Operand::Arg(left), Operand::Arg(right)));
-            assert!(validate_resource_rvalues(&valid).is_ok(), "valid numeric broadcast");
-            assert!(validate_thin_partition_program(&valid, &[]).is_ok(), "per-unit numeric broadcast");
-        }
-        for bad_operand in [2, 3, 5, 6, 9] {
-            for (left, right) in [(0, bad_operand), (bad_operand, 1)] {
-                let malformed = replace(Rvalue::Bin(BinOp::Add, Operand::Arg(left), Operand::Arg(right)));
-                assert_xml_producer_rejected(&malformed, "vector width/element/broadcast relation");
+        for operation in [BinOp::Add, BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Shl, BinOp::Shr] {
+            for (left, right) in [(0, 1), (0, 4), (4, 0)] {
+                let valid = replace(Rvalue::Bin(operation, Operand::Arg(left), Operand::Arg(right)));
+                assert!(validate_resource_rvalues(&valid).is_ok(), "valid numeric broadcast");
+                assert!(validate_thin_partition_program(&valid, &[]).is_ok(), "per-unit numeric broadcast");
             }
         }
-        for operation in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Shl, BinOp::Shr, BinOp::And, BinOp::Or, BinOp::Eq] {
+        let complement = replace(Rvalue::Un(UnOp::BitNot, Operand::Arg(0)));
+        assert!(validate_resource_rvalues(&complement).is_ok());
+        assert!(validate_thin_partition_program(&complement, &[]).is_ok());
+        for operation in [BinOp::Add, BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor, BinOp::Shl, BinOp::Shr] {
+            for bad_operand in [2, 3, 5, 6, 9] {
+                for (left, right) in [(0, bad_operand), (bad_operand, 1)] {
+                    let malformed = replace(Rvalue::Bin(operation, Operand::Arg(left), Operand::Arg(right)));
+                    assert_xml_producer_rejected(&malformed, "vector width/element/broadcast relation");
+                }
+            }
+        }
+        for operand in [2, 3, 4, 5, 6, 9] {
+            let malformed = replace(Rvalue::Un(UnOp::BitNot, Operand::Arg(operand)));
+            assert_xml_producer_rejected(&malformed, "complement exact integer vector result");
+        }
+        // Matching float vector shapes still reject the integer-only operators. Keep
+        // a valid Add twin so a broken parameter/result fixture cannot hide the domain check.
+        for operation in [None, Some(BinOp::BitAnd), Some(BinOp::BitOr), Some(BinOp::BitXor), Some(BinOp::Shl), Some(BinOp::Shr)] {
+            let mut floating = replace(Rvalue::Bin(operation.unwrap_or(BinOp::Add), Operand::Arg(0), Operand::Arg(1)));
+            let integer = Ty::Vec(Scalar::Int(IntTy { bits: 32, signed: true }), 4);
+            let float = Ty::Vec(Scalar::Float(FloatTy { bits: 32 }), 4);
+            for function in &mut floating.fns {
+                for ty in function.slots.iter_mut().chain(&mut function.value_tys) {
+                    if *ty == integer { *ty = float; }
+                }
+            }
+            if operation.is_none() {
+                assert!(validate_resource_rvalues(&floating).is_ok());
+                assert!(validate_thin_partition_program(&floating, &[]).is_ok());
+            } else {
+                assert_xml_producer_rejected(&floating, "matching float vectors reject integer operations");
+            }
+        }
+        for operation in [BinOp::And, BinOp::Or, BinOp::Eq] {
             let malformed = replace(Rvalue::Bin(operation, Operand::Arg(0), Operand::Arg(1)));
             assert_xml_producer_rejected(&malformed, "vector operator/result relation");
         }
-        for operation in [UnOp::Neg, UnOp::Not, UnOp::BitNot] {
+        for operation in [UnOp::Neg, UnOp::Not] {
             let malformed = replace(Rvalue::Un(operation, Operand::Arg(0)));
             assert_xml_producer_rejected(&malformed, "unary vector operator is not a source operation");
         }

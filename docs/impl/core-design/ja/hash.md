@@ -19,7 +19,7 @@ hash128(data)  -> (u64, u64)     // .0 == hash64(data); .1 = decorrelated second
 // scalar math — intrinsic methods on numeric values (no import, no core.math module):
 x.abs()                          // signed int / float; identity on unsigned
 a.min(b) / a.max(b)              // pairwise; int = llvm.{s,u}min/max, float = NaN-propagating minimum/maximum
-x.sqrt() / .floor() / .ceil() / .round() / .trunc()   // float-only; round = ties away from zero
+x.sqrt() / .floor() / .ceil() / .round() / .round_even() / .trunc()   // float-only; round = ties away from zero
 x.exp() / .exp2() / .log() / .log2() / .log10()     // float 専用; float vector にもレーン単位で適用
 b.pow(e)                         // float-only
 fma(a, b, c)                     // free builtin; float scalar or float vector; one rounding
@@ -28,6 +28,13 @@ fma(a, b, c)                     // free builtin; float scalar or float vector; 
 ## Type & ownership classification
 
 すべて Copy in、Copy out（値渡しによる入力と出力）となる。`hash*` はビューを借用する（所有権付きの `string` を渡しても消費されず、そのまま使い続けられる — `print` の前例と同様）。ペアワイズの `a.min(b)` は、配列の要素をリダクションする `arr.min()` とアリティ（引数の数）の違いによって共存する。
+
+`round_even()` は `f32`・`f64` とそれらのベクトルに対する引数なしのメソッドで、
+同じ型の整数値へ最近接丸めし、中間値は偶数側へ丸める。符号付きゼロ
+（`-0.5 -> -0.0` を含む）、無限大、すでに整数である有限値を保持する。
+NaN は NaN のままだが、ペイロード・符号・quiet 化は保証しない。
+abort や割り当ては発生せず、ベクトルでは各レーンに独立に適用する。
+従来の `round()` は中間値をゼロから遠い側へ丸める。
 
 ## Effects
 

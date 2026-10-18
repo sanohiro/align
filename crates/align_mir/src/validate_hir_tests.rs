@@ -8715,6 +8715,194 @@ fn hir_body_validator_task_record_results() {
 }
 
 #[test]
+fn numeric_completion_hir_relations() {
+    use align_ast::{BinOp, UnOp};
+    let scalar = int(32);
+    let vector = Ty::Vec(scalar_int(32), 4);
+    let floating = Ty::Vec(Scalar::Float(FloatTy { bits: 64 }), 4);
+    let make = |types: &[Ty], kind: hir::ExprKind, result: Ty| {
+        let locals = types
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                let Ok(id) = u32::try_from(index) else {
+                    panic!("fixture parameter id")
+                };
+                body_test_local(id, &format!("arg{id}"), *ty, false, true)
+            })
+            .collect::<Vec<_>>();
+        let params = locals.iter().map(|local| local.id).collect();
+        let mut program = baseline_program();
+        let mut function = body_test_function_with_params(
+            "numeric",
+            locals,
+            params,
+            hir::Block {
+                stmts: Vec::new(),
+                value: Some(Box::new(body_test_expr(kind, result))),
+            },
+            result,
+        );
+        function.mutable_retention = Some(vec![
+            hir::MutableRetentionDestination::default();
+            types.len()
+        ]);
+        function.mutable_view_effect = Some(vec![None; types.len()]);
+        program.fns.push(function);
+        program
+    };
+    let local = |id, ty| Box::new(body_test_expr(hir::ExprKind::Local(id), ty));
+    let verify = |program: &hir::Program, valid: bool| {
+        assert_eq!(
+            body_core_metadata_is_valid(program),
+            valid,
+            "{:?}",
+            program.fns.last().map(|f| &f.body)
+        );
+        let lowered = lower_program_checked(program, false, None);
+        assert_eq!(lowered.is_ok(), valid, "{lowered:?}");
+    };
+    let invalid_types = [
+        Ty::Vec(scalar_int(32), 2),
+        Ty::Vec(scalar_int(64), 4),
+        Ty::Vec(
+            Scalar::Int(IntTy {
+                bits: 32,
+                signed: false,
+            }),
+            4,
+        ),
+        floating,
+        Ty::Mask(scalar_int(32), 4),
+        Ty::Bool,
+        int(64),
+        Ty::Vec(scalar_int(32), 3),
+        Ty::Vec(Scalar::Bool, 4),
+        Ty::Vec(
+            Scalar::Int(IntTy {
+                bits: 3,
+                signed: true,
+            }),
+            4,
+        ),
+    ];
+    for op in [
+        BinOp::BitAnd,
+        BinOp::BitOr,
+        BinOp::BitXor,
+        BinOp::Shl,
+        BinOp::Shr,
+    ] {
+        for (left, right) in [(vector, vector), (vector, scalar), (scalar, vector)] {
+            let kind = || hir::ExprKind::Binary {
+                float_mode: hir::FloatMode::STRICT,
+                op,
+                lhs: local(0, left),
+                rhs: local(1, right),
+            };
+            verify(&make(&[left, right], kind(), vector), true);
+            verify(&make(&[left, right], kind(), scalar), false);
+        }
+        for invalid in invalid_types {
+            for (left, right) in [(invalid, vector), (vector, invalid)] {
+                verify(
+                    &make(
+                        &[left, right],
+                        hir::ExprKind::Binary {
+                            float_mode: hir::FloatMode::STRICT,
+                            op,
+                            lhs: local(0, left),
+                            rhs: local(1, right),
+                        },
+                        vector,
+                    ),
+                    false,
+                );
+            }
+        }
+        verify(
+            &make(
+                &[floating, floating],
+                hir::ExprKind::Binary {
+                    float_mode: hir::FloatMode::STRICT,
+                    op,
+                    lhs: local(0, floating),
+                    rhs: local(1, floating),
+                },
+                floating,
+            ),
+            false,
+        );
+    }
+    verify(
+        &make(
+            &[vector],
+            hir::ExprKind::Unary {
+                op: UnOp::BitNot,
+                expr: local(0, vector),
+            },
+            vector,
+        ),
+        true,
+    );
+    for input in invalid_types.into_iter().chain([scalar, vector]) {
+        let valid = matches!(
+            input,
+            Ty::Int(_) | Ty::Vec(Scalar::Int(IntTy { bits: 32 | 64, .. }), 2 | 4)
+        );
+        verify(
+            &make(
+                &[input],
+                hir::ExprKind::Unary {
+                    op: UnOp::BitNot,
+                    expr: local(0, input),
+                },
+                input,
+            ),
+            valid,
+        );
+    }
+    for op in [UnOp::Not, UnOp::Neg] {
+        verify(
+            &make(
+                &[vector],
+                hir::ExprKind::Unary {
+                    op,
+                    expr: local(0, vector),
+                },
+                vector,
+            ),
+            false,
+        );
+    }
+    for input in [
+        Ty::Float(FloatTy { bits: 32 }),
+        Ty::Float(FloatTy { bits: 64 }),
+        floating,
+        scalar,
+        vector,
+        Ty::Bool,
+        Ty::Vec(Scalar::Float(FloatTy { bits: 16 }), 4),
+        Ty::Vec(Scalar::Float(FloatTy { bits: 32 }), 3),
+    ] {
+        for count in [0, 1, 2] {
+            let valid = count == 1
+                && matches!(
+                    input,
+                    Ty::Float(FloatTy { bits: 32 | 64 })
+                        | Ty::Vec(Scalar::Float(FloatTy { bits: 32 | 64 }), 2 | 4 | 8 | 16)
+                );
+            let kind = hir::ExprKind::MathOp {
+                fn_: hir::MathFn::RoundEven,
+                operands: (0..count).map(|_| *local(0, input)).collect(),
+            };
+            verify(&make(&[input], kind.clone(), input), valid);
+            verify(&make(&[input], kind, Ty::Bool), false);
+        }
+    }
+}
+
+#[test]
 fn hir_body_validator_expression_inventory() {
     let integer = int(64);
     let float = Ty::Float(FloatTy { bits: 64 });
@@ -9148,6 +9336,16 @@ fn hir_body_validator_expression_inventory() {
             body_test_expr(
                 hir::ExprKind::MathOp {
                     fn_: hir::MathFn::Round,
+                    operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
+                },
+                float,
+            ),
+        ),
+        body_unit_case(
+            "math_round_even_case",
+            body_test_expr(
+                hir::ExprKind::MathOp {
+                    fn_: hir::MathFn::RoundEven,
                     operands: vec![body_test_expr(hir::ExprKind::Float(1.0), float)],
                 },
                 float,

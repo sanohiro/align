@@ -14252,7 +14252,8 @@ fn unary_result(op: align_ast::UnOp, ty: Ty) -> Option<Ty> {
             _ => None,
         },
         align_ast::UnOp::Not if ty == Ty::Bool => Some(Ty::Bool),
-        align_ast::UnOp::BitNot => matches!(ty, Ty::Int(integer) if valid_int(integer.bits)).then_some(ty),
+        align_ast::UnOp::BitNot => (matches!(ty, Ty::Int(integer) if valid_int(integer.bits))
+            || matches!(ty, Ty::Vec(Scalar::Int(integer), lanes) if valid_int(integer.bits) && valid_vector_lanes(lanes))).then_some(ty),
         _ => None,
     }
 }
@@ -14371,10 +14372,10 @@ fn binary_result(op: align_ast::BinOp, lhs: Ty, rhs: Ty) -> Option<Ty> {
             }
         }
         BinOp::And | BinOp::Or if lhs == Ty::Bool && rhs == Ty::Bool => Some(Ty::Bool),
-        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr
-            if lhs == rhs && matches!(lhs, Ty::Int(integer) if valid_int(integer.bits)) =>
-        {
-            Some(lhs)
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
+            numeric_pair_result(lhs, rhs, false).filter(|ty| {
+                matches!(ty, Ty::Int(_) | Ty::Vec(Scalar::Int(_), _))
+            })
         }
         _ => None,
     }

@@ -4,15 +4,23 @@
 //! (reduction), dispatched by arity.
 
 
+#[cfg(unix)]
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
+
 mod common;
 use common::*;
 
 #[test]
+#[cfg(unix)]
 fn all_math_discriminators_keep_whole_and_per_unit_results() {
-    if !backend_available() {
-        return;
-    }
-    let source = r#"
+    owned_fixture::run(
+        "all_math_discriminators_keep_whole_and_per_unit_results",
+        |_| {
+            if !backend_available() {
+                return;
+            }
+            let source = r#"
 fn display(x: f64, y: f64) {
     print((x - y).abs())
     print(x.min(y))
@@ -21,6 +29,7 @@ fn display(x: f64, y: f64) {
     print((x / y).floor())
     print((x / y).ceil())
     print((x / y).round())
+    print((x / y).round_even())
     print((x / y).trunc())
     print(x.pow(y))
     print(fma(x, y, x))
@@ -42,18 +51,20 @@ fn main() -> i32 {
     return 0
 }
 "#;
-    let expected = "0.0\n2.0\n2.0\n2.0\n1.0\n1.0\n1.0\n1.0\n4.0\n6.0\n1.0\n1.0\n0.0\n0.0\n0.0\n9223372036854775808\ntrue\ntrue\ntrue\n";
-    let whole = build_and_run("math-discriminator-whole", source);
-    assert_eq!(whole.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&whole.stdout), expected);
-    let built = build_per_unit_multi(
-        "math-discriminator-per-unit",
-        &[("main.align", source)],
-        "main.align",
+            let expected = "0.0\n2.0\n2.0\n2.0\n1.0\n1.0\n1.0\n1.0\n1.0\n4.0\n6.0\n1.0\n1.0\n0.0\n0.0\n0.0\n9223372036854775808\ntrue\ntrue\ntrue\n";
+            let whole = build_and_run("math-discriminator-whole", source);
+            assert_eq!(whole.status.code(), Some(0));
+            assert_eq!(String::from_utf8_lossy(&whole.stdout), expected);
+            let built = build_per_unit_multi(
+                "math-discriminator-per-unit",
+                &[("main.align", source)],
+                "main.align",
+            );
+            let per_unit = built.link_and_run();
+            assert_eq!(per_unit.status.code(), Some(0));
+            assert_eq!(String::from_utf8_lossy(&per_unit.stdout), expected);
+        },
     );
-    let per_unit = built.link_and_run();
-    assert_eq!(per_unit.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&per_unit.stdout), expected);
 }
 
 #[test]
@@ -602,4 +613,164 @@ fn pipeline_min_max_values_are_unchanged_for_ordinary_numbers() {
         String::from_utf8_lossy(&out.stdout),
         "11\n-7\n-9223372036854775808\n9223372036854775807\n9.25\n"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn round_even_llvm_overloads() {
+    owned_fixture::run("round_even_llvm_overloads", |_| {
+        if !backend_available() {
+            return;
+        }
+        let mut source = String::new();
+        for bits in [32, 64] {
+            source.push_str(&format!(
+                "pub fn scalar{bits}(x:f{bits})->f{bits}=x.round_even()\n"
+            ));
+            for lanes in [2, 4, 8, 16] {
+                source.push_str(&format!("pub fn vector{bits}_{lanes}(x:vec{lanes}<f{bits}> ) -> vec{lanes}<f{bits}> = x.round_even()\n"));
+            }
+        }
+        source.push_str("fn main() {}\n");
+        let ir = raw_ir("round-even-overloads", &source);
+        for bits in [32, 64] {
+            assert!(ir.contains(&format!("@llvm.roundeven.f{bits}")), "{ir}");
+            for lanes in [2, 4, 8, 16] {
+                assert!(
+                    ir.contains(&format!("@llvm.roundeven.v{lanes}f{bits}")),
+                    "{ir}"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+#[cfg(unix)]
+fn round_even_scalar_vector_ieee_values() {
+    owned_fixture::run("round_even_scalar_vector_ieee_values", |_| {
+        if !backend_available() {
+            return;
+        }
+        let mut source = String::new();
+        let mut calls = String::from("fn main() -> i32 {\n");
+        for bits in [32, 64] {
+            let bit_pattern = |value: f64| -> u64 {
+                if bits == 32 {
+                    u64::from((value as f32).to_bits())
+                } else {
+                    value.to_bits()
+                }
+            };
+            let near = if bits == 32 {
+                ("-0.5000000596046448", "-0.4999999701976776")
+            } else {
+                ("-0.5000000000000001", "-0.49999999999999994")
+            };
+            let large = if bits == 32 {
+                "16777216.0"
+            } else {
+                "9007199254740992.0"
+            };
+            let rows = vec![
+                ("0.0", Some(bit_pattern(0.0))),
+                ("-0.0", Some(bit_pattern(-0.0))),
+                ("0.5", Some(bit_pattern(0.0))),
+                ("-0.5", Some(bit_pattern(-0.0))),
+                ("1.5", Some(bit_pattern(2.0))),
+                ("-1.5", Some(bit_pattern(-2.0))),
+                ("2.5", Some(bit_pattern(2.0))),
+                ("-2.5", Some(bit_pattern(-2.0))),
+                (near.0, Some(bit_pattern(-1.0))),
+                (near.1, Some(bit_pattern(-0.0))),
+                (
+                    large,
+                    Some(bit_pattern(if bits == 32 {
+                        16777216.0
+                    } else {
+                        9007199254740992.0
+                    })),
+                ),
+                ("1.0 / 0.0", Some(bit_pattern(f64::INFINITY))),
+                ("-1.0 / 0.0", Some(bit_pattern(f64::NEG_INFINITY))),
+                ("0.0 / 0.0", None),
+            ];
+            for lanes in [1, 2, 4, 8, 16] {
+                let ty = if lanes == 1 {
+                    format!("f{bits}")
+                } else {
+                    format!("vec{lanes}<f{bits}>")
+                };
+                for (batch, chunk) in rows.chunks(lanes).enumerate() {
+                    let name = format!("check_{bits}_{lanes}_{batch}");
+                    source.push_str(&format!(
+                        "fn {name}(value:{ty}) -> bool {{\n rounded:=value.round_even()\n"
+                    ));
+                    let mut inputs = Vec::new();
+                    for lane in 0..lanes {
+                        let (input, expected) = chunk[lane % chunk.len()];
+                        inputs.push(input);
+                        let result = if lanes == 1 {
+                            "rounded".to_owned()
+                        } else {
+                            format!("rounded[{lane}]")
+                        };
+                        if let Some(expected) = expected {
+                            source.push_str(&format!(
+                                " if {result}.to_bits() != {expected} {{ return false }}\n"
+                            ));
+                        } else {
+                            source
+                                .push_str(&format!(" if !{result}.is_nan() {{ return false }}\n"));
+                        }
+                    }
+                    source.push_str(" return true\n}\n");
+                    let input = if lanes == 1 {
+                        inputs[0].to_owned()
+                    } else {
+                        format!("[{}]", inputs.join(","))
+                    };
+                    calls.push_str(&format!(" if !{name}({input}) {{ return 1 }}\n"));
+                }
+            }
+            calls.push_str(&format!(" plus{bits}:f{bits}:=0.5\n minus{bits}:f{bits}:=-0.5\n if plus{bits}.round()!=1.0 || minus{bits}.round()!=-1.0 {{ return 2 }}\n"));
+        }
+        calls.push_str(" return 0\n}\n");
+        source.push_str(&calls);
+        for result in [
+            build_and_run("round-even-ieee", &source),
+            build_per_unit_multi(
+                "round-even-ieee-units",
+                &[("main.align", &source)],
+                "main.align",
+            )
+            .link_and_run(),
+        ] {
+            assert!(result.status.success(), "{result:?}");
+        }
+    });
+}
+
+#[test]
+fn round_even_rejects_nonfloating_receivers_and_arguments() {
+    for ty in ["i32", "u64", "bool", "str", "vec2<i32>", "mask2<f32>"] {
+        assert!(
+            check_errs(
+                "round-even-invalid-type",
+                &format!("fn bad(value:{ty}) {{ unused:=value.round_even() }}\nfn main() {{}}\n")
+            ),
+            "{ty}"
+        );
+    }
+    for ty in ["f32", "f64", "vec2<f32>", "vec16<f64>"] {
+        assert!(
+            check_errs(
+                "round-even-invalid-arity",
+                &format!(
+                    "fn bad(value:{ty}) {{ unused:=value.round_even(value) }}\nfn main() {{}}\n"
+                )
+            ),
+            "{ty}"
+        );
+    }
 }

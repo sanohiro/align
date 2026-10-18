@@ -1483,13 +1483,20 @@ matching the lane read). (`examples/vec_lane_set.align`.)
 **Slice 9 DONE — scalar-on-the-left broadcast.** A scalar on the **left** of a vector op broadcasts
 too (`10 + a`, `2 < scores`), completing the broadcast symmetry (slice 3 settled implicit `vec OP
 scalar`; this lifts the "vector must be on the left" cut). The operand order is preserved for the
-non-commutative ops (`20 - a` = `[20 - a0, …]`). Settled mechanism: the one-pass checker handles the
-ambiguity with a **speculative rhs check + diagnostic rollback** (`check_binop_rhs`) — the rhs is
-hinted with the lhs type as usual, but if the lhs is a scalar and the rhs is a vector, that hint
-mis-constrains, so its diagnostics are rolled back (`Diagnostics::truncate`) and the rhs re-checked
-unhinted, letting the scalar broadcast. This regresses nothing: a scalar+scalar or generic-call rhs
-still gets the lhs hint (no rollback). `vec_binop` gained the `(scalar, vec)` case; codegen detects
-the vector in either operand and `operand_as_vector` splats the scalar. (`examples/vec_broadcast.align`.)
+non-commutative ops (`20 - a` = `[20 - a0, …]`). The checker supplies separate scalar/vector operand context while retaining exact
+result and branch-join constraints. Every operand is checked once; no diagnostic
+rollback can discard inference or lifted-function state. `vec_binop` validates
+both broadcast directions; codegen splats only the scalar operand. (`examples/vec_broadcast.align`.)
+
+**Integer vector and ties-even completion (plan 225).** Integer `vec2/4/8/16`
+support `&`, `|`, `^`, `<<`, `>>` and `~` with the exact scalar lane semantics,
+all integer widths and binary broadcast in either position. Shift counts are
+masked by lane width; signedness selects right-shift behavior. Float and mask
+bit operations, vector negation and logical operations stay rejected.
+`round_even()` on scalar/vector f32/f64 rounds ties to even, preserving signed
+zero, infinities and integral values; NaN classification is preserved without a
+payload/sign/quieting promise. Existing `round()` remains ties-away. All new
+operations are Pure, Copy and allocation-free.
 
 **Slice 10 DONE — written `maskN<T>` annotation.** A comparison mask is now a **nameable type**, so it
 can be a `let` annotation, a function parameter, or a return type (threading a mask through code).

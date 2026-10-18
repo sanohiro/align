@@ -943,6 +943,15 @@ backend. That a width is *not* in the source is consistent with "nothing hidden"
 like the AVX-vs-NEON choice itself, is a hardware detail, not a semantic effect — so hiding it (unlike
 allocation, errors, or parallelism, which are real effects) is correct, not a leak.
 
+Integer vector bit operations use the scalar lane contract, including masked shift
+counts and signed right shift. `round_even()` names the rounding policy required
+by image resampling while preserving `round()` for ties-away consumers such as
+PCM encoding. Both are complete scalar/vector families, Pure and allocation-free.
+Numeric operand context supplies scalar/vector candidates without changing the
+exact result type or replaying source checking; typed operands and control joins
+still determine one exact type. [Plan 225](impl/225-integer-vector-round-even.md)
+owns the implementation and validation boundary.
+
 For the layout itself, Align takes the **explicit `soa<T>` over automatic inference** road. The safe
 core has no raw pointers or field-address-taking, so a struct array's physical layout is
 semantically unobservable — the compiler *could* silently turn `array<User>` into struct-of-arrays.

@@ -20,7 +20,7 @@ v[i]                             -> T            // lane read, constant index
 v[i] = x                                          // lane write (mut binding)
 v.min() / v.max()                -> T            // horizontal reduce
 a.min(b) / a.max(b)              -> vecN<T>      // element-wise
-v.sqrt()/abs()/floor()/ceil()/round()/trunc()    // per-lane float math
+v.sqrt()/abs()/floor()/ceil()/round()/round_even()/trunc()    // per-lane float math
 v.exp()/exp2()/log()/log2()/log10()             // レーン単位の float math; scalarize され得る
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
@@ -47,6 +47,20 @@ align(N) Struct { ... }                           // over-align struct; stride p
 `emit-llvm --stage optimized` と `explain-opt` で命令選択前の状態を確認する。
 provider のない retained vector IR は後段でも scalarize され得るため、最終的な
 machine SIMD は出力 object の検査で確かめる。[Plan 75](../../75-portable-math-plan.md) がこの境界を定める。
+
+整数の `vec2/4/8/16` は `&`、`|`、`^`、`<<`、`>>` と単項 `~` をレーンごとに適用できる。
+符号付き・符号なしの 8/16/32/64 ビット整数が対象で、二項演算は同じ型のベクトル同士、
+またはベクトルとその要素型に完全一致するスカラーを左右どちらにも指定できる。
+シフト量は負値を含めて要素のビット幅を法としてマスクされ、符号付きの右シフトは
+符号拡張、符号なしはゼロ埋めとなる。float・mask のビット演算、およびベクトルの
+単項 `-`・`!` と論理演算 `&&`・`||` は使えない。すべて Pure・Copy で、割り当ては発生しない。
+
+`round_even()` は `f32`・`f64` とそれらのベクトルに対する引数なしのメソッドで、
+同じ型の整数値へ最近接丸めし、中間値は偶数側へ丸める。符号付きゼロ
+（`-0.5 -> -0.0` を含む）、無限大、すでに整数である有限値を保持する。
+NaN は NaN のままだが、ペイロード・符号・quiet 化は保証しない。
+abort や割り当ては発生せず、ベクトルでは各レーンに独立に適用する。
+従来の `round()` は中間値をゼロから遠い側へ丸める。
 
 ## Effects
 

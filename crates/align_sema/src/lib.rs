@@ -50476,12 +50476,36 @@ impl<'a> MoveCheck<'a> {
     }
 }
 
+/// Context for a numeric operand whose shape may be scalar or vector. Candidates
+/// guide literals and unbound generic arguments; they are never exact result constraints.
+#[derive(Clone, Copy, Default)]
+struct NumericOperandContext {
+    scalar: Option<Ty>,
+    vector: Option<Ty>,
+}
+impl NumericOperandContext {
+    fn from_type(ty: Ty) -> Self {
+        match ty {
+            Ty::Vec(element, _) => Self { scalar: Some(scalar_to_ty(element)), vector: Some(ty) },
+            Ty::Int(_) | Ty::Float(_) | Ty::IntVar(_) | Ty::FloatVar(_) | Ty::Param(_) =>
+                Self { scalar: Some(ty), vector: None },
+            _ => Self::default(),
+        }
+    }
+    fn preferred(self) -> Option<Ty> { self.vector.or(self.scalar) }
+    fn after_left(self, ty: Ty) -> Self {
+        let left = Self::from_type(ty);
+        Self { scalar: left.scalar.or(self.scalar), vector: left.vector.or(self.vector) }
+    }
+}
+
 /// One enclosing `loop` while type-checking a function body. A `break` bound to this loop unifies
 /// its value type into `break_ty` (seeded from the loop's expected type), exactly like `match` arms
 /// running-unify their bodies. `region_depth` records the combined `arena`/`task_group` nesting at
 /// loop entry so a `break` inside a nested region can be rejected (deferred — see `check_break`).
 struct LoopCtx {
     break_ty: Option<Ty>,
+    numeric_context: NumericOperandContext,
     accepted_breaks: std::collections::HashSet<Span>,
     region_depth: u32,
 }
@@ -51611,6 +51635,10 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// Check a block. `expected` is the expected type of its trailing value (if any).
     fn check_block(&mut self, b: &ast::Block, expected: Option<Ty>) -> Block {
+        self.check_block_context(b, expected, NumericOperandContext::default())
+    }
+
+    fn check_block_context(&mut self, b: &ast::Block, expected: Option<Ty>, numeric: NumericOperandContext) -> Block {
         let scope_mark = self.scope.len();
         let mut stmts = Vec::new();
 
@@ -51906,9 +51934,10 @@ impl<'a, 't> Checker<'a, 't> {
         // different: it is always `Ok(())` and needs the private `Result<(), Error>` context even
         // after `return`, `process.exit`, or `process.abort` made the written body diverge.
         let tail_expected = if prefix_diverges && self.test_id.is_none() { None } else { expected };
+        let tail_context = if prefix_diverges { NumericOperandContext::default() } else { numeric };
         let value = b.tail.as_ref().map(|e| {
-            self.reject_bare_array_value(e, tail_expected, "a block value");
-            Box::new(self.check_completion_expr(e, tail_expected))
+            self.reject_bare_array_value(e, tail_expected.or(tail_context.vector), "a block value");
+            Box::new(self.check_completion_expr_context(e, tail_expected, tail_context))
         });
         self.scope.truncate(scope_mark);
         Block { stmts, value }
@@ -52632,8 +52661,13 @@ impl<'a, 't> Checker<'a, 't> {
     /// recompile after the pre-existing error is fixed. A *warning* (e.g. the unnecessary-heap lint)
     /// does not gate it: the error count, not the diagnostic count, is the checkpoint.
     fn check_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
+        self.check_expr_context(e, expected, NumericOperandContext::default())
+    }
+
+    fn check_expr_context(&mut self, e: &ast::Expr, expected: Option<Ty>, numeric: NumericOperandContext) -> Expr {
         let errors_before = self.diags.error_count();
-        let result = self.check_expr_inner(e, expected);
+        let numeric = if expected.is_some() { NumericOperandContext::default() } else { numeric };
+        let result = self.check_expr_inner_context(e, expected, numeric);
         if self.diags.error_count() == errors_before && expected.is_some() {
             self.constrain(result.ty, expected, e.span);
         }
@@ -52746,8 +52780,13 @@ impl<'a, 't> Checker<'a, 't> {
     /// eager parents: without a first-class Never type, their ordinary operand/result relations
     /// remain exact.
     fn check_completion_expr(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
+        self.check_completion_expr_context(e, expected, NumericOperandContext::default())
+    }
+
+    fn check_completion_expr_context(&mut self, e: &ast::Expr, expected: Option<Ty>, numeric: NumericOperandContext) -> Expr {
         let errors_before = self.diags.error_count();
-        let result = self.check_expr_inner(e, expected);
+        let numeric = if expected.is_some() { NumericOperandContext::default() } else { numeric };
+        let result = self.check_expr_inner_context(e, expected, numeric);
         let directly_terminates = matches!(result.kind, ExprKind::ProcessExit { .. } | ExprKind::ProcessAbort);
         if self.diags.error_count() == errors_before && expected.is_some() && !directly_terminates {
             self.constrain(result.ty, expected, e.span);
@@ -52792,6 +52831,10 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     fn check_expr_inner(&mut self, e: &ast::Expr, expected: Option<Ty>) -> Expr {
+        self.check_expr_inner_context(e, expected, NumericOperandContext::default())
+    }
+
+    fn check_expr_inner_context(&mut self, e: &ast::Expr, expected: Option<Ty>, numeric: NumericOperandContext) -> Expr {
         match &e.kind {
             ast::ExprKind::Unit => {
                 self.constrain(Ty::Unit, expected, e.span);
@@ -52799,12 +52842,12 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ast::ExprKind::Int(v) => {
                 let ty = self.fresh_int_var();
-                self.constrain(ty, expected, e.span);
+                self.constrain(ty, expected.or(numeric.scalar), e.span);
                 Expr { kind: ExprKind::Int(*v), ty, span: e.span }
             }
             ast::ExprKind::Float(v) => {
                 let ty = self.fresh_float_var();
-                self.constrain(ty, expected, e.span);
+                self.constrain(ty, expected.or(numeric.scalar), e.span);
                 Expr { kind: ExprKind::Float(*v), ty, span: e.span }
             }
             ast::ExprKind::Char(v) => {
@@ -52821,7 +52864,9 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ast::ExprKind::Path(p) => self.check_path(p, expected, e.span),
             ast::ExprKind::Unary { op, expr } => {
-                let inner = self.check_expr(expr, expected);
+                let inner = self.check_expr_context(expr, expected, if *op == UnOp::Not {
+                    NumericOperandContext::default()
+                } else { numeric });
                 // A rejected operand must yield the error sentinel, never its own type: the
                 // later passes classify a unary result as borrowing nothing, so propagating a
                 // view-bearing operand type here builds a typed node the provenance walk cannot
@@ -52844,10 +52889,10 @@ impl<'a, 't> Checker<'a, 't> {
                     UnOp::BitNot => {
                         if inner.ty == Ty::Error {
                             Ty::Error
-                        } else if inner.ty.is_int_like() {
+                        } else if inner.ty.is_int_like() || matches!(inner.ty, Ty::Vec(Scalar::Int(_), _)) {
                             inner.ty
                         } else {
-                            self.diags.error("unary '~' expects an integer", e.span);
+                            self.diags.error("unary '~' expects an integer or integer vector", e.span);
                             Ty::Error
                         }
                     }
@@ -52855,13 +52900,13 @@ impl<'a, 't> Checker<'a, 't> {
                 Expr { kind: ExprKind::Unary { op: *op, expr: Box::new(inner) }, ty, span: e.span }
             }
             ast::ExprKind::Cast { expr, ty } => self.check_cast(expr, ty, expected, e.span),
-            ast::ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, e.span),
-            ast::ExprKind::Call { callee, args } => self.check_call(callee, args, expected, e.span),
+            ast::ExprKind::Binary { op, lhs, rhs } => self.check_binary(*op, lhs, rhs, expected, numeric, e.span),
+            ast::ExprKind::Call { callee, args } => self.check_call(callee, args, expected, numeric, e.span),
             ast::ExprKind::FieldAccess { recv, field } => {
                 self.check_field_access(recv, field, expected, e.span)
             }
             ast::ExprKind::ArrayLit(elems) => {
-                let want = self.resolve(expected.unwrap_or(Ty::Error));
+                let want = self.resolve(expected.or(numeric.vector).unwrap_or(Ty::Error));
                 let lit = match want {
                     // `[…]` under a `vecN<T>` annotation builds a SIMD vector, not an array.
                     Ty::Vec(s, n) => self.check_vec_lit(elems, s, n, e.span),
@@ -52955,7 +53000,7 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::ElseUnwrap { opt, fallback } => {
                 self.check_else_unwrap(opt, fallback, expected, e.span)
             }
-            ast::ExprKind::Try(inner) => self.check_try(inner, expected, e.span),
+            ast::ExprKind::Try(inner) => self.check_try(inner, expected.or(numeric.scalar), e.span),
             ast::ExprKind::FloatScope {
                 options,
                 block: source_block,
@@ -53008,11 +53053,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.float_mode = mode;
                 let syntax_diverges = ast_block_diverges(source_block);
                 let block =
-                    self.check_block(source_block, if syntax_diverges { None } else { expected });
+                    self.check_block_context(source_block, if syntax_diverges { None } else { expected }, if syntax_diverges { NumericOperandContext::default() } else { numeric });
                 self.float_mode = saved_mode;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53030,11 +53075,11 @@ impl<'a, 't> Checker<'a, 't> {
             ast::ExprKind::Arena(b) => {
                 let syntax_diverges = ast_block_diverges(b);
                 self.arena_depth += 1;
-                let block = self.check_block(b, if syntax_diverges { None } else { expected });
+                let block = self.check_block_context(b, if syntax_diverges { None } else { expected }, if syntax_diverges { NumericOperandContext::default() } else { numeric });
                 self.arena_depth -= 1;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53048,12 +53093,12 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_shadow(&name.name, name.span, self.scope.len());
                 let local = self.declare(&name.name, Ty::ArenaHandle, false);
                 self.arena_depth += 1;
-                let block = self.check_block(b, if syntax_diverges { None } else { expected });
+                let block = self.check_block_context(b, if syntax_diverges { None } else { expected }, if syntax_diverges { NumericOperandContext::default() } else { numeric });
                 self.arena_depth -= 1;
                 self.scope.truncate(scope_mark);
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53067,11 +53112,11 @@ impl<'a, 't> Checker<'a, 't> {
                 // block value passes through exactly like a plain block / `arena {}`.
                 let syntax_diverges = ast_block_diverges(b);
                 self.unsafe_depth += 1;
-                let block = self.check_block(b, if syntax_diverges { None } else { expected });
+                let block = self.check_block_context(b, if syntax_diverges { None } else { expected }, if syntax_diverges { NumericOperandContext::default() } else { numeric });
                 self.unsafe_depth -= 1;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53086,13 +53131,13 @@ impl<'a, 't> Checker<'a, 't> {
                 self.task_group_depth += 1;
                 self.wait_state.push(false);
                 self.task_group_fallible.push(false);
-                let block = self.check_block(b, if syntax_diverges { None } else { expected });
+                let block = self.check_block_context(b, if syntax_diverges { None } else { expected }, if syntax_diverges { NumericOperandContext::default() } else { numeric });
                 self.task_group_fallible.pop();
                 self.wait_state.pop();
                 self.task_group_depth -= 1;
                 let diverges = hir_block_diverges(&block);
                 let ty = if diverges {
-                    diverging_block_result_ty(&block, expected)
+                    diverging_block_result_ty(&block, expected.or(numeric.preferred()))
                 } else {
                     let t = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
                     self.constrain(t, expected, e.span);
@@ -53107,18 +53152,18 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ast::ExprKind::Tuple(elems) => self.check_tuple(elems, expected, e.span),
             ast::ExprKind::TupleIndex { recv, index } => self.check_tuple_index(recv, *index, expected, e.span),
-            ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, e.span),
-            ast::ExprKind::Loop(b) => self.check_loop(b, expected, e.span),
-            ast::ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expected, e.span),
+            ast::ExprKind::If { cond, then, els } => self.check_if(cond, then, els.as_deref(), expected, numeric, e.span),
+            ast::ExprKind::Loop(b) => self.check_loop(b, expected, numeric, e.span),
+            ast::ExprKind::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expected, numeric, e.span),
             ast::ExprKind::Block(b) => {
                 // A block that always returns never yields a value; let it take the
                 // expected type so it fits that value position. With no expected type, preserve a
                 // retained dead tail's structural type for existing eager-parent checking; the HIR
                 // divergence predicate still prevents that tail from creating a continuation edge.
                 let syntax_diverges = ast_block_diverges(b);
-                let block = self.check_block(b, if syntax_diverges { None } else { expected });
+                let block = self.check_block_context(b, if syntax_diverges { None } else { expected }, if syntax_diverges { NumericOperandContext::default() } else { numeric });
                 if hir_block_diverges(&block) {
-                    let ty = diverging_block_result_ty(&block, expected);
+                    let ty = diverging_block_result_ty(&block, expected.or(numeric.preferred()));
                     return Expr { kind: ExprKind::Block(block), ty, span: e.span };
                 }
                 let ty = block.value.as_ref().map(|v| v.ty).unwrap_or(Ty::Unit);
@@ -54033,37 +54078,39 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// Type-check an eager or short-circuit binary tree with heap-owned continuation frames.
-    ///
-    /// Parser-valid left-associative chains may contain 128 AST expressions. Keeping the former
-    /// recursive `check_expr(lhs)` call here made that accepted boundary exhaust the 2 MiB compiler
-    /// test stack before HIR existed. `AfterLhs` retains the source-order type hint and
-    /// scalar/vector retry point; `AfterRhs` applies the former parent logic only after both
-    /// operands have completed.
-    fn check_binary(&mut self, op: BinOp, lhs: &ast::Expr, rhs: &ast::Expr, expected: Option<Ty>, span: Span) -> Expr {
+    /// Numeric operands receive contextual scalar/vector candidates, never a speculative
+    /// exact result type. Heap-owned frames keep accepted long binary chains stack-safe.
+    fn check_binary(
+        &mut self,
+        op: BinOp,
+        lhs: &ast::Expr,
+        rhs: &ast::Expr,
+        expected: Option<Ty>,
+        numeric: NumericOperandContext,
+        span: Span,
+    ) -> Expr {
         #[allow(clippy::large_enum_variant)]
         enum Frame<'e> {
             Enter {
                 expr: &'e ast::Expr,
                 expected: Option<Ty>,
+                numeric: NumericOperandContext,
             },
             AfterLhs {
                 op: BinOp,
                 rhs: &'e ast::Expr,
                 expected: Option<Ty>,
+                numeric: NumericOperandContext,
                 span: Span,
             },
             AfterRhs {
                 op: BinOp,
                 lhs: Expr,
-                rhs: &'e ast::Expr,
                 expected: Option<Ty>,
                 span: Span,
-                diagnostic_mark: Option<usize>,
             },
         }
-
-        let lhs_expected = match op {
+        let operand_context = |op, expected: Option<Ty>, numeric| match op {
             BinOp::Add
             | BinOp::Sub
             | BinOp::Mul
@@ -54073,157 +54120,104 @@ impl<'a, 't> Checker<'a, 't> {
             | BinOp::BitOr
             | BinOp::BitXor
             | BinOp::Shl
-            | BinOp::Shr => expected,
-            BinOp::Eq
-            | BinOp::Ne
-            | BinOp::Lt
-            | BinOp::Le
-            | BinOp::Gt
-            | BinOp::Ge => None,
-            BinOp::And | BinOp::Or => Some(Ty::Bool),
+            | BinOp::Shr => (
+                None,
+                expected
+                    .map(NumericOperandContext::from_type)
+                    .unwrap_or(numeric),
+            ),
+            BinOp::And | BinOp::Or => (Some(Ty::Bool), NumericOperandContext::default()),
+            _ => (None, NumericOperandContext::default()),
         };
+        let (lhs_expected, numeric) =
+            operand_context(op, expected.map(|ty| self.resolve(ty)), numeric);
         let mut frames = vec![
             Frame::AfterLhs {
                 op,
                 rhs,
                 expected,
+                numeric,
                 span,
             },
             Frame::Enter {
                 expr: lhs,
                 expected: lhs_expected,
+                numeric,
             },
         ];
         let mut values = Vec::new();
-
         while let Some(frame) = frames.pop() {
             match frame {
-                Frame::Enter { expr, expected } => {
+                Frame::Enter {
+                    expr,
+                    expected,
+                    numeric,
+                } => {
                     let ast::ExprKind::Binary { op, lhs, rhs } = &expr.kind else {
-                        values.push(self.check_expr(expr, expected));
+                        values.push(self.check_expr_context(expr, expected, numeric));
                         continue;
                     };
-                    let lhs_expected = match op {
-                        BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::Div
-                        | BinOp::Rem
-                        | BinOp::BitAnd
-                        | BinOp::BitOr
-                        | BinOp::BitXor
-                        | BinOp::Shl
-                        | BinOp::Shr => expected,
-                        BinOp::Eq
-                        | BinOp::Ne
-                        | BinOp::Lt
-                        | BinOp::Le
-                        | BinOp::Gt
-                        | BinOp::Ge => None,
-                        BinOp::And | BinOp::Or => Some(Ty::Bool),
-                    };
+                    let (lhs_expected, numeric) =
+                        operand_context(*op, expected.map(|ty| self.resolve(ty)), numeric);
                     frames.push(Frame::AfterLhs {
                         op: *op,
                         rhs,
                         expected,
+                        numeric,
                         span: expr.span,
                     });
                     frames.push(Frame::Enter {
                         expr: lhs,
                         expected: lhs_expected,
+                        numeric,
                     });
                 }
                 Frame::AfterLhs {
                     op,
                     rhs,
                     expected,
+                    numeric,
                     span,
                 } => {
                     let lhs = values.pop().expect("binary lhs value");
-                    let (rhs_expected, diagnostic_mark) = match op {
-                        BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::Div
-                        | BinOp::Rem => {
-                            if matches!(self.resolve(lhs.ty), Ty::Vec(..)) {
-                                (None, None)
-                            } else {
-                                (Some(lhs.ty), Some(self.diags.len()))
-                            }
+                    let left_ty = self.resolve(lhs.ty);
+                    let (rhs_expected, rhs_numeric) = match op {
+                        BinOp::And | BinOp::Or => {
+                            (Some(Ty::Bool), NumericOperandContext::default())
                         }
-                        BinOp::Eq
-                        | BinOp::Ne
-                        | BinOp::Lt
-                        | BinOp::Le
-                        | BinOp::Gt
-                        | BinOp::Ge => {
-                            if matches!(self.resolve(lhs.ty), Ty::Vec(..) | Ty::Str | Ty::String) {
-                                // Text operands deliberately retain their natural ownership type
-                                // until `finish_binary` normalizes both sides to borrowed `str`.
-                                // Feeding one side's exact type into the other would reject the
-                                // supported mixed `string`/`str` case before normalization.
-                                (None, None)
-                            } else {
-                                (Some(lhs.ty), Some(self.diags.len()))
-                            }
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                            if !left_ty.is_numeric() && !matches!(left_ty, Ty::Vec(..)) =>
+                        {
+                            // Text keeps its natural ownership type until finish_binary borrows it.
+                            let exact =
+                                (!matches!(left_ty, Ty::Str | Ty::String)).then_some(lhs.ty);
+                            (exact, NumericOperandContext::default())
                         }
-                        BinOp::And | BinOp::Or => (Some(Ty::Bool), None),
-                        BinOp::BitAnd
-                        | BinOp::BitOr
-                        | BinOp::BitXor
-                        | BinOp::Shl
-                        | BinOp::Shr => (Some(lhs.ty), None),
+                        _ => (None, numeric.after_left(left_ty)),
                     };
                     frames.push(Frame::AfterRhs {
                         op,
                         lhs,
-                        rhs,
                         expected,
                         span,
-                        diagnostic_mark,
                     });
                     frames.push(Frame::Enter {
                         expr: rhs,
                         expected: rhs_expected,
+                        numeric: rhs_numeric,
                     });
                 }
                 Frame::AfterRhs {
                     op,
                     lhs,
-                    rhs,
                     expected,
                     span,
-                    diagnostic_mark,
                 } => {
                     let right = values.pop().expect("binary rhs value");
-                    if let Some(mark) = diagnostic_mark
-                        && matches!(self.resolve(right.ty), Ty::Vec(..))
-                    {
-                        // A scalar lhs may broadcast against a vector rhs. The hinted first check
-                        // can only have added diagnostics: unification never binds a scalar
-                        // inference variable to a vector. Discard those diagnostics and replay the
-                        // rhs without the scalar hint, preserving the former recursive path.
-                        self.diags.truncate(mark);
-                        frames.push(Frame::AfterRhs {
-                            op,
-                            lhs,
-                            rhs,
-                            expected,
-                            span,
-                            diagnostic_mark: None,
-                        });
-                        frames.push(Frame::Enter {
-                            expr: rhs,
-                            expected: None,
-                        });
-                        continue;
-                    }
                     values.push(self.finish_binary(op, lhs, right, expected, span));
                 }
             }
         }
-
         values.pop().expect("binary root value")
     }
 
@@ -54353,19 +54347,16 @@ impl<'a, 't> Checker<'a, 't> {
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr => {
                 // Bitwise / shift: integer-only, no implicit coercion. The shift amount shares the
                 // value's type (unified like arithmetic), so the result is that integer type.
-                let mut t = self.unify(l.ty, r.ty, span);
-                if matches!(t, Ty::Vec(..)) {
-                    // Vectors carry only elementwise `+` `-` `*` `/` `%` (and comparisons → `mask`), not
-                    // the bitwise/shift family. Reject explicitly here — not by relying on `is_int_like()`
-                    // happening to be false for `Ty::Vec` — so the domain restriction is intentional and
-                    // can't silently regress into a codegen `unreachable!` (self-review Gate 3 / #235).
-                    self.diags.error("vectors do not support bitwise or shift operators (only `+` `-` `*` `/` `%` and comparisons)".to_string(), span);
-                    t = Ty::Error;
-                } else if let Ty::Param(_) = t {
+                let mut t = if let Some((element, lanes)) = self.vec_binop(&l, &r, span) {
+                    Ty::Vec(element, lanes)
+                } else {
+                    self.unify(l.ty, r.ty, span)
+                };
+                if let Ty::Param(_) = t {
                     self.diags.error("bitwise and shift operators need a concrete integer (not a generic type parameter)".to_string(), span);
                     t = Ty::Error;
-                } else if !t.is_int_like() && t != Ty::Error {
-                    self.diags.error("bitwise and shift operators expect integers".to_string(), span);
+                } else if !t.is_int_like() && !matches!(t, Ty::Vec(Scalar::Int(_), _)) && t != Ty::Error {
+                    self.diags.error("bitwise and shift operators expect integers or integer vectors".to_string(), span);
                     t = Ty::Error;
                 }
                 ty = t;
@@ -54472,7 +54463,7 @@ impl<'a, 't> Checker<'a, 't> {
         let (want_args, float_only) = match fn_ {
             Abs => (0, false),
             Min | Max => (1, false),
-            Sqrt | Floor | Ceil | Round | Trunc | Exp | Exp2 | Log | Log2 | Log10 => (0, true),
+            Sqrt | Floor | Ceil | Round | RoundEven | Trunc | Exp | Exp2 | Log | Log2 | Log10 => (0, true),
             Pow => (1, true),
             Fma => (2, true), // free builtin; never reached here
             ToBits | IsFinite | IsNan | IsInfinite => (0, true),
@@ -54489,7 +54480,7 @@ impl<'a, 't> Checker<'a, 't> {
         let vec_ok = match r.ty {
             Ty::Vec(Scalar::Float(_), _) => matches!(
                 fn_,
-                Abs | Sqrt | Floor | Ceil | Round | Trunc | Exp | Exp2 | Log | Log2 | Log10
+                Abs | Sqrt | Floor | Ceil | Round | RoundEven | Trunc | Exp | Exp2 | Log | Log2 | Log10
                     | Min | Max
             ),
             Ty::Vec(Scalar::Int(_), _) => matches!(fn_, Abs | Min | Max),
@@ -55147,7 +55138,7 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::CallFnValue { callee: Box::new(callee), args: checked }, ty: ret, span }
     }
 
-    fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_call(&mut self, callee: &ast::Expr, args: &[ast::Expr], expected: Option<Ty>, numeric: NumericOperandContext, span: Span) -> Expr {
         // `Type.Variant(args)` / `mod.Type.Variant(args)` — constructing a sum-type value with a
         // payload (the receiver names a sum type, bare in this module or a qualified import).
         if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
@@ -55167,7 +55158,7 @@ impl<'a, 't> Checker<'a, 't> {
         // Method call `recv.method(...)`: a module builtin (`heap.new`) or a method on a
         // value (`box.get()`, `box.clone()`).
         if let ast::ExprKind::FieldAccess { recv, field } = &callee.kind {
-            return self.check_method_call(recv, &field.name, args, expected, span);
+            return self.check_method_call(recv, &field.name, args, expected, numeric, span);
         }
         let name = match &callee.kind {
             ast::ExprKind::Path(p) => single_name(p).map(|s| s.to_string()),
@@ -55235,7 +55226,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error(format!("undefined function: '{name}'"), span);
             return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         };
-        self.check_named_call(name, display, args, expected, span)
+        self.check_named_call(name, display, args, expected, numeric, span)
     }
 
     /// Reject an extern invocation outside the lexical `unsafe` block that owns the expression.
@@ -55256,7 +55247,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// The shared tail of a direct call once its target is a resolved (mangled) function name:
     /// signature lookup, generic-call dispatch, the `out` no-alias check, argument checking, and the
     /// `Call` node. Reused by a bare call (`check_call`) and a cross-module `mod.fn(...)` call.
-    fn check_named_call(&mut self, name: String, display: String, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_named_call(&mut self, name: String, display: String, args: &[ast::Expr], expected: Option<Ty>, numeric: NumericOperandContext, span: Span) -> Expr {
         if name == "pkg.db.sqlite$function" {
             return self.check_sqlite_callback_descriptor(args, expected, span);
         }
@@ -55301,6 +55292,7 @@ impl<'a, 't> Checker<'a, 't> {
                 &json_scan_param_spellings,
                 args,
                 expected,
+                numeric,
                 span,
             );
         }
@@ -55570,6 +55562,7 @@ impl<'a, 't> Checker<'a, 't> {
         json_scan_param_spellings: &[Option<String>],
         args: &[ast::Expr],
         expected: Option<Ty>,
+        numeric: NumericOperandContext,
         span: Span,
     ) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -55637,8 +55630,13 @@ impl<'a, 't> Checker<'a, 't> {
                 // A position whose parameter is still unknown applies no coercion, so check the
                 // argument unconstrained. A later argument or the final expected-result boundary
                 // may still bind the slot.
-                self.reject_bare_array_value(a, None, "a generic argument");
-                if param_modes[i] == ast::ParamMode::Borrow
+                let argument_context = if matches!(ret, Ty::Param(_)) && declared == ret {
+                    numeric
+                } else { NumericOperandContext::default() };
+                self.reject_bare_array_value(a, argument_context.vector, "a generic argument");
+                if argument_context.preferred().is_some() {
+                    self.check_expr_context(a, None, argument_context)
+                } else if param_modes[i] == ast::ParamMode::Borrow
                     && peel_index_field_chain(a).is_some()
                 {
                     self.check_call_argument_for_mode(
@@ -55685,6 +55683,14 @@ impl<'a, 't> Checker<'a, 't> {
             if let Some(argument) = checked.get(index) {
                 self.validate_borrow_argument(argument, mode, name);
             }
+        }
+        // A return-only numeric slot has no argument evidence. Prefer the vector result
+        // candidate, then the scalar candidate; this never seeds an argument-driven slot.
+        if expected.is_none() && let Ty::Param(parameter) = ret
+            && let Some(slot) = subst.get_mut(parameter as usize)
+            && slot.is_none()
+        {
+            *slot = numeric.preferred();
         }
         // A parameter that appears *nested* (inside `Option<T>` / `Result<…>` / …) must resolve to a
         // concrete scalar now — a `Scalar` cannot hold an inference variable, so leaving it deferred
@@ -56406,7 +56412,7 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// A method call `recv.method(args)`: the `heap.new` builtin, or a method on a value
     /// (`box.get()`, `box.clone()`).
-    fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_method_call(&mut self, recv: &ast::Expr, method: &str, args: &[ast::Expr], expected: Option<Ty>, numeric: NumericOperandContext, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // Builtin **module** dispatches (`heap.*`, `raw.*`, `json.*`, `fs.*`, `path.*`, `env.*`,
         // `time.*`, `io.*`). Each fires only when the module name is a bare path *and* is not
@@ -56852,7 +56858,7 @@ impl<'a, 't> Checker<'a, 't> {
             match self.resolve_qualified_fn(&modpath, method, span) {
                 Ok(Some(mangled)) => {
                     let display = format!("{modpath}.{method}");
-                    return self.check_named_call(mangled, display, args, expected, span);
+                    return self.check_named_call(mangled, display, args, expected, numeric, span);
                 }
                 Ok(None) => {}
                 Err(()) => return err,
@@ -56993,6 +56999,7 @@ impl<'a, 't> Checker<'a, 't> {
             "floor" => Some(hir::MathFn::Floor),
             "ceil" => Some(hir::MathFn::Ceil),
             "round" => Some(hir::MathFn::Round),
+            "round_even" => Some(hir::MathFn::RoundEven),
             "trunc" => Some(hir::MathFn::Trunc),
             "exp" => Some(hir::MathFn::Exp),
             "exp2" => Some(hir::MathFn::Exp2),
@@ -57467,6 +57474,9 @@ impl<'a, 't> Checker<'a, 't> {
         // then failing the slot's width check. Scoped to a `heap.new` receiver: a box-typed *variable*
         // already has a fixed payload, so threading a box-expected there would double-report a genuine
         // mismatch that the `check_expr` reconciliation already catches once.
+        let expected = if method == "get" && is_heap_new_call(recv) {
+            expected.or(numeric.scalar)
+        } else { expected };
         let recv_expected = if is_heap_new_call(recv) {
             match method {
                 // `.get()` yields the payload scalar; the receiver is a `box<that scalar>`.
@@ -71369,7 +71379,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// `match scrutinee { Variant => body, _ => body }` — exhaustive match over a sum type (a user
     /// `enum`, or builtin `Option`/`Result`). Each arm's body unifies to the match's type; every
     /// variant must be covered, or a `_` wildcard.
-    fn check_match(&mut self, scrutinee: &ast::Expr, arms: &[ast::MatchArm], expected: Option<Ty>, span: Span) -> Expr {
+    fn check_match(&mut self, scrutinee: &ast::Expr, arms: &[ast::MatchArm], expected: Option<Ty>, numeric: NumericOperandContext, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let s = self.check_expr(scrutinee, None);
         if s.ty == Ty::Error {
@@ -71384,7 +71394,7 @@ impl<'a, 't> Checker<'a, 't> {
         if matches!(resolved_scrutinee_ty, Ty::Int(_) | Ty::Char | Ty::Str | Ty::String) {
             let mut s = s;
             s.ty = resolved_scrutinee_ty;
-            return self.check_match_value(s, resolved_scrutinee_ty, arms, expected, span);
+            return self.check_match_value(s, resolved_scrutinee_ty, arms, expected, numeric, span);
         }
         let borrowed_place = self.stable_borrowed_match_place(&s, resolved_scrutinee_ty);
         let Some((type_name, variants)) = self.match_variants(resolved_scrutinee_ty) else {
@@ -71593,8 +71603,9 @@ impl<'a, 't> Checker<'a, 't> {
             // non-error arm fixes an otherwise unconstrained result type.
             let arm_expected = if scrutinee_diverges { None } else { result_ty };
             let body_errors_before = self.diags.error_count();
-            self.reject_bare_array_value(&arm.body, arm_expected, "a `match` arm value");
-            let body = self.check_completion_expr(&arm.body, arm_expected);
+            let arm_context = if scrutinee_diverges { NumericOperandContext::default() } else { numeric };
+            self.reject_bare_array_value(&arm.body, arm_expected.or(arm_context.vector), "a `match` arm value");
+            let body = self.check_completion_expr_context(&arm.body, arm_expected, arm_context);
             let body_is_clean = self.diags.error_count() == body_errors_before;
             let body_diverges = hir_expr_diverges(&body);
             if !scrutinee_diverges && result_ty.is_none() && body_diverges && body_is_clean {
@@ -71629,7 +71640,11 @@ impl<'a, 't> Checker<'a, 't> {
                     .error(format!("non-exhaustive `match` on '{type_name}': missing {}", missing.join(", ")), span);
             }
         }
-        let ty = result_ty.unwrap_or(Ty::Unit);
+        // A proven non-fallthrough result may use the soft numeric candidate. Do not
+        // seed arm checking: unreachable children keep their own structural types.
+        let diverges = scrutinee_diverges || checked.iter().all(|arm| hir_expr_diverges(&arm.body));
+        let completion_context = if diverges { numeric.preferred() } else { None };
+        let ty = result_ty.or(completion_context).unwrap_or(Ty::Unit);
         for index in unconstrained_diverging_arms {
             self.reconcile_diverging_completion_expr(&checked[index].body, ty);
         }
@@ -71714,6 +71729,7 @@ impl<'a, 't> Checker<'a, 't> {
         scrut_ty: Ty,
         arms: &[ast::MatchArm],
         expected: Option<Ty>,
+        numeric: NumericOperandContext,
         span: Span,
     ) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -71840,8 +71856,9 @@ impl<'a, 't> Checker<'a, 't> {
 
             let arm_expected = if scrutinee_diverges { None } else { result_ty };
             let body_errors_before = self.diags.error_count();
-            self.reject_bare_array_value(&arm.body, arm_expected, "a `match` arm value");
-            let body = self.check_completion_expr(&arm.body, arm_expected);
+            let arm_context = if scrutinee_diverges { NumericOperandContext::default() } else { numeric };
+            self.reject_bare_array_value(&arm.body, arm_expected.or(arm_context.vector), "a `match` arm value");
+            let body = self.check_completion_expr_context(&arm.body, arm_expected, arm_context);
             let body_is_clean = self.diags.error_count() == body_errors_before;
             let body_diverges = hir_expr_diverges(&body);
             if !scrutinee_diverges && result_ty.is_none() && body_diverges && body_is_clean {
@@ -71891,7 +71908,11 @@ impl<'a, 't> Checker<'a, 't> {
             }
         }
 
-        let ty = result_ty.unwrap_or(Ty::Unit);
+        // A proven non-fallthrough result may use the soft numeric candidate. Do not
+        // seed arm checking: unreachable children keep their own structural types.
+        let diverges = scrutinee_diverges || checked.iter().all(|arm| hir_expr_diverges(&arm.body));
+        let completion_context = if diverges { numeric.preferred() } else { None };
+        let ty = result_ty.or(completion_context).unwrap_or(Ty::Unit);
         for index in unconstrained_diverging_arms {
             self.reconcile_diverging_completion_expr(&checked[index].body, ty);
         }
@@ -71908,19 +71929,21 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, span: Span) -> Expr {
+    fn check_if(&mut self, cond: &ast::Expr, then: &ast::Block, els: Option<&ast::Expr>, expected: Option<Ty>, numeric: NumericOperandContext, span: Span) -> Expr {
         let c = self.check_expr(cond, Some(Ty::Bool));
         let condition_diverges = hir_expr_diverges(&c);
         let branch_expected = if condition_diverges { None } else { expected };
+        let branch_context = if condition_diverges { NumericOperandContext::default() } else { numeric };
         // `task_group` `wait`-state (slice ④c): each branch starts from the pre-`if` state; after
         // the `if`, a `wait()` is guaranteed only if it ran on *every* path — `then && else` (and
         // an absent `else` is a path that did not wait). Soundly tracks `get`-before-`wait`.
         let in_tg = !self.wait_state.is_empty();
         let w_before = self.wait_state.last().copied().unwrap_or(false);
         let then_errors_before = self.diags.error_count();
-        let then_b = self.check_block(
+        let then_b = self.check_block_context(
             then,
             if ast_block_diverges(then) { None } else { branch_expected },
+            if ast_block_diverges(then) { NumericOperandContext::default() } else { branch_context },
         );
         let then_is_clean = self.diags.error_count() == then_errors_before;
         let w_then = self.wait_state.last().copied().unwrap_or(false);
@@ -71929,14 +71952,15 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let else_errors_before = self.diags.error_count();
         let els_b = match els {
-            Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block(
+            Some(ast::Expr { kind: ast::ExprKind::Block(b), .. }) => self.check_block_context(
                 b,
                 if ast_block_diverges(b) { None } else { branch_expected },
+                if ast_block_diverges(b) { NumericOperandContext::default() } else { branch_context },
             ),
             Some(e) => {
                 // `else if` chain: check as an expression and wrap as a block value.
-                self.reject_bare_array_value(e, branch_expected, "an `else` value");
-                let v = self.check_expr(e, branch_expected);
+                self.reject_bare_array_value(e, branch_expected.or(branch_context.vector), "an `else` value");
+                let v = self.check_expr_context(e, branch_expected, branch_context);
                 Block { stmts: Vec::new(), value: Some(Box::new(v)) }
             }
             None => Block { stmts: Vec::new(), value: None },
@@ -71958,7 +71982,7 @@ impl<'a, 't> Checker<'a, 't> {
         let else_ty = (!else_diverges)
             .then_some(els_b.value.as_deref().map(|value| value.ty).unwrap_or(Ty::Unit));
         let ty = if always_diverges {
-            expected.unwrap_or(Ty::Unit)
+            expected.or(numeric.preferred()).unwrap_or(Ty::Unit)
         } else {
             match (then_ty, else_ty) {
                 (Some(then_ty), Some(else_ty)) => self.unify(then_ty, else_ty, span),
@@ -71987,9 +72011,10 @@ impl<'a, 't> Checker<'a, 't> {
     /// `match` arms). A `loop` with no `break` **diverges**: it never yields, so — like a `match`
     /// whose arms all diverge — it satisfies any expected type, and the code after it is unreachable.
     /// The body's trailing value is discarded each iteration (checked with no expected type).
-    fn check_loop(&mut self, b: &ast::Block, expected: Option<Ty>, span: Span) -> Expr {
+    fn check_loop(&mut self, b: &ast::Block, expected: Option<Ty>, numeric: NumericOperandContext, span: Span) -> Expr {
         self.loops.push(LoopCtx {
             break_ty: expected,
+            numeric_context: numeric,
             accepted_breaks: std::collections::HashSet::new(),
             region_depth: self.arena_depth + self.task_group_depth,
         });
@@ -72016,7 +72041,7 @@ impl<'a, 't> Checker<'a, 't> {
             self.loop_fallthrough.remove(&span);
             // No `break`: the loop diverges. It yields no value, so it takes the expected type (like
             // a diverging `match`) — the code after it is unreachable.
-            let ty = expected.unwrap_or(Ty::Unit);
+            let ty = expected.or(numeric.preferred()).unwrap_or(Ty::Unit);
             Expr { kind: ExprKind::Loop { body, diverges: true, body_locals }, ty, span }
         }
     }
@@ -72060,12 +72085,13 @@ impl<'a, 't> Checker<'a, 't> {
         // A bare array literal materializes only as a `let` initializer, slice borrow, pipeline
         // source, or `.len()` receiver; a free break value has no materialization path.
         let expected = self.loops.last().unwrap().break_ty;
+        let numeric = self.loops.last().unwrap().numeric_context;
         if let Some(v) = value
-            && self.reject_bare_array_value(v, expected, "a `break` value")
+            && self.reject_bare_array_value(v, expected.or(numeric.vector), "a `break` value")
         {
             return (Some(self.check_expr(v, None)), true);
         }
-        let v = value.map(|e| self.check_expr(e, expected));
+        let v = value.map(|e| self.check_expr_context(e, expected, numeric));
         let v_ty = v.as_ref().map(|x| x.ty).unwrap_or(Ty::Unit);
         match expected {
             // First break with a value fixes the loop's type (a present value was already

@@ -21,7 +21,7 @@ hash128(data)  -> (u64, u64)     // .0 == hash64(data); .1 = decorrelated second
 // scalar math — intrinsic methods on numeric values (no import, no core.math module):
 x.abs()                          // signed int / float; identity on unsigned
 a.min(b) / a.max(b)              // pairwise; int = llvm.{s,u}min/max, float = NaN-propagating minimum/maximum
-x.sqrt() / .floor() / .ceil() / .round() / .trunc()   // float-only; round = ties away from zero
+x.sqrt() / .floor() / .ceil() / .round() / .round_even() / .trunc()   // float-only; round = ties away from zero
 x.exp() / .exp2() / .log() / .log2() / .log10()     // float-only; also lane-wise on float vectors
 b.pow(e)                         // float-only
 fma(a, b, c)                     // free builtin; float scalar or float vector; one rounding
@@ -31,6 +31,13 @@ fma(a, b, c)                     // free builtin; float scalar or float vector; 
 
 All Copy in, Copy out. `hash*` borrows its view (an owned `string` remains usable — the `print`
 precedent). Pairwise `a.min(b)` coexists with the array-reduction `arr.min()` by arity.
+
+`round_even()` is a zero-argument method on `f32`, `f64` and their float vectors.
+It returns the same type, rounding to the nearest integral floating value with
+ties to the even integer. It preserves signed zero (including `-0.5 -> -0.0`),
+infinities and integral finite values. NaN remains NaN; its payload, sign and
+quieting are unspecified. It never aborts or allocates. `round()` continues to
+round ties away from zero. Vector semantics apply independently to every lane.
 
 ## Effects
 

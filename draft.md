@@ -1649,6 +1649,14 @@ the same defined semantics as their scalar forms, applied per lane: a **zero div
 (never a silent poison lane), and a signed `INT_MIN / -1` lane wraps to the two's-complement result.
 Float `%` is the IEEE remainder (`frem`), with no guard.
 
+Integer vectors also support lane-wise `&`, `|`, `^`, `<<`, `>>` and unary `~` for
+all signed/unsigned 8/16/32/64-bit elements and all four vector widths. Binary
+operands are equal vector types or one vector and its exact element scalar in
+either order. Each shift count is masked modulo the element bit width, including
+negative counts; signed right shift sign-extends, unsigned right shift zero-fills.
+Masks and floats do not support this family; unary vector `-` and `!`, and
+vector logical `&&` and `||`, remain unavailable. These operations are Pure Copy values and allocate nothing.
+
 ```align
 a: vec4<f32> := [1.0, 2.0, 3.0, 4.0]
 b: vec4<f32> := [10.0, 20.0, 30.0, 40.0]
@@ -1660,7 +1668,7 @@ f := fma(a, b, c)          // fused a*b + c, one rounding per lane
 ```
 
 The directly supported unary float math functions — `sqrt`, `abs`, `floor`, `ceil`, `round`,
-`trunc` — apply lane-wise to a float vector (the same names as on a scalar float).
+`round_even`, `trunc` — apply lane-wise to a float vector (the same names as on a scalar float).
 The elementary functions `exp`, `exp2`, `log`, `log2`, and
 `log10` are also lane-wise, but not every target has a machine-vector implementation: LLVM may
 scalarize them. `emit-llvm --stage optimized` exposes the exact pre-instruction-selection result,
@@ -1673,6 +1681,13 @@ element-wise `a.min(b)` / `a.max(b)` of two vectors, and `abs`, also work on int
 with no argument is the reduction instead). Their machine lowering is also target-dependent; `pow` (a libcall) stays
 scalar-only. `fma(a, b, c)` is the fused multiply-add `a*b + c` with a single rounding (a free builtin,
 float scalar or vector) — the kernel of dot products, FIR filters, and Horner-method polynomials.
+
+`round_even()` is a zero-argument method on `f32`, `f64` and their float vectors.
+It returns the same type, rounding to the nearest integral floating value with
+ties to the even integer. It preserves signed zero (including `-0.5 -> -0.0`),
+infinities and integral finite values. NaN remains NaN; its payload, sign and
+quieting are unspecified. It never aborts or allocates. `round()` continues to
+round ties away from zero. Vector semantics apply independently to every lane.
 
 ### Broadcast and lane access
 

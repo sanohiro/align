@@ -64,6 +64,8 @@ pub enum MathFn {
     Ceil,
     /// `x.round()` — round to nearest, ties away from zero (float).
     Round,
+    /// `x.round_even()` — round to nearest, ties to the even integer (float scalar or vector).
+    RoundEven,
     /// `x.trunc()` — round toward zero (float).
     Trunc,
     /// `x.exp()` — base-e exponential (float scalar or vector).
@@ -114,7 +116,7 @@ impl MathFn {
         match self {
             Self::Abs => (exact(1) && numeric).then_some(first),
             Self::Min | Self::Max => (exact(2) && numeric).then_some(first),
-            Self::Sqrt | Self::Floor | Self::Ceil | Self::Round | Self::Trunc
+            Self::Sqrt | Self::Floor | Self::Ceil | Self::Round | Self::RoundEven | Self::Trunc
             | Self::Exp | Self::Exp2 | Self::Log | Self::Log2 | Self::Log10 =>
                 (exact(1) && floating).then_some(first),
             Self::Pow => (exact(2) && matches!(first, Ty::Float(_)) && floating).then_some(first),
@@ -128,7 +130,7 @@ impl MathFn {
         match self {
             Self::ToBits | Self::IsFinite | Self::IsNan | Self::IsInfinite => true,
             Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
-            | Self::Round | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
+            | Self::Round | Self::RoundEven | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
             | Self::Log10 | Self::Pow | Self::Fma => false,
         }
     }
@@ -142,7 +144,7 @@ impl MathFn {
             Self::ToBits => Some(crate::Ty::Int(crate::IntTy { bits, signed: false })),
             Self::IsFinite | Self::IsNan | Self::IsInfinite => Some(crate::Ty::Bool),
             Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
-            | Self::Round | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
+            | Self::Round | Self::RoundEven | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
             | Self::Log10 | Self::Pow | Self::Fma => None,
         }
     }
@@ -160,6 +162,7 @@ impl MathFn {
             Self::Floor => "floor",
             Self::Ceil => "ceil",
             Self::Round => "round",
+            Self::RoundEven => "round_even",
             Self::Trunc => "trunc",
             Self::Exp => "exp",
             Self::Exp2 => "exp2",
