@@ -478,8 +478,9 @@ that Request 42's complete check/build diagnostic contract is resolved.
 Author-side closure: `XmlAccessAnalyzer::value_equation` now has a typed
 `Chunks` arm with source/size READ checks, an owned whole-header result, and
 source-dependent selected elements. `producer_materialized_chunks_preserve_source_element_proofs`
-accepts ByValue/Borrow/BorrowMut inputs and rejects wrong element/result/source/size,
-unreadable Out inputs, raw source forgery, and an unseeded source cycle at
+accepts ByValue/Borrow/BorrowMut and initialized exact-slice Out inputs
+(Plan229), and rejects wrong element/result/source/size, raw source forgery,
+and an unseeded source cycle at
 publication and whole/per-unit boundaries. The source owner
 `materialized_string_chunks_retain_views_across_modules` executes fixed/dynamic
 inputs, imported generic forwarding, short final chunks, and zero/negative sizes.
@@ -503,8 +504,9 @@ provenance and from the local header slot's authority. A writable fixed local's
 `MakeSlice` intentionally has Shared ordinary view provenance; a local slice
 header copied from `ConstArray` also has Shared provenance but points at read-only
 storage. Neither ordinary view provenance nor a writable local header alone
-proves writable elements. An Out parameter guarantees writable buffer storage
-without readable old elements. ByValue/BorrowMut on a Copy slice does not supply
+proves writable elements. An Out parameter guarantees writable buffer storage;
+forwarding that storage does not require an element-read operation. Its initialized
+elements remain readable under Plan229. ByValue/BorrowMut on a Copy slice does not supply
 that guarantee: a sema-clean `borrow mut slice<str>` wrapper can receive a local
 header pointing at a constant table. Treating that parameter's Exclusive header
 authority as writable buffer authority would newly admit a read-only write.
