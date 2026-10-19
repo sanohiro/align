@@ -1992,23 +1992,31 @@ rather than surfacing a `Result`) — `seed_with(s)` is **deterministic**, for t
 reproducibility. `lo >= hi` (`range`) and `k < 0` or
 `k > xs.len()` (`sample`) are programmer errors and abort at runtime, like out-of-bounds indexing.
 
-`std.compress`: `gzip_decompress(data: bytes)` and `zstd_decompress(data: bytes)` return
+`std.compress`: `gzip_decompress(data: bytes, max_bytes: i64 = 1073741824)` and `zstd_decompress(data: bytes, max_bytes: i64 = 1073741824)` return
 `Result<buffer, Error>` with independently owned output after consuming the entire borrowed input.
 Calls are Impure. Concatenated gzip members and current ordinary/skippable zstd frames are accepted;
 skippable frames contribute no output. Empty input, legacy zstd, corrupt/truncated later data and
 trailing bytes (including gzip zero padding) return `Error.Invalid` without partial output.
-The inclusive 1 GiB aggregate payload cap permits gzip/zstd exact-cap empty/skippable suffixes and does not
+The inclusive caller limit (default 1 GiB) on aggregate payload permits gzip/zstd exact-cap empty/skippable suffixes and does not
 bound native workspace or RSS. Native resource/output allocation failures retain `Error.Code`;
 final header OOM retains terminal runtime policy. Exact admission and error precedence are in
 [the compression design](impl/std-design/compress.md).
 
 `zlib_compress` / `zlib_decompress` and `deflate_raw_compress` /
 `deflate_raw_decompress` complete the same family. Compression takes `(data: bytes,
-level: i64)`; decompression takes `(data: bytes)`; all return `Result<buffer, Error>`.
+level: i64)`; decompression takes `(data: bytes, max_bytes: i64 = 1073741824)`; all return `Result<buffer, Error>`.
 The libz modes are 15 and -15. Both decoders require exactly one complete stream,
 reject trailing bytes or a second stream, and share the cap/ownership/error rules.
 Zlib checksum or dictionary failures are Invalid; final raw-byte padding is allowed.
 Levels 0..=9 are accepted; other levels abort before native initialization.
+
+All four decoders accept the optional trailing i64 `max_bytes` in `0..=1073741824`.
+Its default is 1 GiB. Invalid limits abort after ordered operand evaluation and before
+input inspection/native initialization. Zero accepts valid empty-output streams; excess
+output is Invalid. Output allocation requests and payload-buffer spans are clamped to
+the limit, with a separate one-byte stack probe. Allocator rounding, realloc overlap,
+native workspace, buffer headers and RSS remain outside the bound. Input stays live
+through limit evaluation; output is not preallocated to the full declared limit.
 
 Incremental SHA-256 uses `crypto.sha256_stream() -> crypto.digest`,
 `d.update(data: bytes) -> ()`, and consuming `d.finish() -> array<u8>`.

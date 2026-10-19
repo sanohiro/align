@@ -1068,8 +1068,8 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::CompressCompress { kind, data, level, out } => {
             format!("compress_{kind:?}({}, {}, -> _{out})", operand_str(data), operand_str(level))
         }
-        Rvalue::CompressDecompress { kind, data, out } => {
-            format!("decompress_{kind:?}({}, -> _{out})", operand_str(data))
+        Rvalue::CompressDecompress { kind, data, max_bytes, out } => {
+            format!("decompress_{kind:?}({}, {}, -> _{out})", operand_str(data), operand_str(max_bytes))
         }
         Rvalue::Utf8Valid { data } => format!("utf8_valid({})", operand_str(data)),
         Rvalue::CryptoCtEqual { a, b } => format!("crypto_ct_equal({}, {})", operand_str(a), operand_str(b)),

@@ -22,6 +22,18 @@ receiver rule. Existing collection, C/FFI, JSON, SoA, RegionPlain and heap build
 shape restrictions remain. [Plan175](impl/175-rng-record-composition.md) fixes the
 32-byte internal layout and the source/native acceptance boundary.
 
+### Caller-selected decompression limits (SETTLED 2026-10-19)
+
+All four `std.compress` decoders accept optional trailing `max_bytes: i64`, default
+1073741824. The inclusive range is `0..=1073741824`; invalid values abort before
+input inspection/native initialization, after ordered operand evaluation. Output
+requests and payload-buffer writes stay within the limit; zero permits complete
+empty-output streams, and excess output is Invalid. The separate stack probe,
+complete-input rules and independent owned output remain. Allocator overhead,
+realloc overlap, engine workspace and RSS are outside the payload bound.
+[Plan226 R156](impl/226-deflate-framing.md#caller-selected-output-limits-llm-r156)
+extends the original fixed-default contract below.
+
 ### Complete DEFLATE framing (SETTLED 2026-10-18)
 
 The existing compression family includes zlib (RFC1950) and raw DEFLATE (RFC1951)

@@ -148,7 +148,7 @@ fn single_stream_completion_and_reference_vectors() -> TestResult {
     Ok(())
 }
 
-type NativeDecode = unsafe extern "C" fn(*const u8, i64, *mut *mut Buffer) -> i32;
+type NativeDecode = unsafe extern "C" fn(*const u8, i64, i64, *mut *mut Buffer) -> i32;
 struct BufferOwner(*mut Buffer);
 impl Drop for BufferOwner {
     fn drop(&mut self) {
@@ -188,7 +188,7 @@ fn inclusive_cap_and_atomic_publication() -> TestResult {
             .map_err(|s| format!("compress status {s}"))?;
         let size = i64::try_from(encoded.len())?;
         let mut output = BufferOwner(core::ptr::null_mut());
-        assert_eq!(unsafe { native(encoded.as_ptr(), size, &mut output.0) }, 0);
+        assert_eq!(unsafe { native(encoded.as_ptr(), size, 1 << 30, &mut output.0) }, 0);
         assert!(!output.0.is_null());
         encoded.fill(0xcc);
         drop(encoded);
@@ -204,7 +204,7 @@ fn inclusive_cap_and_atomic_publication() -> TestResult {
             // An old caller-owned handle remains separately owned; failure must clear the out slot.
             let mut published = output.0;
             assert_eq!(
-                unsafe { native(input.as_ptr(), i64::try_from(input.len())?, &mut published) },
+                unsafe { native(input.as_ptr(), i64::try_from(input.len())?, 1 << 30, &mut published) },
                 AL_INVALID
             );
             assert!(published.is_null());
@@ -214,6 +214,7 @@ fn inclusive_cap_and_atomic_publication() -> TestResult {
                 native(
                     encoded.as_ptr(),
                     i64::try_from(encoded.len())?,
+                    1 << 30,
                     core::ptr::null_mut(),
                 )
             },

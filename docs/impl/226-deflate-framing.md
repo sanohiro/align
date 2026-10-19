@@ -91,3 +91,61 @@ contract row closes this for gzip/zstd as well as the new framings, without a
 new IR shape or ABI. `deflate_codec_hir_signature_matrix` and
 `deflate_codec_mir_signature_matrix` own malformed data/level/result/output
 relations alongside the successful source/capability owners.
+
+## Caller-selected output limits (LLM R156)
+
+R156's PNG consumer knows its scanline extent before inflating IDAT. Its current
+post-decode size check cannot prevent a larger output allocation. Media's
+`video_png` has the same requirement behind its native `uncompress2` binding;
+voice has no compression consumer. This extension changes only the existing
+decoder parameter contract; the earlier no-configurable-limit boundary above
+describes the original framing delivery.
+
+### Public contract ledger
+
+| Surface | Exact record |
+| --- | --- |
+| Signatures | Each of `compress.gzip_decompress`, `compress.zstd_decompress`, `compress.zlib_decompress`, `compress.deflate_raw_decompress` takes `(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>`. The second positional argument is optional; no general default-parameter language feature is introduced. Existing one-argument calls normalize to the same two-operand HIR. |
+| Domain and validation | Source arity is one or two; data is the existing call-borrowed byte view, followed by an exact i64 limit. Evaluate explicit operands once in source order, keeping input live through limit evaluation. A terminating operand performs no native action. After operand evaluation, a limit outside `0..=1073741824` aborts before input inspection or native initialization, even for malformed/empty compressed input. No ambient configuration. |
+| Output and errors | The aggregate output across the existing accepted members/frames is at most max_bytes, inclusive. Excess output is Error.Invalid. Zero accepts complete streams with no output (and zstd skippable-only input), but not empty encoded input. Exactly-full output still validates all trailing metadata/empty frames and checksums. Existing format/completion and native-error precedence remain unchanged. |
+| Ownership/allocation | Input is arbitrary binary bytes, including NUL, borrowed only for the call. Success returns one independent Move buffer; error publishes null and releases native state and staged output. Existing buffer transfer/replacement/Drop remains unchanged. Every output allocation request and native payload-buffer span is clamped to max_bytes; output grows on demand, starting at min(64 KiB, max_bytes). The separate one-byte overflow probe stays on the stack, including at zero limit. Allocator rounding, transient realloc old/new overlap, engine workspace, buffer header and process RSS are outside this payload-storage bound. No new clone or allocation category. |
+| Owners and ABI | Sema inserts/checks max_bytes; all HIR walkers and replay/monomorphization visit it. MIR requires it before the call; LLVM purely lowers it. All four existing native symbols become `i32(ptr data, i64 len, i64 max_bytes, ptr out)`. Registry, emitted declarations and Rust exports change atomically; no parallel legacy ABI. |
+| Artifact identity | Existing compiler build identity invalidates frontend and object caches; generic source replay preserves the argument. No serialized interface type or public type layout changes, so no interface format bump. Whole-program, per-unit, imported generic and cold/hit execution must agree. |
+| Documentation | This ledger, draft, language-spec, design-notes, Settled, English/Japanese compress design, HIR-validation and native ABI ledgers agree. Existing Plan124 framing semantics continue; the caller limit specializes its aggregate cap. Request receipts distinguish delivery from adoption. |
+| Prerequisite and evidence | Existing complete-input engines (Plan124/226) already implement parameterized inclusive caps. No future milestone is consumed. Runtime allocation observation is a correctness/resource owner, not a speed claim; no timing benchmark is required. |
+
+### Implementation closure matrix
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Formation, malformed input | Extend `Decompress` with required i64 `max_bytes`; source arity/type/domain owners in driver `compression_framing`; extend `deflate_codec_hir_signature_matrix` and `deflate_codec_mir_signature_matrix` to all four codecs and malformed limit children/types. Existing result/out/data controls remain. |
+| Every eager/control path | Sweep `Decompress` alongside two-child `Compress`: borrow reservations, move/escape/effect walks, finalization, depth traversal, replay clone, MIR required-child lowering, MIR operand inventory. `compression_framing::limits_*` covers side-effect order, input invalidation, nested helper/closure captures, `if`, `match`, `else`, `?`, `map_err`, loop/replacement and limit early exit. Existing Result-buffer owners retain move-in/out, source nulling and Drop proof. |
+| Native bounds/completion | `decompression_limit_tests` parameterizes all four exported decoders over zero, exact, one-below and spare limits, empty/nonempty streams, malformed/truncated/trailing input, and gzip/zstd aggregate frames. Existing `decompression_frames_tests` and `deflate_framing_tests` retain independent wire vectors. |
+| Allocation and atomic failure | Observe actual output growth requests/capacities during public native calls with test-local instrumentation, including a compressed large-output witness and zero/tiny/growth-boundary limits. Assert no requested output capacity exceeds limit, no partial handle escapes, and successful handles free normally. Existing native stream cleanup is reused on every return. |
+| Return, imports and caches | `compression_framing::limits_*` whole/per-unit and cold/hit imported generic helpers exercise owned output after input expiry, replacement, propagation and both result arms. Default and explicit 1 GiB calls are equivalent on bounded fixtures. |
+| ABI and publication | Exact runtime registry/type/declaration-golden owners cover all four changed symbols; existing capabilities still require libz/libzstd. Native limit-abort subprocess cases cover -1 and 1073741825 for each codec, including malformed input. |
+
+One family-wide capability is the smallest useful boundary: exposing only one
+decoder or a dormant native parameter would duplicate identical operand,
+allocation and ABI proofs. If the complete sweep and parameterized owners exceed
+1,000 handwritten lines, retaining this boundary lowers integration risk by
+keeping all four ABI changes and the common HIR/MIR operand contract atomic.
+Before implementation, author-check the ledger against existing cap/probe,
+required-child and cache contracts, then obtain one independent strategy review.
+
+The author strategy pass and independent inspection found no P1/P2 issue. The
+span wording now distinguishes payload-buffer spans from the one-byte stack
+probe, including the zero-limit case.
+
+The author matrix-to-diff pass binds the new operands to the shared two-child
+walks, required-child MIR lowering, strict HIR/MIR signature checks, A07 native
+shape and updated pointer escape ordinal 3. Source owners are
+`limits_whole_per_unit_and_cached_lifecycle`,
+`limits_source_domain_and_input_liveness`, and
+`limits_abort_on_invalid_domain_before_decoding` in `compression_framing`.
+Native owners are `caller_limits_bound_actual_output_growth_and_publication`
+and `caller_limit_covers_all_members_and_metadata_tails`; existing frame and
+framing owners retain independent malformed-wire and cleanup coverage.
+The exact ABI owners named above also compare the changed exports to emitted
+LLVM declarations. No type formation, ownership or interface-format cell is
+silently widened by the additional scalar operand.

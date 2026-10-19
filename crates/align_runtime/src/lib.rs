@@ -57,6 +57,8 @@ mod utf8_lossy_tests;
 #[cfg(test)]
 mod decompression_frames_tests;
 #[cfg(test)]
+mod decompression_limit_tests;
+#[cfg(test)]
 mod deflate_framing_tests;
 #[cfg(test)]
 mod base64_quantum_tests;
@@ -14775,7 +14777,7 @@ pub unsafe extern "C" fn align_rt_utf8_valid(ptr: *const u8, len: i64) -> i32 {
 // the memory (Align allocates the owned `buffer` output), borrow the engine (zlib's tuned DEFLATE) —
 // wrap `libz` rather than reimplement DEFLATE. `gzip_compress(data, level)` / `gzip_decompress(data)`
 // return an owned `buffer` handle (Box, freed by `align_rt_buffer_free`), or an `AL_*` status:
-// corrupt/truncated input (and a decompress "bomb" over `GZIP_MAX_OUTPUT`) -> `AL_INVALID`
+// corrupt/truncated input (and a decompress "bomb" over `DECOMPRESS_MAX_OUTPUT`) -> `AL_INVALID`
 // (`Error.Invalid`); an engine/OOM failure -> `Error.Code`. Strict gzip framing both ways
 // (windowBits 15+16), so a non-gzip input to decompress is rejected. The driver links `-lz`.
 // ---------------------------------------------------------------------------------------------
@@ -14874,7 +14876,15 @@ const ZLIB_VERSION: &[u8] = b"1.2.11\0";
 /// to gigabytes. 1 GiB — exceeding it fails with `AL_INVALID` (`Error.Invalid`) rather than
 /// exhausting memory. Only **decompression** is capped; compression output is bounded by the input
 /// size plus small framing overhead, so capping it would wrongly reject a legitimate large compress.
-const GZIP_MAX_OUTPUT: usize = 1 << 30;
+const DECOMPRESS_MAX_OUTPUT: usize = 1 << 30;
+
+/// Validate the caller's payload-storage limit before inspecting input or creating native state.
+fn decompression_limit(max_bytes: i64) -> usize {
+    match usize::try_from(max_bytes) {
+        Ok(limit) if limit <= DECOMPRESS_MAX_OUTPUT => limit,
+        _ => panic_abort("compress.decompress: max_bytes out of range (must be 0..=1073741824)"),
+    }
+}
 
 /// Output growth step for the compress/decompress loops (also the initial chunk). 64 KiB.
 const GZIP_OUT_CHUNK: usize = 64 * 1024;
@@ -14931,6 +14941,8 @@ fn grow_output(out: &mut Vec<u8>, max_cap: usize) -> Result<bool, i32> {
         .min(max_cap);
     let add = want - out.capacity(); // > 0: reachable state here is len == capacity < max_cap, so want > capacity
     out.try_reserve_exact(add).map_err(|_| AL_CODE)?;
+    #[cfg(test)]
+    decompression_limit_tests::observe_growth(want, out.capacity());
     Ok(true)
 }
 
@@ -15014,10 +15026,11 @@ fn deflate_run(strm: &mut ZStream, input: &[u8], input_chunk: usize) -> Result<V
 }
 
 /// Decompress every gzip member in `data`, returning their concatenated bytes or an `AL_*` status.
-/// Aggregate output is capped at [`GZIP_MAX_OUTPUT`] (the bomb guard): exceeding it → `AL_INVALID`.
+/// Aggregate output is capped at [`DECOMPRESS_MAX_OUTPUT`] (the bomb guard): exceeding it → `AL_INVALID`.
 /// Truncated input (zlib needs more but none remains) and corrupt input both map to `AL_INVALID`.
+#[cfg(test)]
 fn gzip_inflate(data: &[u8]) -> Result<Vec<u8>, i32> {
-    zlib_inflate(data, DeflateFormat::Gzip, GZIP_MAX_OUTPUT, zlib_input_chunk())
+    zlib_inflate(data, DeflateFormat::Gzip, DECOMPRESS_MAX_OUTPUT, zlib_input_chunk())
 }
 
 fn zlib_inflate(data: &[u8], format: DeflateFormat, max_cap: usize, input_chunk: usize) -> Result<Vec<u8>, i32> {
@@ -15146,16 +15159,17 @@ pub unsafe extern "C" fn align_rt_compress_gzip_compress(ptr: *const u8, len: i6
     unsafe { publish_buffer(gzip_deflate(data, level), out) }
 }
 
-/// `compress.gzip_decompress(data)` — inflate the gzip byte view `data`, writing an owned `buffer`
+/// `compress.gzip_decompress(data, max_bytes)` — inflate the gzip byte view `data`, writing an owned `buffer`
 /// handle to `*out` and returning `0` (or `AL_INVALID` on corrupt/truncated/bomb input, leaving
-/// `*out` null).
+/// `*out` null). Invalid max_bytes aborts before input inspection/native initialization.
 ///
 /// # Safety
 /// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_compress_gzip_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+pub unsafe extern "C" fn align_rt_compress_gzip_decompress(ptr: *const u8, len: i64, max_bytes: i64, out: *mut *mut Buffer) -> i32 {
+    let max_cap = decompression_limit(max_bytes);
     let data = unsafe { bytes_view(ptr, len) };
-    unsafe { publish_buffer(gzip_inflate(data), out) }
+    unsafe { publish_buffer(zlib_inflate(data, DeflateFormat::Gzip, max_cap, zlib_input_chunk()), out) }
 }
 
 /// `compress.zlib_compress(data, level)` returns one owned complete stream.
@@ -15169,15 +15183,17 @@ pub unsafe extern "C" fn align_rt_compress_zlib_compress(ptr: *const u8, len: i6
     unsafe { publish_buffer(zlib_deflate(data, level, DeflateFormat::Zlib, zlib_input_chunk()), out) }
 }
 
-/// `compress.zlib_decompress(data)` requires one complete stream and no trailing bytes.
-/// The inclusive output cap is 1 GiB. No partial output is published on failure.
+/// `compress.zlib_decompress(data, max_bytes)` requires one complete stream and no trailing bytes.
+/// The caller supplies the inclusive output cap (0..=1 GiB). Invalid limits abort before native
+/// initialization; no partial output is published on failure.
 ///
 /// # Safety
 /// `ptr`/`len` must describe a valid byte range; `out` must be a writable handle slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_compress_zlib_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+pub unsafe extern "C" fn align_rt_compress_zlib_decompress(ptr: *const u8, len: i64, max_bytes: i64, out: *mut *mut Buffer) -> i32 {
+    let max_cap = decompression_limit(max_bytes);
     let data = unsafe { bytes_view(ptr, len) };
-    unsafe { publish_buffer(zlib_inflate(data, DeflateFormat::Zlib, GZIP_MAX_OUTPUT, zlib_input_chunk()), out) }
+    unsafe { publish_buffer(zlib_inflate(data, DeflateFormat::Zlib, max_cap, zlib_input_chunk()), out) }
 }
 
 /// `compress.deflate_raw_compress(data, level)` returns one owned complete stream.
@@ -15191,15 +15207,17 @@ pub unsafe extern "C" fn align_rt_compress_deflate_raw_compress(ptr: *const u8, 
     unsafe { publish_buffer(zlib_deflate(data, level, DeflateFormat::Raw, zlib_input_chunk()), out) }
 }
 
-/// `compress.deflate_raw_decompress(data)` requires one complete stream and no trailing bytes.
-/// The inclusive output cap is 1 GiB. No partial output is published on failure.
+/// `compress.deflate_raw_decompress(data, max_bytes)` requires one complete stream and no trailing bytes.
+/// The caller supplies the inclusive output cap (0..=1 GiB). Invalid limits abort before native
+/// initialization; no partial output is published on failure.
 ///
 /// # Safety
 /// `ptr`/`len` must describe a valid byte range; `out` must be a writable handle slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_compress_deflate_raw_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+pub unsafe extern "C" fn align_rt_compress_deflate_raw_decompress(ptr: *const u8, len: i64, max_bytes: i64, out: *mut *mut Buffer) -> i32 {
+    let max_cap = decompression_limit(max_bytes);
     let data = unsafe { bytes_view(ptr, len) };
-    unsafe { publish_buffer(zlib_inflate(data, DeflateFormat::Raw, GZIP_MAX_OUTPUT, zlib_input_chunk()), out) }
+    unsafe { publish_buffer(zlib_inflate(data, DeflateFormat::Raw, max_cap, zlib_input_chunk()), out) }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -15236,11 +15254,6 @@ struct ZstdOutBuffer {
 /// (down to `ZSTD_minCLevel()`) are a power-user niche and are deliberately excluded to keep the API
 /// one-way (a single non-negative range) — an out-of-range level aborts, mirroring gzip's `0..=9`.
 const ZSTD_MAX_CLEVEL: i64 = 22;
-
-/// Hard cap on zstd-decompressed output (the decompress-bomb guard, P2), identical to gzip's — 1 GiB.
-/// A tiny zstd frame can advertise/inflate to gigabytes; exceeding this fails with `AL_INVALID`
-/// rather than exhausting memory. Only decompression is capped (compress output is input-bounded).
-const ZSTD_MAX_OUTPUT: usize = 1 << 30;
 
 // Stable `ZSTD_ErrorCode` values (`zstd_errors.h`) used to split an engine/resource failure from
 // invalid input on the decompress path. These two are the only realistic non-input faults for a
@@ -15311,11 +15324,15 @@ fn zstd_compress_impl(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
     Ok(out)
 }
 
-/// `compress.zstd_decompress(data)` — inflate every current ordinary/skippable frame in `data`,
-/// returning concatenated bytes or an `AL_*` status. Aggregate output is capped at [`ZSTD_MAX_OUTPUT`] (the bomb
-/// guard) — `ZSTD_getFrameContentSize` is never trusted for sizing. The `DStream` is freed on every
-/// path (init failure, decode error, success).
+/// Default-limit helper for cumulative native framing owners.
+#[cfg(test)]
 fn zstd_decompress_impl(data: &[u8]) -> Result<Vec<u8>, i32> {
+    zstd_decompress_limited_impl(data, DECOMPRESS_MAX_OUTPUT)
+}
+
+/// Decode all current frames under the caller limit without trusting frame size hints.
+/// Free the DStream on initialization failure, decode error and success.
+fn zstd_decompress_limited_impl(data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
     let zds = unsafe { ZSTD_createDStream() };
     if zds.is_null() {
         return Err(AL_CODE); // allocation failure creating the stream — engine fault
@@ -15328,7 +15345,7 @@ fn zstd_decompress_impl(data: &[u8]) -> Result<Vec<u8>, i32> {
         unsafe { ZSTD_freeDStream(zds) };
         return Err(st);
     }
-    let result = zstd_decompress_stream(zds, data, ZSTD_MAX_OUTPUT);
+    let result = zstd_decompress_stream(zds, data, max_cap);
     unsafe { ZSTD_freeDStream(zds) };
     result
 }
@@ -15340,8 +15357,8 @@ fn zstd_current_frame(data: &[u8]) -> bool {
 
 /// Drive `ZSTD_decompressStream` through every frame in `data`, enforcing the `max_cap` output cap
 /// (the bomb guard). The whole input is available at once (a fully-buffered byte view); output grows
-/// via the shared [`grow_output`] up to `max_cap`. `max_cap` is a parameter (not [`ZSTD_MAX_OUTPUT`]
-/// directly) so a unit test can drive the bomb path with a tiny cap. Never dereferences the stream
+/// via the shared [`grow_output`] up to `max_cap`. `max_cap` is a parameter (not [`DECOMPRESS_MAX_OUTPUT`]
+/// directly) to support caller-selected limits and tiny-cap native tests. Never dereferences the stream
 /// after an error (the caller frees it).
 fn zstd_decompress_stream(zds: *mut c_void, data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
     let mut out: Vec<u8> = Vec::new();
@@ -15400,16 +15417,17 @@ pub unsafe extern "C" fn align_rt_compress_zstd_compress(ptr: *const u8, len: i6
     unsafe { publish_buffer(zstd_compress_impl(data, level), out) }
 }
 
-/// `compress.zstd_decompress(data)` — inflate the zstd byte view `data`, writing an owned `buffer`
+/// `compress.zstd_decompress(data, max_bytes)` — inflate the zstd byte view `data`, writing an owned `buffer`
 /// handle to `*out` and returning `0` (or `AL_INVALID` on corrupt/truncated/bomb input, leaving
-/// `*out` null).
+/// `*out` null). Invalid max_bytes aborts before input inspection/native initialization.
 ///
 /// # Safety
 /// `ptr`/`len` must describe a valid byte range; `out` must point to a writable handle slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_compress_zstd_decompress(ptr: *const u8, len: i64, out: *mut *mut Buffer) -> i32 {
+pub unsafe extern "C" fn align_rt_compress_zstd_decompress(ptr: *const u8, len: i64, max_bytes: i64, out: *mut *mut Buffer) -> i32 {
+    let max_cap = decompression_limit(max_bytes);
     let data = unsafe { bytes_view(ptr, len) };
-    unsafe { publish_buffer(zstd_decompress_impl(data), out) }
+    unsafe { publish_buffer(zstd_decompress_limited_impl(data, max_cap), out) }
 }
 
 /// Byte-lexicographic order of two `str` views (`Ord(str)`, 2026-07-09): returns -1 if `a < b`,
@@ -44924,7 +44942,7 @@ mod tests {
     /// Decompress `data` through the FFI entry, returning `Ok(bytes)` or `Err(status)`.
     fn gz_decompress(data: &[u8]) -> Result<Vec<u8>, i32> {
         let mut out: *mut Buffer = core::ptr::null_mut();
-        let st = unsafe { align_rt_compress_gzip_decompress(data.as_ptr(), data.len() as i64, &mut out) };
+        let st = unsafe { align_rt_compress_gzip_decompress(data.as_ptr(), data.len() as i64, 1 << 30, &mut out) };
         if st != 0 {
             assert!(out.is_null(), "the Err path must leave the out handle null");
             return Err(st);
@@ -45000,7 +45018,7 @@ mod tests {
 
     /// The decompress-bomb guard (P2): a tiny gzip stream that inflates past the cap → `AL_INVALID`.
     /// Driven with a small `max_cap` via `inflate_run` directly (a real 1 GiB inflate is impractical);
-    /// the same wiring uses `GZIP_MAX_OUTPUT` in production.
+    /// the same wiring uses `DECOMPRESS_MAX_OUTPUT` in production.
     #[test]
     fn gzip_decompress_bomb_over_cap_is_invalid() {
         // 1 MB of zeros compresses to a tiny gzip stream but inflates to 1 MB — over a 1 KiB cap.
@@ -45091,7 +45109,7 @@ mod tests {
     /// Decompress `data` through the FFI entry, returning `Ok(bytes)` or `Err(status)`.
     fn zst_decompress(data: &[u8]) -> Result<Vec<u8>, i32> {
         let mut out: *mut Buffer = core::ptr::null_mut();
-        let st = unsafe { align_rt_compress_zstd_decompress(data.as_ptr(), data.len() as i64, &mut out) };
+        let st = unsafe { align_rt_compress_zstd_decompress(data.as_ptr(), data.len() as i64, 1 << 30, &mut out) };
         if st != 0 {
             assert!(out.is_null(), "the Err path must leave the out handle null");
             return Err(st);
@@ -45182,7 +45200,7 @@ mod tests {
 
     /// The decompress-bomb guard (P2): a tiny zstd frame that inflates past the cap → `AL_INVALID`.
     /// Driven with a small `max_cap` via `zstd_decompress_stream` directly (a real 1 GiB inflate is
-    /// impractical); the same wiring uses `ZSTD_MAX_OUTPUT` in production. Also exercises the
+    /// impractical); the same wiring uses `DECOMPRESS_MAX_OUTPUT` in production. Also exercises the
     /// create/init/free `DStream` lifecycle on both the capped and the successful path.
     #[test]
     fn zstd_decompress_bomb_over_cap_is_invalid() {

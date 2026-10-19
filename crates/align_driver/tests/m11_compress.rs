@@ -281,7 +281,7 @@ fn missing_import_diagnostic_names_the_capability() {
     assert!(diags.contains("import std.compress"), "diagnostic should name the capability: {diags}");
 }
 
-/// `gzip_compress` takes exactly 2 args (data, level); `gzip_decompress` exactly 1 (data). A wrong
+/// `gzip_compress` takes exactly 2 args (data, level); `gzip_decompress` one or two (data, max_bytes). A wrong
 /// arity is a compile error.
 #[test]
 fn compress_wrong_arity_rejected() {
@@ -290,8 +290,8 @@ fn compress_wrong_arity_rejected() {
         "gzip_compress with 1 argument must error"
     );
     assert!(
-        check_errs("m11c-decomp-arity2", "import std.compress\npub fn main() -> Result<(), Error> {\n  c := compress.gzip_decompress(\"x\", 6)?\n  return Ok(())\n}\n"),
-        "gzip_decompress with 2 arguments must error"
+        check_errs("m11c-decomp-arity2", "import std.compress\npub fn main() -> Result<(), Error> {\n  c := compress.gzip_decompress(\"x\", 6, 0)?\n  return Ok(())\n}\n"),
+        "gzip_decompress with 3 arguments must error"
     );
 }
 
@@ -647,7 +647,7 @@ pub fn main() -> Result<(), Error> {
 
 // --- arity + purity ----------------------------------------------------------------------------
 
-/// `zstd_compress` takes exactly 2 args (data, level); `zstd_decompress` exactly 1 (data). A wrong
+/// `zstd_compress` takes exactly 2 args (data, level); `zstd_decompress` one or two (data, max_bytes). A wrong
 /// arity is a compile error.
 #[test]
 fn zstd_wrong_arity_rejected() {
@@ -656,8 +656,8 @@ fn zstd_wrong_arity_rejected() {
         "zstd_compress with 1 argument must error"
     );
     assert!(
-        check_errs("m11z-decomp-arity2", "import std.compress\npub fn main() -> Result<(), Error> {\n  c := compress.zstd_decompress(\"x\", 6)?\n  return Ok(())\n}\n"),
-        "zstd_decompress with 2 arguments must error"
+        check_errs("m11z-decomp-arity2", "import std.compress\npub fn main() -> Result<(), Error> {\n  c := compress.zstd_decompress(\"x\", 6, 0)?\n  return Ok(())\n}\n"),
+        "zstd_decompress with 3 arguments must error"
     );
 }
 

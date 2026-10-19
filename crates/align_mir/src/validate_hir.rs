@@ -9893,8 +9893,8 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Compress { data, level, .. } => {
                 (byte_view(data.ty) && level.ty == i64).then(|| result(Ty::Buffer, &[data, level]))?
             }
-            hir::ExprKind::Decompress { data, .. } => {
-                (byte_view(data.ty)).then(|| result(Ty::Buffer, &[data]))?
+            hir::ExprKind::Decompress { data, max_bytes, .. } => {
+                (byte_view(data.ty) && max_bytes.ty == i64).then(|| result(Ty::Buffer, &[data, max_bytes]))?
             }
             hir::ExprKind::RandSeed => (expression.ty == Ty::Rng).then_some((Ty::Rng, true, Vec::new())),
             hir::ExprKind::RandSeedWith { seed } => {

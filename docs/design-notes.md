@@ -2519,4 +2519,8 @@ libz engine and Align-owned memory wrapper. PNG clients should not each declare
 an ABI-dependent uncompress2 binding. Their image parsing stays in the client;
 framing validation, full-input consumption, bounded output and cleanup belong
 to the shared codec. [Plan226](impl/226-deflate-framing.md) fixes the single-stream
-contract without changing gzip/zstd concatenation or adding a configurable cap.
+contract without changing gzip/zstd concatenation. R156 adds the same optional
+caller-selected output limit to all four decoders: a PNG header's expected extent
+can bound staging before allocation, rather than reject only after decompression.
+The default remains 1 GiB; this payload limit does not promise bounded native
+workspace or RSS.

@@ -616,6 +616,11 @@ fn walk_body_records<'a>(
                     level: rhs,
                     ..
                 }
+                | ExprKind::Decompress {
+                    data: lhs,
+                    max_bytes: rhs,
+                    ..
+                }
                 | ExprKind::RegexIsMatch {
                     regex: lhs,
                     text: rhs,
@@ -971,7 +976,6 @@ fn walk_body_records<'a>(
                 | ExprKind::UnicodeNfc { input: recv }
                 | ExprKind::EncodingDecode { input: recv, .. }
                 | ExprKind::Utf8Valid { data: recv }
-                | ExprKind::Decompress { data: recv, .. }
                 | ExprKind::RandSeedWith { seed: recv }
                 | ExprKind::RandNext { rng: recv }
                 | ExprKind::RegexCompile { pattern: recv }

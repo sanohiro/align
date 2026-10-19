@@ -281,7 +281,7 @@ fn decompress_aggregate_cap_is_inclusive_across_members_and_input_windows() -> R
     Ok(())
 }
 
-type NativeDecode = unsafe extern "C" fn(*const u8, i64, *mut *mut Buffer) -> i32;
+type NativeDecode = unsafe extern "C" fn(*const u8, i64, i64, *mut *mut Buffer) -> i32;
 struct BufferOwner(*mut Buffer);
 impl Drop for BufferOwner {
     fn drop(&mut self) {
@@ -310,7 +310,7 @@ fn decompress_publishes_independent_complete_output_or_null() -> Result<(), Stri
         ] {
             let mut output = BufferOwner(core::ptr::null_mut());
             let size = i64::try_from(input.len()).map_err(|error| error.to_string())?;
-            let status = unsafe { decode(input.as_ptr(), size, &mut output.0) };
+            let status = unsafe { decode(input.as_ptr(), size, 1 << 30, &mut output.0) };
             input.fill(0xcc);
             if let Some(expected) = expected {
                 assert_eq!(status, 0);

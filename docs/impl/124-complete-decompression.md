@@ -26,7 +26,9 @@ implement their wire parsers in Align or Rust.
 
 Compression functions still produce one member/frame with existing levels and
 behavior. No streaming source API, partial decode API, dictionary support or
-configurable public limit is added. K1 remains deferred.
+configurable public limit is added by this original completion. Plan226 R156
+later exposes a caller-selected lower limit, preserving this framing/cleanup
+contract and its 1 GiB default. K1 remains deferred.
 
 ## Implementation closure
 

@@ -18161,7 +18161,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("gzip_compress returns i32 status")
             }
-            Rvalue::CompressDecompress { kind, data, out } => {
+            Rvalue::CompressDecompress { kind, data, max_bytes, out } => {
                 let key = match kind {
                     align_sema::hir::CompressKind::Gzip => RuntimeKey::CompressGzipDecompress,
                     align_sema::hir::CompressKind::Zlib => RuntimeKey::CompressZlibDecompress,
@@ -18173,8 +18173,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
                     .map_err(|e| self.err(e))?;
                 let (dp, dl) = self.split_str(data)?;
+                let limit = self.operand(max_bytes)?;
                 self.builder
-                    .build_call(self.runtime(key), &[dp.into(), dl.into(), out_ptr.into()], "gzd")
+                    .build_call(self.runtime(key), &[dp.into(), dl.into(), limit.into(), out_ptr.into()], "gzd")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("gzip_decompress returns i32 status")
             }
@@ -42344,7 +42345,7 @@ fn main() -> i32 = 0
                 let valid = mir(&source);
                 assert!(validate_resource_rvalues(&valid).is_ok());
                 assert!(validate_thin_partition_program(&valid, &[]).is_ok());
-                for mutation in 0..if compress { 6 } else { 4 } {
+                for mutation in 0..6 {
                     let mut bad = valid.clone();
                     let mut changed = 0;
                     for function in &mut bad.fns {
@@ -42357,7 +42358,7 @@ fn main() -> i32 = 0
                                     Rvalue::CompressCompress {
                                         data, out, level, ..
                                     } => (data, out, Some(level)),
-                                    Rvalue::CompressDecompress { data, out, .. } => (data, out, None),
+                                    Rvalue::CompressDecompress { data, out, max_bytes, .. } => (data, out, Some(max_bytes)),
                                     _ => continue,
                                 };
                                 changed += 1;
