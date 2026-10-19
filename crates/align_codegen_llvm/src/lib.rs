@@ -34905,14 +34905,14 @@ fn main() -> i32 = 0
         assert!(validate_resource_rvalues(&base).is_ok());
         assert!(validate_thin_partition_program(&base, &[]).is_ok());
         let function = xml_test_function(&base, "chunked");
-        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+        for mode in [align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut, align_ast::ParamMode::Out] {
             let mut borrowed = base.clone();
             borrowed.fns[function].param_modes[0] = mode;
             assert!(validate_mir_producers(&borrowed).is_ok(), "{mode:?}");
             assert!(validate_resource_rvalues(&borrowed).is_ok(), "{mode:?}");
             assert!(validate_thin_partition_program(&borrowed, &[]).is_ok(), "{mode:?}");
         }
-        for mutation in ["element", "result", "source", "size", "unreadable", "raw", "cycle"] {
+        for mutation in ["element", "result", "source", "size", "raw", "cycle"] {
             let mut bad = base.clone();
             let body = &mut bad.fns[function];
             let (value, source) = body.blocks.iter_mut()
@@ -34932,7 +34932,6 @@ fn main() -> i32 = 0
                 }).unwrap_or_else(|| panic!("missing materialized chunks producer"));
             match mutation {
                 "result" => body.value_tys[value as usize] = Ty::Str,
-                "unreadable" => body.param_modes[0] = align_ast::ParamMode::Out,
                 "raw" | "cycle" => {
                     let Operand::Value(source) = source else { panic!("expected loaded source") };
                     let definition = body.blocks.iter_mut()

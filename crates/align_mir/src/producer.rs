@@ -377,14 +377,23 @@ fn xml_event_definition_valid(program: &Program, event_enum: u32) -> bool {
             })
 }
 
-fn xml_argument_access(function: &crate::Function, index: u32) -> XmlAccessProvenance {
-    match function.param_modes.get(index as usize) {
-        Some(align_ast::ParamMode::ByValue) => XmlAccessProvenance::Owned,
-        Some(align_ast::ParamMode::Borrow) => XmlAccessProvenance::Shared,
-        Some(align_ast::ParamMode::BorrowMut) => XmlAccessProvenance::Exclusive,
-        Some(align_ast::ParamMode::Out) => XmlAccessProvenance::Unreadable,
-        None => XmlAccessProvenance::Mixed,
+fn xml_parameter_access(ty: Ty, mode: align_ast::ParamMode) -> XmlAccessProvenance {
+    match mode {
+        align_ast::ParamMode::ByValue => XmlAccessProvenance::Owned,
+        align_ast::ParamMode::Borrow => XmlAccessProvenance::Shared,
+        align_ast::ParamMode::BorrowMut => XmlAccessProvenance::Exclusive,
+        // Out lends initialized slice backing exclusively. It does not introduce a
+        // write-only or uninitialized element type. Other Out shapes are malformed.
+        align_ast::ParamMode::Out if matches!(ty, Ty::Slice(_)) => XmlAccessProvenance::Exclusive,
+        align_ast::ParamMode::Out => XmlAccessProvenance::Unreadable,
     }
+}
+
+fn xml_argument_access(function: &crate::Function, index: u32) -> XmlAccessProvenance {
+    let Some((mode, ty)) = function.param_modes.get(index as usize).zip(
+        function.params.get(index as usize).and_then(|slot| function.slots.get(*slot as usize)),
+    ) else { return XmlAccessProvenance::Mixed; };
+    xml_parameter_access(*ty, *mode)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2347,7 +2356,9 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 // BorrowMut of a Copy slice authenticates its header, not its backing allocation.
                 let out = path.is_empty()
                     && self.graph.function.param_modes.get(*index as usize) == Some(&align_ast::ParamMode::Out);
-                XmlAccessSource::Seed(if out { XmlAccessProvenance::Unreadable } else { XmlAccessProvenance::Shared })
+                XmlAccessSource::Seed(if out {
+                    xml_argument_access(self.graph.function, *index)
+                } else { XmlAccessProvenance::Shared })
             }
             Operand::Arg(index) if xml_owning_buffer_ty(selected) => {
                 XmlAccessSource::Seed(xml_argument_access(self.graph.function, *index))
@@ -3362,7 +3373,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 ),
                 Some(align_ast::ParamMode::Out) => Self::add_source(
                     equation,
-                    XmlAccessSource::Seed(XmlAccessProvenance::Unreadable),
+                    XmlAccessSource::Seed(xml_parameter_access(*expected, align_ast::ParamMode::Out)),
                 ),
                 Some(align_ast::ParamMode::ByValue) => {
                     if matches!(operand, Operand::BorrowedPlace(_)) {
