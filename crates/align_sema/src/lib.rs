@@ -70997,7 +70997,20 @@ impl<'a, 't> Checker<'a, 't> {
         use_kind: IndexedFieldUse,
     ) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
-        let r = self.check_expr(arr, None);
+        let r = if use_kind == IndexedFieldUse::Value
+            && let Some((base, outer_index, names)) = peel_index_field_chain(arr)
+            && !names.is_empty()
+        {
+            self.check_index_field(base, outer_index, &names, None, arr.span, IndexedFieldUse::CopyRead)
+        } else {
+            self.check_expr(arr, None)
+        };
+        // Only an owning array field's independent record needs a copied intermediate.
+        // Existing slice-field projections retain their direct, possibly borrowed semantics.
+        let copy_element = (use_kind == IndexedFieldUse::Value
+            && matches!(r.kind, ExprKind::ElemField { .. }))
+            .then(|| indexed_array_field_copy_element(r.ty, self.structs, self.tuples,
+                self.enums, self.tagged_types)).flatten();
         let i = self.check_array_index_expr(index);
         if i.ty == Ty::Error {
             return err;
@@ -71090,6 +71103,23 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         self.constrain(leaf_ty, expected, span);
+        if let Some(ty @ Ty::Struct(_)) = copy_element {
+            // Canonical Let(Index)/Field retains both bounds, the complete parent reservation,
+            // and the independent Copy result. No intermediate array header becomes a value.
+            let element = Expr {
+                kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty, span,
+            };
+            let root = self.declare(&format!("$indexed_copy{}", self.locals.len()), ty, false);
+            self.scope.pop();
+            return Expr {
+                kind: ExprKind::Block(Block {
+                    stmts: vec![Stmt::Let { local: root, init: element }],
+                    value: Some(Box::new(Expr { kind: ExprKind::Field { root, path }, ty: leaf_ty, span })),
+                }),
+                ty: leaf_ty,
+                span,
+            };
+        }
         Expr {
             kind: ExprKind::ElemField { recv: Box::new(r), index: Box::new(i), path, struct_id },
             ty: leaf_ty,

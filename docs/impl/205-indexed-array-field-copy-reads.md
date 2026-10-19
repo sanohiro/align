@@ -92,3 +92,34 @@ in addition to its success node. Retained-Branch bypass twins for both levels,
 with used and discarded results, are accepted by the reviewed pre-fix compiler
 and rejected after this correction. The full matrix has 27 mutations in both
 result-use states; no representation or public boundary changes for the fix.
+
+## Chained Copy-record field projection (AM-R21)
+
+At `dde9d0de`, `poses.frames[i].points[j]` copies an independent record, but
+appending `.x` incorrectly asks for the owning `points` header as a value. The
+working explicit local binding establishes the complete existing operation.
+Normalize this source spelling to an ordinary block containing one synthetic
+Let of the existing checked Index and a Field projection from that local.
+Nested ordinary record fields use one exact field path. The complete selected
+element must still satisfy the same independent-Copy classifier; selecting a
+scalar field does not admit a view-bearing or owning element.
+
+| Axis | Implementation and owner |
+| --- | --- |
+| Formation and diagnostics | `check_index_field` checks an indexed field receiver once using the existing Copy-read context. Only an owning array with a complete independent record normalizes to Index/Field; existing borrowed slice-field projections retain direct ElemField semantics. Resolve both indices and the ordinary field path once. `indexed_array_field_copy_reads::chained_record_fields` covers direct/nested fields, real media record shapes, unknown fields, invalid indices and excluded view/Move elements. |
+| Evaluation and lifetime | The canonical Index retains both signed bounds and the complete parent reservation. One synthetic Let snapshots its independent result before Field, without a heap allocation, retained view, source transfer or new Drop. The owner crosses runtime indices, effect order, outer bounds before inner effects, inner failure, early exit and parent invalidation; existing lifecycle/bounds/malformed owners remain unchanged. |
+| Imports and publication | The owner uses imported generic helpers, whole/per-unit native execution and cold/hit/body-edit caches. Ordinary Let/Index/Field validation, monomorphization, serialization and MIR/LLVM lowering remain the sole implementation; no new HIR/MIR shape, permission or summary is introduced. |
+| Consistency | Clarify the composed spelling in the existing spec/digest/Settled paragraphs and design rationale, and record its canonical source normalization in the HIR ledger. Consumer code/pins and guide-vector acceptance remain external. |
+
+This follows the already-reviewed Plan205 proof through existing canonical
+nodes; it changes no ownership or validation strategy. The author matrix pass
+and ordinary independent preflight review cover the source normalization.
+
+Author closure: the new imported/generic owner rejects on the pre-fix compiler
+at the owning array field and now executes in whole/per-unit/cache modes. Its
+borrowed slice-field control preserves the existing view-bearing record path.
+All seven existing/new target tests pass, including the extended allocation/free
+and post-parent-retirement owner. The malformed HIR/MIR guards remain unchanged;
+the generated nodes pass their ordinary publication boundaries. The three
+consumer registers and relevant pose, trace and tensor source were inspected;
+no consumer implementation or pin is changed by this capability.
