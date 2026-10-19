@@ -2,14 +2,13 @@
 
 ## Current work direction
 
-The owner's latest instruction (2026-10-16) is to continue implementation,
-completing PR and merge for each capability before starting the next, until the
-owner asks to stop. The preceding outstanding-request pass is complete;
-independently qualified planned work may now continue. Reconcile all three
-external request registers before request-driven work and validate each
-request against real consumer evidence and Align's design. Consumer adoption
-remains external; retain a reasoned deferral when the required design conflicts
-with Align's invariants.
+The owner's 2026-10-20 request pass addresses actionable consumer defects and
+open GitHub issues in all three consumers. Useful deferred capabilities start
+with later investigation under [Plan230](docs/impl/230-request-follow-up-plan.md),
+including the evidence-dependent LLM residuals; an unavailable reproducer is
+not a completed fix. Continue completing PR and merge for each selected
+capability before starting the next. Reconcile all three request registers and
+real consumer evidence before selection. Consumer adoption remains external.
 
 Prioritize existing std/library usability, useful bounded transport/library
 composition, then measured execution/storage/startup improvements. Complex
@@ -25,6 +24,12 @@ request capabilities below are delivered on main after that release. A release b
 not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI state.
 
 ## Recent completed capabilities
+
+- [Plan229](docs/impl/229-out-slice-read-certification.md) certifies initialized
+  `out slice<T>` reads for LLM R157, including imported/generic callers. Readable
+  header storage remains separate from writable backing authority; alias,
+  lifetime and malformed/uninitialized-storage refusals remain. Consumer
+  acquisition adoption is pending.
 
 - [Plan226](docs/impl/226-deflate-framing.md) exposes caller-selected output
   limits on all four `std.compress` decoders for LLM R156. Optional `max_bytes`
@@ -117,9 +122,10 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 - [Plan205](docs/impl/205-indexed-array-field-copy-reads.md) admits
   `rows[row].values[index]` for independent Copy elements of existing owning
-  array fields. Both indices retain signed bounds and the complete parent
-  reservation; scalar and Copy-record results outlive the parent without a
-  header/view escape or allocation. General views and existing whole fixed
+  array fields, including AM-R21's direct `poses.frames[i].points[j].x`
+  projection through a canonical local Copy. Both indices retain signed bounds
+  and the complete parent reservation; scalar and Copy-record results outlive
+  the parent without a header/view escape or allocation. General views and existing whole fixed
   Move-record call/replacement restrictions remain separate.
 
 - [Plan203](docs/impl/203-json-owned-string-root.md) admits a standalone owned
@@ -284,6 +290,14 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 Earlier completed work lives in the owning implementation plans and the
 [2026-10-13 historical handoff](docs/archive/HANDOFF-2026-10-13.md).
 That archive preserves the prior narrative; it is not a source of current status.
+
+## Planned later request investigation
+
+[Plan230](docs/impl/230-request-follow-up-plan.md) owns the later queue, starting
+with voice V006, and the required evidence for unresolved LLM R37/R49/R80.
+Establish consumer value, policy fit, the smallest complete useful capability,
+prerequisites and cost before selection. Distinguish real settled restrictions
+from implementation gaps; broad scope alone does not justify deferral.
 
 ## Deferred work and capability boundaries
 
