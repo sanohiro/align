@@ -28,6 +28,143 @@ fn diagnostics(source: &str) -> String {
 }
 
 #[test]
+fn chained_record_fields() {
+    owned_fixture::run("chained_record_fields", |stage| {
+        let module = r#"module poses
+pub Point {x:f64,y:f64,confidence:f64}
+pub Frame {points:array<Point>}
+pub Poses {frames:array<Frame>}
+pub fn make()->Poses {
+ mut frames:array_builder<Frame>:=array_builder(1)
+ frames.push(Frame{points:[Point{x:0.5,y:0.25,confidence:0.75}].to_array()})
+ return Poses{frames:frames.build()}
+}
+pub fn first<T>(borrow poses:Poses,i:i64,j:i64,marker:T)->f64=poses.frames[i].points[j].x
+pub fn consume(poses:Poses)->i64=0
+"#;
+        std::fs::write(stage.join("poses.align"), module).unwrap();
+        let source = r#"import poses
+Leaf {point:poses.Point}
+Row {items:array<Leaf>}
+ViewPoint {x:f64,text:str}
+ViewFrame {points:slice<ViewPoint>}
+fn main()->i32 {
+ mut value:=poses.make()
+ if poses.first(value,0,0,true)!=0.5 || poses.first(value,0,0,1)!=0.5 {return 1}
+ mut count:=0
+ copied:=value.frames[{count=count+1;0}].points[{count=count*10+2;0}].x
+ if count!=12 {return 2}
+ value=poses.make()
+ unused:=poses.consume(value)
+ if copied!=0.5 {return 3}
+ rows:=[Row{items:[Leaf{point:poses.Point{x:1.25,y:2.5,confidence:0.5}}].to_array()}]
+ if rows[0].items[0].point.x!=1.25 || rows[0].items[0].point.y!=2.5 {return 4}
+ views:=[ViewPoint{x:4.5,text:"kept"}]
+ frames:=[ViewFrame{points:views}]
+ if frames[0].points[0].x!=4.5 || frames[0].points[0].text!="kept" {return 5}
+ return 0
+}
+"#;
+        execute(stage, source, "chained").unwrap();
+        let context = align_driver::CacheContext::at(stage.join("chained-cache"));
+        for pass in 0..3 {
+            if pass == 2 {
+                std::fs::write(
+                    stage.join("poses.align"),
+                    module.replace("points[j].x", "points[j].x+0.0"),
+                )
+                .unwrap();
+            }
+            let mut sources = SourceMap::new();
+            let entry = stage.join("main.align");
+            let mut built = align_driver::build_package(
+                &mut sources,
+                entry.to_str().unwrap(),
+                source,
+                &context,
+                align_driver::UnitReuse::Allowed,
+            );
+            assert!(
+                !built.diags.has_errors(),
+                "{}",
+                align_driver::format_diagnostics(&sources, &built.diags)
+            );
+            assert_eq!(built.units.len(), 2);
+            if pass < 2 {
+                for unit in &built.units {
+                    assert_eq!(unit.frontend.as_ref().unwrap().hit, pass == 1);
+                }
+            } else {
+                assert!(
+                    built
+                        .units
+                        .iter()
+                        .any(|unit| !unit.frontend.as_ref().unwrap().hit)
+                );
+            }
+            let programs = (0..built.units.len())
+                .map(|index| built.materialize(index).unwrap().clone())
+                .collect::<Vec<_>>();
+            let output =
+                run_programs(stage, &programs, &format!("chained-cache-{pass}"), false).unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        for (label, outer, inner) in [
+            ("outer-negative", "-1", "{print(99);0}"),
+            ("outer-high", "1", "{print(99);0}"),
+            ("inner-negative", "0", "-1"),
+            ("inner-high", "0", "1"),
+        ] {
+            let source = format!(
+                "import poses\nfn main(){{value:=poses.make();print(value.frames[{outer}].points[{inner}].x)}}"
+            );
+            for per_unit in [false, true] {
+                let built = programs(stage, &source, per_unit).unwrap();
+                let output =
+                    run_programs(stage, &built, &format!("chained-{label}-{per_unit}"), false)
+                        .unwrap();
+                assert!(
+                    !output.status.success()
+                        && output.stdout.is_empty()
+                        && String::from_utf8_lossy(&output.stderr).contains("bounds"),
+                    "{label}: {output:?}"
+                );
+            }
+        }
+        for (label, outer, inner) in [
+            ("outer-exit", "process.exit(0)", "0"),
+            ("inner-exit", "0", "process.exit(0)"),
+        ] {
+            execute(stage,&format!("import std.process\nimport poses\nfn main(){{value:=poses.make();print(value.frames[{outer}].points[{inner}].x)}}"),label).unwrap();
+        }
+        for (outer, inner, field) in [
+            ("true", "0", "x"),
+            ("0", "0", "missing"),
+            ("poses.consume(value)", "0", "x"),
+            ("0", "poses.consume(value)", "x"),
+        ] {
+            let source = format!(
+                "import poses\nfn main(){{value:=poses.make();unused:=value.frames[{outer}].points[{inner}].{field}}}"
+            );
+            let mut sources = SourceMap::new();
+            let entry = stage.join("negative.align");
+            let checked = align_driver::check(&mut sources, entry.to_str().unwrap(), &source);
+            assert!(checked.diags.has_errors(), "accepted {source}");
+            let mut sources = SourceMap::new();
+            let checked =
+                align_driver::build_per_unit(&mut sources, entry.to_str().unwrap(), &source);
+            assert!(checked.diags.has_errors(), "per-unit accepted {source}");
+        }
+        for fields in ["x:f64,text:str", "x:f64,text:string"] {
+            let errors = diagnostics(&format!(
+                "Point {{{fields}}}\nFrame {{points:array<Point>}}\nfn read(borrow frames:array<Frame>)->f64=frames[0].points[0].x\nfn main(){{}}"
+            ));
+            assert!(errors.contains("Move-type field"), "{errors}");
+        }
+    });
+}
+
+#[test]
 fn values_and_storage() {
     owned_fixture::run("values_and_storage", |stage| {
         execute(
@@ -251,10 +388,11 @@ fn exercise()->i64 {{
  mut total:=0;mut i:=0
  loop {{if i==20 {{break}};total=total+rows[0].ids[1];i=i+1}}
  leaf:=records[0].items[0]
+ chained:=records[0].items[0].n
  if unsafe{{align_rt_alloc_count()}}!=before || unsafe{{align_rt_free_count()}}!=freed {{return -1}}
  records=record_rows(99);consume_records(records)
  saved:=rows[0].ids[1];rows=fresh();moved:=rows;unused:=consume(moved)
- if saved!=9 || leaf.n!=13 || (leaf.maybe else {{0}})!=2 {{return -2}}
+ if saved!=9 || leaf.n!=13 || chained!=13 || (leaf.maybe else {{0}})!=2 {{return -2}}
  arena {{arena_rows:=[R{{ids:[3,4,5].to_array()}}];total=total+arena_rows[0].ids[2]}}
  return total
 }}

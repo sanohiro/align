@@ -354,6 +354,9 @@ covers both once-only indices: outer signed bounds precede the selected header,
 then the inner expression, inner signed bounds and element load. Outer failure
 suppresses the inner expression; termination at either index suppresses later
 actions. The copied value may outlive the parent without allocation or transfer.
+An independent Copy record may be followed directly by its ordinary field path,
+as in `rows[row].values[index].position.x`; the complete Copy read evaluates
+once before field projection.
 This adds no array-header value, slice, pipeline, write or exclusive-borrow
 permission. Shared calls and temporary/nested-index outer bases retain their
 existing restrictions. Plan205 owns the exact independent-data graph and proof.

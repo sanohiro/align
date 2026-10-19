@@ -87,7 +87,9 @@ model nor a new lifetime summary.
 place to `rows[row].values[index]` when the selected element belongs to the
 closed independent-Copy graph. Both bounds and the complete parent lifetime
 remain explicit compiler obligations. A copied record containing no view or
-owner needs no retained-view permission; ordinary array-header reads remain
+owner needs no retained-view permission. Chained record-field spelling normalizes
+to that same complete Copy read followed by an ordinary local projection; it
+does not expose an intermediate array header. Ordinary array-header reads remain
 excluded. The source checker and producer share one type authority.
 
 The [R77–R83 composition batch](impl/56-r77-r83-composition-plan.md) separates
