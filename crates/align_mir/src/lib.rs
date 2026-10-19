@@ -2480,12 +2480,13 @@ pub enum Rvalue {
         level: Operand,
         out: Slot,
     },
-    /// `compress.gzip_decompress(data)` — inflate the gzip byte view `data`; the runtime writes an
+    /// `compress.gzip_decompress(data, max_bytes)` — inflate the gzip byte view `data`; the runtime writes an
     /// owned `buffer` handle into `out` and returns an i32 status (corrupt/truncated/bomb ->
     /// `AL_INVALID`). Value = the i32 status; the wrapped buffer is owned.
     CompressDecompress {
         kind: hir::CompressKind,
         data: Operand,
+        max_bytes: Operand,
         out: Slot,
     },
     /// `encoding.utf8_valid(b)` — whether the byte view `b` (`{ptr,len}`) is valid UTF-8, an `i32`
@@ -9678,15 +9679,17 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ));
                 emit_status_buffer_result(b, code, out, e.ty)
             }
-            hir::ExprKind::Decompress { kind, data } => {
+            hir::ExprKind::Decompress { kind, data, max_bytes } => {
                 let out = b.new_slot(Ty::Buffer);
                 lower_required_binding!(b, d = lower_expr(b, data), Operand::Const(Const::Unit));
+                lower_required_binding!(b, limit = lower_expr(b, max_bytes), Operand::Const(Const::Unit));
                 let code = b.fresh_value(status_ty());
                 b.push(Stmt::Let(
                     code,
                     Rvalue::CompressDecompress {
                         kind: *kind,
                         data: d,
+                        max_bytes: limit,
                         out,
                     },
                 ));

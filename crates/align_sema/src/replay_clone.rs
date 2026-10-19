@@ -1367,9 +1367,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             data: boxed!(data),
             level: boxed!(level),
         },
-        ExprKind::Decompress { kind, data } => ExprKind::Decompress {
+        ExprKind::Decompress { kind, data, max_bytes } => ExprKind::Decompress {
             kind: *kind,
             data: boxed!(data),
+            max_bytes: boxed!(max_bytes),
         },
         ExprKind::RandSeedWith { seed } => ExprKind::RandSeedWith { seed: boxed!(seed) },
         ExprKind::RandNext { rng } => ExprKind::RandNext { rng: boxed!(rng) },
@@ -2494,6 +2495,11 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             level: rhs,
             ..
         }
+        | ExprKind::Decompress {
+            data: lhs,
+            max_bytes: rhs,
+            ..
+        }
         | ExprKind::RegexIsMatch {
             regex: lhs,
             text: rhs,
@@ -2876,7 +2882,6 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::UnicodeNfc { input: recv }
         | ExprKind::EncodingDecode { input: recv, .. }
         | ExprKind::Utf8Valid { data: recv }
-        | ExprKind::Decompress { data: recv, .. }
         | ExprKind::RandSeedWith { seed: recv }
         | ExprKind::RandNext { rng: recv }
         | ExprKind::RegexCompile { pattern: recv }

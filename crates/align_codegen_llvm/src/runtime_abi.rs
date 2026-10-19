@@ -451,11 +451,11 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::CompressGzipCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CompressZlibCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CompressDeflateRawCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::CompressGzipDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::CompressZlibDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::CompressDeflateRawDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressGzipDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressZlibDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressDeflateRawDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CompressZstdCompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::CompressZstdDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::CompressZstdDecompress) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CryptoAesGcmOpen) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CryptoAesGcmSeal) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::CryptoArgon2id) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 8], releases: Release::None, returns_fresh: false, diverges: false },
@@ -1630,17 +1630,17 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::CompressGzipDecompress => RuntimeAbi {
             key,
             symbol: "align_rt_compress_gzip_decompress",
-            shape: RuntimeAbiShape::A08,
+            shape: RuntimeAbiShape::A07,
         },
         RuntimeKey::CompressZlibDecompress => RuntimeAbi {
             key,
             symbol: "align_rt_compress_zlib_decompress",
-            shape: RuntimeAbiShape::A08,
+            shape: RuntimeAbiShape::A07,
         },
         RuntimeKey::CompressDeflateRawDecompress => RuntimeAbi {
             key,
             symbol: "align_rt_compress_deflate_raw_decompress",
-            shape: RuntimeAbiShape::A08,
+            shape: RuntimeAbiShape::A07,
         },
         RuntimeKey::CompressZstdCompress => RuntimeAbi {
             key,
@@ -1650,7 +1650,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::CompressZstdDecompress => RuntimeAbi {
             key,
             symbol: "align_rt_compress_zstd_decompress",
-            shape: RuntimeAbiShape::A08,
+            shape: RuntimeAbiShape::A07,
         },
         RuntimeKey::CryptoAesGcmOpen => RuntimeAbi {
             key,

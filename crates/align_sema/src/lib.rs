@@ -17809,13 +17809,10 @@ impl EffectScan<'_> {
             // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
             // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
             // `par_map`. Recurse into the operands.
-            ExprKind::Compress { data, level, .. } => {
+            ExprKind::Compress { data, level, .. }
+            | ExprKind::Decompress { data, max_bytes: level, .. } => {
                 walk!(data);
                 walk!(level);
-                self.impure_direct = true;
-            }
-            ExprKind::Decompress { data, .. } => {
-                walk!(data);
                 self.impure_direct = true;
             }
             // `std.rand` — **all impure**: `seed()` reads OS entropy; `seed_with`/`next`/`range`/
@@ -30217,11 +30214,11 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.compress` — the owned `buffer` result borrows nothing from `data`; just recurse
             // into the operands so any escape inside them is still checked.
-            ExprKind::Compress { data, level, .. } => {
+            ExprKind::Compress { data, level, .. }
+            | ExprKind::Decompress { data, max_bytes: level, .. } => {
                 self.walk(data, depth);
                 self.walk(level, depth);
             }
-            ExprKind::Decompress { data, .. } => self.walk(data, depth),
             // `std.rand`: an `rng` is Copy/`Static` (borrows nothing); `sample` returns a fresh owned
             // `array<T>` that borrows nothing from `xs`. Nothing escapes — just recurse into the
             // subexpressions so any escape *inside* them (a captured local, etc.) is still checked.
@@ -50291,11 +50288,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => move_expr!(self, input, moved, false, false),
             // `std.compress` borrows its byte-view `data` (never consumed) — like `encoding.*`.
-            ExprKind::Compress { data, level, .. } => {
+            ExprKind::Compress { data, level, .. }
+            | ExprKind::Decompress { data, max_bytes: level, .. } => {
                 move_expr!(self, data, moved, false, false);
                 move_expr!(self, level, moved, false, false);
             }
-            ExprKind::Decompress { data, .. } => move_expr!(self, data, moved, false, false),
             // `std.rand`: the `rng` receiver is Copy (advanced in place, never consumed) and `xs` is a
             // Copy slice view (borrowed), so nothing is moved — recurse non-consuming to catch a
             // use-after-move *inside* the operands.
@@ -67165,13 +67162,22 @@ impl<'a, 't> Checker<'a, 't> {
         let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
         let what = format!("compress.{method}");
         if method.ends_with("_decompress") {
-            if args.len() != 1 {
+            if !(1..=2).contains(&args.len()) {
                 self.diags
-                    .error(format!("'{what}' expects 1 argument (data), got {}", args.len()), span);
+                    .error(format!("'{what}' expects 1 or 2 arguments (data, max_bytes), got {}", args.len()), span);
                 return err;
             }
             let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
-            return Expr { kind: ExprKind::Decompress { kind, data: Box::new(data) }, ty: result_ty, span };
+            let max_bytes = if let Some(argument) = args.get(1) {
+                let value = self.check_expr(argument, None);
+                if value.ty == Ty::Error || !self.require_i64_arg(value.ty, argument.span, &format!("'{what}' max_bytes")) {
+                    return err;
+                }
+                value
+            } else {
+                Expr { kind: ExprKind::Int(1 << 30), ty: Ty::Int(IntTy { bits: 64, signed: true }), span }
+            };
+            return Expr { kind: ExprKind::Decompress { kind, data: Box::new(data), max_bytes: Box::new(max_bytes) }, ty: result_ty, span };
         }
         // `*_compress(data, level)`.
         if args.len() != 2 {
@@ -73049,11 +73055,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
             | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
-            ExprKind::Compress { data, level, .. } => {
+            ExprKind::Compress { data, level, .. }
+            | ExprKind::Decompress { data, max_bytes: level, .. } => {
                 self.finalize_expr(data);
                 self.finalize_expr(level);
             }
-            ExprKind::Decompress { data, .. } => self.finalize_expr(data),
             ExprKind::RandSeed => {}
             ExprKind::RandSeedWith { seed } => self.finalize_expr(seed),
             ExprKind::RandNext { rng } => self.finalize_expr(rng),

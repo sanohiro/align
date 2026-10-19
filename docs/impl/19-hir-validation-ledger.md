@@ -1433,7 +1433,7 @@ merely because its `Ty` matches.
 | `EncodingDecode` | `env[kind]`; `child[input]`; `Str; result ERR(Buffer); fresh owned output on success; Pure`. |
 | `Utf8Valid` | `env[]; child[data]`; `bytes; result Bool; borrowed; Pure`. |
 | `Compress` | `env[kind=Gzip\|Zlib\|DeflateRaw\|Zstd]`; `child[data,level]`; `byte-view,i64; result ERR(Buffer); fresh owned output; Impure`. |
-| `Decompress` | `env[kind=Gzip\|Zlib\|DeflateRaw\|Zstd]`; `child[data]`; `byte-view; result ERR(Buffer); fresh owned output; Impure`. |
+| `Decompress` | `env[kind=Gzip\|Zlib\|DeflateRaw\|Zstd]`; `child[data,max_bytes]`; `byte-view, exact i64 limit; result ERR(Buffer); fresh owned output; Impure`. |
 | `RandSeed` | `env[]; child[]; result Rng; Copy mutable state; Impure`. |
 | `RandSeedWith` | `env[]; child[seed]`; `i64; result Rng; Copy mutable state; Impure`. |
 | `RandNext` | `env[]; child[rng]`; `SourceMutLocal(Rng,rng); result i64; rng mutated; Impure`. |

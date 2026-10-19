@@ -1636,10 +1636,10 @@ pub fn native_owner_mir_contract<'a>(
             contract.outputs = vec![(*out, Ty::Buffer)];
             contract.operands = vec![(data, byte_view(data), read), (level, i64_ty, read)];
         }
-        Rvalue::CompressDecompress { data, out, .. } => {
+        Rvalue::CompressDecompress { data, max_bytes, out, .. } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::Buffer)];
-            contract.operands = vec![(data, byte_view(data), read)];
+            contract.operands = vec![(data, byte_view(data), read), (max_bytes, i64_ty, read)];
         }
         Rvalue::JsonDocCollect { kind, doc, arena, out } => {
             contract.outputs = vec![(*out, Ty::Slice(kind.element()))];
@@ -2063,7 +2063,6 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::TimeParse { input, .. }
         | Rvalue::UnicodeNfc { input, .. }
         | Rvalue::EncodingDecode { input, .. }
-        | Rvalue::CompressDecompress { data: input, .. }
         | Rvalue::CryptoPrivateKeyFromPem { pem: input, .. }
         | Rvalue::CryptoPublicKeyFromPem { pem: input, .. }
         | Rvalue::CommandRun { command: input, .. }
@@ -2123,7 +2122,8 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::RegexSplit { regex, text, .. }
         | Rvalue::RegexCaptures { regex, text, .. } => vec![regex, text],
         Rvalue::CapturesGroup { caps, index, .. } => vec![caps, index],
-        Rvalue::CompressCompress { data, level, .. } => vec![data, level],
+        Rvalue::CompressCompress { data, level, .. }
+        | Rvalue::CompressDecompress { data, max_bytes: level, .. } => vec![data, level],
         Rvalue::CryptoHkdf {
             salt,
             ikm,

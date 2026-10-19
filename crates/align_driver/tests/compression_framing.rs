@@ -116,6 +116,211 @@ fn main()->Result<(),Error> {
   return Ok(())
 }
 "#;
+
+#[test]
+fn limits_whole_per_unit_and_cached_lifecycle() {
+    owned_fixture::run("limits_whole_per_unit_and_cached_lifecycle", |stage| {
+        let result = (|| -> TestResult {
+            let mut model = String::from("module codecs\nimport std.compress\n");
+            let mut main = String::from(
+                "import codecs\nimport std.compress\nfn keep(error:Error)->Error=error\nfn mark(borrow mut trace:i64, digit:i64)->i64 { trace=trace*10+digit; return 0 }\n",
+            );
+            let mut calls = String::new();
+            for codec in ["gzip", "zlib", "deflate_raw", "zstd"] {
+                model.push_str(&format!(
+                    r#"
+pub fn {codec}<T>(tag:T, limit:i64)->Result<buffer,Error> {{
+  packed:=compress.{codec}_compress("left",6)?
+  return compress.{codec}_decompress(packed.bytes(),limit)
+}}
+"#
+                ));
+                main.push_str(&format!(r#"
+fn {codec}_exit(flag:bool)->Result<i64,Error> {{
+  packed:=compress.{codec}_compress("left",6)?
+  result:=compress.{codec}_decompress(packed.bytes(),if flag {{ return Ok(17) }} else {{ 4 }})?
+  return Ok(result.len())
+}}
+fn {codec}_check()->Result<(),Error> {{
+  mut result:=arena {{ codecs.{codec}(false,4)? }}
+  if result.bytes().as_str()?!="left" {{ return Err(Error.Invalid) }}
+  result=codecs.{codec}(1,5).map_err(keep)?
+  if result.len()!=4 {{ return Err(Error.Invalid) }}
+  match codecs.{codec}(false,3) {{
+    Ok(_) => {{ return Err(Error.Invalid) }},
+    Err(error) => match error {{ Invalid => {{}}, _ => {{ return Err(error) }} }},
+  }}
+  packed:=compress.{codec}_compress("left",6)?
+  mut trace:=0
+  ordered:=compress.{codec}_decompress(packed.bytes()[mark(trace,1)..],4+mark(trace,2))?
+  if trace!=12 || ordered.len()!=4 {{ return Err(Error.Invalid) }}
+  captured:=4
+  limit:=fn {{ captured }}
+  indirect:=compress.{codec}_decompress(packed.bytes(),limit())?
+  if indirect.len()!=4 {{ return Err(Error.Invalid) }}
+  default:=compress.{codec}_decompress(packed.bytes())?
+  explicit:=compress.{codec}_decompress(packed.bytes(),1073741824)?
+  if default.bytes().as_str()?!=explicit.bytes().as_str()? {{ return Err(Error.Invalid) }}
+  empty:=compress.{codec}_compress("",6)?
+  zero:=compress.{codec}_decompress(empty.bytes(),0)?
+  if zero.len()!=0 {{ return Err(Error.Invalid) }}
+  mut index:=0
+  loop {{
+    if index==3 {{ break }}
+    result=compress.{codec}_decompress(packed.bytes(),match index {{ 0=>4, _=>5 }}) else {{ return Err(Error.Invalid) }}
+    index=index+1
+  }}
+  if result.len()!=4 || {codec}_exit(true)?!=17 || {codec}_exit(false)?!=4 {{ return Err(Error.Invalid) }}
+  return Ok(())
+}}
+"#));
+                calls.push_str(&format!("{codec}_check()?\n"));
+            }
+            main.push_str(&format!(
+                "fn main()->Result<(),Error> {{\n{calls}return Ok(())\n}}\n"
+            ));
+            std::fs::write(stage.join("codecs.align"), model)?;
+            for per_unit in [false, true] {
+                execute(
+                    stage,
+                    &programs(stage, &main, per_unit)?,
+                    if per_unit {
+                        "limits-units"
+                    } else {
+                        "limits-whole"
+                    },
+                    false,
+                )?;
+            }
+            let entry = stage.join("main.align");
+            let cache = align_driver::CacheContext::at(stage.join("limits-cache"));
+            for (round, hit) in [(0, false), (1, true)] {
+                let mut sources = SourceMap::new();
+                let mut built = align_driver::build_package(
+                    &mut sources,
+                    entry.to_str().ok_or("entry path")?,
+                    &main,
+                    &cache,
+                    align_driver::UnitReuse::Allowed,
+                );
+                assert!(
+                    !built.diags.has_errors(),
+                    "{}",
+                    align_driver::format_diagnostics(&sources, &built.diags)
+                );
+                assert_eq!(built.units.len(), 2);
+                assert!(built.units.iter().all(|unit| {
+                    unit.frontend
+                        .as_ref()
+                        .is_some_and(|frontend| frontend.hit == hit)
+                }));
+                let lowered = (0..built.units.len())
+                    .map(|index| built.materialize(index).cloned())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("{error:?}"))?;
+                execute(stage, &lowered, &format!("limits-cache-{round}"), false)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            panic!("{error}");
+        }
+    });
+}
+
+#[test]
+fn limits_source_domain_and_input_liveness() {
+    owned_fixture::run("limits_source_domain_and_input_liveness", |stage| {
+        for codec in ["gzip", "zlib", "deflate_raw", "zstd"] {
+            for limit in [
+                "true",
+                "1.0",
+                "\"x\"",
+                "1 as i32",
+                "1 as u64",
+                "missing_name",
+            ] {
+                let source = format!(
+                    "import std.compress\nfn main()->Result<(),Error> {{ b:=compress.{codec}_decompress(\"\",{limit})?; return Ok(()) }}\n"
+                );
+                let mut sources = SourceMap::new();
+                let checked = align_driver::check(&mut sources, "limit-domain", &source);
+                assert!(checked.diags.has_errors(), "{source}");
+            }
+            for mutation in ["input=buffer(0)", "consumed:=input", "input.append(\"x\")"] {
+                let source = format!(
+                    "import std.compress\nfn main()->Result<(),Error> {{ mut input:=buffer(16); b:=compress.{codec}_decompress(input.bytes(),{{ {mutation}; 4 }})?; return Ok(()) }}\n"
+                );
+                let path = stage.join("main.align");
+                std::fs::write(&path, &source).unwrap_or_else(|error| panic!("{error}"));
+                for per_unit in [false, true] {
+                    let mut sources = SourceMap::new();
+                    let entry = path.to_str().unwrap_or("invalid fixture path");
+                    let diags = if per_unit {
+                        align_driver::build_per_unit(&mut sources, entry, &source).diags
+                    } else {
+                        align_driver::check(&mut sources, entry, &source).diags
+                    };
+                    assert!(diags.has_errors(), "input invalidation accepted: {source}");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn limits_abort_on_invalid_domain_before_decoding() {
+    owned_fixture::run("limits_abort_on_invalid_domain_before_decoding", |stage| {
+        use std::os::unix::process::ExitStatusExt;
+        for codec in ["gzip", "zlib", "deflate_raw", "zstd"] {
+            let source = format!(
+                r#"import std.compress
+fn main(args:array<str>)->Result<(),Error> {{
+  limit:=args[1].parse_i64()?
+  decoded:=compress.{codec}_decompress("invalid stream",limit)?
+  return Ok(())
+}}
+"#
+            );
+            let result = (|| -> TestResult {
+                let compiled = programs(stage, &source, false)?;
+                let object = stage.join("abort.o");
+                align_driver::emit_object_file(
+                    &compiled[0],
+                    &object,
+                    BuildTarget::Baseline,
+                    Profile::Release,
+                    &[],
+                    false,
+                )?;
+                let binary = stage.join("limit-abort");
+                align_driver::link_objects(
+                    &align_driver::CDriver::default(),
+                    &[object.as_path()],
+                    &binary,
+                    &compiled[0].link_libs,
+                    Profile::Release,
+                )?;
+                for limit in ["-1", "1073741825"] {
+                    let output = std::process::Command::new(&binary).arg(limit).output()?;
+                    assert_eq!(
+                        output.status.signal(),
+                        Some(libc::SIGABRT),
+                        "{codec}/{limit}: {output:?}"
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr).contains("max_bytes out of range"),
+                        "{output:?}"
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                panic!("{error}");
+            }
+        }
+    });
+}
 #[test]
 fn framing_whole_per_unit_and_cached_lifecycle() {
     owned_fixture::run("framing_whole_per_unit_and_cached_lifecycle", |stage| {
@@ -187,7 +392,7 @@ fn framing_source_domain_and_effects() {
             (format!("compress.{codec}_compress(\"x\",1 as i32)"), false),
             (format!("compress.{codec}_compress(true,6)"), false),
             (format!("compress.{codec}_decompress(1)"), false),
-            (format!("compress.{codec}_decompress(\"x\",6)"), false),
+            (format!("compress.{codec}_decompress(\"x\",6,0)"), false),
         ] {
             let source = format!(
                 "import std.compress\nfn main()->Result<(),Error> {{ result:={call}?; return Ok(()) }}\n"

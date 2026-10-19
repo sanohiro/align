@@ -4434,20 +4434,29 @@ event, allocation, ABI, and closure ledger is `docs/impl/std-design/xml.md`.
 
 ```text
 compress.gzip_compress(data: bytes, level: i64) -> Result<buffer, Error>
-compress.gzip_decompress(data: bytes) -> Result<buffer, Error>
+compress.gzip_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.zstd_compress(data: bytes, level: i64) -> Result<buffer, Error>
-compress.zstd_decompress(data: bytes) -> Result<buffer, Error>
+compress.zstd_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.zlib_compress(data: bytes, level: i64) -> Result<buffer, Error>
-compress.zlib_decompress(data: bytes) -> Result<buffer, Error>
+compress.zlib_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.deflate_raw_compress(data: bytes, level: i64) -> Result<buffer, Error>
-compress.deflate_raw_decompress(data: bytes) -> Result<buffer, Error>
+compress.deflate_raw_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 ```
+
+All four decoders accept an optional trailing `max_bytes`, default 1073741824.
+It must be i64 in `0..=1073741824`; an invalid value aborts after source-order operand
+evaluation, before input inspection or native initialization. Zero admits complete
+empty-output streams only; excess output returns `Error.Invalid`. Output allocation
+requests and payload-buffer writes stay within the limit, with a separate one-byte
+stack overflow probe. Allocator rounding, realloc overlap, native workspace, the
+buffer header and RSS are not bounded by this argument. No full-limit upfront
+allocation is required. Input remains live through limit evaluation.
 
 Inputs are borrowed binary views; successful output is an independent owned buffer. Calls are
 Impure. Gzip and zstd decompression consumes one or more complete gzip members or current ordinary/skippable
 zstd frames and concatenates their outputs; skippable frames contribute no bytes. Empty input,
 legacy zstd, corrupt/truncated later frames, and trailing bytes (including gzip zero padding)
-return `Error.Invalid`, with no partial output. The inclusive 1 GiB limit applies to aggregate
+return `Error.Invalid`, with no partial output. The inclusive caller limit (default 1 GiB) applies to aggregate
 output; gzip/zstd exact-limit empty/skippable suffixes remain valid. Native resource/output allocation
 failures retain `Error.Code`; final header OOM retains terminal runtime policy. The limit does not
 bound native workspace or RSS. See `docs/impl/std-design/compress.md` for exact format admission,
@@ -4457,11 +4466,11 @@ Zlib and raw DEFLATE use `libz` with window bits 15 and -15 respectively.
 Each decompressor requires exactly one complete stream and all input consumed;
 a second stream or any trailing byte is `Error.Invalid`. Raw final-byte padding
 bits remain part of that byte; raw DEFLATE has no checksum or identifying magic.
-Zlib rejects bad Adler-32 and preset dictionaries. Both keep the inclusive 1 GiB
+Zlib rejects bad Adler-32 and preset dictionaries. Both keep the inclusive caller
 output cap, atomic owned output, Impure effect and existing error mapping.
 Compression emits one stream, even for empty input. Levels are `i64` 0..=9;
 out-of-range levels abort before native initialization, as for gzip. The source
-arguments evaluate in order. No streaming API, configurable cap, dictionary API
+arguments evaluate in order. No streaming API, dictionary API
 or PNG policy is added. [Plan226](docs/impl/226-deflate-framing.md) owns this completion.
 
 ### std.rand

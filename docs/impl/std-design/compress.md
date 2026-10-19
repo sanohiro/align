@@ -18,14 +18,26 @@ fills it.
 
 ```text
 compress.gzip_compress(data: bytes, level: i64) -> Result<buffer, Error>    // owned output
-compress.gzip_decompress(data: bytes) -> Result<buffer, Error>
+compress.gzip_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.zstd_compress(data: bytes, level: i64) -> Result<buffer, Error>
-compress.zstd_decompress(data: bytes) -> Result<buffer, Error>
+compress.zstd_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.zlib_compress(data: bytes, level: i64) -> Result<buffer, Error>
-compress.zlib_decompress(data: bytes) -> Result<buffer, Error>
+compress.zlib_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.deflate_raw_compress(data: bytes, level: i64) -> Result<buffer, Error>
-compress.deflate_raw_decompress(data: bytes) -> Result<buffer, Error>
+compress.deflate_raw_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 ```
+
+Each decoder accepts an optional trailing `max_bytes` with default 1073741824.
+The type is exactly i64 and the range is `0..=1073741824`. Explicit operands evaluate
+once in source order; input remains live through limit evaluation. Invalid limits
+abort after operand evaluation, before input inspection or native initialization.
+Zero accepts complete empty-output streams, not empty encoded input. Excess output
+returns `Error.Invalid`. Every output allocation request and payload-buffer span stays
+within the limit; the separate one-byte stack probe detects excess without growing
+output. Output grows on demand; the first request is min(64 KiB, max_bytes). Allocator rounding,
+transient old/new realloc overlap, native workspace, buffer headers and process RSS
+are outside this payload-storage bound. [Plan226 R156](../226-deflate-framing.md#caller-selected-output-limits-llm-r156)
+owns this extension.
 
 ## Type & ownership classification
 
@@ -58,7 +70,7 @@ only after consuming all input successfully. No partial output escapes a later f
   skippable payloads contribute no output. Skippable-only input succeeds with an empty buffer.
 - Empty input, incomplete/corrupt members or frames (including later checksums),
   and trailing bytes (including gzip zero padding) return `Error.Invalid`.
-- The aggregate decoded payload has an inclusive hard cap of 1 GiB across all members/frames.
+- The aggregate decoded payload has the inclusive caller limit across all members/frames (default 1 GiB).
   Exceeding it returns `Error.Invalid`. For gzip/zstd at exactly the cap, further valid empty/skippable frames
   remain valid. This bounds the returned payload, not native workspace or process RSS.
 
@@ -66,18 +78,18 @@ Reuse one native stream and one growing output vector per call. At the cap, a on
 probe permits metadata progress without growing the returned storage; any produced byte means
 `Error.Invalid`. A native engine error takes precedence over the probe result. Every failure
 releases native state and partial output. Compression still produces one member/frame. No
-streaming source API, dictionary support, configurable limit, or partial-decode API is added.
+streaming source API, dictionary support, or partial-decode API is added.
 [Plan 124](../124-complete-decompression.md) owns the exact contract and closure.
 
 Zlib and raw DEFLATE use `libz` with window bits 15 and -15 respectively.
 Each decompressor requires exactly one complete stream and all input consumed;
 a second stream or any trailing byte is `Error.Invalid`. Raw final-byte padding
 bits remain part of that byte; raw DEFLATE has no checksum or identifying magic.
-Zlib rejects bad Adler-32 and preset dictionaries. Both keep the inclusive 1 GiB
+Zlib rejects bad Adler-32 and preset dictionaries. Both keep the inclusive caller
 output cap, atomic owned output, Impure effect and existing error mapping.
 Compression emits one stream, even for empty input. Levels are `i64` 0..=9;
 out-of-range levels abort before native initialization, as for gzip. The source
-arguments evaluate in order. No streaming API, configurable cap, dictionary API
+arguments evaluate in order. No streaming API, dictionary API
 or PNG policy is added. [Plan226](../226-deflate-framing.md) owns this completion.
 
 ## New machinery required

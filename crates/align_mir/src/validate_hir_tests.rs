@@ -14273,6 +14273,7 @@ fn hir_body_validator_native() {
             hir::ExprKind::Decompress {
                 kind: hir::CompressKind::Zstd,
                 data: Box::new(native_str()),
+                max_bytes: Box::new(native_i64()),
             },
             result_buffer,
         ),
@@ -21557,6 +21558,7 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
                 hir::ExprKind::Decompress {
                     kind,
                     data: Box::new(native_str()),
+                    max_bytes: Box::new(native_i64()),
                 }
             };
             program.fns.push(body_native_case(
@@ -21565,7 +21567,7 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
                 result,
             ));
             assert!(body_core_metadata_is_valid(&program));
-            for mutation in 0..if compress { 3 } else { 2 } {
+            for mutation in 0..4 {
                 let mut bad = program.clone();
                 let expression = body_statement_expression_mut(&mut bad, "framing");
                 let hir::ExprKind::Try(inner) = &mut expression.kind else {
@@ -21581,8 +21583,14 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
                     },
                     1 => inner.ty = Ty::Result(Scalar::String, Scalar::Enum(error)),
                     _ => match &mut inner.kind {
-                        hir::ExprKind::Compress { level, .. } => {
-                            **level = body_test_expr(hir::ExprKind::Int(1), int(32))
+                        hir::ExprKind::Compress { level, .. }
+                        | hir::ExprKind::Decompress { max_bytes: level, .. } => {
+                            **level = if mutation == 2 {
+                                body_test_expr(hir::ExprKind::Int(1), int(32))
+                            } else {
+                                // Keep the declared type valid but corrupt the new child's kind.
+                                body_test_expr(hir::ExprKind::Bool(false), int(64))
+                            }
                         }
                         _ => return Err("fixture compressor".into()),
                     },

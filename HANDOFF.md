@@ -26,6 +26,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan226](docs/impl/226-deflate-framing.md) exposes caller-selected output
+  limits on all four `std.compress` decoders for LLM R156. Optional `max_bytes`
+  bounds output growth and defaults to 1 GiB; complete-input validation and
+  atomic owned output remain. Consumer PNG adoption remains external.
+
 - [Plan228](docs/impl/228-task-owned-results.md) enables self-contained owned
   task results for LLM Request152: string, buffer, ordinary dynamic arrays,
   records, tuples and sums. Successful wait permits one consuming owned get;
