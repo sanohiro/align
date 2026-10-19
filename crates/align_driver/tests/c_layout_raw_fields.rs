@@ -116,6 +116,11 @@ fn c_layout_raw_whole_and_per_unit() {
     run_owned_role("compile");
 }
 
+#[test]
+fn imported_extern_record_signatures() {
+    run_owned_role("imported-externs");
+}
+
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
@@ -134,6 +139,7 @@ fn c_layout_raw_helper() {
     let stage = Path::new(&stage);
     match std::env::var("ALIGN_C_LAYOUT_RAW_ROLE").unwrap().as_str() {
         "compile" => compile_and_run(stage),
+        "imported-externs" => imported_externs(stage),
         "alignment-cache" => cache_alignment(stage),
         "leader" => {
             // Deliberately leave a live descendant after the group leader exits. Its ownership
@@ -205,6 +211,138 @@ fn c_layout_raw_group_cleanup_survives_leader_exit_and_unwind() {
         std::io::Error::last_os_error().raw_os_error(),
         Some(libc::ECHILD)
     );
+}
+
+fn imported_externs(stage: &Path) {
+    let types = "module records\npub layout(C) Record { value: i64 }\n";
+    let entry = stage.join("main.align");
+    fs::write(stage.join("records.align"), types).unwrap();
+    for (declaration, expected) in [
+        ("layout(C) Record { value: i64 }", "private to module"),
+        ("pub Record { value: i64 }", "must be `layout(C)`"),
+        ("pub layout(C) Record {}", "empty struct"),
+    ] {
+        fs::write(
+            stage.join("records.align"),
+            format!("module records\n{declaration}\n"),
+        )
+        .unwrap();
+        for signature in [
+            "fn probe(value: records.Record)",
+            "fn probe() -> records.Record",
+        ] {
+            let source = format!("import records\nextern \"C\" {signature}\nfn main() {{}}\n");
+            check_imported_extern(stage, &source, Some(expected));
+        }
+    }
+    fs::write(stage.join("records.align"), types).unwrap();
+    // A loaded sibling's import cannot authorize this module's signature.
+    fs::write(
+        stage.join("bridge.align"),
+        "module bridge\nimport records\npub fn value() -> i64 = 0\n",
+    )
+    .unwrap();
+    for signature in [
+        "fn probe(value: records.Record)",
+        "fn probe() -> records.Record",
+    ] {
+        let source = format!("import bridge\nextern \"C\" {signature}\nfn main() {{}}\n");
+        check_imported_extern(stage, &source, Some("is not imported"));
+    }
+    fs::write(
+        stage.join("other.align"),
+        types.replace("module records", "module other"),
+    )
+    .unwrap();
+    for signatures in [
+        "fn probe(value: records.Record)\nfn probe(value: other.Record)",
+        "fn probe() -> records.Record\nfn probe() -> other.Record",
+    ] {
+        let source = format!(
+            "import records\nimport other\nextern \"C\" {{ {signatures} }}\nfn main() {{}}\n"
+        );
+        check_imported_extern(
+            stage,
+            &source,
+            Some("re-declared with a different signature"),
+        );
+    }
+    let bridge = r#"module bridge
+import records
+extern "C" {
+  fn provider_record() -> records.Record
+  fn provider_bump(value: records.Record) -> records.Record
+}
+fn keep<T>(value: T) -> T = value
+pub fn read() -> records.Record { unsafe { return keep(provider_bump(provider_record())) } }
+"#;
+    fs::write(stage.join("bridge.align"), bridge).unwrap();
+    let source = r#"import records
+import bridge
+extern "C" {
+  fn provider_record() -> records.Record
+  fn provider_bump(value: records.Record) -> records.Record
+}
+fn main() -> i32 {
+  unsafe {
+    direct := provider_record()
+    bumped := provider_bump(direct)
+    imported := bridge.read()
+    if direct.value != 41 || bumped.value != 42 || imported.value != 42 { return 1 }
+    return 0
+  }
+}
+"#;
+    fs::write(&entry, source).unwrap();
+    check_imported_extern(stage, source, None);
+    if cfg!(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(
+            target_arch = "aarch64",
+            any(target_os = "linux", target_os = "macos")
+        ),
+    )) {
+        compile_c(
+            stage,
+            r#"
+#include <stdint.h>
+struct Record { int64_t value; };
+struct Record provider_record(void) { return (struct Record){41}; }
+struct Record provider_bump(struct Record value) { value.value += 1; return value; }
+"#,
+        );
+        for per_unit in [false, true] {
+            build_and_run(stage, source, per_unit, "imported-externs");
+        }
+    }
+}
+
+fn check_imported_extern(stage: &Path, source: &str, expected: Option<&str>) {
+    let entry = stage.join("main.align");
+    fs::write(&entry, source).unwrap();
+    for per_unit in [false, true] {
+        let mut sm = SourceMap::new();
+        let diags = if per_unit {
+            align_driver::check_per_unit(&mut sm, entry.to_str().unwrap(), source).diags
+        } else {
+            check(&mut sm, entry.to_str().unwrap(), source).diags
+        };
+        let rendered = align_driver::format_diagnostics(&sm, &diags);
+        if let Some(expected) = expected {
+            // Private declarations are omitted from a separately compiled public interface.
+            let expected = if per_unit && expected == "private to module" {
+                "no type `Record`"
+            } else {
+                expected
+            };
+            assert!(
+                diags.has_errors() && rendered.contains(expected),
+                "{source}\n{rendered}"
+            );
+        } else {
+            assert!(!diags.has_errors(), "{source}\n{rendered}");
+        }
+    }
 }
 
 fn compile_and_run(stage: &Path) {
