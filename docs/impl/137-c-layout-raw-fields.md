@@ -106,3 +106,21 @@ x86_64 Linux LLVM with a Clang22 C helper and runs the ELF executable under
 Docker linux/amd64. It covers following arguments, returned records and exact
 GP/SSE fit; the checked-in native driver owner repeats the equivalent calls
 on a Linux x86-64 host. This is correctness evidence, not a performance claim.
+
+## Imported extern signature resolution (AM-R18)
+
+Extern parameter and return types use the declaring module's imports and the
+ordinary public-type resolver. The old empty-import context predates C record
+passage and incorrectly rejects an explicitly imported public C record. This
+repair implements the existing namespace and FFI contracts; it changes no
+layout, ABI, ownership strategy, IR shape or interface format.
+
+| Axis | Implementation and regression owner |
+| --- | --- |
+| Type formation and visibility | Extern signature collection supplies the declaring module's user imports to `resolve_type` for both parameters and returns. `c_layout_raw_fields::imported_extern_record_signatures` checks both positions, private and missing-import refusals, non-C/empty records and conflicting nominal signatures. |
+| Native construction and return | The same owner links a C producer and round-trip function using the imported record under whole-program and per-unit builds on supported native value-ABI targets. Repeated declarations of the same nominal signature agree; another module's imports grant no authority. |
+| Imports and generic transport | An imported wrapper and generic identity helper preserve the record and native result; existing interface serialization and the cumulative C-layout cache owners remain unchanged. |
+| Ownership and control | Records remain Copy with no implicit allocation, move nulling or Drop. Replacement, joins, early exits, allocation provenance and cleanup algorithms are unchanged and retain this plan's existing owners. No new runtime operation or malformed HIR/MIR form is admitted. |
+
+The author matrix pass is folded into the one preflight review because this
+repair uses the already-reviewed C record and module-resolution strategy.

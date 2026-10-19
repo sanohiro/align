@@ -11034,9 +11034,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     link_libs.push(lib.clone());
                 }
             }
-            // Extern signatures see the top-level type namespace with no module imports (an FFI type
-            // is a primitive/`raw`, never an imported user type); the entry module's context suffices.
-            let imports = &no_imports;
+            // C record parameters and returns obey the declaring module's ordinary import and
+            // visibility rules, independently of the foreign symbol's global linkage.
+            let imports = imports_by_module.get(m.path.as_str()).unwrap_or(&no_imports);
             for sig in &blk.fns {
                 let cname = sig.name.name.clone();
                 let mut params: Vec<Ty> = Vec::with_capacity(sig.params.len());
