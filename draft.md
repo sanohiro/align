@@ -1338,6 +1338,17 @@ A slice of a field borrows the containing storage. An arbitrary temporary remain
 index/slice place: bind it first. The exact type, layout, ownership, interface and validation
 contract is [plan 73](docs/impl/73-fixed-array-field-plan.md).
 
+`rows[row].path.fixed[index]` also accepts a fixed field whose complete type is
+independent Copy data, including already-formed independent Copy record elements.
+It evaluates and copies the existing complete field value before evaluating the inner
+index, exactly as `fixed := rows[row].path.fixed; fixed[index]`. Outer bounds precede
+inner effects; the inner signed bound uses N. The independent result can outlive parent
+replacement or retirement. Chained ordinary record fields use the same snapshot.
+No allocation, retained view, ownership transfer or indexed write is introduced;
+views, owners, pointers and callables in the complete field remain excluded, even at N=0.
+Direct indexed-field slicing and other arbitrary fixed-array expressions still require
+a stable binding. [Plan232](docs/impl/232-indexed-fixed-field-values.md) owns this value composition.
+
 A function-local array literal is fixed storage and normally infers its element type from its
 elements. The empty literal `[]` is accepted only when the surrounding expression supplies one
 exact element type, such as a `slice<Option>` parameter or a `slice<T>` binding annotation. It

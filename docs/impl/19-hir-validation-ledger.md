@@ -2363,6 +2363,16 @@ intermediate/final types, lengths, element kinds, stable roots, authorities,
 initialization states and borrow roots across whole-program and per-unit input.
 The complete closure matrix and named owners are maintained in plan 73.
 
+Plan232 normalizes an indexed fixed-field value read only when the complete
+already-admitted `ElemField` type satisfies `independent_copy_type`. Both
+`check_index` and chained record-field `check_index_field` use the same canonical
+Block/Let(ElemField)/Index(Local) snapshot; a chained Field selects from that
+ordinary independent Index result. The fixed-field value completes before inner
+index effects. No new checked node, place permission or borrowed-array receiver
+is admitted: existing field, local, index, bounds and ordinary block validators
+replay the generated records. `indexed_fixed_field_values` owns native whole/
+per-unit effects, independent lifetime, graph exclusions and imported cache replay.
+
 ## Scoped floating-point relaxation (plan 77)
 
 Checked HIR retains each `FloatScope` with exactly two known bits, `reassoc` and

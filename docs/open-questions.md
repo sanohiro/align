@@ -205,6 +205,14 @@ indexed String writes and unrelated Move consumers remain excluded. Plan165 comp
 `[array<P>; N]` and AoS `[array<Record>; N]` ownership and shared indexed inspection, with no outer
 allocation, indexed ownership extraction or specialized/nested dynamic representation. Record: draft §7, language
 digest, [plan 73](impl/73-fixed-array-field-plan.md), and [plan164](impl/164-fixed-owned-string-arrays.md).
+[Plan232](impl/232-indexed-fixed-field-values.md) additionally composes
+`rows[row].path.fixed[index]` when the complete fixed field is independent Copy
+data. It snapshots the existing complete-field value before the inner index,
+then uses ordinary signed bounds and independent element/record-field reads.
+Parent replacement during the inner expression cannot change that snapshot.
+This adds no allocation, borrowed slice, indexed write or wider payload permission;
+arbitrary temporary arrays and view/owner/callable/pointer-bearing fields retain
+their existing restrictions, including at zero length.
 
 ### Checked decimal text conversion (SETTLED 2026-10-01)
 

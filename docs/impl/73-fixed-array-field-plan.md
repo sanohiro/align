@@ -245,7 +245,10 @@ expression, array repetition syntax, nested fixed-array element, dynamic-length
 field, hidden boxing, C flexible-array member, native extern/raw array ABI,
 equality/hash/print behavior, reflection, data serialization widening or new
 runtime ABI. An arbitrary temporary is still not stable fixed-array storage;
-bind it before indexing or slicing. Tuple element syntax still reaches the
+bind it before indexing or slicing. Plan232 separately composes an already-admitted
+indexed fixed-field independent Copy value with an ordinary index through its
+explicit-binding semantics; it adds no temporary slice or retained storage.
+Tuple element syntax still reaches the
 existing placement gate, which does not admit inline aggregate tuple elements;
 this capability adds no tuple-projected fixed-array storage.
 
