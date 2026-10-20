@@ -299,6 +299,33 @@ fn elementary_vector_math_reports_pre_instruction_selection_visibility() {
     assert!(!default.contains("became machine SIMD"), "{default}");
 }
 
+/// The compiler fallback has its own provenance, independent of optimizer remarks.
+#[test]
+fn cancellation_math_reports_compiler_scalarization_in_every_profile() {
+    let src=write_src("cancellation-math", concat!(
+        "pub fn compute(v:vec4<f32>)->vec4<f32> {\n",
+        "  a:=v.expm1()\n",
+        "  b:=v.log1p()\n",
+        "  return a+b\n",
+        "}\n",
+    ));
+    for profile in ["dev","release","fast","small","tiny"] {
+        for verbose in [false,true] {
+            let mut command=alignc();
+            command.arg("explain-opt").arg(src.path()).args(["--profile",profile]);
+            if verbose {command.arg("--verbose");}
+            let out=command.output().expect("run explain-opt");
+            assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+            let output=String::from_utf8_lossy(&out.stdout);
+            for (line,operation) in [(2,"expm1"),(3,"log1p")] {
+                let expected=format!("vector math `{operation}` was scalarized before instruction selection — LLVM 22 has no vector intrinsic; emitted lane-wise libm calls; no vector math provider is configured");
+                assert_eq!(output.lines().filter(|row|row.contains(&expected)&&row.contains(&format!(":{line}:"))).count(),1,"{profile}/{verbose}: {output}");
+            }
+            assert!(!output.contains("remains vector IR"),"{output}");
+        }
+    }
+}
+
 /// A compile error → exit 1 (not a report), with a diagnostic, never a panic.
 #[test]
 fn compile_error_exits_one() {

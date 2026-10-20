@@ -25,6 +25,11 @@ public-contract ledger and implementation closure matrix. Evidence baseline:
 Align `854815acef2d7e2403532b40d7226aeb4fcbb66a`, LLVM 22.1.8, and align-llm
 Request 92.
 
+[Plan234](234-cancellation-sensitive-math.md) adds the complete cancellation-sensitive
+pair `expm1`/`log1p` across the same scalar/vector types. It owns their width-exact
+libm fallback and special values; E1's vector-intrinsic promise below is unchanged.
+The shared visibility schema includes that pair as specified in section1.1.
+
 ## 1. Public-contract ledger
 
 ```text
@@ -39,15 +44,16 @@ Closed set        core.math reserves the IEEE 754-2019 §9.2 elementary family
                   as one design domain rather than reopening the compiler for
                   one client at a time:
                     E1  exp, exp2, log, log2, log10 (this capability)
-                    E2  expm1, exp2m1, exp10, exp10m1, logp1, log2p1,
+                    E2  expm1, exp2m1, exp10, exp10m1, log1p, log2p1,
                         log10p1, hypot, rSqrt
                     E3  compound, rootn, pown, pow, powr
                     E4  sin, cos, tan, sinPi, cosPi, tanPi, asin, acos, atan,
                         atan2, asinPi, acosPi, atanPi, atan2Pi, sinh, cosh,
                         tanh, asinh, acosh, atanh
-                  Reservation is not availability. Only E1 ships here. A
-                  later tier needs its own complete ledger and implementation
-                  capability. The current pow surface is unchanged.
+                  Reservation is not availability. E1 ships here; Plan234 ships
+                  expm1/log1p. Other reserved functions need their own complete
+                  useful capability and ledger, not necessarily a whole tier.
+                  The current pow surface is unchanged.
 
 Numeric result    Each operation denotes the named real elementary function
                   rounded to the receiver's IEEE binary format by the selected
@@ -179,14 +185,14 @@ cross-target result identity to hide that target fact.
 ### 1.1 Exact visibility record
 
 The inspection path builds one private record for every reached, user-written
-explicit-vector E1 operation before optimization and resolves it after the
+explicit-vector E1 or Plan234 operation before optimization and resolves it after the
 selected profile pipeline:
 
 ```text
 MathVisibilityRecord {
   function: ProgramCall
   operation_ordinal: u32
-  operation: Exp | Exp2 | Log | Log2 | Log10
+  operation: Exp | Exp2 | Log | Log2 | Log10 | Expm1 | Log1p
   ty: Vec(FloatWidth, LaneCount)
   state: EliminatedOrMerged | RetainedVectorIr | Scalarized
   provider: None | Configured(ProviderId)
@@ -202,11 +208,18 @@ MathVisibilitySource {
 ```
 
 `operation_ordinal` is one-based within the concrete function in HIR evaluation
-order across E1 vector operations only. `FloatWidth` is exactly `F32 | F64`;
+order across the seven supported elementary vector operations only. `FloatWidth` is exactly `F32 | F64`;
 `LaneCount` is exactly `2 | 4 | 8 | 16`. `ProviderId` is compiler-owned ASCII
 toolchain identity, never an ambient path or soname; this capability produces
 only `None`. `llvm_reason` is diagnostic text and never artifact identity. A
 missing LLVM reason is rendered with the stable compiler explanation below.
+For retained Plan234 scalar fallback calls, `llvm_reason` is exactly
+`LLVM 22 has no vector intrinsic; emitted lane-wise libm calls`; later LLVM
+remarks do not replace this compiler provenance. Eliminated-or-merged rows
+have no reason. Each original vector operation tags all its scalar calls with
+one identity; extraction/insertion/shuffle instructions are not math operations.
+The fallback therefore cannot become a retained-vector claim just because its
+results are reconstructed into a vector.
 
 The states are exhaustive. `EliminatedOrMerged` means no independent
 result-producing operation with that source identity survives because ordinary

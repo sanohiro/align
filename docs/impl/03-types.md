@@ -144,7 +144,8 @@ in deterministic receiver-before-arity order. The methods are Pure and Copy;
 they add no ownership, lifetime, allocation or error channel. Checked HIR
 replays the same exhaustive type equation. Finite last bits and NaN payloads
 may vary by target implementation; type checking does not mint an accuracy or
-SIMD fact.
+SIMD fact. Plan234 adds `expm1`/`log1p` with exactly the same type equation,
+receiver-before-arity order and Pure Copy ownership. `logp1` is not an alias.
 
 ---
 

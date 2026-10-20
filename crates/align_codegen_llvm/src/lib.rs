@@ -44,6 +44,9 @@ mod ffi_sysv_tests;
 #[cfg(test)]
 mod ffi_fixed_array_tests;
 mod llvm_build_id;
+mod math_libm;
+#[cfg(test)]
+mod math_libm_tests;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
@@ -1549,7 +1552,7 @@ fn math_visibility_inventory(program: &Program) -> Vec<MathVisibilityRecord> {
                 let Stmt::Let(_, Rvalue::MathOp { fn_, ty, .. }) = statement else {
                     continue;
                 };
-                if !fn_.is_elementary_e1() || !matches!(ty, Ty::Vec(Scalar::Float(_), 2 | 4 | 8 | 16)) {
+                if !fn_.is_elementary_math() || !matches!(ty, Ty::Vec(Scalar::Float(_), 2 | 4 | 8 | 16)) {
                     continue;
                 }
                 ordinal += 1;
@@ -1636,7 +1639,7 @@ fn resolve_math_visibility(
         expected_ordinal = expected_ordinal
             .checked_add(1)
             .ok_or_else(|| CodegenError::Lowering("too many math visibility records".into()))?;
-        if !record.operation.is_elementary_e1()
+        if !record.operation.is_elementary_math()
             || !matches!(record.ty, Ty::Vec(Scalar::Float(FloatTy { bits: 32 | 64 }), 2 | 4 | 8 | 16))
             || record.source.is_some_and(|(line, column)| line == 0 || column == 0)
         {
@@ -1683,6 +1686,10 @@ fn attach_math_scalarization_reasons(
 ) {
     for record in records {
         if record.state != MathVisibilityState::Scalarized {
+            continue;
+        }
+        if record.operation.uses_scalar_libm() {
+            record.llvm_reason = Some(math_libm::LOWERING_REASON.to_owned());
             continue;
         }
         let Some(source) = record.source else {
@@ -4004,7 +4011,9 @@ fn lower_prepared_module<'c>(
             }
             ReturnAbi::StructMemory(_) => ctx.void_type().fn_type(&param_types, false),
         };
-        if !runtime_abi::native_extern_abi_matches(ext.name.as_str(), fn_ty, ctx) {
+        if !runtime_abi::native_extern_abi_matches(ext.name.as_str(), fn_ty, ctx)
+            || !math_libm::extern_abi_matches(ext.name.as_str(), fn_ty, ctx)
+        {
             return Err(CodegenError::Lowering(format!(
                 "native extern ABI mismatch:{}",
                 lowercase_hex(ext.name.as_bytes()),
@@ -6271,6 +6280,9 @@ fn callable_preflight(
             format!("runtime:{:?}", abi.key),
         )?;
     }
+    for &(symbol, _, _) in &math_libm::ROWS {
+        reserve_external_identity(&mut reserved, symbol.to_owned(), format!("math:{symbol}"))?;
+    }
     for function in program
         .fns
         .iter()
@@ -6296,7 +6308,9 @@ fn callable_preflight(
         )?;
     }
     for function in &program.externs {
-        if runtime_abi::runtime_abi_for_symbol(function.name.as_str()).is_some() {
+        if runtime_abi::runtime_abi_for_symbol(function.name.as_str()).is_some()
+            || math_libm::contains_symbol(function.name.as_str())
+        {
             continue;
         }
         reserve_external_identity(
@@ -12555,27 +12569,79 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .try_as_basic_value()
             .basic()
             .ok_or_else(|| self.err(format!("intrinsic {name} returned no value")))?;
-        if matches!(ty, Ty::Vec(Scalar::Float(_), 2 | 4 | 8 | 16)) {
-            self.math_visibility_ordinal = self
-                .math_visibility_ordinal
-                .checked_add(1)
-                .ok_or_else(|| self.err("too many elementary vector-math operations"))?;
-            if self.dibuilder.is_some() {
-                let tag = math_visibility_tag(
-                    &self.f.name,
-                    self.math_visibility_ordinal,
-                    operation,
-                    ty,
-                );
-                let node = self.ctx.metadata_node(&[self.ctx.metadata_string(&tag).into()]);
-                value
-                    .as_instruction_value()
-                    .ok_or_else(|| self.err("elementary math call has no instruction"))?
-                    .set_metadata(node, self.ctx.get_kind_id("align.math.visibility"))
-                    .map_err(|_| self.err("cannot attach elementary math visibility metadata"))?;
-            }
+        if let Some(node) = self.math_visibility_node(operation, ty)? {
+            value.as_instruction_value().ok_or_else(|| self.err("elementary math call has no instruction"))?
+                .set_metadata(node, self.ctx.get_kind_id("align.math.visibility"))
+                .map_err(|_| self.err("cannot attach elementary math visibility metadata"))?;
         }
         Ok(value)
+    }
+
+    fn math_visibility_node(
+        &mut self,
+        operation: hir::MathFn,
+        ty: Ty,
+    ) -> Result<Option<inkwell::values::MetadataValue<'c>>, CodegenError> {
+        if !matches!(ty, Ty::Vec(Scalar::Float(_), 2 | 4 | 8 | 16)) {
+            return Ok(None);
+        }
+        self.math_visibility_ordinal = self.math_visibility_ordinal.checked_add(1)
+            .ok_or_else(|| self.err("too many elementary vector-math operations"))?;
+        if self.dibuilder.is_none() { return Ok(None); }
+        let tag = math_visibility_tag(&self.f.name, self.math_visibility_ordinal, operation, ty);
+        Ok(Some(self.ctx.metadata_node(&[self.ctx.metadata_string(&tag).into()])))
+    }
+
+    fn call_scalar_libm_math(
+        &mut self,
+        argument: BasicValueEnum<'c>,
+        operation: hir::MathFn,
+        ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let (bits, lanes) = match ty {
+            Ty::Float(FloatTy { bits: bits @ (32 | 64) }) => (bits, None),
+            Ty::Vec(Scalar::Float(FloatTy { bits: bits @ (32 | 64) }), lanes @ (2 | 4 | 8 | 16)) => (bits, Some(lanes)),
+            _ => return Err(self.err("invalid scalar-libm math type")),
+        };
+        let symbol = math_libm::symbol(operation, bits).ok_or_else(|| self.err("unknown scalar-libm operation"))?;
+        let function_type = math_libm::function_type(self.ctx, symbol).ok_or_else(|| self.err("missing scalar-libm ABI"))?;
+        let function = if let Some(existing) = self.module.get_function(symbol) {
+            if existing.get_type() != function_type || existing.get_call_conventions() != 0 {
+                return Err(self.err("scalar-libm native ABI mismatch"));
+            }
+            existing
+        } else {
+            self.module.add_function(symbol, function_type, None)
+        };
+        // Direct libm calls may update errno/FP status or native dispatch state. Do not invent
+        // memory(none), nofree or nosync attributes from the source-level Pure classification.
+        let node = self.math_visibility_node(operation, ty)?;
+        let call = |argument: BasicValueEnum<'c>| -> Result<BasicValueEnum<'c>, CodegenError> {
+            let value = self.builder.build_call(function, &[argument.into()], "math.libm")
+                .map_err(|error| self.err(error))?.try_as_basic_value().basic()
+                .ok_or_else(|| self.err("scalar-libm call has no result"))?;
+            if let Some(node) = node {
+                value.as_instruction_value().ok_or_else(|| self.err("scalar-libm call has no instruction"))?
+                    .set_metadata(node, self.ctx.get_kind_id("align.math.visibility"))
+                    .map_err(|_| self.err("cannot attach scalar-libm visibility"))?;
+            }
+            Ok(value)
+        };
+        if let Some(lanes) = lanes {
+            let input = match argument { BasicValueEnum::VectorValue(vector) => vector,
+                _ => return Err(self.err("scalar-libm vector operand mismatch")) };
+            let mut result = input.get_type().const_zero();
+            for lane in 0..lanes {
+                let index = self.ctx.i32_type().const_int(u64::from(lane), false);
+                let value = self.builder.build_extract_element(input, index, "math.lane")
+                    .map_err(|error| self.err(error))?;
+                result = self.builder.build_insert_element(result, call(value)?, index, "math.result")
+                    .map_err(|error| self.err(error))?;
+            }
+            Ok(result.into())
+        } else {
+            call(argument)
+        }
     }
 
     /// Find + declare + call an overloaded binary integer intrinsic (`llvm.sadd.sat`,
@@ -14439,6 +14505,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::MathFn::Log => self.call_elementary_math_intrinsic("llvm.log", overload, ops[0], *fn_, *ty)?,
                     align_sema::MathFn::Log2 => self.call_elementary_math_intrinsic("llvm.log2", overload, ops[0], *fn_, *ty)?,
                     align_sema::MathFn::Log10 => self.call_elementary_math_intrinsic("llvm.log10", overload, ops[0], *fn_, *ty)?,
+                    align_sema::MathFn::Expm1 | align_sema::MathFn::Log1p =>
+                        self.call_scalar_libm_math(ops[0], *fn_, *ty)?,
                     // `pow(base, exp)`.
                     align_sema::MathFn::Pow => self.call_intrinsic("llvm.pow", &[overload], &[ops[0].into(), ops[1].into()])?,
                     // `fma(a, b, c)` = a*b + c, one rounding (scalar or vector overload).

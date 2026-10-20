@@ -54694,7 +54694,7 @@ impl<'a, 't> Checker<'a, 't> {
         let (want_args, float_only) = match fn_ {
             Abs => (0, false),
             Min | Max => (1, false),
-            Sqrt | Floor | Ceil | Round | RoundEven | Trunc | Exp | Exp2 | Log | Log2 | Log10 => (0, true),
+            Sqrt | Floor | Ceil | Round | RoundEven | Trunc | Exp | Exp2 | Log | Log2 | Log10 | Expm1 | Log1p => (0, true),
             Pow => (1, true),
             Fma => (2, true), // free builtin; never reached here
             ToBits | IsFinite | IsNan | IsInfinite => (0, true),
@@ -54705,13 +54705,14 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Element-wise vector math (M6): the established operations and E1 family lower to LLVM
         // vector intrinsics. The E1 intrinsics may later scalarize when no provider is available;
-        // that target fact does not remove the source-level vector operation. A float vector takes
+        // that target fact does not remove the source-level vector operation. Expm1/Log1p use
+        // width-exact scalar libm calls when no vector intrinsic exists. A float vector takes
         // the unary float ops + min/max; an integer vector takes abs + min/max. `pow` remains
         // scalar-only because it has no settled explicit-vector surface.
         let vec_ok = match r.ty {
             Ty::Vec(Scalar::Float(_), _) => matches!(
                 fn_,
-                Abs | Sqrt | Floor | Ceil | Round | RoundEven | Trunc | Exp | Exp2 | Log | Log2 | Log10
+                Abs | Sqrt | Floor | Ceil | Round | RoundEven | Trunc | Exp | Exp2 | Log | Log2 | Log10 | Expm1 | Log1p
                     | Min | Max
             ),
             Ty::Vec(Scalar::Int(_), _) => matches!(fn_, Abs | Min | Max),
@@ -57238,6 +57239,8 @@ impl<'a, 't> Checker<'a, 't> {
             "log" => Some(hir::MathFn::Log),
             "log2" => Some(hir::MathFn::Log2),
             "log10" => Some(hir::MathFn::Log10),
+            "expm1" => Some(hir::MathFn::Expm1),
+            "log1p" => Some(hir::MathFn::Log1p),
             "pow" => Some(hir::MathFn::Pow),
             _ => None,
         };

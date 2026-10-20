@@ -24,6 +24,16 @@ This keeps source portable while leaving target math engines responsible for
 their implementations. [Plan 75](impl/75-portable-math-plan.md) owns the exact
 surface, special values and inspection contract.
 
+Cancellation-sensitive `expm1` and `log1p` preserve their own operation identity;
+rewriting them as `exp(x)-1` or `log(1+x)` would lose small inputs before the
+final result. Width-exact system libm supplies both methods on supported targets.
+LLVM22 has no corresponding vector intrinsic, so explicit vectors use visible
+lane-wise scalar calls. E1 retains its existing vector-intrinsic contract;
+shipping this useful pair does not require every reserved E2 operation or a new
+SIMD provider. Native effects must not be erased by invented LLVM attributes,
+and fixed math symbols cannot be replaced by user exports.
+[Plan234](impl/234-cancellation-sensitive-math.md) owns this capability.
+
 Floating-point relaxation is a visible lexical value scope, not an ambient build mode or a family
 of fast reducer names. `float(reassoc) {}` and `float(contract) {}` name exactly the two guarantees
 the programmer may relinquish. They compose independently, nest by union, and never add flags to a

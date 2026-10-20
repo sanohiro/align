@@ -10243,6 +10243,8 @@ fn hir_body_validator_rejects_malformed_elementary_math_rows() {
         hir::MathFn::Log,
         hir::MathFn::Log2,
         hir::MathFn::Log10,
+        hir::MathFn::Expm1,
+        hir::MathFn::Log1p,
     ];
     for operation in operations {
         let mut wrong_arity = baseline_program();
