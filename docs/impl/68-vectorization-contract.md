@@ -494,6 +494,9 @@ cross-target bit-identity promise.
 with `expm1`/`log1p`. Those operations have no LLVM22 intrinsic and explicitly
 lower to width-exact scalar libm calls per lane, with a compiler fallback reason.
 That separate capability does not alter E1's vector-intrinsic guarantee below.
+Plan235 adds sin/cos/atan2 through exact scalar/vector LLVM intrinsics and the
+same visibility contract. Target argument reduction and combined sin/cos helpers
+add no machine-SIMD or cross-target bit-identity promise.
 
 The issue's criterion "loop vectorizer successfully vectorizes loops over slices
 using these operations" is unreachable by adding intrinsics. Worse, with no

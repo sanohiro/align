@@ -433,3 +433,71 @@ fn a_unit_with_main_seeds_no_inspection_roots() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!err.contains("defines no `main`"), "a unit with `main` seeds nothing:\n{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn trigonometry_reports_intrinsic_disposition_in_every_profile() {
+    owned_fixture::run(
+        "trigonometry_reports_intrinsic_disposition_in_every_profile",
+        |root| {
+            let source = root.join("trigonometry.align");
+            std::fs::write(
+                &source,
+                concat!(
+                    "pub fn compute(v:vec4<f32>, w:vec4<f32>)->vec4<f32> {\n",
+                    "  a:=v.sin()\n",
+                    "  b:=v.cos()\n",
+                    "  c:=v.atan2(w)\n",
+                    "  return a+b+c\n",
+                    "}\n",
+                ),
+            )
+            .expect("write owned source");
+            for profile in ["dev", "release", "fast", "small", "tiny"] {
+                for verbose in [false, true] {
+                    let mut command = alignc();
+                    command
+                        .arg("explain-opt")
+                        .arg(&source)
+                        .args(["--profile", profile]);
+                    if verbose {
+                        command.arg("--verbose");
+                    }
+                    let out = command.output().expect("run explain-opt");
+                    assert!(
+                        out.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let output = String::from_utf8_lossy(&out.stdout);
+                    for (line, operation) in [(2, "sin"), (3, "cos"), (4, "atan2")] {
+                        let rows = output
+                            .lines()
+                            .filter(|row| {
+                                row.contains(&format!("vector math `{operation}`"))
+                                    && row.contains(&format!(":{line}:"))
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(rows.len(), 1, "{profile}/{verbose}: {output}");
+                        assert!(
+                            rows[0].contains("remains vector IR")
+                                || rows[0].contains("was scalarized before instruction selection"),
+                            "{}",
+                            rows[0]
+                        );
+                        assert!(
+                            rows[0].contains("no vector math provider is configured"),
+                            "{}",
+                            rows[0]
+                        );
+                    }
+                    assert!(
+                        !output.contains("LLVM 22 has no vector intrinsic"),
+                        "{output}"
+                    );
+                    assert!(!output.contains("became machine SIMD"), "{output}");
+                }
+            }
+        },
+    );
+}

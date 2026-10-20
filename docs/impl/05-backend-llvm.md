@@ -135,6 +135,13 @@ without MathOp; user exports cannot replace those symbols. No new runtime export
 or artifact is introduced. The same visibility record labels retained calls
 scalarized with the compiler's exact fallback reason.
 
+Plan235 sin/cos/atan2 use exact scalar/vector intrinsics without new fast-math
+flags. One native identity authority validates the six standard signatures and
+the platform-specific paired sin/cos helpers before declaration, and reserves
+all against replacement exports. Darwin HFA compatibility follows the existing
+physical C-record classifier rather than nominal record identity. No runtime
+export is added; existing vector visibility owns their optimized disposition.
+
 ### Module verification (every profile, on every emit path)
 
 `build_module` verifies the module it just built. Every emit path — object, PGO, ThinLTO prelink,

@@ -887,6 +887,31 @@ one scalar call per lane in ascending order and `explain-opt` reports that
 compiler fallback. No `logp1` alias is provided. [Plan234](impl/234-cancellation-sensitive-math.md)
 owns the exact native identity and inspection contract.
 
+`sin()` and `cos()` take no arguments on the same scalar/vector float types.
+`y.atan2(x)` takes exactly one argument with the same type as `y`, including
+vector lane count, and returns that type. Angles are radians; `atan2` accounts
+for the quadrant of `(x,y)` without first dividing y by x. The receiver is
+evaluated before its argument, each once; there is no implicit broadcast or
+width conversion. These are Pure Copy operations without Align allocation.
+Scalar and vector forms lower to the corresponding LLVM intrinsic, retaining
+lane-wise vector semantics. The target owns argument reduction and may
+scalarize vectors or combine sin/cos. Lowering adds no fast-math flags. No
+global ULP bound, correct-rounding or scalar/vector/cross-target bit identity
+is promised.
+
+All three are total. `sin` preserves signed zero; `cos` maps both zeros to +1;
+both map infinities and NaNs to NaN. Finite sin/cos results lie in [-1,1]. For
+`atan2`, either NaN gives NaN. A zero y gives signed zero when x has positive
+sign (including +0/+∞), and signed pi when x has negative sign (including
+-0/-∞). Nonzero finite y with either zero x gives signed pi/2. Finite nonzero
+y with +∞ x gives signed zero, and with -∞ x gives signed pi. Infinite y with
+finite x gives signed pi/2; both infinite give signed pi/4 for positive x or
+signed 3pi/4 for negative x. Result sign follows y. Pi multiples use the
+receiver-width target rounding; NaN payload/sign/quieting remain unspecified.
+[Plan235](impl/235-trigonometric-math.md) owns exact native identities, combined-helper ABI and
+inspection rules; `explain-opt` reports these operations using the existing
+three-state visibility contract.
+
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
 layout, so a field-wise pipeline reads contiguous values from the selected columns.
 Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one

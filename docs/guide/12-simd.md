@@ -125,6 +125,16 @@ so vector forms call width-exact platform math once per lane. `explain-opt`
 reports that compiler fallback. They have the same target-dependent precision
 posture, never abort, and introduce no Align allocation.
 
+`sin()`, `cos()` and `y.atan2(x)` also accept these scalar/vector float types
+and return the receiver type. Angles are radians; atan2 takes y first and x
+second, with exactly matching widths and lanes. It accounts for quadrants and
+signed axes without dividing first. There is no implicit vector broadcast.
+Sin preserves signed zero, cos of either zero is +1, and infinite inputs to
+sin/cos give NaN. Atan2 defines signed-axis and infinite quadrants; either NaN
+input gives NaN. The target supplies argument reduction and may scalarize or
+combine sin/cos; `explain-opt` reports the vector disposition. The same precision
+limits and no-allocation, non-aborting behavior apply.
+
 Ordinary arithmetic and reductions are ordered and uncontracted by default. When the algorithm permits different rounding, name the permission at its source:
 
 ```align

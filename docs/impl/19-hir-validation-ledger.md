@@ -981,7 +981,8 @@ section is a reservation and changes no checked-HIR contract.
 | `MathFn::RoundEven` | Exactly one scalar F or valid vector V(FS,n); exact same result type. Nearest integral value, ties-even; signed zeros/infinities/integral values preserved; NaN remains NaN without payload/sign/quieting guarantees. |
 | `MathFn::Trunc` | One operand. Scalar `F` or vector `V(FS,n)`; result equals operand type. |
 | `MathFn::Pow` | Two operands of one exact scalar `F`; vectors reject; result is that `F`. |
-| `MathFn::Exp`, `Exp2`, `Log`, `Log2`, `Log10` (plan75), `Expm1`, `Log1p` (Plan234) | Exactly one operand. Scalar `F` or vector `V(FS,n)`; result equals the exact operand type. Integers, masks, arrays and unresolved numeric variables reject. No accuracy, target-identity or machine-SIMD fact is stored in HIR. |
+| `MathFn::Exp`, `Exp2`, `Log`, `Log2`, `Log10` (plan75), `Expm1`, `Log1p` (Plan234), `Sin`, `Cos` (Plan235) | Exactly one operand. Scalar `F` or vector `V(FS,n)`; result equals the exact operand type. Integers, masks, arrays and unresolved numeric variables reject. No accuracy, target-identity or machine-SIMD fact is stored in HIR. |
+| `MathFn::Atan2` (Plan235) | Exactly two operands, y then x. Both have the same scalar `F` or vector `V(FS,n)` type; the result has that exact type. No scalar/vector broadcast or mixed widths/lanes. The shared concrete grammar independently replays both operands. |
 | `MathFn::ToBits` | Exactly one f32/f64 operand; exact u32/u64 result of matching width. Copy and Pure. |
 | `MathFn::IsFinite`, `IsNan`, `IsInfinite` | Exactly one f32/f64 operand; bool result. Vectors and other scalar types reject. Copy and Pure. |
 | `MathFn::Fma` | Exactly three operands of one exact scalar `F` or vector `V(FS,n)`; result equals operand type. |

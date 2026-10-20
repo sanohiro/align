@@ -10245,8 +10245,12 @@ fn hir_body_validator_rejects_malformed_elementary_math_rows() {
         hir::MathFn::Log10,
         hir::MathFn::Expm1,
         hir::MathFn::Log1p,
+        hir::MathFn::Sin,
+        hir::MathFn::Cos,
+        hir::MathFn::Atan2,
     ];
     for operation in operations {
+        let arity = if operation == hir::MathFn::Atan2 { 2 } else { 1 };
         let mut wrong_arity = baseline_program();
         wrong_arity.fns.push(body_unit_case(
             &format!("math_{}_wrong_arity", operation.source_name()),
@@ -10266,7 +10270,7 @@ fn hir_body_validator_rejects_malformed_elementary_math_rows() {
             body_test_expr(
                 hir::ExprKind::MathOp {
                     fn_: operation,
-                    operands: vec![body_test_expr(hir::ExprKind::Int(1), int(64))],
+                    operands: vec![body_test_expr(hir::ExprKind::Int(1), int(64)); arity],
                 },
                 int(64),
             ),
@@ -10282,7 +10286,7 @@ fn hir_body_validator_rejects_malformed_elementary_math_rows() {
                     operands: vec![body_test_expr(
                         hir::ExprKind::Float(1.0),
                         Ty::Float(FloatTy { bits: 64 }),
-                    )],
+                    ); arity],
                 },
                 Ty::Bool,
             ),

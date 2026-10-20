@@ -82,6 +82,11 @@ pub enum MathFn {
     Expm1,
     /// `x.log1p()` — log(1+x) without small-argument cancellation.
     Log1p,
+    /// Sine/cosine in radians, on float scalars and explicit vectors.
+    Sin,
+    Cos,
+    /// `y.atan2(x)` — quadrant-aware arctangent in radians, with exact matching types.
+    Atan2,
     /// `b.pow(e)` — `b` raised to `e` (float).
     Pow,
     /// `fma(a, b, c)` — fused multiply-add `a*b + c` with a single rounding (float scalar or
@@ -121,8 +126,9 @@ impl MathFn {
             Self::Abs => (exact(1) && numeric).then_some(first),
             Self::Min | Self::Max => (exact(2) && numeric).then_some(first),
             Self::Sqrt | Self::Floor | Self::Ceil | Self::Round | Self::RoundEven | Self::Trunc
-            | Self::Exp | Self::Exp2 | Self::Log | Self::Log2 | Self::Log10 | Self::Expm1 | Self::Log1p =>
+            | Self::Exp | Self::Exp2 | Self::Log | Self::Log2 | Self::Log10 | Self::Expm1 | Self::Log1p | Self::Sin | Self::Cos =>
                 (exact(1) && floating).then_some(first),
+            Self::Atan2 => (exact(2) && floating).then_some(first),
             Self::Pow => (exact(2) && matches!(first, Ty::Float(_)) && floating).then_some(first),
             Self::Fma => (exact(3) && floating).then_some(first),
             Self::ToBits | Self::IsFinite | Self::IsNan | Self::IsInfinite =>
@@ -135,7 +141,7 @@ impl MathFn {
             Self::ToBits | Self::IsFinite | Self::IsNan | Self::IsInfinite => true,
             Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
             | Self::Round | Self::RoundEven | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
-            | Self::Log10 | Self::Expm1 | Self::Log1p | Self::Pow | Self::Fma => false,
+            | Self::Log10 | Self::Expm1 | Self::Log1p | Self::Sin | Self::Cos | Self::Atan2 | Self::Pow | Self::Fma => false,
         }
     }
 
@@ -149,12 +155,12 @@ impl MathFn {
             Self::IsFinite | Self::IsNan | Self::IsInfinite => Some(crate::Ty::Bool),
             Self::Abs | Self::Min | Self::Max | Self::Sqrt | Self::Floor | Self::Ceil
             | Self::Round | Self::RoundEven | Self::Trunc | Self::Exp | Self::Exp2 | Self::Log | Self::Log2
-            | Self::Log10 | Self::Expm1 | Self::Log1p | Self::Pow | Self::Fma => None,
+            | Self::Log10 | Self::Expm1 | Self::Log1p | Self::Sin | Self::Cos | Self::Atan2 | Self::Pow | Self::Fma => None,
         }
     }
 
     pub fn is_elementary_math(self) -> bool {
-        matches!(self, Self::Exp | Self::Exp2 | Self::Log | Self::Log2 | Self::Log10 | Self::Expm1 | Self::Log1p)
+        matches!(self, Self::Exp | Self::Exp2 | Self::Log | Self::Log2 | Self::Log10 | Self::Expm1 | Self::Log1p | Self::Sin | Self::Cos | Self::Atan2)
     }
 
     pub fn uses_scalar_libm(self) -> bool {
@@ -179,6 +185,9 @@ impl MathFn {
             Self::Log10 => "log10",
             Self::Expm1 => "expm1",
             Self::Log1p => "log1p",
+            Self::Sin => "sin",
+            Self::Cos => "cos",
+            Self::Atan2 => "atan2",
             Self::Pow => "pow",
             Self::Fma => "fma",
             Self::ToBits => "to_bits",

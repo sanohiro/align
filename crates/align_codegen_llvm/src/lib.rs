@@ -47,6 +47,8 @@ mod llvm_build_id;
 mod math_libm;
 #[cfg(test)]
 mod math_libm_tests;
+#[cfg(test)]
+mod trigonometry_tests;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
@@ -4012,7 +4014,12 @@ fn lower_prepared_module<'c>(
             ReturnAbi::StructMemory(_) => ctx.void_type().fn_type(&param_types, false),
         };
         if !runtime_abi::native_extern_abi_matches(ext.name.as_str(), fn_ty, ctx)
-            || !math_libm::extern_abi_matches(ext.name.as_str(), fn_ty, ctx)
+            || !math_libm::extern_abi_matches(
+                ext.name.as_str(),
+                fn_ty,
+                ctx,
+                math_libm::NativeTarget::new(arm_abi, x86_64_sysv),
+            )
         {
             return Err(CodegenError::Lowering(format!(
                 "native extern ABI mismatch:{}",
@@ -6280,7 +6287,7 @@ fn callable_preflight(
             format!("runtime:{:?}", abi.key),
         )?;
     }
-    for &(symbol, _, _) in &math_libm::ROWS {
+    for symbol in math_libm::symbols() {
         reserve_external_identity(&mut reserved, symbol.to_owned(), format!("math:{symbol}"))?;
     }
     for function in program
@@ -12554,7 +12561,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         &mut self,
         name: &str,
         overload: BasicTypeEnum<'c>,
-        argument: BasicValueEnum<'c>,
+        arguments: &[inkwell::values::BasicMetadataValueEnum<'c>],
         operation: hir::MathFn,
         ty: Ty,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
@@ -12564,7 +12571,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .ok_or_else(|| self.err(format!("could not declare intrinsic {name}")))?;
         let value = self
             .builder
-            .build_call(function, &[argument.into()], "intr")
+            .build_call(function, arguments, "intr")
             .map_err(|e| self.err(e))?
             .try_as_basic_value()
             .basic()
@@ -14500,11 +14507,14 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     align_sema::MathFn::Round => self.call_intrinsic("llvm.round", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::RoundEven => self.call_intrinsic("llvm.roundeven", &[overload], &[ops[0].into()])?,
                     align_sema::MathFn::Trunc => self.call_intrinsic("llvm.trunc", &[overload], &[ops[0].into()])?,
-                    align_sema::MathFn::Exp => self.call_elementary_math_intrinsic("llvm.exp", overload, ops[0], *fn_, *ty)?,
-                    align_sema::MathFn::Exp2 => self.call_elementary_math_intrinsic("llvm.exp2", overload, ops[0], *fn_, *ty)?,
-                    align_sema::MathFn::Log => self.call_elementary_math_intrinsic("llvm.log", overload, ops[0], *fn_, *ty)?,
-                    align_sema::MathFn::Log2 => self.call_elementary_math_intrinsic("llvm.log2", overload, ops[0], *fn_, *ty)?,
-                    align_sema::MathFn::Log10 => self.call_elementary_math_intrinsic("llvm.log10", overload, ops[0], *fn_, *ty)?,
+                    align_sema::MathFn::Exp => self.call_elementary_math_intrinsic("llvm.exp", overload, &[ops[0].into()], *fn_, *ty)?,
+                    align_sema::MathFn::Exp2 => self.call_elementary_math_intrinsic("llvm.exp2", overload, &[ops[0].into()], *fn_, *ty)?,
+                    align_sema::MathFn::Log => self.call_elementary_math_intrinsic("llvm.log", overload, &[ops[0].into()], *fn_, *ty)?,
+                    align_sema::MathFn::Log2 => self.call_elementary_math_intrinsic("llvm.log2", overload, &[ops[0].into()], *fn_, *ty)?,
+                    align_sema::MathFn::Log10 => self.call_elementary_math_intrinsic("llvm.log10", overload, &[ops[0].into()], *fn_, *ty)?,
+                    align_sema::MathFn::Sin => self.call_elementary_math_intrinsic("llvm.sin", overload, &[ops[0].into()], *fn_, *ty)?,
+                    align_sema::MathFn::Cos => self.call_elementary_math_intrinsic("llvm.cos", overload, &[ops[0].into()], *fn_, *ty)?,
+                    align_sema::MathFn::Atan2 => self.call_elementary_math_intrinsic("llvm.atan2", overload, &[ops[0].into(), ops[1].into()], *fn_, *ty)?,
                     align_sema::MathFn::Expm1 | align_sema::MathFn::Log1p =>
                         self.call_scalar_libm_math(ops[0], *fn_, *ty)?,
                     // `pow(base, exp)`.

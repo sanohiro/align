@@ -13148,6 +13148,9 @@ mod tests {
             (Log10, 1),
             (Expm1, 1),
             (Log1p, 1),
+            (Sin, 1),
+            (Cos, 1),
+            (Atan2, 2),
             (ToBits, 1),
             (IsFinite, 1),
             (IsNan, 1),
@@ -13273,10 +13276,13 @@ mod tests {
                 let scalar = Scalar::Float(FloatTy { bits });
                 let vector = Ty::Vec(scalar, lanes);
                 for operation in [
-                    Abs, Sqrt, Floor, Ceil, Round, RoundEven, Trunc, Exp, Exp2, Log, Log2, Log10, Expm1, Log1p,
+                    Abs, Sqrt, Floor, Ceil, Round, RoundEven, Trunc, Exp, Exp2, Log, Log2, Log10, Expm1, Log1p, Sin, Cos,
                 ] {
                     assert_eq!(operation.result_type(&[vector]), Some(vector));
                 }
+                assert_eq!(Atan2.result_type(&[vector; 2]), Some(vector));
+                assert_eq!(Atan2.result_type(&[vector, Ty::Float(FloatTy { bits })]), None);
+                assert_eq!(Atan2.result_type(&[vector, Ty::Vec(scalar, if lanes == 2 { 4 } else { 2 })]), None);
                 assert_eq!(Min.result_type(&[vector; 2]), Some(vector));
                 assert_eq!(Max.result_type(&[vector; 2]), Some(vector));
                 assert_eq!(Fma.result_type(&[vector; 3]), Some(vector));
@@ -13284,7 +13290,7 @@ mod tests {
                 for operation in [ToBits, IsFinite, IsNan, IsInfinite] {
                     assert_eq!(operation.result_type(&[vector]), None);
                 }
-                for operation in [Abs, Min, Max, Exp, Expm1, Log1p, Fma] {
+                for operation in [Abs, Min, Max, Exp, Expm1, Log1p, Sin, Cos, Atan2, Fma] {
                     for invalid in [
                         Ty::Vec(scalar, 3),
                         Ty::Vec(Scalar::Float(FloatTy { bits: 16 }), lanes),
