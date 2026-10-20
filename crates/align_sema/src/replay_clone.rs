@@ -470,6 +470,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         }
         ExprKind::Unsafe(_) => ExprKind::Unsafe(clones.block()?),
         ExprKind::RawAlloc(expr) => ExprKind::RawAlloc(boxed!(expr)),
+        ExprKind::RawTryAlloc(expr) => ExprKind::RawTryAlloc(boxed!(expr)),
         ExprKind::RawFree(expr) => ExprKind::RawFree(boxed!(expr)),
         ExprKind::RawIsNull(expr) => ExprKind::RawIsNull(boxed!(expr)),
         ExprKind::RawLoad {
@@ -2308,7 +2309,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::ResultOk(expr)
         | ExprKind::ResultErr(expr)
         | ExprKind::Try(expr)
-        | ExprKind::RawAlloc(expr)
+        | ExprKind::RawAlloc(expr) | ExprKind::RawTryAlloc(expr)
         | ExprKind::RawFree(expr)
         | ExprKind::RawIsNull(expr)
         | ExprKind::StaticDescriptorView { ptr: expr, .. }

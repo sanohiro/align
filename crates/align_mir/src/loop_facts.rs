@@ -262,7 +262,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::SqliteCallbackDescriptor { .. } | Rvalue::CallWithCleanup { .. } | Rvalue::Closure { .. } |
         Rvalue::RawCall { .. } | Rvalue::CallIndirectWithCleanup { .. } | Rvalue::MakeError { .. } |
         Rvalue::ArenaBegin { .. } | Rvalue::TgBegin { .. } | Rvalue::SpawnTask { .. } | Rvalue::TaskTake(..) |
-        Rvalue::TgWaitResult { .. } | Rvalue::HeapAlloc { .. } | Rvalue::RawAlloc { .. } |
+        Rvalue::TgWaitResult { .. } | Rvalue::HeapAlloc { .. } | Rvalue::RawAlloc { .. } | Rvalue::RawTryAlloc { .. } |
         Rvalue::ColumnBatchCreate { .. } | Rvalue::ColumnBatchAppend { .. } | Rvalue::ColumnBatchRow { .. } |
         Rvalue::ColumnBatchSoa { .. } | Rvalue::StaticDescriptorView { .. } | Rvalue::ResourceFromRaw { .. } |
         Rvalue::ResourceBorrow { .. } | Rvalue::ResourceRaw { .. } | Rvalue::ResourceIntoRaw { .. } |

@@ -25,6 +25,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan236](docs/impl/236-fallible-raw-carriers.md) supplies media AM-R15 and LLM R34
+  `raw.try_alloc(i64) -> Result<raw, Error>` plus non-owning raw carriers. Allocation
+  refusal returns an error; pointer transport adds no pointee cleanup or authority.
+  Whole/per-unit rollback and three-target native execution qualify the boundary.
+  External writable views and consumer adoption remain separate.
+
 - [Plan235](docs/impl/235-trigonometric-math.md) supplies media AM-R14/20
   `sin`, `cos` and `atan2` on f32/f64 and their explicit vectors through exact
   LLVM intrinsics. Signed axes, nonfinite cases, target argument reduction and

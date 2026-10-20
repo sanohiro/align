@@ -4240,6 +4240,17 @@ is introduced. Locale operations stay out of core/std; other normalization forms
 and grapheme work remain unselected. [Plan191](impl/191-unicode-nfc.md) and the
 [package design](impl/pkg-design/unicode.md) fix ownership, errors and conformance.
 
+### Fallible raw allocation and carriers (Plan236)
+
+Settled: unsafe `raw.try_alloc(size: i64) -> Result<raw, Error>` attempts the
+existing allocator once. Invalid size gives Invalid, zero gives Ok(null), positive
+refusal gives Code(12), and positive success is uninitialized, at least eight-byte
+aligned and manually freed with raw.free. No automatic pointee owner is created.
+Raw is a Copy/Static leaf in Option, both Result positions, concrete/generic sums,
+flat tuples and ordinary record fields. Other members keep their own ownership
+and view facts. Collection/box/task/JSON/foreign carrier domains do not widen.
+Plan236 owns exact validation, ABI, codec, rollback and refusal acceptance.
+
 ## Open (to be decided)
 
 ### SQLite collation identity and persisted-index migration — pending (post-D14, consumer-gated)

@@ -54,6 +54,13 @@ record の直接・tagged タプル field と Align のタプル callback も同
 [Plan190](../../190-tuple-carrier-composition.md) はタプル要素の許可範囲、
 collection/box/global/FFI の制限、共有 borrow からの Move タプル projection の禁止を維持する。
 
+raw は Option、Result の両 payload、sum、フラットなタプル、通常の field に
+格納できる非所有の Copy 値です（[Plan236](../../236-fallible-raw-carriers.md)）。
+構築・取り出し・置換・破棄で参照先を解放しません。unsafe な
+`raw.try_alloc(i64)` は `Result<raw,Error>` を返し、明示的な `raw.free` または
+対応する resource hook が解放を担います。他の要素の Drop と view の寿命は
+維持され、raw の collection や安全な参照先アクセスは追加されません。
+
 ## Effects
 
 Pure な機構である。`?` は制御フローであってエフェクトではない。関数が impure になるのは、その関数が *呼び出す* 処理を通じてのみである。

@@ -1412,8 +1412,7 @@ impl<'a> PlacementValidator<'a> {
                 if self.stream_carrier_class(field.ty) != align_sema::HttpStreamCarrierClass::None
                     || self.upgrade_carrier_class(field.ty)
                         != align_sema::HttpUpgradeCarrierClass::None
-                    || !(self.field_type_ok(field.ty, abstract_node)
-                        || definition.c_repr && field.ty == Ty::Raw)
+                    || !self.field_type_ok(field.ty, abstract_node)
                     || (definition.c_repr && align_sema::c_record_field_scalar(field.ty).is_none())
                     || !self.inline_structs_unaligned(field.ty)
                 {
@@ -1613,7 +1612,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Param(_) => allow_param,
             Ty::Int(integer) => valid_int(integer.bits),
             Ty::Float(float) => valid_float(float.bits),
-            Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Rng => true,
+            Ty::Raw | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Rng => true,
             Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column
             | Ty::CodecBoolColumn | Ty::CodecStrColumn => true,
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple|
@@ -1732,7 +1731,7 @@ impl<'a> PlacementValidator<'a> {
         match scalar {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
-            Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String
+            Scalar::Raw | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String
             | Scalar::HttpClient | Scalar::HttpRequest | Scalar::HttpResponse => true,
             Scalar::DynArray(element) => valid_prim(element),
             Scalar::DynStructArray(id) => self.dynamic_struct_array_ok(id),
@@ -1825,6 +1824,7 @@ impl<'a> PlacementValidator<'a> {
 
     fn scalar_leaf_ok(&self, scalar: Scalar, mode: ScalarPlacement) -> bool {
         match scalar {
+            Scalar::Raw => !matches!(mode, ScalarPlacement::Collection),
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
             Scalar::Param(_) => matches!(
@@ -1930,7 +1930,7 @@ impl<'a> PlacementValidator<'a> {
         match scalar {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
-            Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
+            Scalar::Raw | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
             Scalar::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple|
                 tuple.elems.len() >= 2 && tuple.elems.iter().all(|&element| self.tuple_element_ok(element))),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
@@ -2212,7 +2212,7 @@ impl<'a> PlacementValidator<'a> {
             return false;
         }
         match payload {
-            Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Str => false,
+            Scalar::Raw | Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Str => false,
             Scalar::Tagged(id) => !align_sema::drop_plan(
                 Ty::Tagged(id),
                 &self.program.structs, &self.program.tuples,
@@ -2639,7 +2639,7 @@ impl<'a> Validator<'a> {
                 self.push_ref(Node::Struct(id), Edge::Header, facts)
             }
             Scalar::DynArray(element) | Scalar::Slice(element) => valid_prim(element),
-            Scalar::Bool
+            Scalar::Raw | Scalar::Bool
             | Scalar::Char
             | Scalar::Unit
             | Scalar::String
@@ -3618,7 +3618,7 @@ impl<'a> BodyValidator<'a> {
                 self.body_scalar_ok(payload) && self.placement.box_payload_ok(payload)
             }
             Ty::Array(element, _) => {
-                !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
+                !matches!(element, Scalar::Raw | Scalar::Struct(_)) && self.body_scalar_ok(element)
             }
             Ty::Vec(element, lanes) | Ty::Mask(element, lanes) => {
                 matches!(lanes, 2 | 4 | 8 | 16)
@@ -3628,10 +3628,10 @@ impl<'a> BodyValidator<'a> {
             Ty::StructArray(id, _) => self.program.structs.get(id as usize).is_some(),
             Ty::DynStructArray(id, Layout::Aos) => self.placement.dynamic_struct_array_ok(id),
             Ty::DynStructArray(_, Layout::Soa) => false,
-            Ty::Slice(element) => self.body_scalar_ok(element),
+            Ty::Slice(element) => element != Scalar::Raw && self.body_scalar_ok(element),
             Ty::DynSliceArray(element) => valid_prim(element),
             Ty::DynArray(element) => {
-                !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
+                !matches!(element, Scalar::Raw | Scalar::Struct(_)) && self.body_scalar_ok(element)
             }
             ty @ (Ty::DynVecArray(..)
             | Ty::DynMaskArray(..)
@@ -3651,7 +3651,7 @@ impl<'a> BodyValidator<'a> {
             }
             Ty::Task(payload) => task_result_type(self.program, payload) && self.body_scalar_ok(payload),
             Ty::ArenaHandle | Ty::Builder => true,
-            Ty::ArrayBuilder(element) => self.body_scalar_ok(element),
+            Ty::ArrayBuilder(element) => element != Scalar::Raw && self.body_scalar_ok(element),
             ty @ (Ty::VecArrayBuilder(..)
             | Ty::MaskArrayBuilder(..)
             | Ty::FixedArrayBuilder(..)
@@ -3976,7 +3976,7 @@ impl<'a> BodyValidator<'a> {
         match scalar {
             Scalar::Int(integer) => valid_int(integer.bits),
             Scalar::Float(float) => valid_float(float.bits),
-            Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::Str | Scalar::String => true,
+            Scalar::Raw | Scalar::Bool | Scalar::Char | Scalar::Unit | Scalar::Str | Scalar::String => true,
             Scalar::Tuple(id) => self.program.tuples.get(id as usize).is_some(),
             Scalar::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Scalar::Enum(id) => self.program.enums.get(id as usize).is_some(),
@@ -4077,7 +4077,7 @@ impl<'a> BodyValidator<'a> {
             owned if align_sema::fixed_owned_header_scalar(owned).is_some() => true,
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
-            Ty::Slice(_) => false,
+            Ty::Raw | Ty::Slice(_) => false,
             Ty::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
                     && !align_sema::enum_is_move(
@@ -4454,7 +4454,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::NamedArena { .. }
             | hir::ExprKind::Unsafe(_)
             | hir::ExprKind::RawNull
-            | hir::ExprKind::RawAlloc(_)
+            | hir::ExprKind::RawAlloc(_) | hir::ExprKind::RawTryAlloc(_)
             | hir::ExprKind::RawFree(_)
             | hir::ExprKind::RawLoad { .. }
             | hir::ExprKind::RawStore { .. }
@@ -6801,7 +6801,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::ResultOk(expr)
             | hir::ExprKind::ResultErr(expr)
             | hir::ExprKind::Try(expr)
-            | hir::ExprKind::RawAlloc(expr)
+            | hir::ExprKind::RawAlloc(expr) | hir::ExprKind::RawTryAlloc(expr)
             | hir::ExprKind::RawFree(expr)
             | hir::ExprKind::HeapNew(expr)
             | hir::ExprKind::BoxGet(expr)
@@ -8322,6 +8322,11 @@ impl<'a> BodyValidator<'a> {
                 let flow = self.expr_flow(size)?;
                 (context.unsafe_depth > 0 && flow.ty == i64_ty())
                     .then_some((Ty::Raw, flow.falls, flow.breaks))
+            }
+            hir::ExprKind::RawTryAlloc(size) => {
+                let flow = self.expr_flow(size)?;
+                (context.unsafe_depth > 0 && flow.ty == i64_ty())
+                    .then_some((Ty::Result(Scalar::Raw, Scalar::Enum(self.error_id()?)), flow.falls, flow.breaks))
             }
             hir::ExprKind::RawFree(ptr) => {
                 let flow = self.expr_flow(ptr)?;

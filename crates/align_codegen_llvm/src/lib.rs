@@ -49,6 +49,8 @@ mod math_libm;
 mod math_libm_tests;
 #[cfg(test)]
 mod trigonometry_tests;
+#[cfg(test)]
+mod fallible_raw_tests;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
 pub mod pgo;
@@ -7263,7 +7265,7 @@ fn scalar_type<'c>(
         // one and not the other — sema 8 / codegen `i32` 4, caught only where the layout-parity
         // table happens to have a row.
         Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
-        Ty::Resource(_) | Ty::ResourceRef(_) => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::Raw | Ty::Resource(_) | Ty::ResourceRef(_) => ctx.ptr_type(AddressSpace::default()).into(),
         _ if align_sema::is_move_handle(ty) => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
         Ty::Vec(s, n) => vec_llvm_ty(ctx, scalar_to_ty(s), n),
@@ -7569,7 +7571,7 @@ fn tagged_payload_key(payload: Scalar, llvm_type: BasicTypeEnum<'_>) -> TaggedPa
 fn tagged_child(payload: Scalar) -> Option<u32> {
     match payload {
         Scalar::Tagged(id) => Some(id),
-        Scalar::Int(_)
+        Scalar::Raw | Scalar::Int(_)
         | Scalar::Float(_)
         | Scalar::Bool
         | Scalar::Char
@@ -8330,6 +8332,7 @@ fn set_struct_body<'c>(
 
 fn scalar_bytes(s: Scalar) -> u64 {
     match s {
+        Scalar::Raw => 8,
         Scalar::Int(it) => (it.bits / 8).max(1) as u64,
         Scalar::Float(ft) => (ft.bits / 8) as u64,
         Scalar::Bool => 1,
@@ -14975,6 +14978,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_store(ptr, self.operand(init)?)
                     .map_err(|e| self.err(e))?;
                 ptr.into()
+            }
+            Rvalue::RawTryAlloc { size, error_enum } => {
+                self.gen_raw_try_alloc(size, *error_enum, result_ty)?
             }
             Rvalue::RawAlloc(size) => {
                 // `raw.alloc(size)` → `align_rt_alloc(size) -> ptr` (a flat libc `malloc`). The size
@@ -22885,6 +22891,71 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))?;
         self.builder.position_at_end(valid);
         Ok(())
+    }
+
+    fn gen_raw_try_alloc(
+        &mut self,
+        size: &Operand,
+        error_enum: u32,
+        result_ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        let expected = Ty::Result(Scalar::Raw, Scalar::Enum(error_enum));
+        if result_ty != expected {
+            return Err(self.err("raw.try_alloc result type mismatch"));
+        }
+        let pointer_type = self.ctx.ptr_type(AddressSpace::default());
+        let out = self.alloca_at_entry(pointer_type.into(), "raw.try_alloc.out")?;
+        self.builder.build_store(out, pointer_type.const_null()).map_err(|e| self.err(e))?;
+        let size = self.operand(size)?;
+        let status = self.builder.build_call(
+            self.runtime(RuntimeKey::RawTryAlloc), &[size.into(), out.into()], "raw.try_alloc.status",
+        ).map_err(|e| self.err(e))?.try_as_basic_value().basic()
+            .ok_or_else(|| self.err("raw.try_alloc status is absent"))?.into_int_value();
+        let ok = self.ctx.append_basic_block(self.func, "raw.try_alloc.ok");
+        let invalid = self.ctx.append_basic_block(self.func, "raw.try_alloc.invalid");
+        let refused = self.ctx.append_basic_block(self.func, "raw.try_alloc.refused");
+        let abort = self.ctx.append_basic_block(self.func, "raw.try_alloc.abort");
+        let join = self.ctx.append_basic_block(self.func, "raw.try_alloc.join");
+        let i32_type = self.ctx.i32_type();
+        self.builder.build_switch(status, abort, &[
+            (i32_type.const_zero(), ok), (i32_type.const_int(2, false), invalid),
+            (i32_type.const_int(17, false), refused),
+        ]).map_err(|e| self.err(e))?;
+        let result_type = result_struct_type(self.ctx, Scalar::Raw, Scalar::Enum(error_enum),
+            self.struct_types, self.enum_types, self.tagged_types);
+        let result_shape = self.result_union_shape(Scalar::Raw, Scalar::Enum(error_enum))?;
+        self.builder.position_at_end(ok);
+        let pointer = self.builder.build_load(pointer_type, out, "raw.try_alloc.pointer")
+            .map_err(|e| self.err(e))?;
+        let ok_value = self.build_union_from_values(result_type, self.ctx.i8_type().const_zero(),
+            result_shape.variant(0)?, &[pointer])?;
+        self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
+        let error_type = *self.enum_types.get(error_enum as usize)
+            .ok_or_else(|| self.err("raw.try_alloc Error type is absent"))?;
+        let error_shape = self.enum_union_shape(error_enum)?;
+        let mut errors = Vec::with_capacity(2);
+        for (block, variant, payload) in [
+            (invalid, align_sema::ERROR_VARIANT_INVALID, None),
+            (refused, ERROR_VARIANT_CODE, Some(i32_type.const_int(12, false).into())),
+        ] {
+            self.builder.position_at_end(block);
+            let payload: Vec<BasicValueEnum<'c>> = payload.into_iter().collect();
+            let error = self.build_union_from_values(error_type, i32_type.const_int(variant as u64, false),
+                error_shape.variant(variant as usize)?, &payload)?;
+            let value = self.build_union_from_values(result_type, self.ctx.i8_type().const_int(1, false),
+                result_shape.variant(1)?, &[error.into()])?;
+            self.builder.build_unconditional_branch(join).map_err(|e| self.err(e))?;
+            errors.push((value, block));
+        }
+        self.builder.position_at_end(abort);
+        self.builder.build_call(self.runtime(RuntimeKey::ProcessAbort), &[], "")
+            .map_err(|e| self.err(e))?;
+        self.builder.build_unreachable().map_err(|e| self.err(e))?;
+        self.builder.position_at_end(join);
+        let phi = self.builder.build_phi(result_type, "raw.try_alloc.result").map_err(|e| self.err(e))?;
+        phi.add_incoming(&[(&ok_value, ok)]);
+        for (value, block) in &errors { phi.add_incoming(&[(value, *block)]); }
+        Ok(phi.as_basic_value())
     }
 
     #[inline(never)]

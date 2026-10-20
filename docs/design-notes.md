@@ -2566,3 +2566,14 @@ caller-selected output limit to all four decoders: a PNG header's expected exten
 can bound staging before allocation, rather than reject only after decompression.
 The default remains 1 GiB; this payload limit does not promise bounded native
 workspace or RSS.
+
+### Fallible raw carriers (Plan236)
+
+Current private GPU metadata allocation needs recoverable refusal and partial
+rollback. `raw.try_alloc` uses the one Result model and existing malloc/free
+family; nullable failure would duplicate error handling, while an implicit owning
+pointer would change raw's Copy/Static contract. Option, Result, sum, tuple and
+ordinary-field transport therefore share one non-owning representation. Explicit
+resource construction remains the way to acquire automatic cleanup. Collection
+and foreign-carrier admission are independent capabilities, not consequences of
+adding an internal Scalar leaf. K1 view authority is not supplied or consumed.

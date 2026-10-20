@@ -1057,6 +1057,7 @@ The result formula in every row is followed by the universal
 | `Unsafe` | `env[]`; `child[block at unsafe_depth+1]`; `post[result block/context-selected divergence type; depth is restored before the next sibling; no runtime region; unsafe permission is lexical and effect is Impure]`. |
 | `RawNull` | `env[]; child[]; post[result Raw; copy; no unsafe lexical owner is required because forming the target null value has no memory effect and compile-time constant substitution erases its source origin; source sema still requires `unsafe` for an ordinary expression-level `raw.null()`]`. |
 | `RawAlloc` | `env[]`; `child[size]`; `post[size i64; result Raw; unsafe lexical owner required; caller manually owns allocation]`. |
+| `RawTryAlloc` | `env[builtin Error identity]`; `child[size]`; `post[size i64; exact Result<Raw,Error>; unsafe lexical owner required; Impure; Copy/Static non-owning result; no pointee permission or cleanup fact]`. |
 | `RawFree` | `env[]`; `child[ptr]`; `post[ptr Raw; result Unit; unsafe; runtime deallocates the referenced manual allocation; Raw is Copy, so its bits are neither nulled nor statically consumed and every later use or second free remains the unsafe programmer's responsibility; no automatic Drop fact]`. |
 | `RawLoad` | `env[scalar]`: scalar is Int/Float/Bool/Char or `Struct(id)` whose exact stored definition has `c_repr == true`; unlike extern by-value placement, the producer's raw-storable predicate does not reject an empty C-layout struct. `child[ptr,offset]`; `post[ptr Raw, offset i64, result scalar_to_ty(scalar); unsafe; borrowed memory read]`. |
 | `RawStore` | `env[]`; `child[ptr,offset,value]`; `post[ptr Raw, offset i64, value is Int/Float/Bool/Char or Struct(id) with c_repr == true under the same raw-storable predicate; result Unit; unsafe; manual memory write]`. |
@@ -2519,3 +2520,13 @@ reads Copy task payloads. Callable preflight authenticates the exact callback
 return, DynamicBit cleanup ABI, fallibility and capture metadata before LLVM.
 Forged allocating Task producers and substituted Copy/Move readers reject.
 [Plan228](228-task-owned-results.md) names the malformed-input and native owners.
+
+### Raw carrier admission (Plan236)
+
+Scalar::Raw reversibly names existing Ty::Raw and adds no pointee ownership or
+provenance. Payload, tuple and ordinary-field admission is shared with sema;
+collection placements still reject naked raw. Existing aggregate Drop/region
+walks recurse through the other members. RawTryAlloc replays exact i64 input,
+lexical unsafe and builtin Error result, including eager divergence. RawLoad
+continues to reject Scalar::Raw: pointer storage uses the exact RawPointerLoad
+record, and whole-struct raw storage remains C-layout-only.

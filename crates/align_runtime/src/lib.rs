@@ -18328,9 +18328,18 @@ static OWNED_ALLOC_FAIL_AFTER: core::sync::atomic::AtomicI64 =
 
 #[cfg(test)]
 fn owned_allocator_failpoint() -> bool {
+    if RAW_TRY_ALLOC_FAIL.with(|slot| slot.get()) {
+        return true;
+    }
     let remaining = OWNED_ALLOC_FAIL_AFTER.load(core::sync::atomic::Ordering::Relaxed);
     remaining >= 0
         && OWNED_ALLOC_FAIL_AFTER.fetch_sub(1, core::sync::atomic::Ordering::Relaxed) == 0
+}
+
+#[cfg(test)]
+std::thread_local! {
+    // A scoped owner exercises real malloc refusal without affecting another libtest worker.
+    static RAW_TRY_ALLOC_FAIL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
 }
 
 unsafe fn owned_raw_alloc(size: usize) -> *mut u8 {
@@ -18603,6 +18612,29 @@ pub extern "C" fn align_rt_alloc(size: i64) -> *mut u8 {
     ptr
 }
 
+/// Fallible flat allocation. The output is null on every failure and for a zero extent.
+///
+/// # Safety
+/// Non-null `out` points to one aligned writable pointer cell. A successful positive
+/// result must be released through `align_rt_free` exactly once by the caller.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_raw_try_alloc(size: i64, out: *mut *mut u8) -> i32 {
+    if out.is_null() {
+        return AL_INVALID;
+    }
+    unsafe { out.write(core::ptr::null_mut()) };
+    let Ok(size) = safe_len(size) else { return AL_INVALID; };
+    if size == 0 {
+        return 0;
+    }
+    let pointer = try_owned_alloc(size);
+    if pointer.is_null() {
+        return AL_CODE + 12;
+    }
+    unsafe { out.write(pointer) };
+    0
+}
+
 /// Fallible member of the owned malloc/free family. Callers admit nonzero extents first.
 fn try_owned_alloc(size: usize) -> *mut u8 {
     let ptr = unsafe { owned_raw_alloc(size) };
@@ -18613,6 +18645,9 @@ fn try_owned_alloc(size: usize) -> *mut u8 {
     requested_live_insert(0, ptr, size);
     ptr
 }
+
+#[cfg(test)]
+mod fallible_raw_tests;
 
 /// Free a heap buffer from [`align_rt_alloc`]. Null-safe (a no-op), so dropping an owned
 /// value whose slot was never initialised is harmless.

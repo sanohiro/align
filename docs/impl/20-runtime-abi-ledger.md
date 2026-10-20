@@ -8,8 +8,8 @@ ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
 returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Plan 65's
 SIMD-surface consistency capability adds `BufferAppendFilled`. Unsigned integer display adds `PrintU64`, a non-retaining `u64` input with
 `void(i64)` native ABI and the same stdout/flush behavior as signed display.
-Current inventory: 474 keyed,
-492 base, 499 alloc-count, 496 par-map-probe and 503 maximum exports.
+Current inventory: 475 keyed,
+493 base, 500 alloc-count, 497 par-map-probe and 504 maximum exports.
 
 **R65 planned contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md), designed and ready for implementation, own the new
@@ -79,7 +79,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 474 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 475 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -126,7 +126,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 474 keyed records, 492 base records, and 503 records in the maximum optional-probe export table.
+are 475 keyed records, 493 base records, and 504 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -145,6 +145,7 @@ declaration golden owns the emitted declaration and the class token together.
 | Registry row | Physical symbol | `EffectClass` |
 |---|---|---|
 | `Alloc` | `align_rt_alloc` | `AllocNew` |
+| `RawTryAlloc` | `align_rt_raw_try_alloc` | `IndirectStorage` |
 | `AllocSizeFail` | `align_rt_alloc_size_fail` | `FailNoReturn` |
 | `ArenaAlloc` | `align_rt_arena_alloc` | `IndirectStorage` |
 | `ArenaBegin` | `align_rt_arena_begin` | `AllocNew` |
@@ -1769,24 +1770,24 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 474 keys, mapped symbols, LLVM declaration types, and derived effects
+- all 475 keys, mapped symbols, LLVM declaration types, and derived effects
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 492 base native symbols against default-feature `align_runtime` exports,
+- the 493 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
-- the 499 `alloc-count` and 496 `par-map-probe` native symbols against
+- the 500 `alloc-count` and 497 `par-map-probe` native symbols against
   `align_runtime` built with each feature separately, including the eleven exact
   probe signatures above;
-- the 503 maximum native symbols against `align_runtime` built with
+- the 504 maximum native symbols against `align_runtime` built with
   `alloc-count,par-map-probe,task-group-probe`, while proving
   `task-group-probe` adds no unmangled export;
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 474 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  474 exact registry function types through the production compatibility
+- all 475 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  475 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; explicit `ArgsBuild` exact status/out-pointer source
@@ -2413,3 +2414,19 @@ the flag before transferring/dropping R. Cleanup delegates to canonical iterativ
 Drop. Generated identity version2/tag5 carries the complete canonical R graph.
 No symbol/key count or interface record changes. [Plan228](228-task-owned-results.md)
 owns the lifecycle, unsafe native obligations and regression matrix.
+
+### Plan236 fallible flat raw allocation
+
+`RawTryAlloc` selects `i32 @align_rt_raw_try_alloc(i64 size, ptr out)`. It is
+IndirectStorage with Unstated argument memory, output escape ordinal 1 and no
+release, fresh-return or noalias promise on its status result. Non-null out is
+one aligned writable pointer cell; null out returns 2 before allocation. Clear
+out before validating size. Negative/target-unrepresentable size returns 2;
+zero returns 0 with null; positive refusal returns 17; positive success returns
+0 with one malloc-family allocation. Failure always leaves null. Existing
+`align_rt_free` releases the allocation. No retry, hidden cleanup or arena mode.
+
+The semantic RawTryAlloc MIR produces Result<Raw,builtin Error> atomically. LLVM
+uses a private zeroed out cell and accepts only 0/2/17; other statuses abort as
+a violated private ABI. Runtime scoped refusal tests exercise the real allocator;
+source/native observation separately owns status conversion and partial cleanup.

@@ -410,6 +410,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             format!("tg_wait{} {}", if *fallible { " fallible" } else { "" }, operand_str(tg))
         }
         Rvalue::HeapAlloc(h, init) => format!("heap_alloc({}, {})", operand_str(h), operand_str(init)),
+        Rvalue::RawTryAlloc { size, error_enum } => format!("raw_try_alloc({}, Error#{error_enum})", operand_str(size)),
         Rvalue::RawAlloc(size) => format!("raw_alloc({})", operand_str(size)),
         Rvalue::ColumnBatchCreate { max_rows, struct_id } => format!(
             "column_batch_create({}, struct#{struct_id})",

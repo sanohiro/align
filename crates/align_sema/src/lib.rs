@@ -145,6 +145,8 @@ pub fn signature_key_kind_from_name(name: &str) -> Option<SignatureKeyKind> {
 /// Keeping it `Copy` and non-recursive lets [`Ty`] stay `Copy` (no boxing/interning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum Scalar {
+    /// Non-owning opaque pointer, Copy/Static with no pointee authority or Drop.
+    Raw,
     Int(IntTy),
     Float(FloatTy),
     Bool,
@@ -462,7 +464,7 @@ pub fn scan_accumulator_result(
 ) -> Option<Ty> {
     match acc {
         Ty::Struct(_) => independent_record_array_result(acc, structs, tuples, enums, tagged_types),
-        Ty::Tuple(_) => None,
+        Ty::Raw | Ty::Tuple(_) => None,
         _ => ty_to_scalar(acc).map(Ty::DynArray),
     }
 }
@@ -1026,7 +1028,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::Error => {}
     }
     match *scalar {
-        Scalar::Int { .. }
+        Scalar::Raw | Scalar::Int { .. }
         | Scalar::Float { .. }
         | Scalar::Bool
         | Scalar::Char
@@ -1096,6 +1098,7 @@ fn is_raw_scalar(ty: Ty) -> bool {
 
 pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
     match ty {
+        Ty::Raw => Some(Scalar::Raw),
         Ty::Int(it) => Some(Scalar::Int(it)),
         Ty::Float(ft) => Some(Scalar::Float(ft)),
         Ty::Bool => Some(Scalar::Bool),
@@ -1251,6 +1254,7 @@ fn fn_value_ret_ok_with_http_stream_carrier(
 
 pub fn scalar_to_ty(s: Scalar) -> Ty {
     match s {
+        Scalar::Raw => Ty::Raw,
         Scalar::Int(it) => Ty::Int(it),
         Scalar::Float(ft) => Ty::Float(ft),
         Scalar::Bool => Ty::Bool,
@@ -2856,7 +2860,7 @@ pub fn drop_plan(
 fn tuple_element_is_supported(scalar: Scalar) -> bool {
     matches!(
         scalar,
-        Scalar::Int(_)
+        Scalar::Raw | Scalar::Int(_)
             | Scalar::Float(_)
             | Scalar::Bool
             | Scalar::Char
@@ -3737,7 +3741,7 @@ fn ty_contains_http_receive_stream(
             Scalar::Int(_)
             | Scalar::Float(_)
             | Scalar::Bool
-            | Scalar::Char
+            | Scalar::Raw | Scalar::Char
             | Scalar::Unit
             | Scalar::String
             | Scalar::DynArray(_)
@@ -3961,7 +3965,7 @@ pub fn http_stream_carrier_class(
             scalar @ (Scalar::Int(_)
             | Scalar::Float(_)
             | Scalar::Bool
-            | Scalar::Char
+            | Scalar::Raw | Scalar::Char
             | Scalar::Unit
             | Scalar::Struct(_)
             | Scalar::Tuple(_)
@@ -10088,7 +10092,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             // checked structurally here; its acyclicity and alignment are validated in pass 0b-2,
             // once all struct fields are populated. The field-specific array restrictions are
             // applied below after the complete struct table exists.
-            if !(is_field_ok(ty, &tuples, &tagged_types) || s.c_repr && ty == Ty::Raw) {
+            if !is_field_ok(ty, &tuples, &tagged_types) {
                 diags.error(
                     format!("struct field type is not supported here, got {}", ty_name(ty)),
                     f.span,
@@ -10204,9 +10208,10 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char => {
                         payload.push(ty_to_scalar(ty).expect("primitive scalar"));
                     }
+                    Ty::Raw => payload.push(Scalar::Raw),
+                    Ty::Tuple(id) => payload.push(Scalar::Tuple(id)),
                     // A `str` view payload (J1): makes the enum region-tracked (see `tracks_region` /
                     // `region_of` / `ty_may_borrow`), never Move (a `str` borrows, owns nothing).
-                    Ty::Tuple(id) => payload.push(Scalar::Tuple(id)),
                     Ty::Str => payload.push(Scalar::Str),
                     // An owned string is a finite Move leaf. The enclosing sum's tag-switched Drop
                     // frees it only when this variant is active.
@@ -18395,7 +18400,7 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
                 return !hir_block_diverges(b);
             }
-            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) => {
+            ExprKind::RawAlloc(e) | ExprKind::RawTryAlloc(e) | ExprKind::RawFree(e) => {
                 walk!(e);
                 self.impure_direct = true;
             }
@@ -26021,7 +26026,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FnValue(..)
             | ExprKind::Wait
             | ExprKind::OptionNone
-            | ExprKind::RawAlloc(..)
+            | ExprKind::RawAlloc(..) | ExprKind::RawTryAlloc(..)
             | ExprKind::RawFree(..)
             | ExprKind::RawLoad { .. }
             | ExprKind::RawPointerLoad { .. }
@@ -26450,7 +26455,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::SoaColumn { .. }
             | ExprKind::IndexField { .. }
             | ExprKind::OptionNone
-            | ExprKind::RawAlloc(..)
+            | ExprKind::RawAlloc(..) | ExprKind::RawTryAlloc(..)
             | ExprKind::RawFree(..)
             | ExprKind::RawLoad { .. }
             | ExprKind::RawPointerLoad { .. }
@@ -29901,7 +29906,7 @@ impl<'a> EscapeCheck<'a> {
                 unreachable!("escape control expressions use explicit walk items");
             }
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
-            | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawFree(i)
+            | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawTryAlloc(i) | ExprKind::RawFree(i)
             | ExprKind::RawIsNull(i) | ExprKind::BoxGet(i)
             | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BytesView { bytes: i, .. } | ExprKind::SliceAsBytes { slice: i, .. } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
@@ -32994,7 +32999,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::Spawn { .. }
         | ExprKind::Wait
         | ExprKind::OptionNone
-        | ExprKind::RawAlloc(_)
+        | ExprKind::RawAlloc(_) | ExprKind::RawTryAlloc(_)
         | ExprKind::RawNull
         | ExprKind::RawFree(_)
         | ExprKind::RawLoad { .. }
@@ -42894,7 +42899,7 @@ impl<'a> MoveCheck<'a> {
             //   `HttpResponseBuilder` family.
             ExprKind::Unit | ExprKind::Int(..) | ExprKind::Float(..) | ExprKind::Char(..) | ExprKind::Bool(..)
             | ExprKind::Unary { .. } | ExprKind::Cast(..) | ExprKind::Binary { .. } | ExprKind::IntArith { .. }
-            | ExprKind::MathOp { .. } | ExprKind::Wait | ExprKind::RawAlloc(..) | ExprKind::RawFree(..)
+            | ExprKind::MathOp { .. } | ExprKind::Wait | ExprKind::RawAlloc(..) | ExprKind::RawTryAlloc(..) | ExprKind::RawFree(..)
             | ExprKind::RawLoad { .. } | ExprKind::RawStore { .. } | ExprKind::RawOffset { .. }
             | ExprKind::RawIsNull(..)
             | ExprKind::ResourceFromRaw { parent: None, .. }
@@ -48147,7 +48152,7 @@ impl<'a> MoveCheck<'a> {
                             && matches!(child.kind, ExprKind::ElemField { .. }) => break,
                     ExprKind::Unary { expr: child, .. }
                     | ExprKind::Cast(child)
-                    | ExprKind::RawAlloc(child)
+                    | ExprKind::RawAlloc(child) | ExprKind::RawTryAlloc(child)
                     | ExprKind::RawFree(child)
                     | ExprKind::RawIsNull(child)
                     | ExprKind::BoxGet(child)
@@ -49934,8 +49939,8 @@ impl<'a> MoveCheck<'a> {
                     return false;
                 }
             }
-            // `raw.alloc`'s size / `raw.free`'s pointer are Copy operands (int / `raw`), never moved.
-            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) | ExprKind::RawIsNull(e) => {
+            // Allocation sizes and `raw.free` pointers are Copy operands (int / `raw`), never moved.
+            ExprKind::RawAlloc(e) | ExprKind::RawTryAlloc(e) | ExprKind::RawFree(e) | ExprKind::RawIsNull(e) => {
                 move_expr!(self, e, moved, false, false)
             }
             // `raw.load`/`raw.store` operands are Copy (raw ptr + int offset + scalar value), never moved.
@@ -56477,8 +56482,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// caller, which mislabelled an array literal's element as a payload.
     fn payload_scalar(&mut self, ty: Ty, what: &str, allow_tagged: bool, span: Span) -> Scalar {
         let f = self.finalize(ty);
-        if !allow_tagged && matches!(f, Ty::Tuple(_)) {
-            self.diags.error(format!("{what} cannot be a tuple"), span);
+        if !allow_tagged && matches!(f, Ty::Tuple(_) | Ty::Raw) {
+            self.diags.error(format!("{what} cannot be {}", ty_name(f)), span);
             return Scalar::Int(IntTy { bits: 64, signed: true });
         }
         let scalar = ty_to_scalar(f).or_else(|| match (allow_tagged, f) {
@@ -56700,12 +56705,12 @@ impl<'a, 't> Checker<'a, 't> {
             if module == "heap" && method == "new" {
                 return self.check_heap_new(args, expected, span);
             }
-            // `raw.null()` / `raw.alloc(size)` / `raw.free(p)` / `raw.load(p, off)` /
+            // `raw.null()` / `raw.alloc(size)` / `raw.try_alloc(size)` / `raw.free(p)` / `raw.load(p, off)` /
             // `raw.store(p, off, v)` / `raw.offset(p, n)` — the unsafe raw-pointer ops (`raw` is a
             // module name, not a value).
             // `unsafe {}`-only.
             if module == "raw"
-                && matches!(method, "null" | "alloc" | "free" | "load" | "store" | "offset")
+                && matches!(method, "null" | "alloc" | "try_alloc" | "free" | "load" | "store" | "offset")
             {
                 return self.check_raw_op(method, args, expected, span);
             }
@@ -62453,7 +62458,7 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
             _ => {
-                let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_))) else {
+                let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_) | Scalar::Raw)) else {
                     self.diags.error(
                         format!("'to_array' needs a scalar or Copy struct element, got {}", ty_name(elem)),
                         span,
@@ -62550,7 +62555,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_))) else {
+        let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_) | Scalar::Raw)) else {
             self.diags.error(
                 format!("'map_into' needs a scalar element, got {} (project a field first)", ty_name(elem)),
                 span,
@@ -62918,7 +62923,7 @@ impl<'a, 't> Checker<'a, 't> {
         let Some((source, stages, elem)) = piped else {
             return err;
         };
-        if matches!(elem, Ty::Tuple(_)) || ty_to_scalar(elem).is_none() {
+        if matches!(elem, Ty::Raw | Ty::Tuple(_)) || ty_to_scalar(elem).is_none() {
             self.diags.error(
                 format!("'{name}' needs a scalar element, got {} (project a field first)", ty_name(elem)),
                 span,
@@ -64064,8 +64069,8 @@ impl<'a, 't> Checker<'a, 't> {
             || matches!(ty, Ty::Struct(id) if self.structs.get(id as usize).is_some_and(|s| s.c_repr))
     }
 
-    /// `raw.null()` / `raw.alloc(size)` / `raw.free(p)` — the unsafe raw-pointer ops (draft.md §6.5). Valid only
-    /// inside an `unsafe {}` block. `alloc` takes an integer byte size and yields a `raw` pointer;
+    /// Unsafe raw-pointer operations (draft.md §6.5), valid only inside `unsafe {}`.
+    /// `alloc` takes an integer byte size and yields `raw`; `try_alloc` takes i64 and yields Result<raw, Error>;
     /// `free` takes a `raw` pointer and yields unit. The memory is manually managed (no auto-drop),
     /// which is exactly why these are confined to `unsafe`.
     fn check_raw_op(&mut self, method: &str, args: &[ast::Expr], expected: Option<Ty>, span: Span) -> Expr {
@@ -64078,10 +64083,10 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let nargs = match method {
             "null" => 0,
-            "alloc" | "free" => 1,
+            "alloc" | "try_alloc" | "free" => 1,
             "load" | "offset" => 2,
             "store" => 3,
-            _ => unreachable!("check_raw_op is only dispatched for null/alloc/free/load/store/offset"),
+            _ => unreachable!("check_raw_op is only dispatched for null/alloc/try_alloc/free/load/store/offset"),
         };
         if args.len() != nargs {
             self.diags.error(format!("'raw.{method}' takes {nargs} argument(s), got {}", args.len()), span);
@@ -64103,6 +64108,13 @@ impl<'a, 't> Checker<'a, 't> {
                     return err;
                 }
                 Expr { kind: ExprKind::RawAlloc(Box::new(size)), ty: Ty::Raw, span }
+            }
+            "try_alloc" => {
+                let size = self.check_expr(&args[0], Some(i64t));
+                if size.ty == Ty::Error { return err; }
+                let ty = Ty::Result(Scalar::Raw, Scalar::Enum(self.error_enum_id));
+                self.constrain(ty, expected, span);
+                Expr { kind: ExprKind::RawTryAlloc(Box::new(size)), ty, span }
             }
             "free" => {
                 let p = self.check_expr(&args[0], Some(Ty::Raw));
@@ -64168,7 +64180,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.check_raw_ptr_offset(&p, &n, "offset", args[0].span, args[1].span);
                 Expr { kind: ExprKind::RawOffset { ptr: Box::new(p), offset: Box::new(n) }, ty: Ty::Raw, span }
             }
-            _ => unreachable!("check_raw_op is only dispatched for null/alloc/free/load/store/offset"),
+            _ => unreachable!("check_raw_op is only dispatched for null/alloc/try_alloc/free/load/store/offset"),
         }
     }
 
@@ -72766,7 +72778,7 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::TaskGroup(b)
             | ExprKind::Unsafe(b)
             | ExprKind::Loop { body: b, .. } => self.finalize_block(b),
-            ExprKind::RawAlloc(e) | ExprKind::RawFree(e) | ExprKind::RawIsNull(e) => {
+            ExprKind::RawAlloc(e) | ExprKind::RawTryAlloc(e) | ExprKind::RawFree(e) | ExprKind::RawIsNull(e) => {
                 self.finalize_expr(e)
             }
             ExprKind::RawLoad { ptr, offset, .. } | ExprKind::RawOffset { ptr, offset } => {
@@ -76089,8 +76101,8 @@ fn scalar_arg(
         diags.error(format!("{what} cannot be a generic type parameter yet, got {}", ty_name(ty)), span);
         return None;
     }
-    if matches!(ty, Ty::Tuple(_)) && !allow_param {
-        diags.error(format!("{what} cannot be a tuple"), span);
+    if matches!(ty, Ty::Tuple(_) | Ty::Raw) && !allow_param {
+        diags.error(format!("{what} cannot be {}", ty_name(ty)), span);
         return None;
     }
     // `run_bytes` has one public carrier: the Ok slot of `Result<run_bytes, E>`. The Result
@@ -76224,7 +76236,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
     }
     if matches!(
         ty,
-        Ty::Tuple(_) |
+        Ty::Raw | Ty::Tuple(_) |
         Ty::Buffer
             | Ty::SignatureKey(_)
             | Ty::CliCommand
@@ -77873,7 +77885,7 @@ fn is_field_ok(ty: Ty, tuples: &[hir::TupleDef], tagged_types: &[hir::TaggedType
         // framework handles intentionally admitted as fields, embedding it would broaden the
         // reviewed ownership surface without a field move-out/replacement owner.
         Ty::RunBytes => return false,
-        Ty::Int(_)
+        Ty::Raw | Ty::Int(_)
         | Ty::Float(_)
         | Ty::Bool
         | Ty::Char
@@ -78230,7 +78242,7 @@ fn enum_payload_ok(
     tagged_types: &[hir::TaggedType],
 ) -> bool {
     match s {
-        Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
+        Scalar::Raw | Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char | Scalar::Str | Scalar::String => true,
         Scalar::Struct(id) => structs.get(id as usize).is_some(),
         Scalar::Tuple(id) => tuples.get(id as usize).is_some_and(|tuple| tuple.elems.len() >= 2
             && tuple.elems.iter().copied().all(tuple_element_is_supported)),
@@ -81888,9 +81900,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // OsMemory observes only Copy counts and retains no storage.
         // UnicodeNfc constructs a fresh owned string without retaining input storage.
         // ArraySortCmp shares the fresh pipeline-element policy with the other sort terminals.
+        // RawTryAlloc constructs a Copy Result without retained input storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 359,
+            variants, 360,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

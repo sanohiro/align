@@ -385,6 +385,7 @@ key|ProcessTable|process_table|HostState|declare i32 @align_rt_process_table(i64
 key|ProcessUserNamespace|process_user_namespace|HostState|declare i32 @align_rt_process_user_namespace(ptr, i64, ptr) #2
 key|ProcessUserNamespaceFree|process_user_namespace_free|HostState|declare void @align_rt_process_user_namespace_free(ptr) #2
 key|RangeFail|range_fail|FailNoReturn|declare void @align_rt_range_fail(i64, i64, i64) #1
+key|RawTryAlloc|raw_try_alloc|IndirectStorage|declare i32 @align_rt_raw_try_alloc(i64, ptr) #2
 key|RegexCaptures|regex_captures|IndirectStorage|declare i32 @align_rt_regex_captures(ptr, ptr, i64, ptr) #2
 key|RegexCapturesFree|regex_captures_free|IndirectStorage|declare void @align_rt_regex_captures_free(ptr) #2
 key|RegexCapturesGroup|regex_captures_group|IndirectStorage|declare i32 @align_rt_regex_captures_group(ptr, i64, ptr) #2

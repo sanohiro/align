@@ -1,5 +1,10 @@
 # Raw pointer fields in C-layout records
 
+[Plan236](236-fallible-raw-carriers.md) supersedes this plan's ordinary raw-field
+exclusion with coherent non-owning tagged/product carriers. Its raw pointer
+contract preserves the C layout and unsafe storage obligations below. Historical
+ordinary-field negative owners become accepted twins; other C restrictions remain.
+
 [Plan233](233-c-record-fixed-arrays.md) extends the field domain below with
 positive fixed arrays of C integer/float scalars. Its shared classifier and
 flattened scalar-leaf rules preserve this plan's Copy, scratch and native-call

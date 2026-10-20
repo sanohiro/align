@@ -1398,7 +1398,7 @@ unsafe
 ```
 
 Only inside an unsafe block: the `raw.*` flat-memory ops
-(`null`/`alloc`/`free`/`load`/`store`/`offset`) and
+(`null`/`alloc`/`try_alloc`/`free`/`load`/`store`/`offset`) and
 a foreign call. A C function is declared `extern "C" fn name(params) -> ret` (or a braced group) and
 called like any other function, but only inside `unsafe` — foreign code is outside the safe core. A
 direct call or non-escaping pipeline/reducer/sort callback requires that lexical `unsafe`
@@ -1424,6 +1424,23 @@ unavailable. (`draft.md` §15 for the extern/`unsafe` rules, §8 for the produce
 A function containing `unsafe` is inferred Impure, so it can **never** be a `par_map` callee — the
 danger stays visible and traceable.
 
+`raw.try_alloc(size: i64) -> Result<raw, Error>` is the fallible unsafe
+alternative. Negative or target-unrepresentable sizes return `Error.Invalid`;
+zero returns `Ok(raw.null())` without allocating. A positive size attempts one
+malloc-family allocation; refusal returns `Error.Code(12)` without abort or
+retry. Success exposes uninitialized bytes, aligned like `raw.alloc` (at least
+eight bytes on supported 64-bit targets). The caller must release the pointer
+exactly once with `raw.free` or transfer a positive, non-null result to a matching
+resource. No residency, over-alignment or automatic pointee cleanup is promised.
+Existing `raw.alloc` behavior is unchanged.
+
+`raw` composes through Option, both Result positions, concrete/generic sum
+payloads, flat tuple elements and ordinary record fields. It remains Copy and
+Static: copying, replacing, discarding or returning these carriers never frees
+the pointee or grants lifetime, non-null, aliasing or access authority. Mixed
+owners/views retain their own cleanup/lifetimes. Naked raw collections, boxes,
+task results, JSON and foreign carrier signatures remain outside this extension.
+
 `raw.store(p, offset, value)` and `raw.load(p, offset)` move one inferred flat value at a byte
 offset. Store takes its type from `value`; load takes it from the expected result type. Admitted
 values are primitive scalars, `raw` pointers, and eligible non-empty `layout(C)` structs. Pointer
@@ -1442,7 +1459,7 @@ order, natural alignment, no reordering). Among structs, only such a struct may 
 from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its scalar fields must be
 integers, floats, or `raw` pointers. Pointer fields retain native pointer size/alignment and are
 non-owning Copy values: no implicit free, pointee copy, lifetime extension or dereference authority.
-Direct raw fields in ordinary structs and generic C records remain rejected
+Ordinary raw fields use Plan236's non-owning carrier contract; generic C records remain rejected
 ([plan137](impl/137-c-layout-raw-fields.md)).
 
 Fixed numeric fields `[P; N]` are also C-compatible when P is an integer or
