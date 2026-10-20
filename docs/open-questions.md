@@ -1238,6 +1238,19 @@ Other E2 functions and SIMD providers remain separate capabilities. E1's existin
 structural promise is unchanged. [Plan234](impl/234-cancellation-sensitive-math.md)
 owns the exact contract and closure matrix.
 
+### Scalar/vector trigonometry — DONE (2026-10-20)
+
+**Decision:** `sin()`, `cos()` and `y.atan2(x)` on f32/f64 and vec2/4/8/16
+of either float preserve exact operand/result types and use radians. Atan2's
+argument order and signed-axis/quadrant/nonfinite behavior are fixed; no y/x
+rewrite or implicit broadcast is admitted. All are Pure Copy and never abort,
+with no Align allocation. Existing LLVM intrinsics own scalar/vector lowering;
+the target may scalarize or combine sin/cos, with truthful existing visibility.
+Target precision remains without a global ULP or bit-identity promise. Reserve
+standard and combined native identities against incompatible externs and export
+replacement. Other E4 functions remain independent reservations.
+[Plan235](impl/235-trigonometric-math.md) owns the exact contract and matrix.
+
 ### Radix integer literals (DONE 2026-06-26)
 **Decision: base-prefixed integer literals `0x` (hex) / `0o` (octal) / `0b` (binary), `_` separators
 in any base.** A radix literal is an ordinary integer literal — same `i128` storage, width inferred

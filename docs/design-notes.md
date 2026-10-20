@@ -34,6 +34,14 @@ SIMD provider. Native effects must not be erased by invented LLVM attributes,
 and fixed math symbols cannot be replaced by user exports.
 [Plan234](impl/234-cancellation-sensitive-math.md) owns this capability.
 
+[Plan235](impl/235-trigonometric-math.md) adds the useful sin/cos/atan2 subset
+without requiring the complete reserved E4 family. Existing LLVM vector
+intrinsics preserve operation identity and target argument reduction; atan2
+cannot be replaced by dividing first. Native identity ownership includes the
+paired sin/cos helper selected by the target. Independently checked numeric
+samples qualify implementations without promising identical consumer bits
+across platforms. No new provider, ownership or error model is introduced.
+
 Floating-point relaxation is a visible lexical value scope, not an ambient build mode or a family
 of fast reducer names. `float(reassoc) {}` and `float(contract) {}` name exactly the two guarantees
 the programmer may relinquish. They compose independently, nest by union, and never add flags to a

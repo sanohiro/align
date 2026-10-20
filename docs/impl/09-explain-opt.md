@@ -709,9 +709,9 @@ not enumerate this internal schema.
 
 ## Elementary vector-math visibility (plan 75; implemented)
 
-`exp`, `exp2`, `log`, `log2`, and `log10` preserve a vector operation in raw
+`exp`, `exp2`, `log`, `log2`, `log10`, `sin`, `cos` and `atan2` preserve a vector operation in raw
 LLVM IR, but that fact alone does not prove machine SIMD. For each reached
-explicit-vector E1 or Plan234 operation, the optimized inspection path classifies the
+explicit-vector E1, Plan234 or Plan235 operation, the optimized inspection path classifies the
 selected optimized LLVM shape as eliminated or merged, retained vector IR, or
 scalarized before instruction selection. A scalarized row uses an LLVM reason when one is
 available. For Plan234 `expm1`/`log1p`, retained scalar calls instead carry the

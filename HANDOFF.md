@@ -25,6 +25,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan235](docs/impl/235-trigonometric-math.md) supplies media AM-R14/20
+  `sin`, `cos` and `atan2` on f32/f64 and their explicit vectors through exact
+  LLVM intrinsics. Signed axes, nonfinite cases, target argument reduction and
+  native helper identities are qualified; vector disposition stays visible.
+  Consumer rotary/guide adoption remains external.
+
 - [Plan234](docs/impl/234-cancellation-sensitive-math.md) supplies media AM-R12/19
   `expm1`/`log1p` on f32/f64 and their explicit vectors through width-exact native
   math. Signed-zero/domain semantics and independent finite samples qualify the

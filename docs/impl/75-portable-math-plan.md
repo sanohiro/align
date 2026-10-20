@@ -29,6 +29,9 @@ Request 92.
 pair `expm1`/`log1p` across the same scalar/vector types. It owns their width-exact
 libm fallback and special values; E1's vector-intrinsic promise below is unchanged.
 The shared visibility schema includes that pair as specified in section1.1.
+[Plan235](235-trigonometric-math.md) adds sin/cos/atan2 on the same scalar/vector
+types through exact LLVM intrinsics, including binary argument order and target
+combined-helper native identity ownership.
 
 ## 1. Public-contract ledger
 
@@ -51,7 +54,8 @@ Closed set        core.math reserves the IEEE 754-2019 §9.2 elementary family
                         atan2, asinPi, acosPi, atanPi, atan2Pi, sinh, cosh,
                         tanh, asinh, acosh, atanh
                   Reservation is not availability. E1 ships here; Plan234 ships
-                  expm1/log1p. Other reserved functions need their own complete
+                  expm1/log1p; Plan235 ships sin/cos/atan2. Other reserved
+                  functions need their own complete
                   useful capability and ledger, not necessarily a whole tier.
                   The current pow surface is unchanged.
 
@@ -185,14 +189,14 @@ cross-target result identity to hide that target fact.
 ### 1.1 Exact visibility record
 
 The inspection path builds one private record for every reached, user-written
-explicit-vector E1 or Plan234 operation before optimization and resolves it after the
+explicit-vector E1, Plan234 or Plan235 operation before optimization and resolves it after the
 selected profile pipeline:
 
 ```text
 MathVisibilityRecord {
   function: ProgramCall
   operation_ordinal: u32
-  operation: Exp | Exp2 | Log | Log2 | Log10 | Expm1 | Log1p
+  operation: Exp | Exp2 | Log | Log2 | Log10 | Expm1 | Log1p | Sin | Cos | Atan2
   ty: Vec(FloatWidth, LaneCount)
   state: EliminatedOrMerged | RetainedVectorIr | Scalarized
   provider: None | Configured(ProviderId)
@@ -208,7 +212,7 @@ MathVisibilitySource {
 ```
 
 `operation_ordinal` is one-based within the concrete function in HIR evaluation
-order across the seven supported elementary vector operations only. `FloatWidth` is exactly `F32 | F64`;
+order across the ten supported elementary vector operations only. `FloatWidth` is exactly `F32 | F64`;
 `LaneCount` is exactly `2 | 4 | 8 | 16`. `ProviderId` is compiler-owned ASCII
 toolchain identity, never an ambient path or soname; this capability produces
 only `None`. `llvm_reason` is diagnostic text and never artifact identity. A

@@ -146,6 +146,9 @@ replays the same exhaustive type equation. Finite last bits and NaN payloads
 may vary by target implementation; type checking does not mint an accuracy or
 SIMD fact. Plan234 adds `expm1`/`log1p` with exactly the same type equation,
 receiver-before-arity order and Pure Copy ownership. `logp1` is not an alias.
+Plan235 adds unary `sin`/`cos` and binary `atan2` on these exact types. For
+`y.atan2(x)`, both operands and the result have identical width and lane count;
+check receiver, then arity, then argument type. No scalar broadcast is inferred.
 
 ---
 
