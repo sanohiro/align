@@ -25,6 +25,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan234](docs/impl/234-cancellation-sensitive-math.md) supplies media AM-R12/19
+  `expm1`/`log1p` on f32/f64 and their explicit vectors through width-exact native
+  math. Signed-zero/domain semantics and independent finite samples qualify the
+  pair; scalar vector fallback is visible. No universal ULP/SIMD promise or
+  consumer adoption claim is introduced.
+
 - [Plan229](docs/impl/229-out-slice-read-certification.md) certifies initialized
   `out slice<T>` reads for LLM R157, including imported/generic callers. Readable
   header storage remains separate from writable backing authority; alias,

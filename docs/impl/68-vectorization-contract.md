@@ -490,6 +490,11 @@ together and leaves the existing scalar `pow` on its current contract. It does
 not introduce an Align-owned math library or a Java/StrictMath-style
 cross-target bit-identity promise.
 
+[Plan234](234-cancellation-sensitive-math.md) extends the shared inspection record
+with `expm1`/`log1p`. Those operations have no LLVM22 intrinsic and explicitly
+lower to width-exact scalar libm calls per lane, with a compiler fallback reason.
+That separate capability does not alter E1's vector-intrinsic guarantee below.
+
 The issue's criterion "loop vectorizer successfully vectorizes loops over slices
 using these operations" is unreachable by adding intrinsics. Worse, with no
 vector implementation configured, LLVM 22 turns an `llvm.exp.v2f32` loop into

@@ -127,6 +127,14 @@ SIMD merely from the raw or optimized intrinsic. A future provider is explicit
 target/toolchain configuration and enters cache identity; codegen never
 discovers one ambiently.
 
+Plan234 `expm1`/`log1p` instead use exact C `float(float)` or `double(double)`
+libm calls, with no false memory/effect attributes. Explicit vectors extract,
+call and insert once per lane in ascending order. One shared native signature
+authority validates all four standard symbols even in unused externs or units
+without MathOp; user exports cannot replace those symbols. No new runtime export
+or artifact is introduced. The same visibility record labels retained calls
+scalarized with the compiler's exact fallback reason.
+
 ### Module verification (every profile, on every emit path)
 
 `build_module` verifies the module it just built. Every emit path — object, PGO, ThinLTO prelink,

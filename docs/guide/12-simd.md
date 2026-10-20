@@ -118,6 +118,13 @@ Use scalar accessors such as `raw.f32_le(offset)` for unaligned packed data. A t
 
 `exp`, `exp2`, `log`, `log2`, and `log10` are zero-argument methods on scalar and vector floats. Vector forms apply lane by lane. They may become scalar library calls when the target has no vector math provider; vector-shaped LLVM IR alone does not prove final machine SIMD. These methods do not promise scalar/vector or cross-target bit identity or a fixed ULP error bound.
 
+`expm1()` and `log1p()` also accept the same scalar/vector float types, preserve
+signed zero and return the receiver type. They avoid the cancellation in
+`x.exp() - 1.0` and `(1.0 + x).log()` near zero. LLVM22 has no matching intrinsic,
+so vector forms call width-exact platform math once per lane. `explain-opt`
+reports that compiler fallback. They have the same target-dependent precision
+posture, never abort, and introduce no Align allocation.
+
 Ordinary arithmetic and reductions are ordered and uncontracted by default. When the algorithm permits different rounding, name the permission at its source:
 
 ```align

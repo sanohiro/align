@@ -711,10 +711,13 @@ not enumerate this internal schema.
 
 `exp`, `exp2`, `log`, `log2`, and `log10` preserve a vector operation in raw
 LLVM IR, but that fact alone does not prove machine SIMD. For each reached
-explicit-vector E1 operation, the optimized inspection path classifies the
+explicit-vector E1 or Plan234 operation, the optimized inspection path classifies the
 selected optimized LLVM shape as eliminated or merged, retained vector IR, or
 scalarized before instruction selection. A scalarized row uses an LLVM reason when one is
-available. Provider absence is a separate stable fact: when no provider is
+available. For Plan234 `expm1`/`log1p`, retained scalar calls instead carry the
+exact compiler reason `LLVM 22 has no vector intrinsic; emitted lane-wise libm calls`.
+Optimizer remarks cannot erase that provenance, and reconstruction shuffles
+cannot count as vector math. Provider absence is a separate stable fact: when no provider is
 configured, the report says final instruction selection may still scalarize a
 retained intrinsic. It never calls retained vector IR final machine SIMD, and
 never reports retained-vector success when optimized IR already contains the
@@ -725,7 +728,7 @@ independent exact LLVM view; a provider-level machine-shape promise requires an
 emitted-object disassembly owner.
 
 Plan 75 owns the exact `MathVisibilityRecord`. The producer is a companion of
-the existing optimization runner: it inventories reached E1 vector
+the existing optimization runner: it inventories reached E1 and Plan234 vector
 operations before the selected pipeline, inspects the optimized module before
 instruction selection, and returns the private records with the LLVM remarks.
 Its three exhaustive states are `EliminatedOrMerged`, `RetainedVectorIr`, and

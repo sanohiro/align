@@ -40,6 +40,8 @@ fn display(x: f64, y: f64) {
     print(one.log())
     print(one.log2())
     print(one.log10())
+    print(zero.expm1())
+    print(zero.log1p())
     neg_zero: f64 := -0.0
     print(neg_zero.to_bits())
     print(x.is_finite())
@@ -51,7 +53,7 @@ fn main() -> i32 {
     return 0
 }
 "#;
-            let expected = "0.0\n2.0\n2.0\n2.0\n1.0\n1.0\n1.0\n1.0\n1.0\n4.0\n6.0\n1.0\n1.0\n0.0\n0.0\n0.0\n9223372036854775808\ntrue\ntrue\ntrue\n";
+            let expected = "0.0\n2.0\n2.0\n2.0\n1.0\n1.0\n1.0\n1.0\n1.0\n4.0\n6.0\n1.0\n1.0\n0.0\n0.0\n0.0\n0.0\n0.0\n9223372036854775808\ntrue\ntrue\ntrue\n";
             let whole = build_and_run("math-discriminator-whole", source);
             assert_eq!(whole.status.code(), Some(0));
             assert_eq!(String::from_utf8_lossy(&whole.stdout), expected);

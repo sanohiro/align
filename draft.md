@@ -649,6 +649,20 @@ classes are fixed: exponentials map ±0 to +1, +∞ to +∞ and -∞ to +0;
 logarithms map +1 to +0, ±0 to -∞, +∞ to +∞, and negative nonzero values to
 NaN; NaN inputs produce NaN.
 
+`expm1()` and `log1p()` are also zero-argument methods on these scalar and
+vector float types, returning the exact receiver type. They compute exp(x)-1
+and log(1+x) without first rounding exp(x) or 1+x to the receiver format. Both
+preserve signed zero and map NaN to NaN. `expm1` maps +∞ to +∞ and -∞ to -1;
+positive overflow is +∞. `log1p` maps +∞ to +∞, -1 to -∞ and values below -1
+(including -∞) to NaN. Tiny results may be subnormal or signed zero according
+to target underflow behavior. Both are Pure Copy operations with no Align
+allocation and never abort. The same absence of a global ULP or bit-identity
+promise applies. They call width-exact native `expm1f`/`expm1` and
+`log1pf`/`log1p`; LLVM22 has no corresponding intrinsic. Vector lowering emits
+one scalar call per lane in ascending order and `explain-opt` reports that
+compiler fallback. No `logp1` alias is provided. [Plan234](docs/impl/234-cancellation-sensitive-math.md)
+owns the exact native identity and inspection contract.
+
 Floating-point evaluation is ordered and uncontracted by default. A lexical block may explicitly
 relinquish either guarantee:
 

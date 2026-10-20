@@ -1224,6 +1224,20 @@ identity must be explicit; ambient discovery is rejected. Existing scalar
 `pow` is unchanged. [Plan 75](impl/75-portable-math-plan.md) owns the exact
 special-value and closure matrix.
 
+### Cancellation-sensitive float methods — DONE (2026-10-20)
+
+**Decision:** `expm1()` and `log1p()` on f32/f64 and vec2/4/8/16 of either
+float return the exact receiver type. Width-exact platform libm implements the
+operation without an exp-minus-one or log-of-rounded-one-plus-input rewrite.
+Both preserve signed zero, have defined IEEE exceptional result classes and
+remain Pure Copy without Align allocation. There is no global ULP or bit-identity
+promise. LLVM22's absent intrinsics require compiler-generated scalar calls for
+vectors; the shared visibility record reports this provenance. Standard spelling
+`log1p` replaces the previously unshipped `logp1` reservation without an alias.
+Other E2 functions and SIMD providers remain separate capabilities. E1's existing
+structural promise is unchanged. [Plan234](impl/234-cancellation-sensitive-math.md)
+owns the exact contract and closure matrix.
+
 ### Radix integer literals (DONE 2026-06-26)
 **Decision: base-prefixed integer literals `0x` (hex) / `0o` (octal) / `0b` (binary), `_` separators
 in any base.** A radix literal is an ordinary integer literal — same `i128` storage, width inferred
