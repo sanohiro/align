@@ -297,8 +297,13 @@ That archive preserves the prior narrative; it is not a source of current status
 evidence for unresolved LLM R37/R49/R80. Voice V006
 ([Plan231](docs/impl/231-fixed-scalar-heap-fields.md)) has the provider implementation:
 primitive Copy fixed fields in heap records, exact zero-size storage and existing
-complete-field Copy observation. Consumer adoption remains pending. Media AM-R16/17
-fixed-field access and native layout are next, as separate capability assessments.
+complete-field Copy observation. Media AM-R16's independent fixed-field indexing
+is implemented by [Plan232](docs/impl/232-indexed-fixed-field-values.md), including
+chained record fields and an eager Copy snapshot before the inner index. The outer
+receiver's backing must remain live through its read. Retained indexed-field
+slices still require interprocedural authority and lifetime closure; the current
+shared-helper-return witness loses read-only authority in both frontends.
+Consumer adoption remains pending. AM-R17's C-layout/raw fixed fields are next.
 Establish consumer value, policy fit, the smallest complete useful capability,
 prerequisites and cost before selection. Distinguish real settled restrictions
 from implementation gaps; broad scope alone does not justify deferral.

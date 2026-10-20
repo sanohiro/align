@@ -48,6 +48,15 @@ header or allocation. Length is a literal u32 in the type, not a const-generic
 expression. Existing element exclusions remain singular. [Plan 73](impl/73-fixed-array-field-plan.md)
 owns the exact contract and implementation closure.
 
+[Plan232](impl/232-indexed-fixed-field-values.md) composes an existing indexed
+fixed-field Copy value with an ordinary fixed index. Snapshotting the complete
+independent field before the inner index gives the explicit-binding behavior,
+including original values when that index replaces the parent. It retains no
+parent address or view authority; chained record fields follow the same path.
+The complete field must contain only independent data, not merely have a scalar
+selected result. Indexed slices retain parent storage and remain a separate
+permission/lifetime capability; this value composition does not supply it.
+
 Exact string dispatch belongs to the existing value-pattern family. A
 `match` over `str` or `string` evaluates and borrows its scrutinee once, requires
 the `_` that an infinite domain cannot enumerate, rejects duplicate decoded

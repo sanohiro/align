@@ -25,6 +25,15 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 
 `bytes` is prose shorthand for `slice<u8>`, not a distinct type.
 
+[Plan232](../232-indexed-fixed-field-values.md) supports
+`rows[row].path.fixed[index]` for an existing independent Copy fixed-field value.
+The complete field is copied before the inner index, as with an explicit local
+binding; both signed bounds and source evaluation order remain. The result may
+outlive parent replacement or retirement, including chained record-field reads.
+The read allocates nothing and adds no borrowed view or indexed mutation. Views,
+owners, pointers and callables in the complete field still exclude this form.
+Direct slicing of an indexed fixed field remains a separate capability.
+
 `[T; N]` also names the fixed-array type in annotations. A record field contains its N slots
 inline; no array header, builder or allocation is introduced. Named locals, parameters and stable
 field places share the same checked index/range/slice/pipeline/mutation operations. Copy/Move and
@@ -114,7 +123,7 @@ fields for primitive Copy scalar P, including zero. The field adds no allocation
 A completely zero-sized heap element retains its logical initialized count without payload
 storage. Read a complete fixed field as an ordinary Copy value (`shape := values[i].shape`),
 then index or slice that local. Other fixed element families, broader borrowed payloads
-and direct indexed-parent fixed-field operations remain separate.
+and direct indexed-parent fixed-field views remain separate; Plan232 adds independent value indexing.
 
 R78's request for payload-free enum fields remains deferred/PROPOSED; the
 closed enum-field exclusion above is unchanged. [Plan 56](../56-r77-r83-composition-plan.md) records

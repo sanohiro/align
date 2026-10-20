@@ -49642,6 +49642,9 @@ impl<'a> MoveCheck<'a> {
                     && !path.is_empty()
                 {
                     self.check_borrow_use(base, e.span);
+                    // MIR captures this receiver before the index. Evaluate it here as well so
+                    // the ordinary completion snapshot keeps its backing live until the read.
+                    move_expr!(self, recv, moved, false, false);
                     let exact_index = match index.kind {
                         ExprKind::Int(value) if value >= 0 => u32::try_from(value).ok(),
                         _ => None,
@@ -65701,14 +65704,45 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // A slot-backed fixed array must be a literal or a variable (same restriction as a
         // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
-        if self.collection_receiver_needs_slot_binding(&r) {
+        if self.collection_receiver_needs_slot_binding(&r)
+            && !self.independent_fixed_field_value(&r)
+        {
             self.diags.error(
                 "indexing a fixed array requires an array literal or a variable (an arbitrary array expression is not supported yet)".to_string(),
                 span,
             );
             return err;
         }
-        Expr { kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty: elem, span }
+        self.index_with_fixed_field_snapshot(r, i, elem, span)
+    }
+
+    /// The existing complete-field value read may be snapshotted before an inner index. Views,
+    /// owners and callable environments cannot use this independent-data normalization.
+    fn independent_fixed_field_value(&self, value: &Expr) -> bool {
+        matches!(value.kind, ExprKind::ElemField { .. })
+            && matches!(value.ty, Ty::Array(..) | Ty::StructArray(..))
+            && independent_copy_type(value.ty, self.structs, self.tuples, self.enums, self.tagged_types)
+    }
+
+    /// Canonicalize the explicit Copy binding, including for a chained record-field read. The
+    /// field value completes before the inner index; no parent address survives into that index.
+    fn index_with_fixed_field_snapshot(&mut self, recv: Expr, index: Expr, ty: Ty, span: Span) -> Expr {
+        if !self.independent_fixed_field_value(&recv) {
+            return Expr { kind: ExprKind::Index { recv: Box::new(recv), index: Box::new(index) }, ty, span };
+        }
+        let root = self.declare(&format!("$fixed_copy{}", self.locals.len()), recv.ty, false);
+        self.scope.pop();
+        let local = Expr { kind: ExprKind::Local(root), ty: recv.ty, span: recv.span };
+        Expr {
+            kind: ExprKind::Block(Block {
+                stmts: vec![Stmt::Let { local: root, init: recv }],
+                value: Some(Box::new(Expr {
+                    kind: ExprKind::Index { recv: Box::new(local), index: Box::new(index) }, ty, span,
+                })),
+            }),
+            ty,
+            span,
+        }
     }
 
     /// Whether `elem` is a Move element that a read (index) or a view (range slice) cannot
@@ -71006,12 +71040,15 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             self.check_expr(arr, None)
         };
-        // Only an owning array field's independent record needs a copied intermediate.
-        // Existing slice-field projections retain their direct, possibly borrowed semantics.
+        // Independent records selected from owning or fixed array fields use canonical Copy
+        // intermediates. Slice-field projections retain their direct, possibly borrowed semantics.
         let copy_element = (use_kind == IndexedFieldUse::Value
             && matches!(r.kind, ExprKind::ElemField { .. }))
             .then(|| indexed_array_field_copy_element(r.ty, self.structs, self.tuples,
-                self.enums, self.tagged_types)).flatten();
+                self.enums, self.tagged_types).or_else(|| match r.ty {
+                    Ty::StructArray(id, _) if self.independent_fixed_field_value(&r) => Some(Ty::Struct(id)),
+                    _ => None,
+                })).flatten();
         let i = self.check_array_index_expr(index);
         if i.ty == Ty::Error {
             return err;
@@ -71036,6 +71073,7 @@ impl<'a, 't> Checker<'a, 't> {
         // A fixed `array<Struct>` slot must be a literal or a variable (same restriction as a
         // pipeline source — MIR addresses it through a slot). A `{ptr,len}` view is fine as a value.
         if matches!(r.ty, Ty::StructArray(..))
+            && copy_element.is_none()
             && !matches!(
                 r.kind,
                 ExprKind::ArrayLit { .. } | ExprKind::Local(_) | ExprKind::Field { .. }
@@ -71105,11 +71143,9 @@ impl<'a, 't> Checker<'a, 't> {
         }
         self.constrain(leaf_ty, expected, span);
         if let Some(ty @ Ty::Struct(_)) = copy_element {
-            // Canonical Let(Index)/Field retains both bounds, the complete parent reservation,
-            // and the independent Copy result. No intermediate array header becomes a value.
-            let element = Expr {
-                kind: ExprKind::Index { recv: Box::new(r), index: Box::new(i) }, ty, span,
-            };
+            // Canonical Let(Index)/Field retains both bounds and the independent Copy result.
+            // Owning fields retain their parent reservation; fixed fields snapshot before Index.
+            let element = self.index_with_fixed_field_snapshot(r, i, ty, span);
             let root = self.declare(&format!("$indexed_copy{}", self.locals.len()), ty, false);
             self.scope.pop();
             return Expr {

@@ -21,6 +21,13 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 
 `bytes` はドキュメントなどの文章表現における `slice<u8>` の略記であり、別個の型ではない。
 
+[Plan232](../../232-indexed-fixed-field-values.md) は、既存の独立した Copy 固定長 field に対する
+`rows[row].path.fixed[index]` を扱う。明示的な local binding と同じく、内側の添字を
+評価する前に field 全体をコピーし、両方の符号付き境界検査と評価順序を維持する。
+record field を続けて読む場合も同じで、結果は親の置換・破棄後も使える。
+読み出しは allocation、借用 view、添字代入を追加しない。field 全体に view、owner、
+pointer、callable が含まれる場合は対象外。添字付き固定長 field の直接スライスは別の能力となる。
+
 `[T; N]` は型注釈でも固定長配列型を表す。record field は N 個の slot を inline に保持し、
 array header、builder、allocation を追加しない。named local、parameter、stable field place は
 同じ checked index/range/slice/pipeline/mutation 操作を共有する。Copy/Move と element admission
@@ -109,7 +116,7 @@ Option や array を要素とする array は対象外である。正確な ledg
 record 全体が0バイトでも、heap payload を確保せず初期化済み要素数を保持する。
 `shape := values[i].shape` で field 全体を通常の Copy 値として読み、その local を
 index・slice 操作できる。他の固定配列要素型、borrowed payload の拡張、
-indexed parent から直接 fixed field を操作する構文は別の対応範囲である。
+indexed parent から直接 fixed field の view を作る構文は別の対応範囲である。独立した値の添字読み出しは Plan232 が扱う。
 
 R78 の payload-free enum field 対応依頼は保留/PROPOSED のままであり、既存の
 閉じた enum-field 除外規則は変わらない。[Plan 56](../../56-r77-r83-composition-plan.md) に

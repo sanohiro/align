@@ -36,6 +36,11 @@ admission. A built Move record is already observable through its complete Copy f
 
 ## Public-contract ledger
 
+[Plan232](232-indexed-fixed-field-values.md) subsequently composes independent
+complete-field Copy reads with a direct inner index. It preserves this plan's
+formation, ownership and borrowed-payload boundaries. The neighbor refusal now
+covers direct indexed-field slices, whose retained address needs a separate proof.
+
 | Surface | Exact contract |
 | --- | --- |
 | Formation | Extend the recursive `HeapTreeRecord` field grammar with `[P; N]`, where P is `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `bool` or `char`, and N is the existing u32 literal length. Zero length retains P's semantic type and all exclusions. A field may occur inside an existing nested/optional/dynamic-array record; the surrounding record still satisfies every original layout, cycle, view and ownership restriction. Existing fixed-array formation and placement remain authoritative; this does not add a fixed-array Option payload or top-level heap fixed-array builder. |
