@@ -187,7 +187,8 @@ The following notation is closed and exact:
 - `HTR(id)` is the producer-owned, cycle-safe heap-tree-record predicate from
   `heap_array_builder_record`: `STRUCT(id)` is nonempty, naturally aligned at
   most 8 with no explicit layout/alignment, and every reachable field in source
-  order is a Copy scalar, owned `string`, another `HTR`, recursively admitted
+  order is a Copy scalar, a fixed array of primitive Copy scalars (including zero length),
+  owned `string`, another `HTR`, recursively admitted
   `Option<T>`, or `array<E>` where `E` is a Copy scalar, owned `string`, or an
   `HTR`. Arrays of Options/arrays and every view stay excluded. The checked-HIR
   validator calls that same helper; it does not infer admission merely from a

@@ -4973,6 +4973,11 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    Option, Result, and user-sum payload grammar; their active-tag ownership paths are part of the
    same closure. Full contract and implementation matrix:
    `impl/17-library-boundary-prerequisites.md` §7.6.
+   **Fixed primitive fields SETTLED 2026-10-20 (Voice V006):** the same closed grammar admits
+   `[P; N]` for primitive Copy scalar P, including zero. No child allocation/Drop is added;
+   zero-sized records preserve logical counts without heap payload storage. The existing whole-field
+   Copy read exposes the stored dimensions after freeze. Other fixed elements, broader borrowed
+   payloads and direct indexed-parent fixed-field operations remain separate. Plan231 owns the closure.
    **Region form SETTLED 2026-07-27 (required before `pkg.db`):**
    `array_builder<T>(out: region)` accepts recursively `RegionPlain` scalars/views/structs. It
    deliberately rejects the heap form's independently owned `string` element (copy it to a

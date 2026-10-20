@@ -69,7 +69,6 @@ fn array_builder_reads_initialized_prefix() {
         for stack in [false, true] {
             if region && stack { continue; }
             for stride in [0, 1, 2, 4, 8, 16, 32] {
-                if stride == 0 && !region { continue; }
                 for capacity in [0, 1, 64] {
                     let arena = RegionOwner(if region { align_rt_arena_begin() } else { core::ptr::null_mut() });
                     let mut header = Header([0; 64]);
@@ -79,6 +78,9 @@ fn array_builder_reads_initialized_prefix() {
                         unsafe { align_rt_array_builder_init_stack(header.0.as_mut_ptr(), stride, capacity) }
                     } else { align_rt_array_builder_new(stride, capacity) }, stack);
                     let bytes = usize::try_from(stride).unwrap();
+                    assert_eq!(unsafe { (*owner.0).elem_size }, bytes);
+                    #[cfg(feature = "alloc-count")]
+                    let payload_events = RAW_STORAGE_EVENTS.with(core::cell::Cell::get);
                     let mut expected = Vec::new();
                     for index in 0..35u8 {
                         let row = vec![index; bytes];
@@ -106,11 +108,28 @@ fn array_builder_reads_initialized_prefix() {
                         else { unsafe { align_rt_array_builder_build(builder) } };
                     std::mem::forget(owner);
                     assert_eq!(frozen.len, 37);
+                    if !region && bytes == 0 {
+                        assert!(frozen.ptr.is_null());
+                        #[cfg(feature = "alloc-count")]
+                        assert_eq!(RAW_STORAGE_EVENTS.with(core::cell::Cell::get), payload_events,
+                            "zero-stride heap builder allocated payload storage");
+                    }
                     if bytes != 0 {
                         assert_eq!(unsafe { core::slice::from_raw_parts(frozen.ptr.add(34 * bytes), bytes) }, expected[34]);
                         assert_eq!(unsafe { core::slice::from_raw_parts(frozen.ptr.add(36 * bytes), bytes) }, &suffix[..bytes]);
                     }
                     if !region { unsafe { align_rt_free(frozen.ptr as *mut u8) }; }
+                    if !region && bytes == 0 {
+                        let abandoned = ArrayOwner(if stack {
+                            unsafe { align_rt_array_builder_init_stack(header.0.as_mut_ptr(), 0, capacity) }
+                        } else { align_rt_array_builder_new(0, capacity) }, stack);
+                        unsafe { align_rt_array_builder_push_bytes(abandoned.0, core::ptr::NonNull::<u8>::dangling().as_ptr()) };
+                        assert!(unsafe { (*abandoned.0).data.is_null() });
+                        drop(abandoned);
+                        #[cfg(feature = "alloc-count")]
+                        assert_eq!(RAW_STORAGE_EVENTS.with(core::cell::Cell::get), payload_events + 2,
+                            "only the two null payload frees may reach the native storage seam");
+                    }
                 }
             }
         }
@@ -123,10 +142,24 @@ fn array_builder_reads_initialized_prefix() {
 fn array_builder_read_failure_probe() {
     let Some(mode) = std::env::var_os("ALIGN_BUILDER_READ_FAILURE") else { return };
     let mode = mode.to_str().unwrap();
+    let (storage, mode) = mode.split_once(':').unwrap_or(("region", mode));
     if mode == "stall" { loop { std::thread::park(); } }
     if mode == "null" { unsafe { align_rt_array_builder_at(core::ptr::null(), 0) }; }
-    let arena = RegionOwner(align_rt_arena_begin());
-    let owner = ArrayOwner(unsafe { align_rt_array_builder_new_in(arena.0, 0, 8, 64) }, false);
+    let arena = RegionOwner(if storage == "region" { align_rt_arena_begin() } else { core::ptr::null_mut() });
+    let mut header = Header([0; 64]);
+    let stride = if mode == "stride-overflow" { -1 } else { 0 };
+    let owner = ArrayOwner(match storage {
+        "heap" => align_rt_array_builder_new(stride, 64),
+        "stack" => unsafe { align_rt_array_builder_init_stack(header.0.as_mut_ptr(), stride, 64) },
+        _ => unsafe { align_rt_array_builder_new_in(arena.0, stride, 8, 64) },
+    }, storage == "stack");
+    if matches!(mode, "push-overflow" | "append-overflow") {
+        unsafe { (*owner.0).len = isize::MAX.unsigned_abs(); (*owner.0).cap = isize::MAX.unsigned_abs(); }
+        let source = core::ptr::NonNull::<u8>::dangling().as_ptr();
+        if mode == "push-overflow" { unsafe { align_rt_array_builder_push_bytes(owner.0, source) }; }
+        else { unsafe { align_rt_array_builder_append(owner.0, source, 1) }; }
+        panic!("zero-stride growth overflow returned");
+    }
     if mode == "overflow" {
         unsafe { (*owner.0).len = usize::try_from(i64::MAX).unwrap() + 1; (*owner.0).cap = usize::MAX; }
     } else if mode != "empty" {
@@ -172,7 +205,10 @@ fn array_builder_read_failures() {
             if !self.stop() { eprintln!("builder overflow probe could not be reaped"); }
         }
     }
-    for mode in ["null", "empty", "negative", "high", "overflow", "stall"] {
+    for mode in ["null", "empty", "negative", "high", "overflow", "stall",
+        "heap:empty", "heap:negative", "heap:high", "stack:empty", "stack:negative", "stack:high",
+        "heap:push-overflow", "heap:append-overflow", "stack:push-overflow", "stack:append-overflow",
+        "region:push-overflow", "region:append-overflow", "heap:stride-overflow", "stack:stride-overflow"] {
         let process = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "array_builder_read_tests::array_builder_read_failure_probe", "--nocapture"])
             .env("ALIGN_BUILDER_READ_FAILURE", mode)
@@ -195,6 +231,6 @@ fn array_builder_read_failures() {
         let mut error = String::new();
         std::io::Read::read_to_string(&mut child.process.stderr.take().unwrap(), &mut error).unwrap();
         assert_eq!(status.signal(), Some(libc::SIGABRT), "{mode}: {error}");
-        assert!(error.contains(if mode == "overflow" { "align: panic: allocation size overflow" } else { "index out of bounds" }), "{mode}: {error}");
+        assert!(error.contains(if mode.ends_with("overflow") { "align: panic: allocation size overflow" } else { "index out of bounds" }), "{mode}: {error}");
     }
 }

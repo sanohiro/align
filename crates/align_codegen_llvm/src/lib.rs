@@ -13431,6 +13431,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let agg = self.operand(base)?.into_struct_value();
                     let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                     let st = self.struct_types[*struct_id as usize];
+                let buf = self.element_storage_base(st.into(), buf)?;
                     let idx = self.operand(index)?.into_int_value();
                     // `[index]` reaches element `index` (stride `st`); each physical field index then
                     // descends one struct level to the leaf being written.
@@ -13452,6 +13453,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let p = self.operand(ptr)?.into_pointer_value();
                     let index = self.operand(idx)?.into_int_value();
                     let val = self.operand(op)?;
+                    let p = self.element_storage_base(val.get_type(), p)?;
                     let ep = unsafe {
                         self.builder
                             .build_in_bounds_gep(val.get_type(), p, &[index], "ptrstore")
@@ -13467,6 +13469,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     let p = self.operand(ptr)?.into_pointer_value();
                     let idx = self.operand(index)?.into_int_value();
                     let val = self.operand(value)?;
+                    let p = self.element_storage_base(val.get_type(), p)?;
                     let ep = unsafe {
                         self.builder
                             .build_in_bounds_gep(val.get_type(), p, &[idx], "ptrstore")
@@ -15411,6 +15414,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let agg = self.operand(base)?.into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let st = self.struct_types[*struct_id as usize];
+                let buf = self.element_storage_base(st.into(), buf)?;
                 let index = self.operand(index)?.into_int_value();
                 let mut indices = vec![index];
                 indices.extend(self.phys_field_indices(*struct_id, path).into_iter()
@@ -15506,6 +15510,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let agg = self.operand(base)?.into_struct_value();
                 let buf = self.builder.build_extract_value(agg, 0, "aosptr").map_err(|e| self.err(e))?.into_pointer_value();
                 let st = self.struct_types[*struct_id as usize];
+                let buf = self.element_storage_base(st.into(), buf)?;
                 let index = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -19349,6 +19354,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .map_err(|error| self.err(error))?.into_pointer_value()
                 };
                 let ty = self.llvm_type(physical_ty);
+                let ptr = self.element_storage_base(ty, ptr)?;
                 let index = self.operand(idx)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -19378,6 +19384,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .into_pointer_value();
                 let ty = self.llvm_type(physical_ty);
+                let ptr = self.element_storage_base(ty, ptr)?;
                 let idx = self.operand(index)?.into_int_value();
                 let ep = unsafe {
                     self.builder
@@ -20621,6 +20628,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|e| self.err(e))?
             .into_struct_value()
             .into())
+    }
+
+    /// Zero-stride arrays have a logical prefix but may have no payload pointer. Materialize
+    /// the unique zero-sized value when an access needs an address (including borrowed calls).
+    /// Bounds/evaluation remain in the original MIR; no heap backing or new borrow is created.
+    fn element_storage_base(
+        &self,
+        ty: BasicTypeEnum<'c>,
+        base: inkwell::values::PointerValue<'c>,
+    ) -> Result<inkwell::values::PointerValue<'c>, CodegenError> {
+        if self.element_allocation_size(ty) != 0 { return Ok(base); }
+        let storage = self.alloca_at_entry(ty, "zero.element")?;
+        self.builder.build_store(storage, ty.const_zero()).map_err(|error| self.err(error))?;
+        Ok(storage)
     }
 
     /// `&slot[index]` via an array GEP (indices `[0, index]` into the `[N x T]` alloca).
@@ -25996,6 +26017,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         // bounds decision and is formed only now, after every later argument has fallen through.
         let physical_element_ty = align_sema::shared_index_element_type(place.base.ty)
             .ok_or_else(|| self.err("borrowed element place base is not an ordinary array or slice"))?;
+        let data = self.element_storage_base(self.llvm_type(physical_element_ty), data)?;
         let element = unsafe {
             self.builder
                 .build_gep(
@@ -32820,6 +32842,31 @@ fn main() -> i32 = 0
         let ir = emit_llvm_ir(&zero, &BuildTarget::Baseline, Profile::Release, false, &[], None).map_err(|_| "zero read")?;
         assert!(ir.contains("call ptr @align_rt_array_builder_at("));
         assert!(!ir.contains("builder.copy = load"), "zero-width read dereferenced storage");
+        Ok(())
+    }
+
+    #[test]
+    fn heap_fixed_zero_elements_use_addressable_storage() -> Result<(), &'static str> {
+        for length in [0, 1] {
+            let source = format!("Row {{ dims: [i64; {length}] }}\n\
+                fn whole(xs: slice<Row>, index: i64) -> Row = xs[index]\n\
+                fn field(xs: slice<Row>, index: i64) -> [i64; {length}] = xs[index].dims\n\
+                fn collect(xs: slice<Row>) -> array<Row> = xs.map(fn row: Row {{ row }}).to_array()\n\
+                fn main() {{}}\n");
+            let program = mir(&source);
+            let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                .map_err(|_| "fixed heap field access IR")?;
+            assert!(ir.contains("@align_rt_bounds_fail("));
+            let addresses = ir.lines().filter(|line| line.contains("getelementptr inbounds %Row,")).collect::<Vec<_>>();
+            assert!(!addresses.is_empty(), "element address positive control");
+            if length == 0 {
+                assert!(ir.contains("alloca %Row"));
+                assert!(addresses.iter().all(|line| line.contains("ptr %zero.element")),
+                    "zero-width access used a possibly null array payload: {addresses:?}");
+            } else {
+                assert!(!ir.contains("zero.element"), "positive-sized access used zero storage");
+            }
+        }
         Ok(())
     }
 

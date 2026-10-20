@@ -2058,6 +2058,18 @@ migrate together; no compatibility exports are retained.
 | ArrayBuilderRegionCapacity | `noalias ptr @align_rt_array_builder_new_in(ptr arena, i64 stride, i64 align, i64 capacity) {nounwind}` | Existing arena/stride/alignment validation precedes count/layout validation and allocation. Header and initial chunk belong to the arena; length zero. |
 | ArrayBuilderStackCapacity | `ptr @align_rt_array_builder_init_stack(ptr out, i64 stride, i64 capacity)` | Existing writable 64-byte/16-aligned header precondition; same count/layout validation; heap payload with stack header. |
 
+Plan231 preserves an exact zero element stride in heap as well as region headers. Heap
+constructors reject negative/unrepresentable stride before capacity validation or allocation.
+Zero stride reserves no payload, regardless of capacity. Push and valid native append count
+initialized elements without copying bytes; growth in either mode rejects a resulting count
+above target `isize::MAX` before mutation. Null-source no-op behavior is unchanged. Heap freeze
+returns `{null, initialized_count}`; boxed freeze releases its header, while stack freeze consumes
+the caller header. Drop has no payload to free. Region freeze retains its existing arena sentinel.
+Bounds-checked builder reads return null for zero stride, and codegen materializes the unique
+zero-sized value without loading that pointer. Frozen-array access likewise never dereferences
+null payload storage; a required borrowed address uses aligned zero-sized caller storage.
+`array_builder_read_tests` owns zero/positive stride, header modes, count overflow and allocation.
+
 Capacity zero is the explicit generated argument for omitted source capacity.
 Only initialized prefixes participate in Drop or freeze; the heap payload still
 transfers and the region output still compacts. `explicit_constructor_capacity_preserves_payload_and_initialized_prefix`

@@ -104,6 +104,13 @@ Option や array を要素とする array は対象外である。正確な ledg
 §7.6 にあり、直接 string-array field を持つ record に対する既存の Option/Result/user-sum payload
 も閉じる。完全な capability は 2026-08-14 に実装された。
 
+[Plan231](../../231-fixed-scalar-heap-fields.md) は primitive Copy scalar P の inline
+`[P; N]` record field を、長さ0も含めて受け入れる。field 自体の allocation と Drop は増えない。
+record 全体が0バイトでも、heap payload を確保せず初期化済み要素数を保持する。
+`shape := values[i].shape` で field 全体を通常の Copy 値として読み、その local を
+index・slice 操作できる。他の固定配列要素型、borrowed payload の拡張、
+indexed parent から直接 fixed field を操作する構文は別の対応範囲である。
+
 R78 の payload-free enum field 対応依頼は保留/PROPOSED のままであり、既存の
 閉じた enum-field 除外規則は変わらない。[Plan 56](../../56-r77-r83-composition-plan.md) に
 調査結果と plan 23 の未充足の再検討条件を記録する。この batch では enum field の

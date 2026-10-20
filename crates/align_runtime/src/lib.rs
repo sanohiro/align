@@ -18807,11 +18807,11 @@ impl ArrayBuilder {
     /// [`align_rt_realloc`]).
     unsafe fn reserve(&mut self, additional: usize) {
         let needed = match self.len.checked_add(additional) {
-            Some(n) => n,
-            None => panic_abort("array_builder capacity overflow"),
+            Some(n) if n <= isize::MAX.unsigned_abs() => n,
+            _ => align_rt_alloc_size_fail(),
         };
         if self.elem_size == 0 {
-            self.cap = usize::MAX;
+            self.cap = isize::MAX.unsigned_abs();
             return;
         }
         if needed <= self.cap {
@@ -18903,7 +18903,7 @@ impl ArrayBuilder {
 }
 
 fn array_builder_value(elem_size: i64) -> ArrayBuilder {
-    let es = safe_len(elem_size).unwrap_or(0).max(1);
+    let es = safe_len(elem_size).unwrap_or_else(|()| align_rt_alloc_size_fail());
     ArrayBuilder {
         data: core::ptr::null_mut(),
         len: 0,
@@ -18916,8 +18916,9 @@ fn array_builder_value(elem_size: i64) -> ArrayBuilder {
     }
 }
 
-/// `array_builder<T>()` — open an empty builder whose element stride is `elem_size` bytes (`>= 1`;
-/// 16 for a `string` element). Explicit capacity is reserved before returning; zero defers growth.
+/// `array_builder<T>()` — open an empty builder whose element stride is `elem_size` bytes (`>= 0`;
+/// 16 for a `string` element). Invalid strides abort before allocation. Explicit capacity is reserved
+/// before returning; zero defers growth. Zero-stride elements need no payload allocation.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_array_builder_new(elem_size: i64, capacity: i64) -> *mut ArrayBuilder {
     let mut value = array_builder_value(elem_size);
@@ -19059,7 +19060,7 @@ pub unsafe extern "C" fn align_rt_array_builder_push_bytes(
     }
     let b = unsafe { &mut *b };
     let dst = unsafe { b.push_destination() };
-    unsafe { core::ptr::copy_nonoverlapping(src, dst, b.elem_size) };
+    if b.elem_size != 0 { unsafe { core::ptr::copy_nonoverlapping(src, dst, b.elem_size) }; }
     b.len += 1;
 }
 
@@ -19081,6 +19082,11 @@ pub unsafe extern "C" fn align_rt_array_builder_append(b: *mut ArrayBuilder, src
         return;
     };
     if n == 0 || src.is_null() {
+        return;
+    }
+    if b.elem_size == 0 {
+        unsafe { b.reserve(n) };
+        b.len += n;
         return;
     }
     let bytes = match n

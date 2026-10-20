@@ -291,10 +291,14 @@ Earlier completed work lives in the owning implementation plans and the
 [2026-10-13 historical handoff](docs/archive/HANDOFF-2026-10-13.md).
 That archive preserves the prior narrative; it is not a source of current status.
 
-## Planned later request investigation
+## Sequential request follow-up
 
-[Plan230](docs/impl/230-request-follow-up-plan.md) owns the later queue, starting
-with voice V006, and the required evidence for unresolved LLM R37/R49/R80.
+[Plan230](docs/impl/230-request-follow-up-plan.md) owns the queue and the required
+evidence for unresolved LLM R37/R49/R80. Voice V006
+([Plan231](docs/impl/231-fixed-scalar-heap-fields.md)) has the provider implementation:
+primitive Copy fixed fields in heap records, exact zero-size storage and existing
+complete-field Copy observation. Consumer adoption remains pending. Media AM-R16/17
+fixed-field access and native layout are next, as separate capability assessments.
 Establish consumer value, policy fit, the smallest complete useful capability,
 prerequisites and cost before selection. Distinguish real settled restrictions
 from implementation gaps; broad scope alone does not justify deferral.

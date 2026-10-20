@@ -1622,7 +1622,8 @@ unreadable before freeze; text-builder byte views remain outside this surface.
 
 `array_builder<T>()` retains its individually owned heap/zero-copy-freeze form.
 Besides Copy scalars and `string`, it accepts nonempty naturally aligned declared records composed
-recursively of Copy scalars, owned `string`, the same record class, `Option<T>` over the accepted
+recursively of Copy scalars, inline `[P; N]` fields for primitive Copy scalar P (including N=0),
+owned `string`, the same record class, `Option<T>` over the accepted
 field grammar, and `array<E>` whose element is a Copy scalar, `string`, or an accepted record.
 Options may nest; arrays of options or arrays remain outside the type representation. Such records
 contain no views. A Move record is pushed only when every reachable string and dynamic-array owner
@@ -1642,6 +1643,13 @@ arena chunks with no hidden heap allocation and performs one documented compacti
 a helper may push through a `borrow mut` parameter but cannot store, return, or consume that borrowed
 builder. The heap owner may move through an ordinary typed parameter or return; the region-backed
 owner cannot outlive its explicit region and therefore retains its existing boundary restrictions.
+
+Fixed primitive fields add no child allocation or Drop obligation. A record whose complete
+size is zero retains that exact stride: heap construction/growth allocates no element payload,
+push counts initialized values without reading bytes, and freeze returns an array with that
+logical length. Counts and bounds remain checked. A complete fixed field can be read as an ordinary Copy value, for example
+`shape := values[i].shape`, then indexed or sliced through that local. Direct indexed-parent
+fixed-field operations and additional borrowed-payload admission remain separate. [Plan231](impl/231-fixed-scalar-heap-fields.md) owns this composition.
 
 R78's request for payload-free enum fields remains deferred/PROPOSED; the
 closed enum-field exclusion above is unchanged. [Plan 56](impl/56-r77-r83-composition-plan.md) records

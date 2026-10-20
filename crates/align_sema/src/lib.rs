@@ -1537,6 +1537,7 @@ pub fn heap_tree_record_error(
                 | Ty::FsDirCursor
                 | Ty::ProcessSignalSubscription | Ty::ProcessChildScope | Ty::ProcessMember | Ty::FsMemoryWriter | Ty::FsSealedFile | Ty::ProcessImage | Ty::ProcessUserNamespace
                 | Ty::SignatureKey(_) => {}
+                Ty::Array(Scalar::Int(_) | Scalar::Float(_) | Scalar::Bool | Scalar::Char, _) => {}
                 Ty::Struct(id) => work.push(Work::EnterStruct { id, path }),
                 Ty::Option(payload) => work.push(Work::Field {
                     ty: scalar_to_ty(payload),
@@ -93831,6 +93832,26 @@ fn exit_branch(flag: bool) -> i64 {
         ];
         assert!(heap_tree_record_type_ok(0, &valid, &tagged));
         assert!(heap_tree_record_type_ok(1, &valid, &tagged));
+
+        let primitives = [Scalar::Int(IntTy { bits: 8, signed: true }),
+            Scalar::Int(IntTy { bits: 16, signed: true }), Scalar::Int(IntTy { bits: 32, signed: true }),
+            Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Int(IntTy { bits: 8, signed: false }),
+            Scalar::Int(IntTy { bits: 16, signed: false }), Scalar::Int(IntTy { bits: 32, signed: false }),
+            Scalar::Int(IntTy { bits: 64, signed: false }), Scalar::Float(FloatTy { bits: 32 }),
+            Scalar::Float(FloatTy { bits: 64 }), Scalar::Bool, Scalar::Char];
+        for primitive in primitives {
+            for length in [0, 1, 3, 37] {
+                let mut records = valid.clone();
+                records[0].fields[1].ty = Ty::Array(primitive, length);
+                assert!(heap_tree_record_type_ok(1, &records, &tagged), "{primitive:?}/{length}");
+            }
+        }
+        for excluded in [Scalar::String, Scalar::Str, Scalar::Struct(0), Scalar::Fn(0)] {
+            for length in [0, 2] {
+                let records = vec![structure("BadFixed", vec![("bad", Ty::Array(excluded, length))])];
+                assert!(!heap_tree_record_type_ok(0, &records, &tagged), "{excluded:?}/{length}");
+            }
+        }
 
         let copy_dual_mode = vec![structure("CopyDualMode", vec![("value", i64_ty)])];
         assert!(heap_tree_record_type_ok(0, &copy_dual_mode, &[]));

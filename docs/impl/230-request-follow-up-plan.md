@@ -3,8 +3,8 @@
 ## Selection and completion rule
 
 The owner's 2026-10-20 direction queues useful, policy-consistent deferred
-requests for later investigation, starting with voice V006. This is not an
-immediate implementation commitment. Reconcile all three request registers
+requests for investigation. The follow-up instruction selects them in queue order,
+starting with voice V006; complete each useful capability before taking the next. Reconcile all three request registers
 before selection; overlapping requests share one capability assessment.
 
 Establish consumer value and four-way alignment. Distinguish a missing
@@ -26,8 +26,8 @@ closure-matrix and independent-review gates. Consumer adoption remains external.
 
 | Requests | Value and investigation output |
 | --- | --- |
-| Voice V006 | Keep a fixed inline shape beside an owned tensor name in a heap-built record. Verify why [Plan17](17-library-boundary-prerequisites.md)'s heap-record grammar excludes fixed arrays; distinguish policy from missing construction/growth/transfer/Drop coverage. Assess the complete fixed-Copy-field composition without adding a second builder or hidden heap allocation. The real scalar-expansion/reconstruction workaround supplies evidence; a deliberate restriction still follows Plan23. |
-| Media AM-R16 and AM-R17 | Assess fixed-array field reads separately from C-layout/raw-storable fixed arrays. The former needs exact indexing/bounds/storage lifetime; the latter needs layout/alignment, nested-field validity and native ABI agreement. Do not assume either depends on unrelated owning-record widening, or treat ordinary dynamic-array Copy reads as delivery of these requests. |
+| Voice V006 | Provider implementation: [Plan231](231-fixed-scalar-heap-fields.md) qualifies primitive Copy fixed fields through heap construction, growth, transfer, Drop and exact zero-size storage. `shape := values[i].shape` uses the existing complete-field Copy read and replaces scalar expansion/reconstruction. Independent design review accepted Category A composition under the original view-free relocation rationale. Consumer adoption remains pending. |
+| Media AM-R16 and AM-R17 | Assess fixed-array field reads separately from C-layout/raw-storable fixed arrays. The former needs exact indexing/bounds/storage lifetime; Plan231 records the separate shared-match fixed-field storage issue and preserves that exclusion. The direct indexed-field request must not accidentally widen the shared payload classifier; the latter needs layout/alignment, nested-field validity and native ABI agreement. Do not assume either depends on unrelated owning-record widening, or treat ordinary dynamic-array Copy reads as delivery of these requests. |
 | Media AM-R12 and AM-R19 | `expm1` and `log1p` have concrete small-argument accuracy uses. Resolve [Plan75](75-portable-math-plan.md)'s `logp1` spelling, exact special values and signed zero, independently checked accuracy, target implementation and scalar/vector behavior. Decide a complete useful operation boundary; E2 tier membership alone does not require shipping every E2 operation together. The consumer's exact `1-U` special domain does not justify a general `log(1+x)` substitute. |
 | Media AM-R14 and AM-R20 | Trigonometry and quadrant-aware atan2 serve rotary validation and guide orientation. Fix argument order, axes/signed zero, nonfinite cases, argument reduction, accuracy and target/scalar/vector behavior. Assess a bounded complete subset rather than automatically requiring the whole E4 tier. Shared guide vectors qualify concrete consumer behavior, not an unproved cross-target bitwise contract. |
 | Media AM-R15 and AM-R07 | Separate fallible raw allocation with an owned error/cleanup carrier from positional reads into externally owned writable views. Establish allocation failure before side effects, size/alignment/null obligations, exclusive backing, native lifetime and cleanup. Identify shared prerequisites without inventing an opaque mutable view or hiding ownership. |

@@ -3290,14 +3290,22 @@ borrowable `array<T>`.
 
 The individually owned heap form accepts **Copy scalars** (int/float/bool/char), **`string`**, and a
 closed recursively view-free declared-record class. An admitted record is nonempty, naturally
-aligned to at most 8 bytes, has no explicit layout/alignment, and contains Copy scalars, `string`,
+aligned to at most 8 bytes, has no explicit layout/alignment, and contains Copy scalars,
+inline `[P; N]` fields for Copy primitive scalar P (including N=0), `string`,
 another admitted record, recursively admitted `Option<T>`, or an owned `array<E>` whose element is
 a Copy scalar, `string`, or an admitted record. Options may nest. Arrays whose elements are options
-or dynamic arrays remain outside the type representation; fixed arrays, results, sums, tuples,
+or dynamic arrays remain outside the type representation; other fixed fields, results, sums, tuples,
 boxes, resources/refs, raw/function/builder values, empty or cyclic records, explicit
 layout/alignment, and every direct or nested view are rejected before construction. A concrete
 generic record is tested only after monomorphization; there is no new generic bound or runtime
 dictionary.
+
+Fixed primitive fields add no child allocation or Drop obligation. A record whose complete
+size is zero retains that exact stride: heap construction/growth allocates no element payload,
+push counts initialized values without reading bytes, and freeze returns an array with that
+logical length. Counts and bounds remain checked. A complete fixed field can be read as an ordinary Copy value, for example
+`shape := values[i].shape`, then indexed or sliced through that local. Direct indexed-parent
+fixed-field operations and additional borrowed-payload admission remain separate. [Plan231](docs/impl/231-fixed-scalar-heap-fields.md) owns this composition.
 
 R78's request for payload-free enum fields remains deferred/PROPOSED; the
 closed enum-field exclusion above is unchanged. [Plan 56](docs/impl/56-r77-r83-composition-plan.md) records

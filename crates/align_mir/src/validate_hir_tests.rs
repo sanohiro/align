@@ -1201,18 +1201,18 @@ fn checked_test_program(source: &str) -> Result<hir::Program, &'static str> {
 #[test]
 fn heap_record_array_builder_rows_match_the_producer() {
     let source = concat!(
-        "Child { label: string }\n",
+        "Child { label: string, shape: [i64; 3], empty: [bool; 0] }\n",
         "Item { name: string, maybe: Option<Child>, nested: Option<Option<Child>>, names: array<string>, children: array<Child> }\n",
         "fn main() -> i32 {\n",
         "  mut children: array_builder<Child> := array_builder()\n",
-        "  children.push(Child{label: \"child\".clone()})\n",
+        "  children.push(Child{label: \"child\".clone(), shape: [1, 2, 3], empty: []})\n",
         "  child_values := children.build()\n",
         "  mut names: array_builder<string> := array_builder()\n",
         "  names.push(\"first\".clone())\n",
         "  names.push(\"second\".clone())\n",
         "  name_values := names.build()\n",
         "  mut items: array_builder<Item> := array_builder()\n",
-        "  items.push(Item{name: \"owned\".clone(), maybe: Some(Child{label: \"optional\".clone()}), nested: Some(Some(Child{label: \"nested\".clone()})), names: name_values, children: child_values})\n",
+        "  items.push(Item{name: \"owned\".clone(), maybe: Some(Child{label: \"optional\".clone(), shape: [4, 5, 6], empty: []}), nested: Some(Some(Child{label: \"nested\".clone(), shape: [7, 8, 9], empty: []})), names: name_values, children: child_values})\n",
         "  values := items.build()\n",
         "  return 0\n",
         "}\n",
@@ -1252,13 +1252,10 @@ fn heap_record_array_builder_rows_match_the_producer() {
         Ty::Fn(0),
         Ty::Builder,
         Ty::Param(0),
-        Ty::Array(
-            Scalar::Int(IntTy {
-                bits: 64,
-                signed: true,
-            }),
-            2,
-        ),
+        Ty::Array(Scalar::String, 0),
+        Ty::Array(Scalar::String, 2),
+        Ty::Array(Scalar::Str, 0),
+        Ty::StructArray(0, 0),
         Ty::Result(
             Scalar::String,
             Scalar::Int(IntTy {
