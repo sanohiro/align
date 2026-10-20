@@ -1275,6 +1275,9 @@ b.append(xs: slice<T>)   // remains Copy-scalar-only
 b.build() -> array<T>    // consumes the builder; zero-copy freeze
 ```
 
+This section records the original scalar/string field boundary; §7.6 and Plan231 own its
+recursive and primitive fixed-field extensions.
+
 This capability admits declared records to the existing individually owned heap form. It does not
 add a constructor, type argument syntax, allocator input, ambient option, conversion, or second
 collection abstraction. The explicit-region form in §§7.1–7.4 remains the only builder that accepts
@@ -1354,14 +1357,17 @@ This extension keeps the Request 8 syntax, owner model, nominal identity, and ru
 ABI. It widens only the admitted record graph needed by the named C6 evaluator records. There is no
 second builder, allocator selector, dynamic value tree, collection conversion, or implicit clone.
 
+Plan231 adds primitive fixed fields and qualifies zero-stride storage and existing shared
+Copy field observation. The August record below remains the origin of the recursive ownership model.
+
 #### Public-contract ledger
 
 | Field | Contract |
 |---|---|
 | Surface and owner | The surface remains `array_builder()` under an expected `array_builder<S>` type, `b.push(value: S)`, and consuming `b.build() -> array<S>`. Sema owns formation and allocation-mode proof; Move/Escape analysis owns transfer; MIR owns initialized-prefix cleanup; LLVM owns recursive element Drop; the runtime retains only raw checked byte growth. |
-| Recursive element predicate | `HeapTreeRecord(S)` requires the Request 8 root invariants: a nonempty, acyclic declared struct, natural alignment at most 8, and no `align(N)` or `layout(C)`. Each field is a Copy integer/float/`bool`/`char`, owned `string`, another `HeapTreeRecord`, `Option<T>` where `T` recursively satisfies this field grammar, or `array<E>` where `E` is a Copy scalar, owned `string`, or `HeapTreeRecord`. Options may nest; an array element is never another Option or dynamic array. |
+| Recursive element predicate | `HeapTreeRecord(S)` requires the Request 8 root invariants: a nonempty, acyclic declared struct, natural alignment at most 8, and no `align(N)` or `layout(C)`. Each field is a Copy integer/float/`bool`/`char`, an inline fixed array of those primitive Copy scalars (Plan231, including zero length), owned `string`, another `HeapTreeRecord`, `Option<T>` where `T` recursively satisfies this field grammar, or `array<E>` where `E` is a Copy scalar, owned `string`, or `HeapTreeRecord`. Options may nest; an array element is never another Option or dynamic array. |
 | Exact consumer closure | The grammar covers the exact C6 `SnapshotRequest`, `PromptEvaluationTask`, `PromptTaskRow`, `TaskAggregate`, `CorpusAggregate`, `RegressionReason`, `RunSnapshotAttestation`, `SnapshotResult`, and `TaskInputSnapshot` construction graphs recorded below: optional scalars/records/arrays, arrays of strings, and arrays of recursively owned records. One checked-in Align fixture copies this complete graph and the projected result root exactly; a reduced representative shape is not acceptance evidence. |
-| Closed exclusions | Direct or nested `str`, `slice`, `resource_ref`, resource, raw, function, builder, Result, user sum/enum, tuple, box, fixed array, response array, region-owned aggregate, and every other view or Move handle reject before construction. `array<Option<T>>`, `array<array<T>>`, and other composite-element dynamic arrays remain unrepresentable and outside this request. Unknown definitions, inline cycles, empty records, and explicit/over-aligned layouts fail closed. |
+| Closed exclusions | Direct or nested `str`, `slice`, `resource_ref`, resource, raw, function, builder, Result, user sum/enum, tuple, box, other fixed-array fields, response array, region-owned aggregate, and every other view or Move handle reject before construction. `array<Option<T>>`, `array<array<T>>`, and other composite-element dynamic arrays remain unrepresentable and outside this request. Unknown definitions, inline cycles, empty records, and explicit/over-aligned layouts fail closed. |
 | Type formation outside the builder | A direct `array<string>` record field becomes an ordinary valid Move field, matching the already valid `Option<array<string>>` path. Its element-wise string Drop is the existing standalone `array<string>` Drop. Existing Option, Result, and user-sum payload grammars may therefore carry a newly valid record containing that field; their syntax and tag ABI do not widen, but their construction, extraction, partial cleanup, and tag-switched Drop must close over it. This Request 10 boundary did not itself change JSON decode/encode modes, fixed arrays, indexing, pipelines, or literal producers; the later settled Request 9 direct-owned JSON route now owns its one flat JSON producer. |
 | Construction and move | `push` evaluates one complete record rvalue, verifies its exact nominal type and allocation mode, then transfers the entire value and zeros the selected source before growth. `None` owns no payload; `Some` transfers its one complete payload. Empty arrays use `{null,0}`; nonempty arrays transfer their existing buffer. No child is cloned or rebuilt by `push`. |
 | Allocation mode | Every reachable owned `string` and dynamic-array buffer, including array elements' recursive owners, must be uniformly free-standing at the selected push path. Arena-owned, mixed, unknown, or path-dependent ownership rejects in source field/index order before the runtime growth call. Copy fields and `None` contribute no owner. |

@@ -109,6 +109,13 @@ Options or arrays remain outside this capability. The exact ledger and implement
 §7.6; they also close existing Option/Result/user-sum payloads over a record with a direct string
 array field. The complete capability shipped on 2026-08-14.
 
+[Plan231](../231-fixed-scalar-heap-fields.md) additionally admits inline `[P; N]` record
+fields for primitive Copy scalar P, including zero. The field adds no allocation or Drop.
+A completely zero-sized heap element retains its logical initialized count without payload
+storage. Read a complete fixed field as an ordinary Copy value (`shape := values[i].shape`),
+then index or slice that local. Other fixed element families, broader borrowed payloads
+and direct indexed-parent fixed-field operations remain separate.
+
 R78's request for payload-free enum fields remains deferred/PROPOSED; the
 closed enum-field exclusion above is unchanged. [Plan 56](../56-r77-r83-composition-plan.md) records
 the assessment and plan 23's unmet reopening prerequisite. No enum-field

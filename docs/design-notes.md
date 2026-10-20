@@ -764,6 +764,13 @@ the explicit-region builder; other owned collections wait for their own recursiv
 That split keeps allocation visible and lets realloc move raw record bytes without inventing hidden
 arenas, reflection, or callbacks.
 
+Plan231 qualifies inline fixed arrays of primitive Copy scalars under that same rationale:
+no reachable view, child owner, hidden allocation or relocation-sensitive address exists. The
+existing whole-field Copy read makes a stored dimension array observable without adding
+a new borrowed-payload class. Exact zero-size layout requires logical element counts without payload allocation
+or byte reads; it must not be coerced to a one-byte stride. Fixed Move/view/record elements remain
+outside this capability because they require their own complete element/projection proof.
+
 ---
 
 ## The lambda philosophy
