@@ -65,6 +65,13 @@ tuple record fields and Align tuple callbacks use the same layout and lifetimes.
 [Plan190](../190-tuple-carrier-composition.md) keeps the tuple element whitelist,
 collection/box/global/FFI restrictions, and shared Move-tuple projection exclusion.
 
+Raw payloads are non-owning Copy values in Option, either Result position, user
+sums, flat tuples and ordinary fields ([Plan236](../236-fallible-raw-carriers.md)).
+Carrier construction, extraction, replacement and discard never free a pointee.
+Unsafe `raw.try_alloc(i64)` returns `Result<raw,Error>`; explicit `raw.free` or a
+matching resource hook owns release. Other members retain their existing Drop
+and view lifetimes; this adds no raw collections or safe dereference permission.
+
 ## Effects
 
 Pure machinery. `?` is control flow, not an effect; a function is impure only through what it

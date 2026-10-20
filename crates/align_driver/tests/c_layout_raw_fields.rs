@@ -641,7 +641,6 @@ fn main() -> i32 {
         }
     }
     for bad in [
-        "Plain { data: raw }",
         "layout(C) Generic<T> { data: T }",
         "layout(C) Bad { data: bool }",
         "layout(C) Bad { data: char }",

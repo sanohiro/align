@@ -1131,6 +1131,8 @@ pub enum Rvalue {
     /// `raw.alloc(size)` (unsafe): flat-heap-allocate `size` bytes, yield a `raw` byte pointer.
     /// Manually managed (freed by [`Stmt::RawFree`]); no arena handle, no auto-drop.
     RawAlloc(Operand),
+    /// Atomic fallible raw allocation; native status/out storage belongs to backend lowering.
+    RawTryAlloc { size: Operand, error_enum: u32 },
     /// Generated direct-column batch storage. The static producer supplies a concrete struct id;
     /// no package name, reflection, or artifact lookup reaches lowering.
     ColumnBatchCreate {
@@ -8463,7 +8465,7 @@ fn expression_uses_eager_worklist(e: &hir::Expr) -> bool {
         | hir::ExprKind::ResultOk(_)
         | hir::ExprKind::ResultErr(_)
         | hir::ExprKind::Try(_)
-        | hir::ExprKind::RawAlloc(_)
+        | hir::ExprKind::RawAlloc(_) | hir::ExprKind::RawTryAlloc(_)
         | hir::ExprKind::RawFree(_)
         | hir::ExprKind::HeapNew(_)
         | hir::ExprKind::BoxGet(_)
@@ -10333,6 +10335,16 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 lower_required_binding!(b, sz = lower_expr(b, size), Operand::Const(Const::Unit));
                 let v = b.fresh_value(Ty::Raw);
                 b.push(Stmt::Let(v, Rvalue::RawAlloc(sz)));
+                Operand::Value(v)
+            }
+            hir::ExprKind::RawTryAlloc(size) => {
+                lower_required_binding!(b, sz = lower_expr(b, size), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                let Ty::Result(Scalar::Raw, Scalar::Enum(error_enum)) = e.ty else {
+                    b.terminate(Term::Unreachable);
+                    return terminated_operand();
+                };
+                b.push(Stmt::Let(v, Rvalue::RawTryAlloc { size: sz, error_enum }));
                 Operand::Value(v)
             }
             // `raw.free(p)` → free the pointer (a side-effecting statement, like `ArenaEnd`); yields unit.
@@ -18262,7 +18274,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         // Copy Ord scalars and keyed comparison columns to Copy Ord scalars), but they are explicit so a
         // future new `Scalar` variant is a compile error here until it is deliberately triaged into
         // Total or PartialFloat.
-        Scalar::Unit
+        Scalar::Raw | Scalar::Unit
         | Scalar::Struct(_)
         | Scalar::Tuple(_)
         | Scalar::String

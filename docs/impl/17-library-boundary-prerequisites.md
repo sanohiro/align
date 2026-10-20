@@ -2815,9 +2815,17 @@ as `u32` little-endian. Existing definition tag `2` stores the ordered element
 count (`u32` little-endian) and complete scalar records. For `Option<(i64,bool)>`,
 the complete independent v3 golden is
 `[3,1,0,0,0,2,2,0,0,0,0,1,64,2,4,62,0,0,0,0]`.
-A changed member changes identity; permuted raw ids do not. Unknown tag 63,
+A changed member changes identity; permuted raw ids do not. Unknown tag 64,
 truncation, trailing bytes, missing/wrong-kind ordinals, and inline tuple cycles
 reject. The interface's existing structural `IType::Tuple` record is unchanged.
+
+Plan236 adds scalar tag `63` with no trailing field for non-owning Raw. The
+existing Ty tag `21` and structural interface `Named("raw")` remain unchanged.
+`Option<raw>` is `[3,0,0,0,0,4,63]`; `Option<(raw,bool)>` is
+`[3,1,0,0,0,2,2,0,0,0,63,2,4,62,0,0,0,0]`, retaining definitions before root.
+Raw composes through Option, both Result payloads, concrete/generic sums, flat
+tuples and ordinary fields without pointee ownership or authority. Collection,
+box, task, JSON and foreign carrier grammars remain separate and unchanged.
 
 Parameter modes are `0=ByValue`, `1=Out`, `2=Borrow`, `3=BorrowMut`; am-c input still rejects the
 later two modes. A summary is `0=None` or `1 || param_count || params || capture_count || captures`;

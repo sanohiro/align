@@ -1265,6 +1265,8 @@ pub enum ExprKind {
     /// `raw.alloc(size)` — allocate `size` bytes on the flat heap, yielding a `raw` byte pointer.
     /// `unsafe`-only; the caller owns the memory and must `raw.free` it (no auto-drop).
     RawAlloc(Box<Expr>),
+    /// One fallible flat allocation, returning Result<raw, Error>.
+    RawTryAlloc(Box<Expr>),
     /// `raw.null()` — construct the null raw pointer for an explicit native ABI argument or
     /// sentinel. `unsafe`-only; safe code may hold and test the resulting Copy `raw` value.
     RawNull,

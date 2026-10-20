@@ -1296,6 +1296,23 @@ In ordinary code there is no manual free.
 
 Raw allocation is only in unsafe.
 
+`raw.try_alloc(size: i64) -> Result<raw, Error>` is the fallible unsafe
+alternative. Negative or target-unrepresentable sizes return `Error.Invalid`;
+zero returns `Ok(raw.null())` without allocating. A positive size attempts one
+malloc-family allocation; refusal returns `Error.Code(12)` without abort or
+retry. Success exposes uninitialized bytes, aligned like `raw.alloc` (at least
+eight bytes on supported 64-bit targets). The caller must release the pointer
+exactly once with `raw.free` or transfer a positive, non-null result to a matching
+resource. No residency, over-alignment or automatic pointee cleanup is promised.
+Existing `raw.alloc` behavior is unchanged.
+
+`raw` composes through Option, both Result positions, concrete/generic sum
+payloads, flat tuple elements and ordinary record fields. It remains Copy and
+Static: copying, replacing, discarding or returning these carriers never frees
+the pointee or grants lifetime, non-null, aliasing or access authority. Mixed
+owners/views retain their own cleanup/lifetimes. Naked raw collections, boxes,
+task results, JSON and foreign carrier signatures remain outside this extension.
+
 ```align
 unsafe {
   p := raw.alloc(size)
@@ -2799,7 +2816,8 @@ pattern (hand C a buffer, read/write structs in it). Primitive scalars and `raw`
 other admitted flat values. Its scalar fields must be FFI-mappable (integers, floats, or `raw`
 pointers). A pointer field has native pointer size/alignment and remains non-owning: the record
 is Copy, adds no Drop, and never extends a pointee lifetime or grants dereference authority.
-Direct `raw` fields in ordinary structs and generic `layout(C)` declarations remain rejected.
+Ordinary raw fields use the same non-owning pointer contract (Plan236); generic
+`layout(C)` declarations remain rejected.
 [Plan137](docs/impl/137-c-layout-raw-fields.md) records the exact field and validation contract.
 
 Fixed numeric fields `[P; N]` are also C-compatible when P is an integer or

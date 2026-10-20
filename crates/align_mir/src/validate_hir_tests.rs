@@ -13,6 +13,47 @@ use align_parser::parse_file;
 use std::cell::Cell;
 
 #[test]
+fn fallible_raw_checked_hir_boundaries() -> Result<(), &'static str> {
+    let base = checked_source_program("fn alloc(size:i64)->Result<raw,Error> = unsafe {raw.try_alloc(size)}\nfn main() {}\n");
+    assert!(lower_program_checked(&base, false, None).is_ok());
+    for mutation in 0..4 {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "alloc").ok_or("fixture member")?;
+        let outer = function.body.value.as_mut().ok_or("fixture member")?;
+        let hir::ExprKind::Unsafe(block) = &mut outer.kind else { panic!("unsafe fixture") };
+        let operation = block.value.as_mut().ok_or("fixture member")?;
+        match mutation {
+            0 => {
+                let hir::ExprKind::RawTryAlloc(size) = &mut operation.kind else { panic!("raw fixture") };
+                size.ty = Ty::Bool;
+                size.kind = hir::ExprKind::Bool(true);
+            }
+            1 => operation.ty = Ty::Raw,
+            2 => operation.ty = Ty::Result(Scalar::Raw, Scalar::Raw),
+            _ => outer.kind = operation.kind.clone(),
+        }
+        assert!(lower_program_checked(&bad, false, None).is_err(), "mutation {mutation}");
+    }
+    let raw_load = checked_source_program("fn load(pointer:raw)->raw = unsafe {raw.load(pointer,0)}\nfn main() {}\n");
+    assert!(lower_program_checked(&raw_load, false, None).is_ok());
+    let mut bad = raw_load.clone();
+    let function = bad.fns.iter_mut().find(|f| f.name == "load").ok_or("fixture member")?;
+    let hir::ExprKind::Unsafe(block) = &mut function.body.value.as_mut().ok_or("fixture member")?.kind else { panic!("unsafe fixture") };
+    let operation = block.value.as_mut().ok_or("fixture member")?;
+    let hir::ExprKind::RawPointerLoad { ptr, offset } = &operation.kind else { panic!("pointer load") };
+    operation.kind = hir::ExprKind::RawLoad { ptr:ptr.clone(), offset:offset.clone(), scalar:Scalar::Raw };
+    assert!(lower_program_checked(&bad, false, None).is_err());
+    let record = checked_source_program("Record { value:raw }\nfn main() {}\n");
+    assert!(validate_hir::type_placement_metadata_is_valid(&record));
+    for ty in [Ty::Array(Scalar::Raw, 2), Ty::DynArray(Scalar::Raw), Ty::Slice(Scalar::Raw), Ty::Box(Scalar::Raw)] {
+        let mut bad = record.clone();
+        bad.structs[0].fields[0].ty = ty;
+        assert_placement_rejected("raw collection field", &bad);
+    }
+    Ok(())
+}
+
+#[test]
 fn c_layout_raw_fields_require_the_exact_scalar_domain() {
     let program = checked_source_program(
         "layout(C) Cell { data: raw }\nextern \"C\" fn echo(value: Cell) -> Cell\nfn main() {}\n",
@@ -21,7 +62,7 @@ fn c_layout_raw_fields_require_the_exact_scalar_domain() {
     let mut ordinary = program.clone();
     ordinary.externs.clear();
     ordinary.structs[0].c_repr = false;
-    assert_placement_rejected("ordinary raw field", &ordinary);
+    assert!(validate_hir::type_placement_metadata_is_valid(&ordinary));
     for ty in [
         Ty::Bool,
         Ty::Char,
@@ -17456,7 +17497,7 @@ fn hir_body_type_mangle_golden_vectors() {
 #[allow(dead_code)]
 const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
     match *scalar {
-        Scalar::Int { .. }
+        Scalar::Raw | Scalar::Int { .. }
         | Scalar::Float { .. }
         | Scalar::Bool
         | Scalar::Char
@@ -17529,7 +17570,7 @@ fn delegation_scalar_samples() -> Vec<Scalar> {
         }),
         Scalar::Float(FloatTy { bits: 32 }),
         Scalar::Float(FloatTy { bits: 64 }),
-        Scalar::Bool,
+        Scalar::Raw, Scalar::Bool,
         Scalar::Char,
         Scalar::Unit,
         Scalar::Struct(0),

@@ -6715,6 +6715,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::TgWaitResult { .. }
             | Rvalue::HeapAlloc(..)
             | Rvalue::RawAlloc(..)
+            | Rvalue::RawTryAlloc { .. }
             | Rvalue::ColumnBatchCreate { .. }
             | Rvalue::ColumnBatchAppend { .. }
             | Rvalue::RawNull
@@ -9996,6 +9997,12 @@ fn validate_resource_rvalues_component(
                             XmlProducerState::Present(XmlAccessProvenance::Owned)
                         )
                     }
+                    Rvalue::RawTryAlloc { size, error_enum } => {
+                        operand_ty(function, size) == Some(i64_ty)
+                            && result == Ty::Result(Scalar::Raw, Scalar::Enum(*error_enum))
+                            && builtin_error_enum_is_exact(program, *error_enum)
+                            && primary_definitions.get(*value as usize) == Some(&1)
+                    }
                     Rvalue::RawIsNull(pointer) => {
                         operand_ty(function, pointer) == Some(Ty::Raw) && result == Ty::Bool
                     }
@@ -10978,7 +10985,7 @@ fn validate_tagged_program_inner(
                 Scalar::SoaParam(id) => Err(Self::invalid(format!(
                     "abstract soa payload parameter {id} survived into MIR"
                 ))),
-                Scalar::Int(_)
+                Scalar::Raw | Scalar::Int(_)
                 | Scalar::Float(_)
                 | Scalar::Bool
                 | Scalar::Char

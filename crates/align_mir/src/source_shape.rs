@@ -355,7 +355,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             Scalar::Fn(left) => node!(Fn, Fn, left),
             Scalar::Resource(left) => node!(Resource, Resource, left),
             Scalar::ResourceRef(left) => node!(ResourceRef, Resource, left),
-            Scalar::Int(_)
+            Scalar::Raw | Scalar::Int(_)
             | Scalar::Float(_)
             | Scalar::DynArray(_)
             | Scalar::Slice(_)

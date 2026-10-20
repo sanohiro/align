@@ -377,7 +377,7 @@ fn walk_body_records<'a>(
                 | ExprKind::ResultOk(expr)
                 | ExprKind::ResultErr(expr)
                 | ExprKind::Try(expr)
-                | ExprKind::RawAlloc(expr)
+                | ExprKind::RawAlloc(expr) | ExprKind::RawTryAlloc(expr)
                 | ExprKind::RawFree(expr)
                 | ExprKind::RawIsNull(expr)
                 | ExprKind::ResourceBorrow { owner: expr, .. }

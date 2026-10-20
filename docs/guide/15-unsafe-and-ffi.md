@@ -89,7 +89,7 @@ and owning/view elements are excluded. Naked arrays cannot cross extern calls.
 A pointer-bearing record is Copy;
 copying, replacing or returning it never copies/frees the pointee or extends its
 lifetime. Pointer validity and dereferencing remain your responsibility inside
-`unsafe`. Direct raw fields in ordinary structs and generic C records are not supported.
+`unsafe`. Ordinary raw fields follow the same non-owning rule. Generic C records remain unsupported.
 
 `layout(C)` structs can cross through a `raw` pointer or by value on supported
 ABIs. **LP64 x86-64 Linux (GNU/musl), Apple Silicon and Linux ARM64** support
@@ -108,3 +108,25 @@ C-owned memory returns as `raw` because a C pointer carries no length. Use `raw.
 ## The discipline
 
 Keep native integration in a small, reviewable module. It owns the `extern` declarations and `unsafe` blocks, passes views with their lengths, handles and frees `raw` pointers, and converts errors to `Result`. Its public API must uphold Align's safety guarantees for callers. Searching for `unsafe` helps locate code that needs manual review, including the assumptions made by its wrappers.
+
+## Recoverable raw allocation
+
+`raw.try_alloc(size: i64) -> Result<raw, Error>` is the fallible unsafe
+alternative. Negative or target-unrepresentable sizes return `Error.Invalid`;
+zero returns `Ok(raw.null())` without allocating. A positive size attempts one
+malloc-family allocation; refusal returns `Error.Code(12)` without abort or
+retry. Success exposes uninitialized bytes, aligned like `raw.alloc` (at least
+eight bytes on supported 64-bit targets). The caller must release the pointer
+exactly once with `raw.free` or transfer a positive, non-null result to a matching
+resource. No residency, over-alignment or automatic pointee cleanup is promised.
+Existing `raw.alloc` behavior is unchanged.
+
+`raw` composes through Option, both Result positions, concrete/generic sum
+payloads, flat tuple elements and ordinary record fields. It remains Copy and
+Static: copying, replacing, discarding or returning these carriers never frees
+the pointee or grants lifetime, non-null, aliasing or access authority. Mixed
+owners/views retain their own cleanup/lifetimes. Naked raw collections, boxes,
+task results, JSON and foreign carrier signatures remain outside this extension.
+
+Use a positive successful pointer with a declared resource when its lifetime should
+end through a Drop hook. A zero-size null result cannot construct such a resource.
