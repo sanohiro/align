@@ -49642,9 +49642,13 @@ impl<'a> MoveCheck<'a> {
                     && !path.is_empty()
                 {
                     self.check_borrow_use(base, e.span);
-                    // MIR captures this receiver before the index. Evaluate it here as well so
-                    // the ordinary completion snapshot keeps its backing live until the read.
-                    move_expr!(self, recv, moved, false, false);
+                    // MIR captures a dynamic/slice header before the index. Its ordinary
+                    // completion snapshot must keep backing live until the read. A fixed local
+                    // instead supplies a stable slot; its selected-field checks below preserve
+                    // independent sibling access after a partial element-field move.
+                    if matches!(recv.ty, Ty::DynStructArray(..) | Ty::Slice(..) | Ty::Soa(_)) {
+                        move_expr!(self, recv, moved, false, false);
+                    }
                     let exact_index = match index.kind {
                         ExprKind::Int(value) if value >= 0 => u32::try_from(value).ok(),
                         _ => None,

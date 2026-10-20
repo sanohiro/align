@@ -82,8 +82,10 @@ through that old pointer. The same source with a scalar field also checks; an
 ordinary Index and a field-rooted receiver correctly reject. These are compile-only
 witnesses, never executed. MoveCheck's local ElemField arm checked named liveness
 but omitted receiver evaluation, so the existing eager completion machinery never
-registered the loaded header. Walk that receiver before its index just as the
-ordinary Index and nonlocal ElemField paths already do. This reuses the existing
+registered the loaded header. Walk dynamic/slice/SoA receivers before their index
+just as the ordinary Index and nonlocal ElemField paths already do. Fixed locals
+instead supply a stable inline slot; retain their selected-field move check so
+an independently moved sibling does not invalidate the whole local. This reuses the existing
 generation/alias/invalidated-completion proof and introduces no new reservation,
 IR shape or safety strategy. The matrix now covers local, field and returned-view
 receivers, outer consume/replacement/exclusive mutation, both frontends, and the
@@ -110,6 +112,9 @@ valid independent snapshot followed by parent Drop during the inner index.
   reads, scalar siblings, replacement, exclusive helper mutation, aliases, returned
   views, field roots and joins reject invalidated backing in both frontends. Its
   controls retain early termination and valid inline storage replacement.
+  `pkg_template::resource_fields_in_fixed_move_record_arrays_borrow_finish_and_drop_once`
+  retains independent sibling extraction, replacement, nulling and exact Drop after
+  partial moves; it rejects treating a fixed receiver as a whole-value use.
 - `excluded_neighbors` keeps complete-graph view/pointer/callable/owner refusals,
   including zero-length twins, direct slices/pipelines/writes and arbitrary temporary
   arrays. `fixed_array_fields`, `heap_fixed_scalar_fields`,
