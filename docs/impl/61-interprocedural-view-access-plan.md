@@ -17,7 +17,10 @@ implementation, PRs, or merges. A new explicit user request is required before
 either approach resumes. Independent capabilities continue from current `main`
 without completing, reviewing, or adopting this work first. Preserve the parked
 source and evidence outside the active worktree.
-See [the current handoff](../../HANDOFF.md#deferred-k1).
+See [the current handoff](../../HANDOFF.md#deferred-work-and-capability-boundaries)
+and [the 2026-10-20 scope assessment](230-request-follow-up-plan.md#k1-scope-and-difficulty-assessment-2026-10-20).
+The latter records the owner's assessment-only direction; it does not select the
+historical strategy below.
 
 This is boundary 2 of [plan 52](52-readonly-view-provenance-plan.md).
 The producer-validation owner established by [plan 55](55-mir-producer-validation-plan.md)

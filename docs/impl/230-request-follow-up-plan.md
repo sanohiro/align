@@ -34,6 +34,70 @@ closure-matrix and independent-review gates. Consumer adoption remains external.
 | Media AM-R15 and AM-R07 | Separate fallible raw allocation with an owned error/cleanup carrier from positional reads into externally owned writable views. Establish allocation failure before side effects, size/alignment/null obligations, exclusive backing, native lifetime and cleanup. Identify shared prerequisites without inventing an opaque mutable view or hiding ownership. |
 | LLM R28/R132/R137/R142 and related media view composition | Reconcile the current remaining portions against shipped builder Copy reads, owning-field extraction and indexed independent Copy observations. Use [Plan61](61-interprocedural-view-access-plan.md), [Plan196](196-indexed-array-field-length.md) and [Plan210](210-text-builder-byte-views.md) to identify the exact missing interprocedural read-only/writable authority and retained-view proof. Do not reopen already delivered portions or widen a readable header into writable/owned backing. |
 
+## K1 scope and difficulty assessment (2026-10-20)
+
+The owner selected independent AM-R16 element reads first and an assessment of
+K1 before implementation. PR1398 delivers those reads. Retained fixed-field
+slices and either parked K1 implementation remain unselected. This assessment
+records current evidence and decision criteria; it adds no language contract or
+implementation authorization.
+
+Both frontends still accept Plan232's compile-only negative: a function returns
+`row.shape[..]` from a shared `borrow row`, and its caller writes through the
+returned slice. The reader control passes. Never execute this negative.
+`ReturnBorrowSummary` contains parameter/capture indices, and
+`summary_from_roots` drops `ReadOnly` and temporal observations. The existing
+summary therefore proves neither writable backing nor continuing validation.
+Plan210's text-byte return witness exercises the same missing transport.
+
+| Remaining request | Useful result | Missing proof beyond delivered values |
+| --- | --- | --- |
+| AM-R16 retained fixed-field slice | Read a selected indexed field without a whole-owner binding or hidden copy. | Parent backing lifetime/reservation and read-only authority through calls, returns and mutable destinations. Independent element reads already ship. |
+| R28 text and view-bearing builder reads | Inspect initialized builder data without materializing an owned copy. | Retire the selected generation on growth, writes, build, replacement and Drop; transport contained view origins. Length and independent Copy element reads already ship. |
+| R137 retained owning-field projections | Pass an indexed owned-array field to ordinary readers/pipelines. | Preserve parent generation, selected field authority and both bounds across calls/returns. Length and independent Copy IDs already ship. |
+| AM-R07 external writable read destination | Read directly into caller-owned native storage. | K1 is necessary but insufficient: exclusive external-view formation, initialization, bounds/overlap, native resource lifetime and synchronous short-read/error semantics need their own contract. No pinned-memory speed claim is established. |
+| R132 exclusive owned subrecord | Pass one stable owning field to a mutating helper. | Separate cleanup-representation problem: a whole aggregate has one allocation-mode bit. Replacing one field must neither change sibling cleanup nor free arena storage as heap. Authority, replacement compatibility and allocation mode must close together. |
+| R142 exclusive active sum payload | Mutate an active payload through a helper without consuming it. | Preserve active tag and exclusive parent authority, exclude conflicting replacement, and retain exactly-once cleanup; nested owning fields may also encounter R132. The retired Qwen2 design is not current product adoption evidence. |
+
+At candidate `1e3dd74d`, reduced R132 and R142 packets reject in both frontends
+with the current partial-Move-field and mutable-storage diagnostics. Their
+whole-owner mutation and shared-reader controls pass. These are compile-only
+observations, not evidence that removing either rejection is safe.
+
+The smallest complete K1 repair crosses permission producers/projections,
+callee effects, return values and mutable outputs, aggregate/tagged carriers,
+branch/loop joins and recursion, imported generic/interface/cache transport,
+and independent checked-HIR/MIR/native admission. A return-only read-only flag
+would repair one witness while leaving hidden writes and output paths open.
+Metadata production and its caller/validator consumers cannot ship as separate
+dormant capabilities.
+
+The main uncertainty is representation, not syntax or a missing method. Whole-
+parameter roots lose independent sibling-field precision; exact selected paths
+can grow through recursive slice graphs. A finite abstraction must preserve
+permission/backing correlations and useful disjoint-field precision while
+terminating. Mutation must end overlapping generation/validation facts without
+invalidating unrelated destinations. Cached facts require independent replay,
+not a trusted permission flag. Plan61's parked implementation and isolated models
+are evidence to examine, not an accepted end-to-end solution or a cost estimate.
+
+This is a substantial cross-compiler capability, materially larger than the
+completed Copy indexing. A defensible implementation estimate needs a selected
+finite representation and a closed interface protocol first. R132's allocation-
+mode repair and R142's exclusive payload projection are related ownership axes,
+not automatic benefits of K1, and must be estimated separately.
+
+Recommended next decision: select a bounded feasibility investigation before
+committing to full implementation. Its output must be (1) a finite-domain and
+termination argument, (2) a small executable model checked against concrete
+permission/alias/recursive-join counterexamples and independent-field controls,
+and (3) one end-to-end producer/interface/caller/validator closure matrix with
+remaining risks and a credible implementation boundary. If no sound, sufficiently
+precise representation emerges, report the specific failed invariant and keep
+retained views deferred. This investigation has no new public surface, no broad
+benchmark claim and no consumer adoption work. Any selected implementation then
+receives the ordinary independent strategy review before compiler changes.
+
 ## Evidence-dependent compiler triage
 
 The 2026-10-19 LLM reconciliation names the following residuals. Their exact

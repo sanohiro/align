@@ -311,8 +311,9 @@ slices still require interprocedural authority and lifetime closure; the current
 shared-helper-return witness loses read-only authority in both frontends.
 [Plan233](docs/impl/233-c-record-fixed-arrays.md) implements AM-R17's positive
 numeric fixed fields in C records, including raw storage and both native
-by-value ABI families. Consumer adoption remains pending. AM-R12/AM-R19's
-small-argument math operations are next.
+by-value ABI families. [Plan234](docs/impl/234-cancellation-sensitive-math.md)
+implements AM-R12/AM-R19's scalar/vector `expm1` and `log1p`. Consumer adoption
+remains pending. AM-R14/AM-R20's `sin`, `cos` and `atan2` are next.
 Establish consumer value, policy fit, the smallest complete useful capability,
 prerequisites and cost before selection. Distinguish real settled restrictions
 from implementation gaps; broad scope alone does not justify deferral.
@@ -327,11 +328,14 @@ an established finite abstraction for recursive selected view origins;
 whole-parameter lifetime roots lose independent field authority. Known
 interprocedural write-authority and temporal-validation gaps remain.
 
-The owner's 2026-10-14 instruction authorizes fresh assessment of deferred
-requests after the current delivery. It does not select either archived
-implementation: qualify each real-use requirement and its safety strategy
-independently. Keep parked source and evidence archived outside the active
-worktree; their adoption is not a prerequisite for independent work.
+The owner's 2026-10-20 direction selects the independent AM-R16 reads first
+and a K1 scope/difficulty assessment before implementation.
+[Plan230's assessment](docs/impl/230-request-follow-up-plan.md#k1-scope-and-difficulty-assessment-2026-10-20)
+separates return/call authority, generation/validation transport, partial-owner
+cleanup and active-payload exclusivity. A finite selected-origin representation
+and a complete cross-unit proof remain the main K1 uncertainties. Neither parked
+implementation is selected. Keep parked source and evidence archived outside the
+active worktree; their adoption is not a prerequisite for independent work.
 
 - Request28's independent Copy typed-builder reads ship under Plan209.
   [Plan210](docs/impl/210-text-builder-byte-views.md) confirms that text-byte
