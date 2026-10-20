@@ -5807,6 +5807,14 @@ See the `unsafe`/`raw` Settled entry above for the full record.
 
 **`layout(C)` struct ABI — slice 1 SHIPPED (2026-07-01):** a `layout(C)` attribute (composes with `align(N)`) pins a struct to a stable, C-compatible flat layout (decl order, natural alignment, no reordering — Align's default, which the marker *locks* and opts into FFI). Among structs, only a `layout(C)` struct may be moved through a `raw` pointer — `raw.store`/`raw.load` widened to accept a struct value (no new IR variant; the existing `Scalar::Struct` flows through `RawLoad`/`RawStore`, codegen does an unaligned aggregate load/store). Fields are int/float or opaque `raw` pointers (plan137, 2026-10-07). A raw field retains native pointer layout, is non-owning Copy, adds no Drop, and grants no pointee lifetime or access authority. Direct raw fields in ordinary structs and generic C records stay rejected. Primitive scalars and `raw` pointers are the other admitted flat values. This is the **pointer-based** FFI pattern (hand C a buffer, read/write structs or native handle slots in it).
 
+[Plan233](impl/233-c-record-fixed-arrays.md) composes positive fixed arrays of
+C integer/float scalars through C-record layout, raw storage and every supported
+by-value ABI. Elements retain ordinary inline Copy size/alignment, with no child
+allocation or owning clone. SysV merges their scalar eightbytes; ARM HFA counts
+homogeneous leaves across arrays. Zero-length C fields, bool/char/raw arrays,
+nested records/arrays, views, owners and naked extern arrays remain excluded.
+
+
 **FFI views — SHIPPED (2026-07-01):** a `str`/`slice`/`bytes` view is FFI-safe as an extern **parameter**, lowered to its data pointer (C `char*`/`void*`); the length is passed separately by the caller (`s.len()`) — the C `(ptr, len)` idiom, no hidden arg (`is_ffi_safe_param`; codegen `ffi_param_type` + an `extern_params` map that coerces the `{ptr,len}` arg to element 0). Slice element must be an int/float scalar (`slice<str>`/`slice<Struct>` rejected — no settled C element layout). Not a valid return type (a bare pointer has no length → returns stay scalar-only); not NUL-terminated (length-based C fns only).
 
 **External library linking — SHIPPED (2026-07-01):** an `extern "C" link("name")` clause names a library to link (`-lname`); sema validates + dedupes into `hir`/`mir::Program.link_libs`, and the driver's `link_executable` appends `-l<name>` after the objects/runtime (libc/libm stay auto-linked). The name is charset-validated (`[A-Za-z0-9._+-]`) and passed as a single `-l<name>` argv (no flag/shell injection). `ast::ExternBlock.link`.

@@ -303,7 +303,10 @@ chained record fields and an eager Copy snapshot before the inner index. The out
 receiver's backing must remain live through its read. Retained indexed-field
 slices still require interprocedural authority and lifetime closure; the current
 shared-helper-return witness loses read-only authority in both frontends.
-Consumer adoption remains pending. AM-R17's C-layout/raw fixed fields are next.
+[Plan233](docs/impl/233-c-record-fixed-arrays.md) implements AM-R17's positive
+numeric fixed fields in C records, including raw storage and both native
+by-value ABI families. Consumer adoption remains pending. AM-R12/AM-R19's
+small-argument math operations are next.
 Establish consumer value, policy fit, the smallest complete useful capability,
 prerequisites and cost before selection. Distinguish real settled restrictions
 from implementation gaps; broad scope alone does not justify deferral.

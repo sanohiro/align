@@ -41,6 +41,8 @@ mod ffi_aarch64;
 mod ffi_aarch64_tests;
 #[cfg(test)]
 mod ffi_sysv_tests;
+#[cfg(test)]
+mod ffi_fixed_array_tests;
 mod llvm_build_id;
 /// Instrument-PGO driver-facing surface (production): the safe wrapper over the
 /// C++ shim's `align_pgo_run_pipeline` entry for `--pgo-instrument` / `--pgo-use`.
@@ -3888,7 +3890,7 @@ fn lower_prepared_module<'c>(
                         if let Some(target) = arm_abi {
                             ParamAbi::ArmRecord(ffi_aarch64::Record::classify(id, st, def, &target_data, target)?)
                         } else {
-                            match classify_struct_abi(id, &st, def, &target_data) {
+                            match classify_struct_abi(id, &st, def, &target_data)? {
                                 Some(abi) => ParamAbi::StructRegs(abi),
                                 None => ParamAbi::StructMemory(SysvMemory::new(id, st, def, &target_data)?),
                             }
@@ -3904,7 +3906,7 @@ fn lower_prepared_module<'c>(
                     if let Some(target) = arm_abi {
                         ReturnAbi::ArmRecord(ffi_aarch64::Record::classify(id, st, def, &target_data, target)?)
                     } else {
-                        match classify_struct_abi(id, &st, def, &target_data) {
+                        match classify_struct_abi(id, &st, def, &target_data)? {
                             Some(abi) => ReturnAbi::StructRegs(abi),
                             None => ReturnAbi::StructMemory(SysvMemory::new(id, st, def, &target_data)?),
                         }
@@ -8011,35 +8013,54 @@ fn classify_struct_abi(
     st: &StructType,
     def: &StructDef,
     td: &inkwell::targets::TargetData,
-) -> Option<StructAbi> {
+) -> Result<Option<StructAbi>, CodegenError> {
+    let invalid = || CodegenError::Lowering("invalid SysV C-record ABI layout".into());
+    if !def.c_repr || def.fields.is_empty()
+        || def.align.is_some_and(|alignment| !alignment.is_power_of_two())
+        || !def.fields.iter().all(|field| align_sema::c_record_field_scalar(field.ty).is_some())
+    {
+        return Err(invalid());
+    }
     let size = td.get_store_size(st);
     if size > 16 {
-        return None; // MEMORY-class: not register-passed
+        return Ok(None); // MEMORY-class: not register-passed
     }
     // A zero-size (empty) struct has no C ABI representation; sema rejects it as an FFI type before
     // codegen, so it never reaches here — but stay total (no eightbytes to classify).
     if size == 0 {
-        return Some(StructAbi { ebs: Vec::new(), storage_eightbytes: 0, id });
+        return Err(invalid());
     }
     let eb_count = size.div_ceil(8) as usize; // 1 or 2 eightbytes
     let mut ebs: Vec<Option<Eb>> = vec![None; eb_count];
-    // `layout(C)` keeps declaration order (identity physical map), so field `i` sits at physical
-    // slot `i`; a naturally-aligned scalar ≤ 8 bytes lies wholly within one eightbyte.
+    // C fields keep declaration order. Classify every fixed-array element at its actual byte
+    // offset: each naturally aligned scalar fits one eightbyte, while its array may span two.
     for (i, f) in def.fields.iter().enumerate() {
-        let off = td.offset_of_element(st, i as u32).unwrap_or(0);
-        let eb = (off / 8) as usize;
-        let cls = if matches!(f.ty, Ty::Float(_)) { Eb::Sse } else { Eb::Integer };
-        // Merge within an eightbyte: INTEGER dominates SSE (SSE only if every field is float).
-        ebs[eb] = Some(match ebs[eb] {
-            Some(Eb::Integer) => Eb::Integer,
-            _ if cls == Eb::Integer => Eb::Integer,
-            Some(Eb::Sse) | None => cls,
-        });
+        let off = td.offset_of_element(st, u32::try_from(i).map_err(|_| invalid())?).ok_or_else(invalid)?;
+        let (scalar, count) = align_sema::c_record_field_scalar(f.ty).ok_or_else(invalid)?;
+        let bytes = match scalar {
+            Ty::Int(integer) => u64::from(integer.bits / 8),
+            Ty::Float(float) => u64::from(float.bits / 8),
+            Ty::Raw => 8,
+            _ => return Err(invalid()),
+        };
+        let end = off.checked_add(bytes.checked_mul(u64::from(count)).ok_or_else(invalid)?).ok_or_else(invalid)?;
+        if off % bytes != 0 || end > size { return Err(invalid()); }
+        let cls = if matches!(scalar, Ty::Float(_)) { Eb::Sse } else { Eb::Integer };
+        // The enclosing size bound limits this loop to at most sixteen numeric leaves.
+        for element in 0..count {
+            let eb = usize::try_from((off + u64::from(element) * bytes) / 8).map_err(|_| invalid())?;
+            let slot = ebs.get_mut(eb).ok_or_else(invalid)?;
+            *slot = Some(match *slot {
+                Some(Eb::Integer) => Eb::Integer,
+                _ if cls == Eb::Integer => Eb::Integer,
+                Some(Eb::Sse) | None => cls,
+            });
+        }
     }
     // Natural scalar fields cannot leave a full interior eightbyte empty, but align(16) can
     // append one. SysV NO_CLASS tail padding consumes no register. Keep the complete storage
     // size separately: an aggregate store/load still reaches that tail even when no register does.
-    Some(StructAbi { ebs: ebs.into_iter().flatten().collect(), storage_eightbytes: eb_count, id })
+    Ok(Some(StructAbi { ebs: ebs.into_iter().flatten().collect(), storage_eightbytes: eb_count, id }))
 }
 
 /// How one `extern "C"` parameter crosses the ABI boundary.
@@ -8120,12 +8141,7 @@ impl SysvMemory {
         let invalid = || CodegenError::Lowering("invalid SysV C-record ABI layout".into());
         if !def.c_repr || def.fields.is_empty()
             || def.align.is_some_and(|alignment| !alignment.is_power_of_two())
-            || !def.fields.iter().all(|field| match field.ty {
-                Ty::Raw => true,
-                Ty::Int(ty) => matches!(ty.bits, 8 | 16 | 32 | 64),
-                Ty::Float(ty) => matches!(ty.bits, 32 | 64),
-                _ => false,
-            }) {
+            || !def.fields.iter().all(|field| align_sema::c_record_field_scalar(field.ty).is_some()) {
             return Err(invalid());
         }
         let size = data.get_abi_size(&st);
@@ -27679,6 +27695,7 @@ fn main() -> i32 = 0
                 };
                 st.set_body(&fields, false);
                 let abi = classify_struct_abi(0, &st, &def, &td)
+                    .map_err(|error| error.to_string())?
                     .ok_or("register record classified as memory")?;
                 assert_eq!(abi.ebs, [expected]);
                 assert_eq!(

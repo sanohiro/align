@@ -1,5 +1,10 @@
 # ARM64 C-record value passage
 
+[Plan233](233-c-record-fixed-arrays.md) extends the field domain below with
+positive fixed arrays of C integer/float scalars. Its shared classifier and
+flattened scalar-leaf rules preserve this plan's Copy, scratch and native-call
+contract. The original scalar-only formation boundary is superseded to that extent.
+
 Status: implemented capability after plan137. Request32 names two native signatures
 that require record values: a 24-byte context parameter and a returned allocator
 record. Both supported ARM64 hosts currently reject every record value. This
@@ -36,13 +41,12 @@ result := probe_params(NativeParams { length: 42, data: raw.null(), flags: 1 }, 
 ## Physical plan table
 
 Let S be the native padded size, A the greater of natural field alignment and
-explicit aggregate align(N), and F the semantic field list. Every admitted
-field is naturally aligned and at most eight bytes. LLVM's nominal record
+explicit aggregate align(N), and F the semantic field list. Every admitted scalar leaf is naturally aligned and at most eight bytes. LLVM's nominal record
 alignment alone does not encode align(N); use A for scratch and sret.
 
-An HFA is one through four fields all of exactly the same f32 or f64 type,
-with no object padding beyond those fields (S equals field count times field
-size). Explicit alignment does not disqualify a no-padding HFA. Padding that
+An HFA has one through four scalar leaves, flattening fixed fields, all of
+exactly the same f32 or f64 type, with no object padding beyond those leaves
+(S equals leaf count times leaf size). Explicit alignment does not disqualify a no-padding HFA. Padding that
 increases S does. Test both sides of this distinction.
 
 | Shape / position | Linux AAPCS64 | macOS DarwinPCS |

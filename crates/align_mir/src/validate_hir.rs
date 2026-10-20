@@ -1414,7 +1414,7 @@ impl<'a> PlacementValidator<'a> {
                         != align_sema::HttpUpgradeCarrierClass::None
                     || !(self.field_type_ok(field.ty, abstract_node)
                         || definition.c_repr && field.ty == Ty::Raw)
-                    || (definition.c_repr && !align_sema::is_ffi_safe(field.ty))
+                    || (definition.c_repr && align_sema::c_record_field_scalar(field.ty).is_none())
                     || !self.inline_structs_unaligned(field.ty)
                 {
                     return false;
@@ -2363,7 +2363,7 @@ impl<'a> PlacementValidator<'a> {
                     && definition
                         .fields
                         .iter()
-                        .all(|field| align_sema::is_ffi_safe(field.ty))
+                        .all(|field| align_sema::c_record_field_scalar(field.ty).is_some())
             })
     }
 }

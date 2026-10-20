@@ -1,5 +1,10 @@
 # Raw pointer fields in C-layout records
 
+[Plan233](233-c-record-fixed-arrays.md) extends the field domain below with
+positive fixed arrays of C integer/float scalars. Its shared classifier and
+flattened scalar-leaf rules preserve this plan's Copy, scratch and native-call
+contract. The original scalar-only formation boundary is superseded to that extent.
+
 Status: implemented capability. Request 32 supplies the concrete consumer:
 `ggml_init_params` contains `size_t`, `void *`, and an integer-represented C
 boolean. The present field gate prevents even the existing pointer-based FFI
