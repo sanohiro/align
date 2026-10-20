@@ -1400,11 +1400,22 @@ descending alignment to eliminate padding (`{ a: i8, b: i64, c: i8 }` → 16 byt
 by-name-invisible cache-density win. A `layout(C)` attribute (`layout(C) Point { … }`, composes with
 `align(N)`) is the escape hatch — it pins a struct to a stable, C-compatible flat layout (declaration
 order, natural alignment, no reordering). Among structs, only such a struct may be written to / read
-from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its fields must be
+from `raw` memory (`raw.store`/`raw.load` of a whole struct) — the pointer-based FFI pattern. Its scalar fields must be
 integers, floats, or `raw` pointers. Pointer fields retain native pointer size/alignment and are
 non-owning Copy values: no implicit free, pointee copy, lifetime extension or dereference authority.
 Direct raw fields in ordinary structs and generic C records remain rejected
-([plan137](impl/137-c-layout-raw-fields.md)). On **little-endian LP64 x86-64
+([plan137](impl/137-c-layout-raw-fields.md)).
+
+Fixed numeric fields `[P; N]` are also C-compatible when P is an integer or
+floating-point C scalar and N is positive. Elements are contiguous inline values
+with P's native size/alignment; ordinary C field and tail padding still apply.
+They retain Copy semantics through raw storage and supported by-value foreign
+calls. Zero-length C fields, bool/char/raw-pointer arrays, nested arrays/records,
+views and owning elements remain excluded; ordinary Align zero-length arrays
+are unchanged. Naked fixed arrays do not become extern parameters or results.
+[Plan233](impl/233-c-record-fixed-arrays.md) owns the fixed-field contract.
+
+On **little-endian LP64 x86-64
 Linux (SysV AMD64, GNU/musl)**, records up to 16 bytes use non-padding INTEGER/SSE
 eightbytes when every argument class fits. Larger or register-exhausted arguments
 use typed byval stack copies aligned to max(record alignment,8), consuming no

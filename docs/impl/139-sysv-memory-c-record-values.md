@@ -1,5 +1,10 @@
 # SysV MEMORY C-record value passage
 
+[Plan233](233-c-record-fixed-arrays.md) extends the field domain below with
+positive fixed arrays of C integer/float scalars. Its shared classifier and
+flattened scalar-leaf rules preserve this plan's Copy, scratch and native-call
+contract. The original scalar-only formation boundary is superseded to that extent.
+
 Status: implemented capability after plan138. Request32 demonstrates a 24-byte
 native context argument and native record result. ARM64 now supports the full
 existing flat C-record field domain. This capability removes Linux x86-64's

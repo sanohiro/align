@@ -363,6 +363,12 @@ Plan139 completes Linux x86-64 through one typed MEMORY argument path for both
 large records and exhausted register aggregates. Whole-aggregate rollback and
 the hidden-result register budget belong to that same physical plan. Independent
 aligned copies preserve the existing Copy contract without heap allocation.
+Plan233 extends this same C representation to positive fixed arrays of numeric
+C scalars. Inline elements need neither allocation nor new ownership. C storage
+and all supported by-value ABIs ship together: SysV classifies each element's
+occupied eightbyte and ARM counts homogeneous scalar leaves through arrays.
+A raw-only exception would contradict the type's native representation promise.
+Zero-length C arrays have no standard C member representation and remain excluded.
 Bool/char FFI remains deferred.
 
 ---

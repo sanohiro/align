@@ -4586,6 +4586,24 @@ pub fn is_ffi_safe(ty: Ty) -> bool {
     matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Raw)
 }
 
+/// A C-record field's scalar leaf and inline multiplicity. Arrays require a positive length
+/// and numeric C elements; scalar extern parameters/results still use `is_ffi_safe`.
+/// Keeping widths here also closes the independently checked HIR and native ABI classifiers.
+pub fn c_record_field_scalar(ty: Ty) -> Option<(Ty, u32)> {
+    let (scalar, count) = match ty {
+        Ty::Array(Scalar::Int(integer), count) if count > 0 => (Ty::Int(integer), count),
+        Ty::Array(Scalar::Float(float), count) if count > 0 => (Ty::Float(float), count),
+        Ty::Int(_) | Ty::Float(_) | Ty::Raw => (ty, 1),
+        _ => return None,
+    };
+    match scalar {
+        Ty::Int(integer) if matches!(integer.bits, 8 | 16 | 32 | 64) => Some((scalar, count)),
+        Ty::Float(float) if matches!(float.bits, 32 | 64) => Some((scalar, count)),
+        Ty::Raw => Some((scalar, count)),
+        _ => None,
+    }
+}
+
 /// FFI-safe as an extern **parameter**: everything [`is_ffi_safe`] accepts, plus a `str` and a
 /// `slice<T>` **whose element is an FFI-safe scalar** (int/float — so `bytes` = `slice<u8>` qualifies,
 /// but `slice<str>` / `slice<Struct>` do not: their element layout has no settled C representation,
@@ -10076,12 +10094,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     f.span,
                 );
             }
-            // A `layout(C)` struct promises a C-compatible flat layout, so its fields must be the
-            // FFI-mappable scalars (integers/floats/raw pointers). A pointer field has the same
-            // non-owning unsafe contract as a raw local; it never participates in Drop.
-            if s.c_repr && ty != Ty::Error && !is_ffi_safe(ty) {
+            // C fields use scalars or positive numeric fixed arrays with their ordinary inline
+            // representation. Direct pointers remain non-owning and never participate in Drop.
+            if s.c_repr && ty != Ty::Error && c_record_field_scalar(ty).is_none() {
                 diags.error(
-                    format!("a `layout(C)` struct field must be an integer, float, or raw pointer (got {}) — other field types are a later FFI slice", ty_name(ty)),
+                    format!("a `layout(C)` struct field must be an integer, float, raw pointer, or positive-length fixed array of integers or floats (got {})", ty_name(ty)),
                     f.span,
                 );
             }
@@ -78580,6 +78597,38 @@ fn parse_mask_name(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c_record_field_domain() {
+        for scalar in [
+            Scalar::Int(IntTy { bits: 8, signed: true }), Scalar::Int(IntTy { bits: 8, signed: false }),
+            Scalar::Int(IntTy { bits: 16, signed: true }), Scalar::Int(IntTy { bits: 16, signed: false }),
+            Scalar::Int(IntTy { bits: 32, signed: true }), Scalar::Int(IntTy { bits: 32, signed: false }),
+            Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Int(IntTy { bits: 64, signed: false }),
+            Scalar::Float(FloatTy { bits: 32 }), Scalar::Float(FloatTy { bits: 64 }),
+        ] {
+            let leaf = scalar_to_ty(scalar);
+            assert_eq!(c_record_field_scalar(leaf), Some((leaf, 1)));
+            for count in [1, 2, 3, 4, 5, 8, 41, u32::MAX] {
+                let field = Ty::Array(scalar, count);
+                assert_eq!(c_record_field_scalar(field), Some((leaf, count)));
+                assert!(!is_ffi_safe(field));
+            }
+            assert_eq!(c_record_field_scalar(Ty::Array(scalar, 0)), None);
+        }
+        assert_eq!(c_record_field_scalar(Ty::Raw), Some((Ty::Raw, 1)));
+        for scalar in [Scalar::Bool, Scalar::Char, Scalar::Str, Scalar::String,
+            Scalar::Int(IntTy { bits: 7, signed: false }), Scalar::Float(FloatTy { bits: 16 })] {
+            assert_eq!(c_record_field_scalar(scalar_to_ty(scalar)), None);
+            for count in [0, 1, 41] {
+                assert_eq!(c_record_field_scalar(Ty::Array(scalar, count)), None);
+            }
+        }
+        for ty in [Ty::Struct(0), Ty::StructArray(0, 1), Ty::DynArray(Scalar::Bool),
+            Ty::Slice(Scalar::Bool), Ty::Buffer, Ty::Unit, Ty::Error] {
+            assert_eq!(c_record_field_scalar(ty), None);
+        }
+    }
     fn with_dynamic_array_field_checkers(
         source: &str,
         operation: impl FnOnce(&mut EscapeCheck<'_>, &mut MoveCheck<'_>),

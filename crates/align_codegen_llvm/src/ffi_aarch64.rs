@@ -108,12 +108,7 @@ impl Record {
         let invalid = || CodegenError::Lowering("invalid ARM64 C-record ABI layout".into());
         if !definition.c_repr
             || definition.fields.is_empty()
-            || !definition.fields.iter().all(|field| match field.ty {
-                Ty::Raw => true,
-                Ty::Int(ty) => matches!(ty.bits, 8 | 16 | 32 | 64),
-                Ty::Float(ty) => matches!(ty.bits, 32 | 64),
-                _ => false,
-            })
+            || !definition.fields.iter().all(|field| align_sema::c_record_field_scalar(field.ty).is_some())
         {
             return Err(invalid());
         }
@@ -125,13 +120,13 @@ impl Record {
             return Err(invalid());
         }
         let homogeneous = definition.fields.first().and_then(|first| {
-            let Ty::Float(float) = first.ty else {
-                return None;
-            };
-            let members = u32::try_from(definition.fields.len()).ok()?;
-            (members <= 4
-                && size == u64::from(members) * u64::from(float.bits / 8)
-                && definition.fields.iter().all(|field| field.ty == first.ty))
+            let (Ty::Float(float), _) = align_sema::c_record_field_scalar(first.ty)? else { return None; };
+            let members = definition.fields.iter().try_fold(0u32, |members, field| {
+                let (scalar, count) = align_sema::c_record_field_scalar(field.ty)?;
+                let total = members.checked_add(count)?;
+                (scalar == Ty::Float(float) && total <= 4).then_some(total)
+            })?;
+            (size == u64::from(members) * u64::from(float.bits / 8))
             .then_some(Coerce::Homogeneous {
                 bits: float.bits,
                 members,

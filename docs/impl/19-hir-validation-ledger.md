@@ -1,11 +1,15 @@
 # Checked-HIR validation ledger
 
-Concrete `layout(C)` fields and extern struct signatures share the sema-owned
-`is_ffi_safe` integer/float/raw family predicate (plan137). The ordinary field
-predicate admits raw only when that containing definition has c_repr; malformed
-widths still fail ordinary type validation. Raw fields remain non-owning Copy
-values with no inferred pointee authority. The parameterized raw-field placement
-owner rejects non-C/raw and C/non-scalar mutations before MIR.
+Concrete `layout(C)` fields and extern struct signatures share sema's
+`c_record_field_scalar` predicate (plans137/233): C integer/float/raw scalars or
+positive fixed arrays of numeric C scalars, with exact scalar-width validation.
+The returned leaf/multiplicity also governs both native ABI classifiers.
+Scalar extern parameters/results retain the separate `is_ffi_safe` domain;
+a naked fixed array is not a native parameter/result. The ordinary field
+predicate admits direct raw only under c_repr. Raw fields remain non-owning
+Copy with no inferred pointee authority. Parameterized source/checked-HIR owners
+reject invalid widths, zero/non-numeric C arrays, non-C raw fields and naked
+extern arrays before MIR. Existing fixed field/length interface records suffice.
 
 Ordinary field placement also admits the existing Copy `Rng` leaf (plan175),
 including generic substitution and nested records. Semantic layout is exactly

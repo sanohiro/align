@@ -7,6 +7,8 @@ mod ffi_aarch64;
 mod ffi_sysv_cases;
 #[path = "helpers/ffi_sysv.rs"]
 mod ffi_sysv;
+#[path = "helpers/ffi_fixed_array_cases.rs"]
+mod ffi_fixed_array_cases;
 
 use align_driver::{
     ArtifactStage, BuildTarget, Profile, build_per_unit, check, emit_llvm_ir, link_objects,
@@ -126,6 +128,89 @@ fn imported_extern_record_signatures() {
     all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
 ))]
 #[test]
+fn fixed_numeric_fields_cross_c_storage_and_values() {
+    run_owned_role("fixed-arrays");
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+))]
+#[test]
+fn fixed_numeric_field_cache_tracks_width_count_and_revert() {
+    run_owned_role("fixed-array-cache");
+}
+
+fn fixed_arrays(stage: &Path) {
+    let (c, source, calls) = ffi_fixed_array_cases::sources();
+    assert_eq!(calls, 392, "fixed C-field native inventory changed");
+    compile_c(stage, &c);
+    fs::write(stage.join("factory.align"), format!("module factory\n{source}")).unwrap();
+    for per_unit in [false, true] {
+        build_and_run(stage, "import factory\nfn main() -> i32 = factory.exercise()\n", per_unit, "fixed-arrays");
+    }
+}
+
+fn fixed_array_cache(stage: &Path) {
+    let entry = stage.join("main.align");
+    let main = "import factory\nfn main() -> i32 = factory.exercise()\n";
+    fs::write(&entry, main).unwrap();
+    let context = align_driver::CacheContext::at(stage.join("cache"));
+    let mut original = Vec::new();
+    for (round, revision) in [0, 0, 1, 2, 0].into_iter().enumerate() {
+        let (c, source, _) = ffi_fixed_array_cases::sources_for_revision(revision);
+        compile_c(stage, &c);
+        fs::write(stage.join("factory.align"), format!("module factory\n{source}")).unwrap();
+        let mut sm = SourceMap::new();
+        let mut built = align_driver::build_package(&mut sm, entry.to_str().unwrap(), main,
+            &context, align_driver::UnitReuse::Allowed);
+        assert!(!built.diags.has_errors(), "{}", align_driver::format_diagnostics(&sm, &built.diags));
+        for name in ["factory", "main"] {
+            let unit = built.units.iter().find(|unit| unit.unit == name).unwrap();
+            assert_eq!(unit.frontend.as_ref().unwrap().hit, round == 1 || round == 4, "{round}/{name}");
+        }
+        let programs = (0..built.units.len()).map(|i| built.materialize(i).unwrap().clone()).collect::<Vec<_>>();
+        let snapshot = programs.iter().map(|p| format!("{:?}\n{}", p.structs, align_mir::print::program_to_string(p))).collect::<Vec<_>>();
+        if round == 0 { original = snapshot; }
+        else if revision != 0 { assert!(original != snapshot); }
+        else { assert!(original == snapshot); }
+        run_programs(stage, &programs, &format!("fixed-cache-{round}"), 0);
+    }
+}
+
+#[test]
+fn fixed_c_fields_preserve_the_excluded_domains() {
+    let stage = ArtifactStage::temp("fixed-c-domain").unwrap();
+    let mut cases = Vec::new();
+    for field in ["[i64; 0]", "[f64; 0]", "[bool; 1]", "[char; 1]", "[str; 1]", "[string; 1]",
+        "[raw; 1]", "[bool; 0]", "[[i64; 2]; 1]", "[Inner; 1]", "slice<i64>"] {
+        cases.push(format!("Inner {{ x:i64 }}\nlayout(C) Bad {{ value:{field} }}\nfn main() {{}}\n"));
+    }
+    cases.extend([
+        "layout(C) Generic<T> { value:[T;1] }\nfn main() {}\n".into(),
+        "extern \"C\" fn f(value:[i64;2])\nfn main() {}\n".into(),
+        "extern \"C\" fn f() -> [i64;2]\nfn main() {}\n".into(),
+        "layout(C) Cell { values:[i64;2] }\nfn escape() -> slice<i64> { cell := Cell { values:[1,2] }; return cell.values[..] }\nfn main() {}\n".into(),
+    ]);
+    for (i, source) in cases.iter().enumerate() {
+        let entry = stage.path().join(format!("bad-{i}.align"));
+        fs::write(&entry, source).unwrap();
+        for per_unit in [false, true] {
+            let mut sm = SourceMap::new();
+            let diags = if per_unit { build_per_unit(&mut sm, entry.to_str().unwrap(), source).diags }
+                else { check(&mut sm, entry.to_str().unwrap(), source).diags };
+            let text = align_driver::format_diagnostics(&sm, &diags);
+            assert!(diags.has_errors(), "accepted excluded C field {i}/{per_unit}");
+            assert!(!text.contains("internal error") && !text.contains("expected expression") && !text.contains("undefined name"), "bad fixture {i}: {text}");
+        }
+    }
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
+))]
+#[test]
 fn c_layout_record_alignment_cache_round_trip() {
     // The same-symbol cold/warm/change/restore cycle is an independent native owner.
     // Give it its own existing work/cleanup budget instead of extending the combined one.
@@ -141,6 +226,8 @@ fn c_layout_raw_helper() {
         "compile" => compile_and_run(stage),
         "imported-externs" => imported_externs(stage),
         "alignment-cache" => cache_alignment(stage),
+        "fixed-arrays" => fixed_arrays(stage),
+        "fixed-array-cache" => fixed_array_cache(stage),
         "leader" => {
             // Deliberately leave a live descendant after the group leader exits. Its ownership
             // remains with the parent test's ChildGroup, not with this intentionally short helper.

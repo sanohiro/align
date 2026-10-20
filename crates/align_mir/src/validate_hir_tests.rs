@@ -38,6 +38,33 @@ fn c_layout_raw_fields_require_the_exact_scalar_domain() {
     }
 }
 
+#[test]
+fn c_layout_fixed_fields_require_positive_numeric_elements() {
+    let program = checked_source_program(
+        "layout(C) Cell { values: [f64; 4], tag: i32 }\nextern \"C\" fn echo(value: Cell) -> Cell\nfn main() {}\n",
+    );
+    assert!(validate_hir::type_placement_metadata_is_valid(&program));
+    for ty in [
+        Ty::Array(Scalar::Float(FloatTy { bits: 64 }), 0),
+        Ty::Array(Scalar::Float(FloatTy { bits: 16 }), 1),
+        Ty::Array(Scalar::Int(IntTy { bits: 7, signed: true }), 2),
+        Ty::Array(Scalar::Bool, 4), Ty::Array(Scalar::Char, 4),
+        Ty::Array(Scalar::Str, 4), Ty::Array(Scalar::String, 4),
+        Ty::StructArray(0, 1),
+    ] {
+        let mut invalid = program.clone();
+        invalid.structs[0].fields[0].ty = ty;
+        assert_rejected(&format!("invalid fixed C field {ty:?}"), &invalid);
+    }
+    for parameter in [true, false] {
+        let mut invalid = program.clone();
+        let array = Ty::Array(Scalar::Float(FloatTy { bits: 64 }), 4);
+        if parameter { invalid.externs[0].params[0] = array; }
+        else { invalid.externs[0].ret = array; }
+        assert_placement_rejected("naked fixed-array extern", &invalid);
+    }
+}
+
 fn direct_program_name(call: &DirectCall) -> Option<&str> {
     match call {
         DirectCall::Program(target) => Some(target.as_str()),

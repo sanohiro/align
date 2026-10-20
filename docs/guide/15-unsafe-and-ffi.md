@@ -81,7 +81,12 @@ fn main() -> i32 {
 layout(C) Point { x: i32, y: i32 }      // matches `struct { int32_t x, y; }`
 ```
 
-Fields may be integers, floats, or `raw` pointers. A pointer-bearing record is Copy;
+Fields may be integers, floats, `raw` pointers, or positive-length fixed arrays
+of C integer/float scalars, such as `dims: [i64; 8]`. Numeric arrays are inline
+Copy data, including in raw storage and supported record-value calls; no child
+allocation is added. Zero-length C fields, bool/char/raw arrays, nested arrays/records
+and owning/view elements are excluded. Naked arrays cannot cross extern calls.
+A pointer-bearing record is Copy;
 copying, replacing or returning it never copies/frees the pointee or extends its
 lifetime. Pointer validity and dereferencing remain your responsibility inside
 `unsafe`. Direct raw fields in ordinary structs and generic C records are not supported.

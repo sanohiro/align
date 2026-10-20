@@ -2757,17 +2757,25 @@ unsafe {
 Among structs, only a `layout(C)` struct may be moved through a `raw` pointer (`raw.store`/`raw.load`
 of a whole struct), because only it promises a fixed representation — this is the pointer-based FFI
 pattern (hand C a buffer, read/write structs in it). Primitive scalars and `raw` pointers are the
-other admitted flat values. Its fields must be FFI-mappable scalars (integers, floats, or `raw`
+other admitted flat values. Its scalar fields must be FFI-mappable (integers, floats, or `raw`
 pointers). A pointer field has native pointer size/alignment and remains non-owning: the record
 is Copy, adds no Drop, and never extends a pointee lifetime or grants dereference authority.
 Direct `raw` fields in ordinary structs and generic `layout(C)` declarations remain rejected.
 [Plan137](docs/impl/137-c-layout-raw-fields.md) records the exact field and validation contract.
 
+Fixed numeric fields `[P; N]` are also C-compatible when P is an integer or
+floating-point C scalar and N is positive. Elements are contiguous inline values
+with P's native size/alignment; ordinary C field and tail padding still apply.
+They retain Copy semantics through raw storage and supported by-value foreign
+calls. Zero-length C fields, bool/char/raw-pointer arrays, nested arrays/records,
+views and owning elements remain excluded; ordinary Align zero-length arrays
+are unchanged. Naked fixed arrays do not become extern parameters or results.
+[Plan233](docs/impl/233-c-record-fixed-arrays.md) owns the fixed-field contract.
+
 ### By-value structs
 
 Concrete nonempty `layout(C)` records cross `extern "C"` by value on x86-64
-Linux and little-endian LP64 ARM64 Linux/macOS. Their fields remain integers,
-floats or non-owning `raw` pointers. Calls retain the existing unsafe permission,
+Linux and little-endian LP64 ARM64 Linux/macOS. Their fields use the C scalar and fixed numeric domain above. Calls retain the existing unsafe permission,
 Copy semantics and pointee obligations.
 
 On **little-endian LP64 x86-64 Linux (SysV AMD64, GNU/musl)**, records up to
