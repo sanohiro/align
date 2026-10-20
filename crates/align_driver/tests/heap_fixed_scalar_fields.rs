@@ -243,6 +243,37 @@ fn primitive_layouts() {
 }
 
 #[test]
+fn zero_parallel_consumers() {
+    owned_fixture::run("zero_parallel_consumers", |stage| {
+        for length in [0, 1] {
+            let source = format!(r#"Row {{ dims: [i64; {length}] }}
+fn score(row: Row) -> i64 = row.dims.len() + 1
+fn exercise(count: i64) -> i32 {{
+  mut b: array_builder<Row> := array_builder()
+  mut i := 0
+  loop {{ if i == count {{ break }}; b.push(Row {{ dims: [{}] }}); i = i + 1 }}
+  rows := b.build()
+  mapped := rows.par_map(score).to_array()
+  expected := count * ({length} + 1)
+  if mapped.len() != count || mapped.sum() != expected {{ return 1 }}
+  if rows.par_map(score).sum() != expected {{ return 2 }}
+  kept := rows.where(fn row: Row {{ row.dims.len() == {length} }}).par_map(score).to_array()
+  if kept.len() != count || kept.sum() != expected {{ return 3 }}
+  rejected := rows.where(fn row: Row {{ row.dims.len() != {length} }}).par_map(score).to_array()
+  if rejected.len() != 0 {{ return 4 }}
+  return 0
+}}
+fn main() -> i32 {{
+  if exercise(0) != 0 || exercise(3) != 0 || exercise(131073) != 0 {{ return 1 }}
+  return 0
+}}
+"#, if length == 0 { "" } else { "7" });
+            native::execute(stage, &source, &format!("parallel-{length}")).unwrap();
+        }
+    });
+}
+
+#[test]
 fn zero_bounds_preserve_evaluation() {
     owned_fixture::run("zero_bounds_preserve_evaluation", |stage| {
         for built in [false, true] {

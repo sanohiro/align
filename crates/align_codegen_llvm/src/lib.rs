@@ -12864,6 +12864,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
         self.builder.position_at_end(body);
         let x = match source {
+            // A positive logical count may have a null payload when its record stride is zero.
+            // The unique value needs no load; keep this inside the outlined kernel rather than
+            // allocating addressable storage in the enclosing source function.
+            ParallelSource::Materialized(_) if self.element_allocation_size(in_ty) == 0 => {
+                in_ty.const_zero()
+            }
             ParallelSource::Materialized(_) => {
                 let in_p = unsafe {
                     self.builder.build_in_bounds_gep(in_ty, in_base, &[i], "in.elem").map_err(|e| self.err(e))?
@@ -32852,11 +32858,18 @@ fn main() -> i32 = 0
                 fn whole(xs: slice<Row>, index: i64) -> Row = xs[index]\n\
                 fn field(xs: slice<Row>, index: i64) -> [i64; {length}] = xs[index].dims\n\
                 fn collect(xs: slice<Row>) -> array<Row> = xs.map(fn row: Row {{ row }}).to_array()\n\
+                fn parallel(xs: slice<Row>) -> array<i64> = xs.par_map(fn row: Row {{ row.dims.len() + 1 }}).to_array()\n\
+                fn filtered(xs: slice<Row>) -> array<i64> = xs.where(fn row: Row {{ row.dims.len() == {length} }}).par_map(fn row: Row {{ row.dims.len() + 1 }}).to_array()\n\
+                fn reduced(xs: slice<Row>) -> i64 = xs.par_map(fn row: Row {{ row.dims.len() + 1 }}).sum()\n\
                 fn main() {{}}\n");
             let program = mir(&source);
             let ir = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
                 .map_err(|_| "fixed heap field access IR")?;
             assert!(ir.contains("@align_rt_bounds_fail("));
+            for entry in ["par_map", "par_map_filter", "par_map_reduce"] {
+                assert!(ir.lines().any(|line| line.contains("call") && line.contains(&format!("@align_rt_{entry}("))),
+                    "missing outlined {entry} positive control");
+            }
             let addresses = ir.lines().filter(|line| line.contains("getelementptr inbounds %Row,")).collect::<Vec<_>>();
             assert!(!addresses.is_empty(), "element address positive control");
             if length == 0 {
