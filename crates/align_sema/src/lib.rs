@@ -464,7 +464,7 @@ pub fn scan_accumulator_result(
 ) -> Option<Ty> {
     match acc {
         Ty::Struct(_) => independent_record_array_result(acc, structs, tuples, enums, tagged_types),
-        Ty::Tuple(_) => None,
+        Ty::Raw | Ty::Tuple(_) => None,
         _ => ty_to_scalar(acc).map(Ty::DynArray),
     }
 }
@@ -81900,9 +81900,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // OsMemory observes only Copy counts and retains no storage.
         // UnicodeNfc constructs a fresh owned string without retaining input storage.
         // ArraySortCmp shares the fresh pipeline-element policy with the other sort terminals.
+        // RawTryAlloc constructs a Copy Result without retained input storage.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 359,
+            variants, 360,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

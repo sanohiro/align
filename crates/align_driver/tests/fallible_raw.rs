@@ -154,6 +154,41 @@ fn fallible_raw_rejects_invalid_domains() {
 }
 
 #[test]
+fn fallible_raw_collection_producers_reject() {
+    owned_fixture::run("fallible_raw_collection_producers_reject", |stage| {
+        let cases = [
+            ("fn bad(pointer:raw) {values:=[1,2].scan(pointer,fn prior:raw,x:i64 {prior})}", "'scan' accumulator must be a materializable"),
+            ("fn bad(pointer:raw) {values:=[pointer]}", "raw"),
+            ("fn bad(pointer:raw) {values:=[1,2].map(fn x:i64 {pointer}).to_array()}", "'to_array' needs a scalar"),
+            ("fn bad(pointer:raw,out destination:slice<i64>) {[1,2].map(fn x:i64 {pointer}).map_into(destination)}", "'map_into' needs a scalar"),
+            ("fn bad(pointer:raw) {value:=heap.new(pointer)}", "raw"),
+            ("fn bad() {mut builder:array_builder<raw>:=array_builder()}", "array_builder<T> element"),
+            ("fn bad(pointer:raw) {value:=[1,2].map(fn x:i64 {pointer}).any(fn p:raw {p.is_null()})}", "'any' needs a scalar"),
+            ("fn bad(pointer:raw) {value:=[1,2].map(fn x:i64 {pointer}).all(fn p:raw {p.is_null()})}", "'all' needs a scalar"),
+        ];
+        let entry = stage.join("bad.align");
+        for (source, expected) in cases {
+            let source = format!("module main\n{source}\nfn main() {{}}\n");
+            std::fs::write(&entry, &source).unwrap();
+            for per_unit in [false, true] {
+                let mut map = SourceMap::new();
+                let diags = if per_unit {
+                    align_driver::build_per_unit(&mut map, entry.to_str().unwrap(), &source).diags
+                } else {
+                    align_driver::check(&mut map, entry.to_str().unwrap(), &source).diags
+                };
+                let rendered = align_driver::format_diagnostics(&map, &diags);
+                assert!(diags.has_errors() && rendered.contains(expected),
+                    "raw producer ({per_unit}): {source}\n{rendered}");
+            }
+        }
+        // A scalar reduction transports an existing pointer without collecting it.
+        let source = "module main\nfn keep(pointer:raw)->raw = [1,2].reduce(pointer,fn prior:raw,x:i64 {prior})\nfn main() {}\n";
+        for per_unit in [false, true] { let _ = programs(stage, source, per_unit); }
+    });
+}
+
+#[test]
 fn fallible_raw_generic_cache() {
     owned_fixture::run("fallible_raw_generic_cache", |stage| {
         let cache = align_driver::CacheContext::at(stage.join("cache"));

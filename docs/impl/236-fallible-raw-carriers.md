@@ -40,7 +40,7 @@ including sizes smaller than eight; no stronger alignment is inferred.
 
 | Axis | Implementation and exact discriminating owner |
 | --- | --- |
-| Type formation and validation | Scalar/Ty conversions, concrete/generic enum payloads and tuple/field admission, constructor replay and complete type graph. `align_driver --test fallible_raw` covers every carrier family and its nearest forbidden collection/FFI/JSON placements, including generic instantiation. `align_mir --lib fallible_raw` mutates one checked-HIR property at a time and checks RawLoad cannot use the new Scalar to bypass RawPointerLoad or C-only struct storage. Existing c_layout_raw_fields positives remain; its ordinary-field negative becomes a positive in the new owner. |
+| Type formation and validation | Scalar/Ty conversions, concrete/generic enum payloads and tuple/field admission, constructor replay and complete type graph. `align_driver --test fallible_raw` covers every carrier family and its nearest forbidden collection/FFI/JSON placements, including generic instantiation and scan/to_array/literal/box/builder producers. `align_mir --lib fallible_raw` mutates one checked-HIR property at a time and checks RawLoad cannot use the new Scalar to bypass RawPointerLoad or C-only struct storage; body-only array/slice/builder/box and raw literal mutations also reject without relying on a record-field placement gate. Existing c_layout_raw_fields positives remain; its ordinary-field negative becomes a positive in the new owner. |
 | Copy, move-in/out, nulling, Drop, replacement and return | Explicit Raw leaf in ownership/region/drop/layout classifiers; existing composite algorithms traverse other elements unchanged. Driver `fallible_raw` returns static native pointers through every carrier, copies and replaces them without automatic free; mixed resource/view controls retain exactly-once cleanup and escape rejection. Reuse tuples, tuple_carriers, owned_tagged_payloads, else_result and unsafe_raw cumulative owners. |
 | Control and inference | Source owner crosses if/match/else/?/map_err, branch and loop joins, both active tags, early exits and partial eager construction. Include expected type present/absent, immediate/diverging operand completion, source-order effects and clean/already-invalid arguments. Existing joins are reused, not redesigned. Borrowed local/arena views inside mixed carriers retain their rejection owners. |
 | Generic, interface and cache | Imported public fields/sums and generic raw transport; direct/indirect callbacks and map_err. Driver cold/hit/leaf-edit/revert executions prove actual values; the same owner round-trips each actual structural interface, including Raw under tagged/product positions. `align_mir --lib fallible_raw` owns exact scalar-63 canonical bytes and malformed unknown tags. |
@@ -98,3 +98,16 @@ that actual allocator refusal through a scoped thread-local failpoint, including
 another thread's independence and restoration. No probe exhausts host memory.
 Native artifact hashes and exact executions are retained in the capability
 receipt; consumer integration remains outside this provider qualification.
+
+## Code-review closure
+
+The independent code review identified the new leaf's unintended admission by
+`scan` and body-only collection validation, two stale ExprKind inventory counts,
+and stale Raw entries in Plan17's exact type-placement table. The correction
+closes the collection producer and body/type/literal validators together, updates
+both complete variant inventories to 360 after the visitor sweep, and reconciles
+Plan17's Raw producer sets and field/enum/tuple rows. A parameterized source owner
+covers collection-producing contexts in both frontends; malformed body-only HIR
+and accepted raw carrier twins distinguish placement from transport. The audit
+of every `ty_to_scalar` use retains independent builder, const, task, sort, JSON
+and FFI domain gates. No public surface, IR shape or ownership strategy changes.

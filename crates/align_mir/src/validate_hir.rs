@@ -2212,7 +2212,7 @@ impl<'a> PlacementValidator<'a> {
             return false;
         }
         match payload {
-            Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Str => false,
+            Scalar::Raw | Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Str => false,
             Scalar::Tagged(id) => !align_sema::drop_plan(
                 Ty::Tagged(id),
                 &self.program.structs, &self.program.tuples,
@@ -3618,7 +3618,7 @@ impl<'a> BodyValidator<'a> {
                 self.body_scalar_ok(payload) && self.placement.box_payload_ok(payload)
             }
             Ty::Array(element, _) => {
-                !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
+                !matches!(element, Scalar::Raw | Scalar::Struct(_)) && self.body_scalar_ok(element)
             }
             Ty::Vec(element, lanes) | Ty::Mask(element, lanes) => {
                 matches!(lanes, 2 | 4 | 8 | 16)
@@ -3628,10 +3628,10 @@ impl<'a> BodyValidator<'a> {
             Ty::StructArray(id, _) => self.program.structs.get(id as usize).is_some(),
             Ty::DynStructArray(id, Layout::Aos) => self.placement.dynamic_struct_array_ok(id),
             Ty::DynStructArray(_, Layout::Soa) => false,
-            Ty::Slice(element) => self.body_scalar_ok(element),
+            Ty::Slice(element) => element != Scalar::Raw && self.body_scalar_ok(element),
             Ty::DynSliceArray(element) => valid_prim(element),
             Ty::DynArray(element) => {
-                !matches!(element, Scalar::Struct(_)) && self.body_scalar_ok(element)
+                !matches!(element, Scalar::Raw | Scalar::Struct(_)) && self.body_scalar_ok(element)
             }
             ty @ (Ty::DynVecArray(..)
             | Ty::DynMaskArray(..)
@@ -3651,7 +3651,7 @@ impl<'a> BodyValidator<'a> {
             }
             Ty::Task(payload) => task_result_type(self.program, payload) && self.body_scalar_ok(payload),
             Ty::ArenaHandle | Ty::Builder => true,
-            Ty::ArrayBuilder(element) => self.body_scalar_ok(element),
+            Ty::ArrayBuilder(element) => element != Scalar::Raw && self.body_scalar_ok(element),
             ty @ (Ty::VecArrayBuilder(..)
             | Ty::MaskArrayBuilder(..)
             | Ty::FixedArrayBuilder(..)
@@ -4077,7 +4077,7 @@ impl<'a> BodyValidator<'a> {
             owned if align_sema::fixed_owned_header_scalar(owned).is_some() => true,
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
-            Ty::Slice(_) => false,
+            Ty::Raw | Ty::Slice(_) => false,
             Ty::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
                     && !align_sema::enum_is_move(

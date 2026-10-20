@@ -50,6 +50,30 @@ fn fallible_raw_checked_hir_boundaries() -> Result<(), &'static str> {
         bad.structs[0].fields[0].ty = ty;
         assert_placement_rejected("raw collection field", &bad);
     }
+    let gates = validate_hir::DelegatedGates::new(&record);
+    for ty in [Ty::Array(Scalar::Raw, 0), Ty::Array(Scalar::Raw, 2),
+        Ty::DynArray(Scalar::Raw), Ty::Slice(Scalar::Raw), Ty::ArrayBuilder(Scalar::Raw),
+        Ty::Box(Scalar::Raw), Ty::Task(Scalar::Raw)] {
+        assert!(!gates.body_ty_ok(ty), "body-only raw collection: {ty:?}");
+    }
+    for ty in [Ty::Raw, Ty::Option(Scalar::Raw), Ty::Result(Scalar::Raw, Scalar::Raw)] {
+        assert!(gates.body_ty_ok(ty), "raw carrier: {ty:?}");
+    }
+    assert!(align_sema::scan_accumulator_result(Ty::Raw, &record.structs,
+        &record.tuples, &record.enums, &record.tagged_types).is_none());
+    assert!(align_sema::scan_accumulator_result(Ty::Bool, &record.structs,
+        &record.tuples, &record.enums, &record.tagged_types).is_some());
+    let mut literal = checked_source_program("fn f(pointer:raw) {values:=[true,false]}\n");
+    assert!(lower_program_checked(&literal, false, None).is_ok());
+    let expression = body_first_let_init_mut(&mut literal, "f");
+    expression.ty = Ty::Array(Scalar::Raw, 2);
+    let hir::ExprKind::ArrayLit { elems, elem, .. } = &mut expression.kind else { return Err("array literal") };
+    *elem = Ty::Raw;
+    *elems = vec![native_local(0, Ty::Raw), native_local(0, Ty::Raw)];
+    let function = literal.fns.iter_mut().find(|f| f.name == "f").ok_or("f")?;
+    let local = function.locals.iter_mut().find(|local| local.name == "values").ok_or("values")?;
+    local.ty = Ty::Array(Scalar::Raw, 2);
+    assert_body_entrypoints_empty("body-only raw literal", &literal);
     Ok(())
 }
 
@@ -13039,8 +13063,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // BufferTryNew adds one explicit fallible owned-buffer construction family.
         // UnicodeNfc adds the canonical owned-string normalization producer.
         // ArraySortCmp adds the explicit two-input comparison terminal.
+        // RawTryAlloc adds the atomic non-owning Result allocation producer.
         variants,
-        359,
+        360,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
