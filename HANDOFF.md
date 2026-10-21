@@ -18,10 +18,11 @@ queue. [Plan51](docs/impl/51-package-composition-review-plan.md) closes the
 process, filesystem and CLI overlap assessment without selecting new exec,
 tree or CLI packages. Plans92, 93 and 95 record those dispositions.
 
-Align v0.10.2 is released with the task-callback and WebSocket fixes. The workspace
-version and [release notes](RELEASE_NOTES_0.10.2.md) own that checkpoint. The newer
-request capabilities below are delivered on main after that release. A release build does
-not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI state.
+Align v0.11.0 collects the consumer-request capabilities through Plan238. The
+workspace version and [release notes](RELEASE_NOTES_0.11.0.md) own that checkpoint.
+Provider delivery remains separate from consumer adoption. A release build does
+not authorize a versioned release. Inspect Git/GitHub for publication, branch,
+PR and CI state.
 
 ## Recent completed capabilities
 
