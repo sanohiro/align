@@ -12084,7 +12084,7 @@ fn hir_body_validator_pipeline_template_json_group() {
                         integer,
                     )),
                     hir::TemplatePart::Text("}".to_string()),
-                ]), max_bytes: Some(Box::new(body_test_expr(hir::ExprKind::Int(2), integer))) },
+                ]), max_bytes: Some(Box::new(body_test_expr(hir::ExprKind::Int(2), integer))), options: None },
             result_string,
         ),
         result_string,
@@ -21603,7 +21603,7 @@ fn json_field_source_and_piece_identity_matrix() -> Result<(), Box<dyn std::erro
             for mutation in 0..7 {
                 let mut bad = base.clone();
                 let expression = body_first_let_init_mut(&mut bad, "encode");
-                let hir::ExprKind::JsonEncode { source, plan, max_bytes } = &mut expression.kind else {
+                let hir::ExprKind::JsonEncode { source, plan, max_bytes, .. } = &mut expression.kind else {
                     return Err("JSON field fixture".into());
                 };
                 match mutation {
@@ -21642,7 +21642,7 @@ fn json_doc_encode_checked_source_and_piece_matrix() -> Result<(), &'static str>
         for mutation in 0..8 {
             assert_owned_json_body_mutation(&base,"document-source",|program| {
                 let expression=body_first_let_init_mut(program,"encode");
-                let hir::ExprKind::JsonEncode {source,plan:hir::JsonEncodePlan::Pieces(parts),max_bytes}=&mut expression.kind else {panic!("document encoder");};
+                let hir::ExprKind::JsonEncode {source,plan:hir::JsonEncodePlan::Pieces(parts),max_bytes,..}=&mut expression.kind else {panic!("document encoder");};
                 match mutation {
                     0=>source.root=u32::MAX,
                     1=>source.path.push(0),
@@ -21774,6 +21774,37 @@ fn task_owned_hir_wait_move_and_payload_replay() -> Result<(), String> {
         for per_unit in [false,true] {
             assert!(lower_program_checked(&invalid,per_unit,None).is_err(),"{mutation}/{per_unit}");
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn json_doc_options_checked_nominal_and_child_matrix() -> Result<(), &'static str> {
+    let base = checked_source_program("import core.json\nfn encode(document:json.doc, options:json.encode_options)->Result<string,Error> {output:=json.encode_bounded(document,100,options);output}\nfn main() {}\n");
+    assert!(body_core_metadata_is_valid(&base));
+    let options_id = base.structs.iter().position(|d| d.name == "json.encode_options").ok_or("options definition fixture")?;
+    for mutation in 0..8 {
+        assert_owned_json_body_mutation(&base, "document-options", |program| {
+            if mutation < 3 {
+                let expression = body_first_let_init_mut(program, "encode");
+                let hir::ExprKind::JsonEncode {options:Some(options),plan,..} = &mut expression.kind else {panic!("options encoder");};
+                match mutation {
+                    0 => options.ty = Ty::Bool,
+                    1 => options.kind = hir::ExprKind::Local(u32::MAX),
+                    _ => *plan = hir::JsonEncodePlan::Pieces(vec![hir::TemplatePart::Text("null".into())]),
+                }
+            } else {
+                // The mutation helper clones the fixture without changing its struct table.
+                let definition = &mut program.structs[options_id];
+                match mutation {
+                    3 => definition.name = "ForgedOptions".into(),
+                    4 => definition.fields.swap(0,1),
+                    5 => definition.fields[0].ty = Ty::Str,
+                    6 => definition.c_repr = true,
+                    _ => definition.align = Some(16),
+                }
+            }
+        });
     }
     Ok(())
 }

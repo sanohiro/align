@@ -2043,7 +2043,7 @@ fn xml_out_producer_result_ty(rvalue: &Rvalue) -> Option<Ty> {
 
 fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
     match rvalue {
-        Rvalue::JsonEncode { max_bytes, .. } => max_bytes.iter().collect(),
+        Rvalue::JsonEncode { max_bytes, options, .. } => max_bytes.iter().chain(options.iter()).collect(),
         Rvalue::JsonDecode { input, arena, .. }
         | Rvalue::JsonOwnedDecode { input, arena, .. }
         | Rvalue::JsonDecodeStructArray { input, arena, .. }
@@ -7057,6 +7057,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Rvalue::JsonEncode {
                 pieces,
                 max_bytes,
+                options,
                 out,
             } => {
                 if slot_ty != Ty::String
@@ -7068,6 +7069,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return;
                 }
                 if let Some(limit) = max_bytes { self.check_operand(equation, limit, i64_ty); }
+                if let Some(options) = options {
+                    let ty = xml_operand_base_ty(self.graph.function, options).unwrap_or(Ty::Error);
+                    if !matches!(pieces.as_slice(), [crate::TemplatePiece::JsonDoc(_)])
+                        || !align_sema::json_encode_options_type(ty, &self.graph.program.structs) {
+                        equation.invalid = true;
+                        return;
+                    }
+                    self.check_operand(equation, options, ty);
+                }
+
                 for piece in pieces {
                     if !self.check_template_piece(equation, piece) {
                         equation.invalid = true;

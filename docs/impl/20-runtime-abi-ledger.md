@@ -1624,8 +1624,8 @@ from the bodies. A merged body also carries no producer string attribute.
 | A70 | `void @SYM(ptr, i64, ptr, i64, ptr)` | `align_rt_json_doc_get`, `align_rt_dict_lookup` |
 | A71 | `void @SYM(ptr, i64, ptr, ptr)` | `align_rt_json_doc_elems`, `align_rt_json_doc_keys` |
 | A72 | `void @SYM(ptr, ptr)` | `align_rt_array_builder_push_bytes`, `align_rt_buffer_bytes` |
-| A73 | `void @SYM(ptr, ptr, i64)` | `align_rt_builder_write`, `align_rt_builder_write_json_str`, `align_rt_json_encode_doc`, `align_rt_command_cwd`, `align_rt_buffer_append`, `align_rt_array_builder_push_str`, `align_rt_array_builder_append`, `align_rt_cli_flag_bool`, `align_rt_http_body`, `align_rt_http_rb_body`, `align_rt_crypto_digest_update` |
-| A74 | `void @SYM(ptr, ptr, i64, i32)` | `align_rt_json_encode_scalar_array` |
+| A73 | `void @SYM(ptr, ptr, i64)` | `align_rt_builder_write`, `align_rt_builder_write_json_str`, `align_rt_command_cwd`, `align_rt_buffer_append`, `align_rt_array_builder_push_str`, `align_rt_array_builder_append`, `align_rt_cli_flag_bool`, `align_rt_http_body`, `align_rt_http_rb_body`, `align_rt_crypto_digest_update` |
+| A74 | `void @SYM(ptr, ptr, i64, i32)` | `align_rt_json_encode_scalar_array`, `align_rt_json_encode_doc` |
 | A75 | `void @SYM(ptr, ptr, i64, i64)` | `align_rt_rng_shuffle`, `align_rt_cli_flag_i64` |
 | A76 | `void @SYM(ptr, ptr, i64, i64, ptr, i64)` | `align_rt_builder_write_str_int_str` |
 | A77 | `void @SYM(ptr, ptr, i64, ptr, i64)` | `align_rt_command_env`, `align_rt_cli_flag_str`, `align_rt_http_header`, `align_rt_http_rb_header` |
@@ -2436,10 +2436,16 @@ source/native observation separately owns status conversion and partial cleanup.
 ## Document subtree encoder (R158)
 
 [Plan237](237-json-doc-encoding.md) adds `JsonEncodeDoc` /
-`align_rt_json_encode_doc(builder: *mut Builder, tape: *const DocTape, node: i64)`
-with native `void(ptr, ptr, i64)` shape A73 and conservative IndirectStorage
+`align_rt_json_encode_doc(builder: *mut Builder, tape: *const DocTape, node: i64, flags: i32)`
+with native `void(ptr, ptr, i64, i32)` shape A74 and conservative IndirectStorage
 effects and `captures(none)` on the tape argument. Only the exclusive builder/output changes; tape/input pointers never
 escape. Sticky failure precedes tape access, and the existing JSON finish owns
 status publication, failure cleanup and output transfer. Document layout and
 interface format are unchanged. Registry, declaration golden, native signature
 and compiler/private-output owners qualify the new row together.
+
+Plan238 changes the private document encoder ABI directly: flags bits 0/1/2
+select comma spacing, colon spacing and incremental string re-escaping. Other
+bits fail before document inspection. Default calls pass zero. Numbers always
+retain their original tokens. Builder layout, effects, failure cleanup and
+no-retention obligations are unchanged; no legacy native entrypoint remains.

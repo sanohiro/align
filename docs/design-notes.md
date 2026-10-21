@@ -1107,6 +1107,12 @@ Retaining validated string escapes avoids unbounded decoding scratch under a
 tiny output cap. The independent owned result makes source expiry explicit;
 typed schemas and their numeric spelling remain separate existing contracts.
 [Plan237](impl/237-json-doc-encoding.md) defines that composition.
+[Plan238](impl/238-json-document-render-options.md) adds an explicit ordinary
+Copy policy record for document spacing and incremental string re-escaping.
+These are presentation choices; exact numeric tokens, default bytes and the
+owned bounded output contract remain. Boolean spacing avoids invalid arbitrary
+separator text, and streaming scalar decoding avoids a hidden normalization
+allocation. No model-template mode or lossy numerical emulation is introduced.
 
 **R63 rationale (2026-09-10).** Standard JSON
 numbers must not become invalid wire tokens merely because a record owns text.

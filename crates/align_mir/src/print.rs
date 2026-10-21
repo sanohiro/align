@@ -724,11 +724,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::JsonEncode {
             pieces,
             max_bytes,
+            options,
             out,
         } => format!(
-            "json.encode({} pieces, max={}, -> _{out})",
+            "json.encode({} pieces, max={}, options={}, -> _{out})",
             pieces.len(),
-            max_bytes.as_ref().map(operand_str).unwrap_or_else(|| "unbounded".to_string())
+            max_bytes.as_ref().map(operand_str).unwrap_or_else(|| "unbounded".to_string()),
+            options.as_ref().map(operand_str).unwrap_or_else(|| "default".to_string())
         ),
         Rvalue::JsonDecode { struct_id, input, out, .. } => {
             format!("json_decode(struct#{struct_id}, {}, -> _{out})", operand_str(input))

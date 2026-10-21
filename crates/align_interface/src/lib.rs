@@ -1702,6 +1702,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("http_stream", 0, BuiltinCapability::Opaque),
     ("http_upgrade", 0, BuiltinCapability::Opaque),
     ("json.kind", 0, BuiltinCapability::Opaque),
+    ("json.encode_options", 0, BuiltinCapability::Opaque),
     ("log.level", 0, BuiltinCapability::Opaque),
     ("buffer.page_policy", 0, BuiltinCapability::Opaque),
     ("codec.kind", 0, BuiltinCapability::Opaque),
@@ -3163,6 +3164,7 @@ pub fn summary_to_source(
                         | "crypto.ed25519_public_key" => {
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
+                        "json.encode_options" => { builtin_type_imports.insert("core.json".to_string()); }
                         "fs.memory_writer" | "fs.sealed_file" | "fs.memory_kind" | "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.access_mode" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
                         "process.child_scope" | "process.member" | "process.member_info" | "process.reaped" | "process.image" | "process.user_namespace" | "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
                         "os.host_info" | "os.identity_info" => { builtin_type_imports.insert("std.os".to_string()); }
@@ -3440,6 +3442,7 @@ mod builtin_spelling_tests {
             "json.scanner",
             "resource_ref",
             "json.kind",
+            "json.encode_options",
             "log.level",
             "buffer.page_policy",
             "codec.kind",

@@ -5839,6 +5839,7 @@ fn callable_preflight(
                     Rvalue::JsonEncode {
                         pieces,
                         max_bytes,
+                        options,
                         out,
                     } => {
                         let i64_ty = Ty::Int(align_sema::IntTy {
@@ -5850,6 +5851,10 @@ fn callable_preflight(
                             signed: true,
                         });
                         if max_bytes.as_ref().is_some_and(|limit| preflight_operand_ty(function, limit) != Some(i64_ty))
+                            || options.as_ref().is_some_and(|options| {
+                                !matches!(pieces.as_slice(), [align_mir::TemplatePiece::JsonDoc(_)])
+                                    || !align_sema::json_encode_options_type(preflight_operand_ty(function, options).unwrap_or(Ty::Error), &program.structs)
+                            })
                             || function.slots.get(*out as usize) != Some(&Ty::String)
                             || function.value_tys.get(*value as usize) != Some(&status_ty)
                             || !align_mir::json_encode_sequence_is_valid(pieces)
@@ -16840,8 +16845,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonEncode {
                 pieces,
                 max_bytes,
+                options,
                 out,
-            } => self.gen_template(result_id, pieces, None, Some((max_bytes.as_ref(), *out)))?,
+            } => self.gen_template(result_id, pieces, None, Some((max_bytes.as_ref(), options.as_ref(), *out)))?,
             Rvalue::JsonDecode {
                 struct_id,
                 input,
@@ -24500,7 +24506,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
         result_id: ValueId,
         pieces: &[align_mir::TemplatePiece],
         arena: Option<&Operand>,
-        json: Option<(Option<&Operand>, Slot)>,
+        json: Option<(Option<&Operand>, Option<&Operand>, Slot)>,
     ) -> Result<BasicValueEnum<'c>, CodegenError> {
         // Pass the enclosing arena handle, or null for an individually owned finish retained by a
         // synthetic MIR string owner.
@@ -24513,9 +24519,22 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let zero = self.ctx.i64_type().const_zero();
         let header = self.stack_template_headers[&result_id];
         let limit = json
-            .and_then(|(max_bytes, _)| max_bytes).map(|max_bytes| self.operand(max_bytes))
+            .and_then(|(max_bytes, _, _)| max_bytes).map(|max_bytes| self.operand(max_bytes))
             .transpose()?;
-        let (init, init_args) = if let Some((cap, _)) = json {
+        let mut doc_flags = self.ctx.i32_type().const_zero();
+        if let Some(options) = json.and_then(|(_, options, _)| options) {
+            let BasicValueEnum::StructValue(options) = self.operand(options)? else {
+                return Err(self.err("JSON encoding options require a record value"));
+            };
+            for (field, mask) in [(0, 1), (1, 2), (2, 4)] {
+                let value = self.builder.build_extract_value(options, field, "json.option").map_err(|e| self.err(e))?;
+                let BasicValueEnum::IntValue(value) = value else { return Err(self.err("JSON option must be Boolean")); };
+                let bit = self.builder.build_int_z_extend(value, self.ctx.i32_type(), "json.option.i32").map_err(|e| self.err(e))?;
+                let bit = self.builder.build_int_mul(bit, self.ctx.i32_type().const_int(mask, false), "json.option.bit").map_err(|e| self.err(e))?;
+                doc_flags = self.builder.build_or(doc_flags, bit, "json.options").map_err(|e| self.err(e))?;
+            }
+        }
+        let (init, init_args) = if let Some((cap, _, _)) = json {
             (
                 RuntimeKey::JsonBuilderInit,
                 vec![header.into(), self.ctx.i32_type().const_int(u64::from(cap.is_some()), false).into(), limit.unwrap_or(zero.into()).into()],
@@ -24538,7 +24557,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .basic()
             .expect("builder_init_stack returns a pointer");
         let i64t = self.ctx.i64_type();
-        let json_finish = if let Some((_, out)) = json {
+        let json_finish = if let Some((_, _, out)) = json {
             let func = self.builder.get_insert_block().and_then(|block| block.get_parent())
                 .ok_or_else(|| self.err("no enclosing function for json.encode"))?;
             let finish = self.ctx.append_basic_block(func, "json.encode.finish");
@@ -24627,7 +24646,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     }
                     let (tape, node) = self.split_doc(op)?;
                     self.builder.build_call(self.runtime(RuntimeKey::JsonEncodeDoc),
-                        &[bptr.into(), tape.into(), node.into()], "")
+                        &[bptr.into(), tape.into(), node.into(), doc_flags.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
                 align_mir::TemplatePiece::OwnedJsonRecords { value, plan } => {
@@ -33226,7 +33245,7 @@ fn main() -> i32 = 0
             let rvalue=bad.fns[index].blocks.iter_mut().flat_map(|block| &mut block.stmts).find_map(|statement|match statement {
                 Stmt::Let(_,rvalue @ Rvalue::JsonEncode {..})=>Some(rvalue), _=>None,
             }).ok_or("doc encoder fixture")?;
-            let Rvalue::JsonEncode {pieces,max_bytes,out}=rvalue else {return Err("doc encoder variant");};
+            let Rvalue::JsonEncode {pieces,max_bytes,out,..}=rvalue else {return Err("doc encoder variant");};
             match mutation {
                 0=>*pieces=vec![align_mir::TemplatePiece::JsonDoc(Operand::Const(Const::Bool(true)))],
                 1=>*pieces=vec![align_mir::TemplatePiece::JsonDoc(Operand::Value(u32::MAX))],
@@ -33237,6 +33256,31 @@ fn main() -> i32 = 0
                 _=>*rvalue=Rvalue::Template(pieces.clone(),None),
             }
             assert_xml_producer_rejected(&bad,"document encoder input/output/sequence authority");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn json_doc_options_mir_type_and_sequence_matrix() -> Result<(), &'static str> {
+        let base = mir("import core.json\nfn f(d:json.doc,o:json.encode_options)->Result<string,Error> = json.encode_bounded(d,100,o)\nfn main() {}\n");
+        assert!(validate_resource_rvalues(&base).is_ok());
+        let index = xml_test_function(&base, "f");
+        let ir = emit_llvm_ir(&base,&BuildTarget::Baseline,Profile::Release,false,&[],None).map_err(|_| "options IR")?;
+        assert!(ir.contains("call void @align_rt_json_encode_doc("));
+        for mutation in 0..5 {
+            let mut bad = base.clone();
+            let value = bad.fns[index].blocks.iter_mut().flat_map(|block| &mut block.stmts).find_map(|statement| match statement {
+                Stmt::Let(_, value @ Rvalue::JsonEncode {..}) => Some(value), _ => None,
+            }).ok_or("options fixture")?;
+            let Rvalue::JsonEncode {options,pieces,..} = value else {return Err("options variant");};
+            match mutation {
+                0 => *options = Some(Operand::Const(Const::Bool(true))),
+                1 => *options = Some(Operand::Value(u32::MAX)),
+                2 => *options = Some(Operand::Arg(0)),
+                3 => *pieces = vec![align_mir::TemplatePiece::Static("null".into())],
+                _ => bad.structs.iter_mut().find(|d| d.name == "json.encode_options").ok_or("options definition")?.fields.swap(0,1),
+            }
+            assert_xml_producer_rejected(&bad, "document encoding options type/sequence");
         }
         Ok(())
     }
@@ -34305,6 +34349,7 @@ fn main() -> i32 = 0
                 Rvalue::JsonEncode {
                     pieces: vec![align_mir::TemplatePiece::StrHole(Operand::Arg(0))],
                     max_bytes: Some(Operand::Arg(1)),
+                    options: None,
                     out: 2,
                 },
                 vec![Ty::Str, i64_ty],
@@ -39386,7 +39431,7 @@ fn main() -> i32 = 0
                             array: Operand::Value(0),
                             elem: Scalar::Char,
                         }],
-                        max_bytes: None, out: 1,
+                        max_bytes: None, options: None, out: 1,
                     },
                 ),
             ],
@@ -39423,7 +39468,7 @@ fn main() -> i32 = 0
                             array: Operand::Value(0),
                             elem: Scalar::Enum(0),
                         }],
-                        max_bytes: None, out: 1,
+                        max_bytes: None, options: None, out: 1,
                     },
                 ),
             ],
@@ -39450,7 +39495,7 @@ fn main() -> i32 = 0
             for function in &mut bad.fns {
                 for block in &mut function.blocks {
                     for statement in &mut block.stmts {
-                        let Stmt::Let(_, Rvalue::JsonEncode { pieces, max_bytes, out }) = statement else { continue };
+                        let Stmt::Let(_, Rvalue::JsonEncode { pieces, max_bytes, out, .. }) = statement else { continue };
                         found = true;
                         match mutation {
                             0 => *pieces = vec![align_mir::TemplatePiece::Static("{\"x\":1,}".into())],
@@ -39518,6 +39563,7 @@ fn main() -> i32 = 0
                 Rvalue::JsonEncode {
                     pieces: vec![align_mir::TemplatePiece::Static("{}".to_string())],
                     max_bytes: Some(Operand::Const(Const::Bool(true))),
+                    options: None,
                     out: 0,
                 },
             )],

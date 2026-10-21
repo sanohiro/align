@@ -1565,6 +1565,7 @@ pub enum ExprKind {
         source: JsonEncodeSource,
         plan: JsonEncodePlan,
         max_bytes: Option<Box<Expr>>,
+        options: Option<Box<Expr>>,
     },
     /// `json.decode(input)` for struct `struct_id` — parse the `str` `input` into that
     /// struct at runtime. The expression `ty` is `Result<Struct, Error>`.

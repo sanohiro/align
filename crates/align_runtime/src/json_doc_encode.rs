@@ -1,12 +1,93 @@
 //! Encode the existing validated tape without numeric conversion or decoded-string scratch.
 use super::*;
 
+/// Decode one escape without scanning or materializing the remainder of the string.
+fn escaped_scalar(raw: &[u8], position: &mut usize) -> Option<char> {
+    let escape = *raw.get(*position)?;
+    *position += 1;
+    Some(match escape {
+        b'"' => '"',
+        b'\\' => '\\',
+        b'/' => '/',
+        b'b' => '\u{8}',
+        b'f' => '\u{c}',
+        b'n' => '\n',
+        b'r' => '\r',
+        b't' => '\t',
+        b'u' => {
+            let high = json_hex4(raw, *position)?;
+            *position += 4;
+            let scalar = if (0xD800..=0xDBFF).contains(&high) {
+                if raw.get(*position..position.checked_add(2)?)? != b"\\u" {
+                    return None;
+                }
+                let low = json_hex4(raw, position.checked_add(2)?)?;
+                if !(0xDC00..=0xDFFF).contains(&low) {
+                    return None;
+                }
+                *position += 6;
+                0x10000 + ((high - 0xD800) << 10) + low - 0xDC00
+            } else {
+                high
+            };
+            char::from_u32(scalar)?
+        }
+        _ => return None,
+    })
+}
+
+fn write_scalar(buf: &mut BuilderBuf, scalar: char) -> Option<()> {
+    match scalar {
+        '"' => buf.extend_from_slice(br#"\""#),
+        '\\' => buf.extend_from_slice(br"\\"),
+        '\u{8}' => buf.extend_from_slice(br"\b"),
+        '\u{c}' => buf.extend_from_slice(br"\f"),
+        '\n' => buf.extend_from_slice(br"\n"),
+        '\r' => buf.extend_from_slice(br"\r"),
+        '\t' => buf.extend_from_slice(br"\t"),
+        '\0'..='\u{1f}' => {
+            let value = u8::try_from(u32::from(scalar)).ok()?;
+            let hex = b"0123456789abcdef";
+            // The range above proves both nibble indices fit.
+            let high = usize::from(value >> 4);
+            let low = usize::from(value & 15);
+            buf.extend_from_slice(&[b'\\', b'u', b'0', b'0', hex[high], hex[low]]);
+        }
+        _ => {
+            let mut bytes = [0; 4];
+            buf.extend_from_slice(scalar.encode_utf8(&mut bytes).as_bytes());
+        }
+    }
+    Some(())
+}
+
+fn write_reescaped(buf: &mut BuilderBuf, raw: &[u8]) -> Option<()> {
+    buf.push(b'"');
+    let mut position = 0;
+    while position < raw.len() {
+        if buf.failed_limit() {
+            return None;
+        }
+        let byte = *raw.get(position)?;
+        position += 1;
+        match byte {
+            b'\\' => write_scalar(buf, escaped_scalar(raw, &mut position)?)?,
+            0..=0x1f | b'"' => return None,
+            // The parser authenticated UTF-8. Copy its literal bytes without another full scan.
+            _ => buf.push(byte),
+        }
+    }
+    buf.push(b'"');
+    (!buf.failed_limit()).then_some(())
+}
+
 fn write_node(
     buf: &mut BuilderBuf,
     input: &[u8],
     nodes: &[DocNode],
     index: usize,
     depth: u32,
+    flags: i32,
 ) -> Option<usize> {
     if buf.failed_limit() || depth > 128 {
         return None;
@@ -28,6 +109,9 @@ fn write_node(
                 }
                 if ordinal != 0 {
                     buf.push(b',');
+                    if flags & 1 != 0 {
+                        buf.push(b' ');
+                    }
                 }
                 if object {
                     let key = nodes.get(child)?;
@@ -35,13 +119,16 @@ fn write_node(
                         return None;
                     }
                     // Keys do not increase JSON value depth, matching DocBuilder::object.
-                    child = write_node(buf, input, nodes, child, depth)?;
+                    child = write_node(buf, input, nodes, child, depth, flags)?;
                     if child >= next {
                         return None;
                     }
                     buf.push(b':');
+                    if flags & 2 != 0 {
+                        buf.push(b' ');
+                    }
                 }
-                child = write_node(buf, input, nodes, child, depth + 1)?;
+                child = write_node(buf, input, nodes, child, depth + 1, flags)?;
                 if child > next {
                     return None;
                 }
@@ -59,6 +146,10 @@ fn write_node(
             let len = usize::try_from(node.b).ok()?;
             let raw = input.get(start..start.checked_add(len)?)?;
             let string = node.kind == DOC_STR;
+            if string && flags & 4 != 0 {
+                write_reescaped(buf, raw)?;
+                return Some(next);
+            }
             // Reserve the complete token first: a large escaped string under a tiny cap never
             // allocates decoded bytes or visits its body. The parser already validated it.
             if !buf.reserve(len.checked_add(if string { 2 } else { 0 })?) {
@@ -91,7 +182,8 @@ fn write_node(
 
 /// Append one validated document subtree to the existing JSON builder. Missing or invalid
 /// metadata sets sticky failure; finalization owns error publication and output cleanup.
-/// Original string escapes and number tokens are preserved; only structural whitespace is lost.
+/// Flag bits 0/1/2 select comma spacing, colon spacing and string re-escaping. Other bits reject.
+/// Number tokens are always preserved; zero flags preserve the original compact byte contract.
 ///
 /// # Safety
 /// `builder` is null or an exclusive live JSON builder. A nonnull `tape` is a live parser-produced
@@ -102,6 +194,7 @@ pub unsafe extern "C" fn align_rt_json_encode_doc(
     builder: *mut Builder,
     tape: *const DocTape,
     node: i64,
+    flags: i32,
 ) {
     if builder.is_null() {
         return;
@@ -112,7 +205,7 @@ pub unsafe extern "C" fn align_rt_json_encode_doc(
         return;
     }
     let result = (|| {
-        if tape.is_null() {
+        if tape.is_null() || !(0..=7).contains(&flags) {
             return None;
         }
         let index = usize::try_from(node).ok()?;
@@ -129,14 +222,14 @@ pub unsafe extern "C" fn align_rt_json_encode_doc(
         // nonnull pointers were checked above. Node/span indexing below stays checked.
         let input = unsafe { core::slice::from_raw_parts(tape.input_ptr, tape.input_len) };
         let nodes = unsafe { core::slice::from_raw_parts(tape.nodes, tape.nodes_len) };
-        write_node(buf, input, nodes, index, 0)
+        write_node(buf, input, nodes, index, 0, flags)
     })();
     if result.is_none() {
         buf.encode_failed = true;
     }
 }
 
-const _: unsafe extern "C" fn(*mut Builder, *const DocTape, i64) = align_rt_json_encode_doc;
+const _: unsafe extern "C" fn(*mut Builder, *const DocTape, i64, i32) = align_rt_json_encode_doc;
 
 #[cfg(test)]
 mod tests {
@@ -175,6 +268,10 @@ mod tests {
     struct Header([u8; 64]);
 
     fn encode(handle: DocHandle, limit: Option<i64>, expected: Option<&str>) {
+        encode_policy(handle, limit, 0, expected);
+    }
+
+    fn encode_policy(handle: DocHandle, limit: Option<i64>, flags: i32, expected: Option<&str>) {
         let mut header = Header([0; 64]);
         let b = unsafe {
             align_rt_json_builder_init(
@@ -183,7 +280,7 @@ mod tests {
                 limit.unwrap_or(0),
             )
         };
-        unsafe { align_rt_json_encode_doc(b, handle.tape, handle.node) };
+        unsafe { align_rt_json_encode_doc(b, handle.tape, handle.node, flags) };
         let capacity = unsafe { (*b).buf.cap };
         if let Some(limit) = limit {
             assert!(capacity <= usize::try_from(limit).unwrap_or(0));
@@ -209,6 +306,73 @@ mod tests {
                 assert!(output.ptr.is_null());
                 assert_eq!(output.len, 0);
             }
+        }
+    }
+
+    #[test]
+    fn json_doc_render_policy_and_bound_matrix() {
+        let input = r#"[{"\u0061":"\u0000\u0001\u001F\b\f\n\r\t\"\\\/\uD83D\uDE00日本語"},-0,1.2300E+009,1e9999,18446744073709551616,{},[],true,null]"#;
+        for flags in 0..8 {
+            let comma = if flags & 1 != 0 { ", " } else { "," };
+            let colon = if flags & 2 != 0 { ": " } else { ":" };
+            let (key, body) = if flags & 4 != 0 {
+                (r#""a""#, r#""\u0000\u0001\u001f\b\f\n\r\t\"\\/😀日本語""#)
+            } else {
+                (
+                    r#""\u0061""#,
+                    r#""\u0000\u0001\u001F\b\f\n\r\t\"\\\/\uD83D\uDE00日本語""#,
+                )
+            };
+            let expected = format!(
+                "[{{{key}{colon}{body}}}{comma}-0{comma}1.2300E+009{comma}1e9999{comma}18446744073709551616{comma}{{}}{comma}[]{comma}true{comma}null]"
+            );
+            let document = Document::parse(input);
+            let size = i64::try_from(expected.len()).unwrap();
+            for cap in [None, Some(-1), Some(0), Some(size - 1), Some(size)] {
+                encode_policy(
+                    document.handle,
+                    cap,
+                    flags,
+                    cap.is_none_or(|n| n >= size).then_some(expected.as_str()),
+                );
+            }
+            for (source, expected) in [
+                ("{}", "{}"),
+                ("[]", "[]"),
+                ("null", "null"),
+                (
+                    r#""\/\u0022\u005c\u0061\u2028\u2029""#,
+                    "\"/\\\"\\\\a\u{2028}\u{2029}\"",
+                ),
+                (r#"{"\u0061":0,"a":1}"#, r#"{"a":0,"a":1}"#),
+            ] {
+                let document = Document::parse(source);
+                // Fixed compact re-escaping controls are independent of the spacing matrix.
+                encode_policy(document.handle, None, 4, Some(expected));
+            }
+        }
+        let document = Document::parse("null");
+        for flags in [-1, 8, i32::MAX] {
+            encode_policy(document.handle, None, flags, None);
+        }
+        // Rendering stops on the cap before decoding a later invalid escape. This internal
+        // poisoned suffix witnesses bounded work; real document input is parser-validated.
+        let mut buf = BuilderBuf::new_bounded(1);
+        assert!(write_reescaped(&mut buf, br"a\uZZZZ").is_none());
+        assert!(buf.failed_limit());
+        assert_eq!(buf.as_slice(), b"\"");
+        let escaped = format!("\"{}\"", r"\u0061".repeat(100_000));
+        let document = Document::parse(&escaped);
+        encode_policy(document.handle, Some(8), 7, None);
+        for raw in [
+            br"\uD800".as_slice(),
+            br"\uDC00",
+            br"\uD800\u0000",
+            br"\x",
+            b"\"",
+        ] {
+            let mut buf = BuilderBuf::new_bounded(100);
+            assert!(write_reescaped(&mut buf, raw).is_none());
         }
     }
 
@@ -400,7 +564,7 @@ mod tests {
             },
         ];
         let mut buf = BuilderBuf::new_bounded(1);
-        assert!(write_node(&mut buf, input, &nodes, 0, 0).is_none());
+        assert!(write_node(&mut buf, input, &nodes, 0, 0, 0).is_none());
         assert!(buf.failed_limit());
         assert_eq!(buf.as_slice(), b"[");
     }
@@ -423,6 +587,36 @@ mod tests {
             before,
             "serialization uses no Rust scratch allocation"
         );
+        let escaped = format!("\"{}\"", r"\u0061".repeat(100_000));
+        let escaped_document = Document::parse(&escaped);
+        let decoded = format!("\"{}\"", "a".repeat(100_000));
+        // Requested-live instrumentation itself allocates BTreeMap nodes. Observe Rust
+        // scratch first while that probe is inactive, then measure output storage separately.
+        for observe_live in [false, true] {
+            for limit in [0, 1, 8, i64::try_from(decoded.len()).unwrap()] {
+                if observe_live {
+                    align_rt_requested_live_reset();
+                }
+                let before = global_alloc_count();
+                encode_policy(
+                    escaped_document.handle,
+                    Some(limit),
+                    7,
+                    (limit == i64::try_from(decoded.len()).unwrap()).then_some(decoded.as_str()),
+                );
+                if observe_live {
+                    assert_eq!(align_rt_requested_live_bytes(), 0);
+                    assert!(align_rt_requested_live_peak() <= limit * 2);
+                } else {
+                    assert_eq!(
+                        global_alloc_count(),
+                        before,
+                        "re-escaping has no proportional scratch"
+                    );
+                }
+            }
+        }
+
         // Parse allocations predate this observer. Each failed/successful output is independent.
         for _ in 0..8 {
             for limit in [0, 1, 8, 64, i64::try_from(input.len()).unwrap()] {
