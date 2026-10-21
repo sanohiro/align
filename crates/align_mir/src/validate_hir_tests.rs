@@ -21779,9 +21779,10 @@ fn task_owned_hir_wait_move_and_payload_replay() -> Result<(), String> {
 }
 
 #[test]
-fn json_doc_options_checked_nominal_and_child_matrix() {
+fn json_doc_options_checked_nominal_and_child_matrix() -> Result<(), &'static str> {
     let base = checked_source_program("import core.json\nfn encode(document:json.doc, options:json.encode_options)->Result<string,Error> {output:=json.encode_bounded(document,100,options);output}\nfn main() {}\n");
     assert!(body_core_metadata_is_valid(&base));
+    let options_id = base.structs.iter().position(|d| d.name == "json.encode_options").ok_or("options definition fixture")?;
     for mutation in 0..8 {
         assert_owned_json_body_mutation(&base, "document-options", |program| {
             if mutation < 3 {
@@ -21793,7 +21794,8 @@ fn json_doc_options_checked_nominal_and_child_matrix() {
                     _ => *plan = hir::JsonEncodePlan::Pieces(vec![hir::TemplatePart::Text("null".into())]),
                 }
             } else {
-                let definition = program.structs.iter_mut().find(|d| d.name == "json.encode_options").unwrap();
+                // The mutation helper clones the fixture without changing its struct table.
+                let definition = &mut program.structs[options_id];
                 match mutation {
                     3 => definition.name = "ForgedOptions".into(),
                     4 => definition.fields.swap(0,1),
@@ -21804,4 +21806,5 @@ fn json_doc_options_checked_nominal_and_child_matrix() {
             }
         });
     }
+    Ok(())
 }
