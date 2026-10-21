@@ -331,7 +331,12 @@ shared-helper-return witness loses read-only authority in both frontends.
 numeric fixed fields in C records, including raw storage and both native
 by-value ABI families. [Plan234](docs/impl/234-cancellation-sensitive-math.md)
 implements AM-R12/AM-R19's scalar/vector `expm1` and `log1p`. Consumer adoption
-remains pending. AM-R14/AM-R20's `sin`, `cos` and `atan2` are next.
+of these upstream deliveries remains pending.
+[Plan235](docs/impl/235-trigonometric-math.md) delivers AM-R14/AM-R20's `sin`,
+`cos` and `atan2`; [Plan236](docs/impl/236-fallible-raw-carriers.md) delivers
+AM-R15/LLM R34's fallible raw allocation and non-owning carriers. The remaining
+queue consists of the explicitly deferred capability boundaries and the
+evidence-dependent investigations below; no math implementation remains queued.
 Establish consumer value, policy fit, the smallest complete useful capability,
 prerequisites and cost before selection. Distinguish real settled restrictions
 from implementation gaps; broad scope alone does not justify deferral.
