@@ -698,6 +698,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
                     crate::TemplatePiece::CharHole(o) => format!("char({})", operand_str(o)),
                     crate::TemplatePiece::FloatHole(o) => format!("float({})", operand_str(o)),
                     crate::TemplatePiece::JsonStrHole(o) => format!("json_str({})", operand_str(o)),
+                    crate::TemplatePiece::JsonDoc(o) => format!("json_doc({})", operand_str(o)),
                     crate::TemplatePiece::OwnedJsonRecords { value, plan } => {
                         format!(
                             "owned_json_records_v4(root=struct#{}, graph={:?}, {})",

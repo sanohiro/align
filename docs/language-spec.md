@@ -1220,6 +1220,21 @@ Malformed UTF-8/strings, other JSON shapes and trailing input return
 outlive input/arena; views of it retain its owner's lifetime. Bare `str` and
 `char` remain separate. Plan203 owns exact validation, publication and cleanup.
 
+**Document subtree encoding (R158).** Both encoders additionally accept a named
+`json.doc` local or parameter, including a named `get`/`at` result. Every real
+JSON kind is encodable; Missing returns `Error.Invalid`. Output is compact JSON
+preserving member/element order, duplicate members, exact number tokens and
+original string/key escape spellings. Huge numbers never pass through i64/f64;
+escaped Unicode and NUL keep their decoded meaning. This is not canonicalization.
+The call borrows source bytes and parse arena through eager limit evaluation and
+encoding; success returns one independent owned string valid after both expire.
+Negative/exceeded inclusive bounds return `Error.Invalid` with no partial owner;
+exact fit succeeds and negative bounds skip traversal. Capacity growth stays
+within the bound, with no decoded-string or traversal heap scratch. Earlier parse
+storage, allocator rounding and realloc overlap are outside that output bound.
+Typed encoder bytes, ordinary `json.doc` field exclusions and terminal allocation
+policy remain unchanged. Plan237 owns the complete contract and acceptance.
+
 **Stable field sources (AM-R11).** Both encoders accept a named local or a nested
 record-field path rooted in one, including already-admitted shared parameters
 and match bindings. Only the selected type must satisfy the existing complete

@@ -69,6 +69,8 @@ mod sample_permutation_tests;
 #[cfg(test)]
 mod regex_match_storage_tests;
 use buffer_storage::BufferStorage;
+mod json_doc_encode;
+pub use json_doc_encode::align_rt_json_encode_doc;
 mod json_number;
 mod unicode_data;
 mod unicode_nfc;

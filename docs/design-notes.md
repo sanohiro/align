@@ -1099,6 +1099,15 @@ records the source and imported-call closure.
 
 ## The JSON philosophy
 
+**Document serialization (R158).** A validated document already owns a structural
+tape and exact source-token spans. Encoding that tape through the existing
+bounded builder preserves arbitrary tool-schema keys and numbers without a
+second dynamic value tree, lossy float conversion or application scanner.
+Retaining validated string escapes avoids unbounded decoding scratch under a
+tiny output cap. The independent owned result makes source expiry explicit;
+typed schemas and their numeric spelling remain separate existing contracts.
+[Plan237](impl/237-json-doc-encoding.md) defines that composition.
+
 **R63 rationale (2026-09-10).** Standard JSON
 numbers must not become invalid wire tokens merely because a record owns text.
 The [exact contract](impl/47-json-numeric-contract.md) admits f32/f64 structurally,

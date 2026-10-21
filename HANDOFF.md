@@ -25,6 +25,12 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan237](docs/impl/237-json-doc-encoding.md) extends both JSON encoders to
+  named document roots and subtrees for LLM R158. Compact output preserves
+  number tokens, string escapes, member order and duplicate occurrences;
+  bounded output checks before growth and transfers an independent owned
+  string. Consumer schema forwarding and native Codex adoption remain external.
+
 - [Plan236](docs/impl/236-fallible-raw-carriers.md) supplies media AM-R15 and LLM R34
   `raw.try_alloc(i64) -> Result<raw, Error>` plus non-owning raw carriers. Allocation
   refusal returns an error; pointer transport adds no pointee cleanup or authority.

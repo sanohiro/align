@@ -1,5 +1,10 @@
 # Standard JSON numbers and owned encoder results (R63)
 
+[Plan237](237-json-doc-encoding.md) additionally admits named `json.doc` roots
+and subtrees in both encoders. It preserves original number/string tokens without
+typed conversion; the typed numeric spellings and ownership contract below remain.
+
+
 **Current mixed-text contract:** [Plan193](193-mixed-json-graphs.md) supersedes this
 plan's mixed-view exclusions, fully-independent lifetime claim for mixed results,
 and graph/interface versions. It admits Str at existing text positions, retains

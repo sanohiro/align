@@ -24621,6 +24621,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.runtime(RuntimeKey::BuilderWriteJsonStr), &[bptr.into(), ptr.into(), len.into()], "")
                         .map_err(|e| self.err(e))?;
                 }
+                align_mir::TemplatePiece::JsonDoc(op) => {
+                    if json.is_none() || self.f.operand_ty(op) != Ty::JsonDoc {
+                        return Err(self.err("document piece requires json.encode and a json.doc operand"));
+                    }
+                    let (tape, node) = self.split_doc(op)?;
+                    self.builder.build_call(self.runtime(RuntimeKey::JsonEncodeDoc),
+                        &[bptr.into(), tape.into(), node.into()], "")
+                        .map_err(|e| self.err(e))?;
+                }
                 align_mir::TemplatePiece::OwnedJsonRecords { value, plan } => {
                     let ty = self.f.operand_ty(value);
                     if !matches!(ty, Ty::Struct(id) | Ty::DynStructArray(id, Layout::Aos) if id == plan.root) {
@@ -33201,6 +33210,33 @@ fn main() -> i32 = 0
                 assert!(changed);
                 assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{ty}/{mutation}");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn json_doc_encoder_mir_exact_source_and_private_output() -> Result<(), &'static str> {
+        let base=mir("import core.json\nfn f(d:json.doc)->Result<string,Error> = json.encode_bounded(d,100)\nfn main() {}\n");
+        assert!(validate_resource_rvalues(&base).is_ok());
+        let index=xml_test_function(&base,"f");
+        let ir=emit_llvm_ir(&base,&BuildTarget::Baseline,Profile::Release,false,&[],None).map_err(|_|"doc encoder IR")?;
+        assert!(ir.contains("call void @align_rt_json_encode_doc("));
+        for mutation in 0..7 {
+            let mut bad=base.clone();
+            let rvalue=bad.fns[index].blocks.iter_mut().flat_map(|block| &mut block.stmts).find_map(|statement|match statement {
+                Stmt::Let(_,rvalue @ Rvalue::JsonEncode {..})=>Some(rvalue), _=>None,
+            }).ok_or("doc encoder fixture")?;
+            let Rvalue::JsonEncode {pieces,max_bytes,out}=rvalue else {return Err("doc encoder variant");};
+            match mutation {
+                0=>*pieces=vec![align_mir::TemplatePiece::JsonDoc(Operand::Const(Const::Bool(true)))],
+                1=>*pieces=vec![align_mir::TemplatePiece::JsonDoc(Operand::Value(u32::MAX))],
+                2=>pieces.push(pieces[0].clone()),
+                3=>pieces.insert(0,align_mir::TemplatePiece::Static("[".into())),
+                4=>*out=u32::MAX,
+                5=>*max_bytes=Some(Operand::Const(Const::Bool(true))),
+                _=>*rvalue=Rvalue::Template(pieces.clone(),None),
+            }
+            assert_xml_producer_rejected(&bad,"document encoder input/output/sequence authority");
         }
         Ok(())
     }

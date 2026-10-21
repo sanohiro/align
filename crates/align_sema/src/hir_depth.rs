@@ -72,7 +72,7 @@ fn transparent_record_diverges(record: BodyRecord<'_>) -> bool {
         },
         BodyRecord::TemplatePart(part) => match part {
             TemplatePart::Hole(expression)
-            | TemplatePart::JsonStr(expression)
+            | TemplatePart::JsonStr(expression) | TemplatePart::JsonDoc(expression)
             | TemplatePart::OptionField {
                 access: expression, ..
             }
@@ -326,7 +326,7 @@ fn walk_body_records<'a>(
                 StageKind::WhereField { .. } | StageKind::Project { .. } => {}
             },
             BodyRecord::TemplatePart(part) => match part {
-                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
+                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) | TemplatePart::JsonDoc(expr) => {
                     work.push((BodyRecord::Expr(expr), child_depth));
                 }
                 TemplatePart::OptionField { access, .. }

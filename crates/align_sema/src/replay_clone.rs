@@ -146,6 +146,7 @@ fn clone_template_part(clones: &mut ChildValues, part: &TemplatePart) -> Option<
         TemplatePart::Text(text) => TemplatePart::Text(text.clone()),
         TemplatePart::Hole(_) => TemplatePart::Hole(clones.expr()?),
         TemplatePart::JsonStr(_) => TemplatePart::JsonStr(clones.expr()?),
+        TemplatePart::JsonDoc(_) => TemplatePart::JsonDoc(clones.expr()?),
         TemplatePart::OptionField { name, .. } => TemplatePart::OptionField {
             access: clones.expr()?,
             name: name.clone(),
@@ -2212,7 +2213,7 @@ fn drop_functions(fns: Vec<hir::Fn>) {
             }
             DropWork::TemplatePart(part) => match part {
                 TemplatePart::Text(text) => drop(text),
-                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) => {
+                TemplatePart::Hole(expr) | TemplatePart::JsonStr(expr) | TemplatePart::JsonDoc(expr) => {
                     work.push(DropWork::Expr(expr));
                 }
                 TemplatePart::OptionField { access, name }

@@ -18560,7 +18560,7 @@ impl EffectScan<'_> {
             ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => walk!(h),
                         TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => walk!(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
@@ -18569,7 +18569,7 @@ impl EffectScan<'_> {
             ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => walk!(h),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => walk!(h),
                         TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => walk!(access),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
@@ -30065,7 +30065,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => self.walk(h, depth),
                         TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
@@ -30074,7 +30074,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.walk(h, depth),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => self.walk(h, depth),
                         TemplatePart::OptionField { access, .. } | TemplatePart::OptionStructField { access, .. } | TemplatePart::StructArrayField { access, .. } | TemplatePart::ScalarArrayField { access, .. } | TemplatePart::UnionValue { access, .. } => self.walk(access, depth),
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
@@ -50067,7 +50067,7 @@ impl<'a> MoveCheck<'a> {
                 for p in parts {
                     // A hole / option-field value is read (copied) into the builder, not moved out.
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => {
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => {
                             move_expr!(self, h, moved, false, false)
                         }
                         TemplatePart::OptionField { access, .. }
@@ -50114,7 +50114,7 @@ impl<'a> MoveCheck<'a> {
                 if let crate::hir::JsonEncodePlan::Pieces(parts) = plan {
                     for part in parts {
                         match part {
-                            TemplatePart::Hole(access) | TemplatePart::JsonStr(access)
+                            TemplatePart::Hole(access) | TemplatePart::JsonStr(access) | TemplatePart::JsonDoc(access)
                             | TemplatePart::OptionField { access, .. }
                             | TemplatePart::OptionStructField { access, .. }
                             | TemplatePart::StructArrayField { access, .. }
@@ -58035,7 +58035,7 @@ impl<'a, 't> Checker<'a, 't> {
                     Some(text)
                 }
                 TemplatePart::Hole(_)
-                | TemplatePart::JsonStr(_)
+                | TemplatePart::JsonStr(_) | TemplatePart::JsonDoc(_)
                 | TemplatePart::OptionField { .. }
                 | TemplatePart::OptionStructField { .. }
                 | TemplatePart::PopComma
@@ -64526,7 +64526,7 @@ impl<'a, 't> Checker<'a, 't> {
     ) -> Option<(Vec<TemplatePart>, hir::JsonEncodeSource, Ty, OwnedJsonRoute)> {
         let Some((base, path, ty)) = self.resolve_place(value) else {
             self.diags
-                .error(format!("'{}' expects an encodable record, array or sum value (a local binding or record field)", dir.name()), value.span);
+                .error(format!("'{}' expects an encodable record, array, sum or json.doc value (a local binding or record field)", dir.name()), value.span);
             return None;
         };
         let source = hir::JsonEncodeSource { root: base, path };
@@ -64537,6 +64537,7 @@ impl<'a, 't> Checker<'a, 't> {
         let mut parts = vec![];
         let mut ok = true;
         match ty {
+            Ty::JsonDoc => parts.push(TemplatePart::JsonDoc(source.expression(ty, value.span))),
             // A single struct → a JSON object.
             Ty::Struct(sid) => match &route {
                 OwnedJsonRoute::Existing => {
@@ -64590,7 +64591,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             _ => {
                 self.diags
-                    .error(format!("'{}' expects an encodable record, array or sum, got {}", dir.name(), ty_name(ty)), value.span);
+                    .error(format!("'{}' expects an encodable record, array, sum or json.doc, got {}", dir.name(), ty_name(ty)), value.span);
                 return None;
             }
         }
@@ -72988,7 +72989,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::Template(parts) => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => self.finalize_expr(h),
                         TemplatePart::OptionField { access, .. }
                         | TemplatePart::OptionStructField { access, .. }
                         | TemplatePart::StructArrayField { access, .. }
@@ -73001,7 +73002,7 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
                 for p in parts {
                     match p {
-                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) => self.finalize_expr(h),
+                        TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => self.finalize_expr(h),
                         TemplatePart::OptionField { access, .. }
                         | TemplatePart::OptionStructField { access, .. }
                         | TemplatePart::StructArrayField { access, .. }
