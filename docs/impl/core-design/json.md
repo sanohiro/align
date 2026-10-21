@@ -20,7 +20,7 @@ accept a named `json.doc` local or parameter, including a named `get`/`at`
 result, and return `Result<string, Error>`. Objects, arrays, strings, numbers,
 booleans and null are valid roots; Missing returns `Error.Invalid`.
 
-Output is deterministic compact JSON, with original member order, duplicates
+By default, output is deterministic compact JSON, with original member order, duplicates
 and array order. Number tokens are copied exactly, including negative zero,
 exponent spellings and values outside machine numeric ranges. String/key tokens
 retain their original escapes and decoded Unicode/NUL bytes. Structural
@@ -39,6 +39,58 @@ allocator rounding and realloc overlap are outside the output bound. Allocation
 failure remains terminal. Typed schemas/bytes and the ordinary prohibition on
 `json.doc` record fields are unchanged. [Plan237](../237-json-doc-encoding.md)
 owns exact compiler/native validation and acceptance.
+
+## Explicit document rendering options (R159)
+
+Requires `import core.json`. The builtin is an ordinary Copy record, with no
+allocation, backing lifetime or cleanup obligation. Every field is required:
+
+```text
+// Declaration of the provider-owned type; applications do not redeclare it.
+json.encode_options {
+  space_after_comma: bool
+  space_after_colon: bool
+  reescape_strings: bool
+}
+```
+
+An additional final argument selects the document policy:
+
+```align
+options := json.encode_options {
+  space_after_comma: true,
+  space_after_colon: true,
+  reescape_strings: true,
+}
+encoded := json.encode_bounded(document, 4096, options)?
+unbounded := json.encode(document, options)?
+```
+
+Omission means all false and preserves the previous exact bytes. The spacing
+fields insert exactly one ASCII space after a separating comma or object colon;
+empty containers, punctuation boundaries and string contents gain no other space.
+All four separator combinations are valid with either string policy. Arbitrary
+separator strings, indentation and application/template-specific modes are absent.
+
+When `reescape_strings` is true, keys and string values decode incrementally.
+Quote and backslash use their two-byte JSON escapes; backspace, formfeed,
+newline, carriage return and tab use `\b`, `\f`, `\n`, `\r`, `\t`.
+Remaining C0 controls use lowercase `\u00xx`; slash is literal. Other Unicode
+scalars use raw UTF-8, including decoded surrogate pairs and U+2028/U+2029.
+There is no Unicode normalization, ASCII-only or HTML escaping. False preserves
+original tokens. Both policies preserve member/array order, duplicate occurrences
+and every numeric token, without parsing numbers into machine types.
+
+Options may be an ordinary record expression and apply only to a named document
+root/subtree. Typed record/array/sum encoders reject explicit options. Validation
+order is arity, source/schema, exact i64 limit when present, then nominal options
+type. Runtime evaluates limit then options exactly once while reserving document
+backing, including when the limit is negative; divergence and side effects obey
+ordinary expression rules. Encoding then follows the R158 errors and ownership.
+Spaces and all escape bytes count toward the inclusive output cap. Each fragment
+is checked before growth; there is no full-string normalization/counting pass or
+proportional scratch. [Plan238](../238-json-document-render-options.md) owns the
+complete contract and compiler/runtime closure matrix.
 
 ## Stable encoder sources
 

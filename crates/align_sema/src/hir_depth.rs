@@ -1206,17 +1206,13 @@ fn walk_body_records<'a>(
                             .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
                     );
                 }
-                ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
-                    work.extend(
-                        parts
-                            .iter()
-                            .map(|part| (BodyRecord::TemplatePart(part), child_depth)),
-                    );
-                    if let Some(max_bytes) = max_bytes { work.push((BodyRecord::Expr(max_bytes), child_depth)); }
-                }
-                ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
-                ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => {
-                    work.push((BodyRecord::Expr(max_bytes), child_depth));
+                ExprKind::JsonEncode { plan, max_bytes, options, .. } => {
+                    if let crate::hir::JsonEncodePlan::Pieces(parts) = plan {
+                        work.extend(parts.iter().map(|part| (BodyRecord::TemplatePart(part), child_depth)));
+                    }
+                    for argument in max_bytes.iter().chain(options.iter()) {
+                        work.push((BodyRecord::Expr(argument), child_depth));
+                    }
                 }
                 ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
                     for child in [file, buffer, destination_offset, length, offset] {

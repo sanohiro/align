@@ -2447,7 +2447,7 @@ outlive input/arena; views of it retain its owner's lifetime. Bare `str` and
 
 **Document subtree encoding (R158).** Both encoders additionally accept a named
 `json.doc` local or parameter, including a named `get`/`at` result. Every real
-JSON kind is encodable; Missing returns `Error.Invalid`. Output is compact JSON
+JSON kind is encodable; Missing returns `Error.Invalid`. By default, output is compact JSON
 preserving member/element order, duplicate members, exact number tokens and
 original string/key escape spellings. Huge numbers never pass through i64/f64;
 escaped Unicode and NUL keep their decoded meaning. This is not canonicalization.
@@ -2459,6 +2459,23 @@ within the bound, with no decoded-string or traversal heap scratch. Earlier pars
 storage, allocator rounding and realloc overlap are outside that output bound.
 Typed encoder bytes, ordinary `json.doc` field exclusions and terminal allocation
 policy remain unchanged. Plan237 owns the complete contract and acceptance.
+
+**Explicit document policy (R159).** An additional final argument to either
+encoder may be the ordinary Copy record `json.encode_options`, with three
+required Boolean fields in order: `space_after_comma`, `space_after_colon`,
+`reescape_strings`. Omission is equivalent to all false. The first two fields
+insert exactly one ASCII space after each separating comma or object colon;
+empty containers gain no space. Re-escaping incrementally decodes keys/strings:
+quote/backslash and backspace/formfeed/newline/return/tab use short JSON escapes,
+other C0 controls use lowercase `\u00xx`, slash is literal, and other Unicode
+scalars (including paired surrogates and U+2028/U+2029) use raw UTF-8. No Unicode
+normalization or HTML escaping occurs. Order, duplicates and number tokens remain
+exact under all eight combinations. Options apply only to `json.doc` sources;
+typed encoders retain their existing signatures and byte policy. Limit then
+options evaluate once while the source remains reserved; all separator/escape
+bytes count toward the inclusive cap. Rendering stops at failure without a
+full-string normalization buffer or pre-counting pass. Plan238 owns the exact
+policy, native ABI and acceptance; all other R158 ownership/error limits remain.
 
 **Stable field sources (AM-R11).** Both encoders accept a named local or a nested
 record-field path rooted in one, including already-admitted shared parameters

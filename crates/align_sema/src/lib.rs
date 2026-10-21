@@ -7137,6 +7137,7 @@ struct BuiltinNominalAlias {
 }
 
 const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
+    BuiltinNominalAlias { bare: "json.encode_options", explicit: "json.encode_options", canonical: "json.encode_options", required_import: Some("core.json") },
     BuiltinNominalAlias { bare: "fs.dir_entry", explicit: "fs.dir_entry", canonical: "fs.dir_entry", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "process.signal_subscription", explicit: "process.signal_subscription", canonical: "process.signal_subscription", required_import: Some("std.process") },
     BuiltinNominalAlias { bare: "process.child_scope", explicit: "process.child_scope", canonical: "process.child_scope", required_import: Some("std.process") },
@@ -9799,6 +9800,13 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             align: None,
             c_repr: false,
         });
+    }
+
+    if let Ok(id) = u32::try_from(structs.len()) {
+        struct_ids.insert("json.encode_options".to_string(), id);
+        structs.push(json_encode_options_definition());
+    } else {
+        diags.error("JSON builtin type table capacity exceeded".to_string(), Span::new(0, 0, 0));
     }
 
     // The builtin `json.kind` enum (core.json J4) — the result of `d.kind()` on a `json.doc`. A
@@ -18566,7 +18574,7 @@ impl EffectScan<'_> {
                     }
                 }
             }
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, options, .. } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => walk!(h),
@@ -18574,10 +18582,11 @@ impl EffectScan<'_> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
-                if let Some(max_bytes) = max_bytes { walk!(max_bytes); }
+                for argument in max_bytes.iter().chain(options.iter()) { walk!(argument); }
             }
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => walk!(max_bytes),
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes, options, .. } => {
+                for argument in max_bytes.iter().chain(options.iter()) { walk!(argument); }
+            }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::StrParseI64 { input }
             | ExprKind::JsonDecodeScalar { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. }
@@ -30071,7 +30080,7 @@ impl<'a> EscapeCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, options, .. } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => self.walk(h, depth),
@@ -30079,10 +30088,11 @@ impl<'a> EscapeCheck<'a> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
-                if let Some(max_bytes) = max_bytes { self.walk(max_bytes, depth); }
+                for argument in max_bytes.iter().chain(options.iter()) { self.walk(argument, depth); }
             }
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => self.walk(max_bytes, depth),
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes, options, .. } => {
+                for argument in max_bytes.iter().chain(options.iter()) { self.walk(argument, depth); }
+            }
             ExprKind::JsonDecode { input, .. } | ExprKind::JsonOwnedDecode { input, .. } | ExprKind::JsonDecodeArray { input, .. } | ExprKind::StrParseI64 { input }
             | ExprKind::JsonDecodeScalar { input, .. } | ExprKind::JsonDecodeStructArray { input, .. } | ExprKind::JsonDecodeSoa { input, .. } | ExprKind::JsonDecodeUnion { input, .. } => self.walk(input, depth),
             ExprKind::CsvDecode {
@@ -50081,7 +50091,7 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            ExprKind::JsonEncode { source, plan, max_bytes } => {
+            ExprKind::JsonEncode { source, plan, max_bytes, options } => {
                 // Reserve the source place and its transitive backing generations before the
                 // eager limit runs. Finish validates and retires this reservation even when the
                 // limit diverges; output completion must never inherit the source provenance.
@@ -50126,8 +50136,8 @@ impl<'a> MoveCheck<'a> {
                         }
                     }
                 }
-                if let Some(limit) = max_bytes {
-                    move_expr!(self, limit, moved, false, false);
+                for argument in max_bytes.iter().chain(options.iter()) {
+                    move_expr!(self, argument, moved, false, false);
                 }
             }
             ExprKind::JsonDecode { input, .. }
@@ -64501,17 +64511,20 @@ impl<'a, 't> Checker<'a, 't> {
     /// Both encoders share schema selection, canonical bytes and fallible builder cleanup.
     fn check_json_encode(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if args.len() != 1 {
+        if !(1..=2).contains(&args.len()) {
             self.diags
-                .error(format!("'json.encode' expects 1 argument, got {}", args.len()), span);
+                .error(format!("'json.encode' expects 1 or 2 arguments, got {}", args.len()), span);
             return err;
         }
-        let Some((parts, source, _, route)) = self.json_encode_parts(&args[0], JsonDir::Encode) else {
+        let Some((parts, source, source_ty, route)) = self.json_encode_parts(&args[0], JsonDir::Encode) else {
             return err;
         };
+        let options = match self.check_json_encode_options(args.get(1), source_ty) {
+            Ok(options) => options, Err(()) => return err,
+        };
         let kind = match route {
-            OwnedJsonRoute::Existing => ExprKind::JsonEncode { source, plan: hir::JsonEncodePlan::Pieces(parts), max_bytes: None },
-            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: None },
+            OwnedJsonRoute::Existing => ExprKind::JsonEncode { source, plan: hir::JsonEncodePlan::Pieces(parts), max_bytes: None, options },
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: None, options },
         };
         Expr { kind, ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)), span }
     }
@@ -64605,12 +64618,12 @@ impl<'a, 't> Checker<'a, 't> {
 
     fn check_json_encode_bounded(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        if args.len() != 2 {
+        if !(2..=3).contains(&args.len()) {
             self.diags
-                .error(format!("'json.encode_bounded' expects 2 arguments, got {}", args.len()), span);
+                .error(format!("'json.encode_bounded' expects 2 or 3 arguments, got {}", args.len()), span);
             return err;
         }
-        let Some((parts, source, _, route)) = self.json_encode_parts(&args[0], JsonDir::EncodeBounded) else {
+        let Some((parts, source, source_ty, route)) = self.json_encode_parts(&args[0], JsonDir::EncodeBounded) else {
             return err;
         };
         // Check without a hint, then bind an untyped integer literal through the one exact-i64
@@ -64627,15 +64640,38 @@ impl<'a, 't> Checker<'a, 't> {
         ) {
             return err;
         }
+        let options = match self.check_json_encode_options(args.get(2), source_ty) {
+            Ok(options) => options, Err(()) => return err,
+        };
         let kind = match route {
-            OwnedJsonRoute::Existing => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes: Some(Box::new(max_bytes)) },
-            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(Box::new(max_bytes)) },
+            OwnedJsonRoute::Existing => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes: Some(Box::new(max_bytes)), options },
+            OwnedJsonRoute::Owned(plan) => ExprKind::JsonEncode { source, plan: crate::hir::JsonEncodePlan::Owned(plan), max_bytes: Some(Box::new(max_bytes)), options },
         };
         Expr {
             kind,
             ty: Ty::Result(Scalar::String, Scalar::Enum(self.error_enum_id)),
             span,
         }
+    }
+
+    fn check_json_encode_options(&mut self, input: Option<&ast::Expr>, source_ty: Ty) -> Result<Option<Box<Expr>>, ()> {
+        let Some(input) = input else { return Ok(None); };
+        if source_ty != Ty::JsonDoc {
+            self.diags.error("explicit JSON encoding options require a json.doc source".to_string(), input.span);
+            return Err(());
+        }
+        let Some(id) = self.struct_ids.get("json.encode_options").copied() else {
+            self.diags.error("JSON encoding options type is unavailable".to_string(), input.span);
+            return Err(());
+        };
+        let options = self.check_expr(input, Some(Ty::Struct(id)));
+        let ty = self.resolve(options.ty);
+        if ty == Ty::Error { return Err(()); }
+        if ty != Ty::Struct(id) {
+            self.diags.error("JSON encoding options must be json.encode_options".to_string(), input.span);
+            return Err(());
+        }
+        Ok(Some(Box::new(options)))
     }
 
     /// `json.decode(input)` — parse a `str` into a struct at runtime, yielding
@@ -72999,7 +73035,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
             }
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, .. } => {
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Pieces(parts), max_bytes, options, .. } => {
                 for p in parts {
                     match p {
                         TemplatePart::Hole(h) | TemplatePart::JsonStr(h) | TemplatePart::JsonDoc(h) => self.finalize_expr(h),
@@ -73011,10 +73047,11 @@ impl<'a, 't> Checker<'a, 't> {
                         TemplatePart::Text(_) | TemplatePart::PopComma => {}
                     }
                 }
-                if let Some(max_bytes) = max_bytes { self.finalize_expr(max_bytes); }
+                for argument in max_bytes.iter_mut().chain(options.iter_mut()) { self.finalize_expr(argument); }
             }
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: None, .. } => {}
-            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes: Some(max_bytes), .. } => self.finalize_expr(max_bytes),
+            ExprKind::JsonEncode { plan: crate::hir::JsonEncodePlan::Owned(_), max_bytes, options, .. } => {
+                for argument in max_bytes.iter_mut().chain(options.iter_mut()) { self.finalize_expr(argument); }
+            }
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonOwnedDecode { input, .. }
             | ExprKind::JsonDecodeArray { input, .. }
@@ -95279,4 +95316,23 @@ pub fn identity_info_schema_valid(actual: &hir::StructDef) -> bool {
 }
 pub fn fs_access_mode_schema_valid(actual: &hir::StructDef) -> bool {
     observation_schema_matches(actual,fs_access_mode_definition())
+}
+
+const JSON_ENCODE_OPTION_FIELDS: [&str; 3] = ["space_after_comma", "space_after_colon", "reescape_strings"];
+
+/// The nominal Copy policy record shared by source formation and independent IR validators.
+pub fn json_encode_options_definition() -> hir::StructDef {
+    hir::StructDef {
+        name: "json.encode_options".to_string(), source_name: "json.encode_options".to_string(),
+        fields: JSON_ENCODE_OPTION_FIELDS.into_iter()
+            .map(|name| hir::FieldDef { name: name.to_string(), ty: Ty::Bool }).collect(),
+        align: None, c_repr: false,
+    }
+}
+pub fn json_encode_options_type(ty: Ty, structs: &[hir::StructDef]) -> bool {
+    let Ty::Struct(id) = ty else { return false; };
+    let Some(def) = usize::try_from(id).ok().and_then(|id| structs.get(id)) else { return false; };
+    def.name == "json.encode_options" && def.source_name == "json.encode_options"
+        && def.align.is_none() && !def.c_repr && def.fields.len() == JSON_ENCODE_OPTION_FIELDS.len()
+        && def.fields.iter().zip(JSON_ENCODE_OPTION_FIELDS).all(|(field, name)| field.name == name && field.ty == Ty::Bool)
 }

@@ -1,4 +1,4 @@
-//! R158: document tokens, bounded output and borrowed-source/owned-output lifecycle.
+//! R158/R159: document rendering, bounded output and borrowed-source/owned-output lifecycle.
 #![cfg(unix)]
 #[path = "helpers/owned_fixture.rs"]
 mod owned_fixture;
@@ -83,6 +83,8 @@ const HELPER: &str = r#"module helper
 import core.json
 pub Typed { value:i64 }
 pub fn encode<T>(document:json.doc, cap:i64, marker:T)->Result<string,Error> = json.encode_bounded(document,cap)
+pub fn policy(comma:bool,colon:bool,strings:bool)->json.encode_options = json.encode_options{space_after_comma:comma,space_after_colon:colon,reescape_strings:strings}
+pub fn render<T>(document:json.doc, cap:i64, options:json.encode_options, marker:T)->Result<string,Error> = json.encode_bounded(document,cap,options)
 pub fn fields(first:json.doc, second:json.doc)->Result<string,Error> {
   a:=json.encode(first)?
   b:=json.encode_bounded(second,100)?
@@ -140,7 +142,70 @@ fn owned(input:str, mode:i64)->Result<string,Error> {
   }
 }
 fn divergent(document:json.doc)->Result<string,Error> = json.encode_bounded(document,{return Ok("early".clone()); 100})
+fn policy_options(comma:bool, colon:bool, strings:bool)->json.encode_options = helper.policy(comma,colon,strings)
+fn render_owned(input:str, options:json.encode_options)->Result<string,Error> {
+  source:=input.clone()
+  arena { document:=json.doc(source)?; json.encode(document,options) }
+}
+fn policy_early(document:json.doc)->Result<string,Error> = json.encode_bounded(document,100,{ return Ok("early".clone()); policy_options(true,true,true) })
+fn selected_options(mode:i64)->Result<json.encode_options,Error> {
+  if mode==0 { return Err(Error.Invalid) }
+  selected:=if mode==1 { policy_options(true,true,true) } else {
+    match mode { 2=>policy_options(true,true,true), _=>policy_options(true,true,true) }
+  }
+  value:=loop { break selected }
+  Ok(value)
+}
+fn failed_options(document:json.doc)->Result<string,Error> = json.encode_bounded(document,100,selected_options(0)?)
+fn policy_case(options:json.encode_options, expected:str)->Result<(),Error> = arena {
+  document:=json.doc("[{\"\\u0061\":\"\\u0061\"},{}]")?
+  require(json.encode(document,options)?==expected)?
+  require(helper.render(document,expected.len(),options,true)?==expected)?
+  match json.encode_bounded(document,expected.len()-1,options) {Err(Invalid)=>{},_=>{return Err(Error.Invalid)}}
+  Ok(())
+}
+fn policies()->Result<(),Error> {
+  policy_case(policy_options(false,false,false),"[{\"\\u0061\":\"\\u0061\"},{}]")?
+  policy_case(policy_options(true,false,false),"[{\"\\u0061\":\"\\u0061\"}, {}]")?
+  policy_case(policy_options(false,true,false),"[{\"\\u0061\": \"\\u0061\"},{}]")?
+  policy_case(policy_options(true,true,false),"[{\"\\u0061\": \"\\u0061\"}, {}]")?
+  policy_case(policy_options(false,false,true),"[{\"a\":\"a\"},{}]")?
+  policy_case(policy_options(true,false,true),"[{\"a\":\"a\"}, {}]")?
+  policy_case(policy_options(false,true,true),"[{\"a\": \"a\"},{}]")?
+  policy_case(policy_options(true,true,true),"[{\"a\": \"a\"}, {}]")?
+
+  arena {
+    document:=json.doc("{\"\\u0061\":[\"\\u0061\",-0,1e999]}")?
+    defaults:=policy_options(false,false,false)
+    require(json.encode(document,defaults)?==json.encode(document)?)?
+    require(policy_early(document)?=="early")?
+    match failed_options(document) {Err(Invalid)=>{},_=>{return Err(Error.Invalid)}}
+    mut mode:i64:=1
+    loop {
+      if mode==4 { break }
+      require(json.encode(document,selected_options(mode)?)?=="{\"a\": [\"a\", -0, 1e999]}")?
+      mode=mode+1
+    }
+    mut effects:i64:=0
+    options:=policy_options(true,true,true)
+    require(json.encode_bounded(document,{effects=effects+1;100},{effects=effects*10+2;options})?=="{\"a\": [\"a\", -0, 1e999]}")?
+    require(effects==12)?
+    match json.encode_bounded(document,-1,{effects=effects+1;options}) {Err(Invalid)=>{},_=>{return Err(Error.Invalid)}}
+    require(effects==13)?
+    selected:=document.get("a")
+    require(helper.render(selected,100,options,0)?=="[\"a\", -0, 1e999]")?
+    missing:=document.get("missing")
+    match json.encode(missing,options) {Err(Invalid)=>{},_=>{return Err(Error.Invalid)}}
+  }
+  mut result:=render_owned("[\"\\u0061\",0]",policy_options(true,true,true))?
+  require(result=="[\"a\", 0]")?
+  result=render_owned("[\"\\u0061\",0]",policy_options(false,false,true))?
+  require(result=="[\"a\",0]")?
+  Ok(())
+}
 fn exercise()->Result<(),Error> {
+  policies()?
+
   verify(" { } ","{}")?
   verify(" [ ] ","[]")?
   verify(" null ","null")?
@@ -195,11 +260,19 @@ fn document_encoding_lifecycle_import_and_cache() {
             let path = stage.join("main.align");
             let entry = path.to_str().ok_or("fixture path")?;
             let cache = align_driver::CacheContext::at(stage.join("cache"));
-            for round in 0..3 {
+            for round in 0..4 {
                 let source = if round == 2 {
                     SOURCE
                         .replace(" [ 3 ] ", " [ 4 ] ")
                         .replace("\"[3]\"", "\"[4]\"")
+                        .replace(
+                            "policy_options(false,false,true))?",
+                            "policy_options(true,false,true))?",
+                        )
+                        .replace(
+                            r#"require(result=="[\"a\",0]")?"#,
+                            r#"require(result=="[\"a\", 0]")?"#,
+                        )
                 } else {
                     SOURCE.to_owned()
                 };
@@ -227,8 +300,13 @@ fn document_encoding_lifecycle_import_and_cache() {
                             .iter()
                             .all(|unit| unit.frontend.as_ref().unwrap().hit)
                     );
-                } else {
-                    assert!(built.units.iter().any(|unit| !unit.frontend.as_ref().unwrap().hit));
+                } else if round != 3 {
+                    assert!(
+                        built
+                            .units
+                            .iter()
+                            .any(|unit| !unit.frontend.as_ref().unwrap().hit)
+                    );
                 }
                 let programs = (0..built.units.len())
                     .map(|i| built.materialize(i).unwrap().clone())
@@ -268,6 +346,26 @@ fn document_encoding_rejects_invalid_sources() {
             (
                 "temporary",
                 "fn bad(d:json.doc)->Result<string,Error> = json.encode(d.get(\"x\"))",
+            ),
+            (
+                "wrong-options",
+                "fn bad(d:json.doc)->Result<string,Error> = json.encode(d,0)",
+            ),
+            (
+                "typed-options",
+                "Row {x:i64}\nfn bad()->Result<string,Error> {r:=Row{x:1};json.encode(r,json.encode_options{space_after_comma:true,space_after_colon:true,reescape_strings:true})}",
+            ),
+            (
+                "lookalike-options",
+                "Options {space_after_comma:bool,space_after_colon:bool,reescape_strings:bool}\nfn bad(d:json.doc,o:Options)->Result<string,Error> = json.encode_bounded(d,100,o)",
+            ),
+            (
+                "drop-in-options",
+                "fn consume(s:string)->json.encode_options = json.encode_options{space_after_comma:true,space_after_colon:true,reescape_strings:true}\nfn bad()->Result<string,Error> = arena {input:=\"{}\".clone();d:=json.doc(input)?;json.encode_bounded(d,100,consume(input))}",
+            ),
+            (
+                "replace-in-options",
+                "fn bad()->Result<string,Error> = arena {mut input:=\"{}\".clone();d:=json.doc(input)?;json.encode(d,{input=\"[]\".clone();json.encode_options{space_after_comma:true,space_after_colon:true,reescape_strings:true}})}",
             ),
             (
                 "wrong-limit",

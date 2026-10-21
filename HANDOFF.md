@@ -25,6 +25,11 @@ not authorize a versioned release. Inspect Git/GitHub for branch, PR and CI stat
 
 ## Recent completed capabilities
 
+- [Plan238](docs/impl/238-json-document-render-options.md) delivers explicit
+  document spacing and incremental string re-escaping through `json.encode_options`.
+  Defaults and number tokens stay exact; all output bytes share the existing cap
+  and independent ownership. Consumer template/Codex/tool/image qualification
+  remains external.
 - [Plan237](docs/impl/237-json-doc-encoding.md) extends both JSON encoders to
   named document roots and subtrees for LLM R158. Compact output preserves
   number tokens, string escapes, member order and duplicate occurrences;

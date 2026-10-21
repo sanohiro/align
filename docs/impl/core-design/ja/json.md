@@ -16,7 +16,7 @@ JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §1
 名前付きの `get` / `at` の結果も対象となる。object、array、string、number、boolean、null
 を root にできる。Missing は `Error.Invalid` を返す。
 
-出力は決定的なコンパクト JSON であり、メンバー順、重複メンバー、配列順を保持する。
+既定の出力は決定的なコンパクト JSON であり、メンバー順、重複メンバー、配列順を保持する。
 数値トークンは負のゼロ、指数表記、機械数値型の範囲外の値も含めて正確にコピーする。
 文字列とキーの元のエスケープ表記および復号後の Unicode/NUL の意味を保持する。
 構造上の空白を除去し、文字列内の空白は保持する。正規化や型付き数値への変換は行わない。
@@ -31,6 +31,45 @@ descriptor、走査用の heap scratch は割り当てず、stack 走査は pars
 割り当て失敗の terminal 方針、型付き schema と出力バイト列、通常の `json.doc` レコード
 フィールド禁止は変わらない。[Plan237](../../237-json-doc-encoding.md) が正確なコンパイラ・
 native 検証と受け入れ条件を規定する。
+
+## 明示的な文書出力設定（R159）
+
+`import core.json` が必要。通常の Copy レコードである組み込み型
+`json.encode_options` は、宣言順に `space_after_comma: bool`、
+`space_after_colon: bool`、`reescape_strings: bool` の3フィールドを持つ。
+全フィールドが必須で、割り当て、借用元の寿命、解放義務は持たない。
+
+```align
+options := json.encode_options {
+  space_after_comma: true,
+  space_after_colon: true,
+  reescape_strings: true,
+}
+encoded := json.encode_bounded(document, 4096, options)?
+unbounded := json.encode(document, options)?
+```
+
+省略はすべて false と同じで、従来の出力バイト列を保つ。空白設定は区切りのコンマと
+object のコロンの直後に ASCII 空白をちょうど1個挿入する。空のコンテナー、境界、
+文字列の内容には追加しない。区切り4通りと文字列方針2通りの全8組を受理する。
+任意の区切り文字列、インデント、アプリケーションやテンプレート専用モードはない。
+
+`reescape_strings` が true ならキーと文字列値を逐次復号する。引用符とバックスラッシュ
+は2バイトの JSON エスケープ、backspace/formfeed/newline/carriage return/tab は
+`\b`、`\f`、`\n`、`\r`、`\t`、残りの C0 制御文字は小文字の `\u00xx` を使う。
+スラッシュはそのまま出力する。他の Unicode scalar は UTF-8 を直接出力し、有効な
+サロゲートペアの復号結果と U+2028/U+2029 も含む。Unicode 正規化、ASCII 限定化、
+HTML エスケープは行わない。false は元のトークンを保持する。両方の方針でメンバー順、
+配列順、重複、数値トークンを正確に保持し、機械数値型への変換はしない。
+
+設定は通常のレコード式で指定でき、名前付き文書 root/部分木だけが対象となる。
+型付き record/array/sum のエンコーダーは追加設定を拒否する。検査順は引数個数、
+入力/schema、上限がある場合の exact i64、設定の nominal 型。実行時には入力元を
+予約したまま上限、設定の順に各1回評価し、負の上限でも設定の副作用は実行する。
+途中終了と副作用は通常の式の規則に従い、その後の所有権とエラーは R158 と同じ。
+空白とエスケープを含む全出力バイトを inclusive 上限に数え、断片ごとに拡張前に検査する。
+全文字列の正規化・事前カウント走査や入力長に比例する scratch は使わない。
+[Plan238](../../238-json-document-render-options.md) が完全な契約と実装の検証表を規定する。
 
 ## エンコーダーの安定した入力参照
 

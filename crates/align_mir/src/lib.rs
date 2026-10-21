@@ -1670,6 +1670,7 @@ pub enum Rvalue {
     JsonEncode {
         pieces: Vec<TemplatePiece>,
         max_bytes: Option<Operand>,
+        options: Option<Operand>,
         out: Slot,
     },
     /// `json.decode` into struct `struct_id`: parse the `str` `input` and fill the `out`
@@ -7989,9 +7990,12 @@ fn lower_json_encode(
     source: &hir::JsonEncodeSource,
     plan: &hir::JsonEncodePlan,
     max_bytes: Option<&hir::Expr>,
+    options: Option<&hir::Expr>,
     result_ty: Ty,
 ) -> Operand {
     let limit = max_bytes.map(|limit| lower_expr(b, limit));
+    if !lowering_continues(b) { return terminated_operand(); }
+    let options = options.map(|options| lower_expr(b, options));
     if !lowering_continues(b) { return terminated_operand(); }
     let pieces = match plan {
         hir::JsonEncodePlan::Pieces(parts) => {
@@ -8007,6 +8011,7 @@ fn lower_json_encode(
         Rvalue::JsonEncode {
             pieces,
             max_bytes: limit,
+            options,
             out,
         },
     ));
@@ -8537,7 +8542,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         hir::ExprKind::NamedArena { local, block } => lower_named_arena_block(b, *local, block),
         hir::ExprKind::TaskGroup(block) => lower_task_group_block(b, block),
         hir::ExprKind::Template(_) => lower_template_spine(b, e),
-        hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty),
+        hir::ExprKind::JsonEncode { source, plan, max_bytes, options } => lower_json_encode(b, source, plan, max_bytes.as_deref(), options.as_deref(), e.ty),
         hir::ExprKind::FileCreateRw { .. }
         | hir::ExprKind::FileOpenRw { .. }
         | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
@@ -8937,7 +8942,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 len: _,
             } => finish_const_array(b, elems, *elem, e.ty),
             hir::ExprKind::Template(_) => lower_template_spine(b, e),
-            hir::ExprKind::JsonEncode { source, plan, max_bytes } => lower_json_encode(b, source, plan, max_bytes.as_deref(), e.ty),
+            hir::ExprKind::JsonEncode { source, plan, max_bytes, options } => lower_json_encode(b, source, plan, max_bytes.as_deref(), options.as_deref(), e.ty),
             hir::ExprKind::JsonDecode { struct_id, input } => {
                 lower_json_decode_declared(b, *struct_id, input, e.ty, None)
             }
@@ -26764,7 +26769,7 @@ mod tests {
             kind: hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: 0, path: Vec::new() }, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
                     root: 0,
                     records: Vec::new(),
-                }), max_bytes: None },
+                }), max_bytes: None, options: None },
             ty: Ty::Result(Scalar::String, Scalar::Enum(0)),
             span,
         };
@@ -26772,7 +26777,7 @@ mod tests {
             kind: hir::ExprKind::JsonEncode { source: hir::JsonEncodeSource { root: 0, path: Vec::new() }, plan: align_sema::hir::JsonEncodePlan::Owned(hir::OwnedJsonGraphPlanV4 {
                     root: 0,
                     records: Vec::new(),
-                }), max_bytes: Some(Box::new(max_bytes)) },
+                }), max_bytes: Some(Box::new(max_bytes)), options: None },
             ty: Ty::Result(Scalar::String, Scalar::Enum(0)),
             span,
         };

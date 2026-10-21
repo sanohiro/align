@@ -2600,7 +2600,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         RuntimeKey::JsonEncodeDoc => RuntimeAbi {
             key,
             symbol: "align_rt_json_encode_doc",
-            shape: RuntimeAbiShape::A73,
+            shape: RuntimeAbiShape::A74,
         },
         RuntimeKey::JsonEncodeObject => RuntimeAbi {
             key,

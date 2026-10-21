@@ -95,3 +95,10 @@ The extracted exact/before/every/reject obligations above map to these owners:
 
 No matrix cell is deferred within this capability. Consumer protocol adoption
 and record-held document formation remain outside its public contract.
+
+## Explicit policy extension
+
+[Plan238](238-json-document-render-options.md) adds an optional ordinary policy
+record to both document encoders. Calls without it retain every byte/error/
+ownership guarantee above. Its private ABI revision and streaming re-escaping
+are owned by that plan; typed encoders retain their existing surface.
