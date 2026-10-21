@@ -2777,6 +2777,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             crate::TemplatePiece::IntHole(operand)
             | crate::TemplatePiece::StrHole(operand)
             | crate::TemplatePiece::JsonStrHole(operand)
+            | crate::TemplatePiece::JsonDoc(operand)
             | crate::TemplatePiece::BoolHole(operand)
             | crate::TemplatePiece::CharHole(operand)
             | crate::TemplatePiece::FloatHole(operand)
@@ -5972,7 +5973,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
             }
             Rvalue::Template(pieces, arena) => {
-                if result_ty != Ty::Str || !path.is_empty() {
+                if result_ty != Ty::Str || !path.is_empty()
+                    || pieces.iter().any(|piece| matches!(piece, crate::TemplatePiece::JsonDoc(_))) {
                     equation.invalid = true;
                 } else {
                     for piece in &pieces {
@@ -7058,6 +7060,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 out,
             } => {
                 if slot_ty != Ty::String
+                    || (pieces.iter().any(|piece| matches!(piece, crate::TemplatePiece::JsonDoc(_)))
+                        && !matches!(pieces.as_slice(), [crate::TemplatePiece::JsonDoc(_)]))
                     || max_bytes.as_ref().is_some_and(|limit| xml_operand_base_ty(self.graph.function, limit) != Some(i64_ty))
                 {
                     equation.invalid = true;
@@ -12481,6 +12485,7 @@ pub fn template_piece_is_type_safe(
         crate::TemplatePiece::StrHole(operand) => operand_ty(operand) == Some(Ty::Str),
         crate::TemplatePiece::CharHole(operand) => operand_ty(operand) == Some(Ty::Char),
         crate::TemplatePiece::JsonStrHole(operand) => operand_ty(operand) == Some(Ty::Str),
+        crate::TemplatePiece::JsonDoc(operand) => operand_ty(operand) == Some(Ty::JsonDoc),
         crate::TemplatePiece::OwnedJsonRecords { value, plan } => {
             matches!(operand_ty(value), Some(Ty::Struct(id) | Ty::DynStructArray(id, align_sema::Layout::Aos)) if id == plan.root)
                 && plan.owns_text()

@@ -8,10 +8,37 @@ ownership and effect classification, error policy, pitfalls, and related tests.
 ## Overview
 
 JSON across typed and schema-unknown boundaries (draft §14). The surface has five operations:
-typed `encode` / `encode_bounded` / `decode`, lazy schema-unknown `doc`, and streaming typed-row `scan`. Target and row
+typed/document `encode` / `encode_bounded`, typed `decode`, lazy schema-unknown `doc`, and streaming typed-row `scan`. Target and row
 types are carried by **inference, never a written type argument** (settled: Align has no
 expression-position type-argument syntax / no turbofish). Requires `import core.json` (the
 capability-header rule applies to core.json exactly like std modules).
+
+## Document subtree encoding (R158)
+
+`json.encode(document)` and `json.encode_bounded(document, max_bytes: i64)`
+accept a named `json.doc` local or parameter, including a named `get`/`at`
+result, and return `Result<string, Error>`. Objects, arrays, strings, numbers,
+booleans and null are valid roots; Missing returns `Error.Invalid`.
+
+Output is deterministic compact JSON, with original member order, duplicates
+and array order. Number tokens are copied exactly, including negative zero,
+exponent spellings and values outside machine numeric ranges. String/key tokens
+retain their original escapes and decoded Unicode/NUL bytes. Structural
+whitespace is removed; whitespace inside a string is preserved. No canonical
+normalization or typed numeric conversion is applied to a document.
+
+The document, source bytes and parse arena remain borrowed through eager limit
+evaluation and encoding. Success transfers one independent owned string, valid
+after input/arena expiry, without a final copy. Negative or exceeded inclusive
+caps return `Error.Invalid`, publish nothing and release private output. Exact
+fit succeeds; zero rejects every real value. Negative caps skip traversal.
+The existing builder checks before growth and capacity requests never exceed the
+cap. No decoded-string, descriptor or traversal heap scratch is allocated;
+stack traversal retains the parser's maximum value depth of 128. Parse storage,
+allocator rounding and realloc overlap are outside the output bound. Allocation
+failure remains terminal. Typed schemas/bytes and the ordinary prohibition on
+`json.doc` record fields are unchanged. [Plan237](../237-json-doc-encoding.md)
+owns exact compiler/native validation and acceptance.
 
 ## Stable encoder sources
 

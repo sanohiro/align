@@ -21633,6 +21633,46 @@ fn json_field_source_and_piece_identity_matrix() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
+fn json_doc_encode_checked_source_and_piece_matrix() -> Result<(), &'static str> {
+    for bounded in [false, true] {
+        let call=if bounded { "json.encode_bounded(document,100)" } else { "json.encode(document)" };
+        let base=checked_source_program(&format!("import core.json\nfn encode(document:json.doc, sibling:json.doc)->Result<string,Error> {{ output:={call}\noutput }}\nfn main() {{}}\n"));
+        assert!(body_core_metadata_is_valid(&base));
+        assert!(!is_empty(&lower_program(&base)));
+        for mutation in 0..8 {
+            assert_owned_json_body_mutation(&base,"document-source",|program| {
+                let expression=body_first_let_init_mut(program,"encode");
+                let hir::ExprKind::JsonEncode {source,plan:hir::JsonEncodePlan::Pieces(parts),max_bytes}=&mut expression.kind else {panic!("document encoder");};
+                match mutation {
+                    0=>source.root=u32::MAX,
+                    1=>source.path.push(0),
+                    2=>parts.push(parts[0].clone()),
+                    3=>parts.clear(),
+                    4=>{
+                        let hir::TemplatePart::JsonDoc(access)=&mut parts[0] else {panic!("document part");};
+                        access.kind=hir::ExprKind::Local(1);
+                    }
+                    5=>{
+                        let hir::TemplatePart::JsonDoc(access)=&mut parts[0] else {panic!("document part");};
+                        access.ty=Ty::Str;
+                    }
+                    6=>{
+                        if let Some(limit)=max_bytes {limit.ty=Ty::Bool;}
+                        else {parts[0]=hir::TemplatePart::Text("null".to_owned());}
+                    }
+                    _=>{
+                        let parts=parts.clone();
+                        expression.kind=hir::ExprKind::Template(parts);
+                        expression.ty=Ty::Str;
+                    }
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
     for kind in [
         hir::CompressKind::Gzip,

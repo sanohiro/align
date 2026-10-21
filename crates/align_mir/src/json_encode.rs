@@ -173,6 +173,9 @@ fn identifier(name: &[u8]) -> bool {
 /// Operand widths and descriptor graphs are independently checked by the emitter's type gate.
 pub fn json_encode_sequence_is_valid(pieces: &[TemplatePiece]) -> bool {
     fn validate(pieces: &[TemplatePiece]) -> Option<()> {
+        if pieces.iter().any(|piece| matches!(piece, TemplatePiece::JsonDoc(_))) {
+            return matches!(pieces, [TemplatePiece::JsonDoc(_)]).then_some(());
+        }
         let mut stream = Stream {
             pieces,
             index: 0,

@@ -7,7 +7,30 @@
 
 ## Overview
 
-JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §14）。表面は、型付きの `encode` / `encode_bounded` / `decode`、遅延スキーマ未知ビューの `doc`、型付き行をストリーム処理する `scan` の5操作である。対象型と行型は **明示的な型引数ではなく型推論によって** 決定される（決定済: Align には式位置での型引数構文、つまり turbofish のような記法は存在しない）。使用には `import core.json` が必要である（capability-header のルールは `core.json` に対しても std モジュールと全く同様に適用される）。
+JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §14）。表面は、型付き値と文書を受け取る `encode` / `encode_bounded`、型付きの `decode`、遅延スキーマ未知ビューの `doc`、型付き行をストリーム処理する `scan` の5操作である。対象型と行型は **明示的な型引数ではなく型推論によって** 決定される（決定済: Align には式位置での型引数構文、つまり turbofish のような記法は存在しない）。使用には `import core.json` が必要である（capability-header のルールは `core.json` に対しても std モジュールと全く同様に適用される）。
+
+## 文書の部分木エンコード（R158）
+
+`json.encode(document)` と `json.encode_bounded(document, max_bytes: i64)` は、
+名前付きの `json.doc` ローカルまたはパラメーターを受理し、`Result<string, Error>` を返す。
+名前付きの `get` / `at` の結果も対象となる。object、array、string、number、boolean、null
+を root にできる。Missing は `Error.Invalid` を返す。
+
+出力は決定的なコンパクト JSON であり、メンバー順、重複メンバー、配列順を保持する。
+数値トークンは負のゼロ、指数表記、機械数値型の範囲外の値も含めて正確にコピーする。
+文字列とキーの元のエスケープ表記および復号後の Unicode/NUL の意味を保持する。
+構造上の空白を除去し、文字列内の空白は保持する。正規化や型付き数値への変換は行わない。
+
+文書、入力バイト列、parse arena は上限の eager 評価とエンコードが完了するまで借用する。
+成功時は最終コピーなしで独立した所有 string を返し、入力と arena の終了後も使用できる。
+負の上限または inclusive 上限超過は `Error.Invalid` となり、部分出力を公開せず私有出力を
+解放する。完全一致は成功し、上限ゼロでは実際の JSON 値をすべて拒否する。負の上限では
+走査しない。既存 builder は拡張前に検査し、容量要求は上限を超えない。復号文字列、
+descriptor、走査用の heap scratch は割り当てず、stack 走査は parser と同じ最大値深度128
+に従う。parse 済み領域、allocator の丸め、realloc の新旧領域の重複は出力上限の対象外。
+割り当て失敗の terminal 方針、型付き schema と出力バイト列、通常の `json.doc` レコード
+フィールド禁止は変わらない。[Plan237](../../237-json-doc-encoding.md) が正確なコンパイラ・
+native 検証と受け入れ条件を規定する。
 
 ## エンコーダーの安定した入力参照
 

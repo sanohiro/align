@@ -1,5 +1,10 @@
 # JSON encoding from stable aggregate fields
 
+[Plan237](237-json-doc-encoding.md) subsequently admits named `json.doc` sources
+through the same reservation and owned-output pipeline. Ordinary document-field
+formation remains excluded; this plan still owns stable typed-record fields.
+
+
 Proposed capability for align-media AM-R11. All three consumer registers and
 the VACE Guide.frames consumer were inspected. This closes source-place
 composition of the existing encoder family; it does not widen JSON schemas.

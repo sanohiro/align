@@ -3054,6 +3054,8 @@ pub enum TemplatePiece {
     FloatHole(Operand),
     /// A `str` operand emitted as a JSON string literal (quoted + escaped). From `json.encode`.
     JsonStrHole(Operand),
+    /// A complete borrowed document subtree; only valid in `Rvalue::JsonEncode`.
+    JsonDoc(Operand),
     /// One owned record or AoS record array rendered through the validated V4 element graph.
     OwnedJsonRecords {
         value: Operand,
@@ -7860,6 +7862,7 @@ fn template_piece(part: &hir::TemplatePart, operand: Operand) -> TemplatePiece {
             }
         }
         hir::TemplatePart::JsonStr(_) => TemplatePiece::JsonStrHole(operand),
+        hir::TemplatePart::JsonDoc(_) => TemplatePiece::JsonDoc(operand),
         hir::TemplatePart::OptionField { name, .. } => TemplatePiece::OptionField {
             opt: operand,
             name: name.clone(),
@@ -7893,6 +7896,7 @@ fn template_part_expr(part: &hir::TemplatePart) -> Option<&hir::Expr> {
     match part {
         hir::TemplatePart::Hole(expr)
         | hir::TemplatePart::JsonStr(expr)
+        | hir::TemplatePart::JsonDoc(expr)
         | hir::TemplatePart::OptionField { access: expr, .. }
         | hir::TemplatePart::OptionStructField { access: expr, .. }
         | hir::TemplatePart::StructArrayField { access: expr, .. }

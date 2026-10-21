@@ -329,6 +329,7 @@ key|JsonDocKeys|json_doc_keys|IndirectStorage|declare void @align_rt_json_doc_ke
 key|JsonDocKind|json_doc_kind|IndirectStorage|declare i32 @align_rt_json_doc_kind(ptr, i64) #2
 key|JsonDocLen|json_doc_len|IndirectStorage|declare i64 @align_rt_json_doc_len(ptr, i64) #2
 key|JsonDocParse|json_doc_parse|IndirectStorage|declare i32 @align_rt_json_doc_parse(ptr, i64, ptr, ptr) #2
+key|JsonEncodeDoc|json_encode_doc|IndirectStorage|declare void @align_rt_json_encode_doc(ptr, ptr captures(none), i64) #2
 key|JsonEncodeObject|json_encode_object|IndirectStorage|declare void @align_rt_json_encode_object(ptr, ptr, ptr, i64) #2
 key|JsonEncodeScalarArray|json_encode_scalar_array|IndirectStorage|declare void @align_rt_json_encode_scalar_array(ptr, ptr, i64, i32) #2
 key|JsonEncodeStructArray|json_encode_struct_array|IndirectStorage|declare void @align_rt_json_encode_struct_array(ptr, ptr, i64, ptr, i64, i64) #2

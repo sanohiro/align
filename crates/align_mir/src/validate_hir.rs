@@ -4679,6 +4679,7 @@ impl<'a> BodyValidator<'a> {
             }
             hir::ExprKind::Template(parts) => {
                 !parts.is_empty() && self.template_parts_envelope_ok(parts)
+                    && !parts.iter().any(|part| matches!(part, hir::TemplatePart::JsonDoc(_)))
             }
             hir::ExprKind::JsonEncode { source, plan: align_sema::hir::JsonEncodePlan::Owned(plan), max_bytes: None } => {
                 self.owned_json_source_ok(source, plan, context)
@@ -6019,7 +6020,7 @@ impl<'a> BodyValidator<'a> {
 
     fn template_parts_envelope_ok(&self, parts: &[hir::TemplatePart]) -> bool {
         parts.iter().all(|part| match part {
-            hir::TemplatePart::Text(_) | hir::TemplatePart::Hole(_) | hir::TemplatePart::JsonStr(_) => true,
+            hir::TemplatePart::Text(_) | hir::TemplatePart::Hole(_) | hir::TemplatePart::JsonStr(_) | hir::TemplatePart::JsonDoc(_) => true,
             hir::TemplatePart::OptionField { name, .. } => valid_declaration_name(name),
             hir::TemplatePart::OptionStructField {
                 name, struct_id, ..
@@ -6158,7 +6159,7 @@ impl<'a> BodyValidator<'a> {
         }
 
         if parts.len() == 1 {
-            return matches!(&parts[0], hir::TemplatePart::UnionValue { .. }
+            return matches!(&parts[0], hir::TemplatePart::JsonDoc(_) | hir::TemplatePart::UnionValue { .. }
                 | hir::TemplatePart::StructArrayField { .. }
                 | hir::TemplatePart::ScalarArrayField { .. });
         }
@@ -7215,7 +7216,7 @@ impl<'a> BodyValidator<'a> {
                 hir::ExprKind::Template(parts) => {
                     for part in parts.iter().rev() {
                         match part {
-                            hir::TemplatePart::Hole(expr) | hir::TemplatePart::JsonStr(expr) => {
+                            hir::TemplatePart::Hole(expr) | hir::TemplatePart::JsonStr(expr) | hir::TemplatePart::JsonDoc(expr) => {
                                 push_expr!(expr, context.clone());
                             }
                             hir::TemplatePart::OptionField { access, .. }
@@ -7235,7 +7236,7 @@ impl<'a> BodyValidator<'a> {
                     if let Some(max_bytes) = max_bytes { push_expr!(max_bytes, context.clone()); }
                     for part in parts.iter().rev() {
                         match part {
-                            hir::TemplatePart::Hole(expr) | hir::TemplatePart::JsonStr(expr) => {
+                            hir::TemplatePart::Hole(expr) | hir::TemplatePart::JsonStr(expr) | hir::TemplatePart::JsonDoc(expr) => {
                                 push_expr!(expr, context.clone());
                             }
                             hir::TemplatePart::OptionField { access, .. }
@@ -11728,6 +11729,7 @@ impl<'a> BodyValidator<'a> {
         let mut object_has_option = Vec::new();
         for part in parts {
             match part {
+                hir::TemplatePart::JsonDoc(_) => return None,
                 hir::TemplatePart::Text(text) => match text.as_str() {
                     "{" => object_has_option.push(false),
                     "}" => match object_has_option.pop() {
@@ -11979,6 +11981,10 @@ impl<'a> BodyValidator<'a> {
             return false;
         };
         match root {
+            Ty::JsonDoc => {
+                return matches!(parts, [hir::TemplatePart::JsonDoc(access)]
+                    if access.ty == Ty::JsonDoc && Self::json_source_access_matches(access, source));
+            }
             Ty::DynStructArray(id, align_sema::Layout::Aos) => {
                 return matches!(parts, [hir::TemplatePart::StructArrayField { access, struct_id }]
                     if *struct_id == id && self.body_ty_matches(access.ty, root)
@@ -12150,6 +12156,11 @@ impl<'a> BodyValidator<'a> {
         let mut flows = Vec::new();
         for part in parts {
             let flow = match part {
+                hir::TemplatePart::JsonDoc(expression) => {
+                    let flow = self.expr_flow(expression)?;
+                    if flow.ty != Ty::JsonDoc { return None; }
+                    flow
+                }
                 hir::TemplatePart::Text(_) | hir::TemplatePart::PopComma => continue,
                 hir::TemplatePart::Hole(expression) => {
                     let flow = self.expr_flow(expression)?;
