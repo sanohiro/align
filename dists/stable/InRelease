@@ -1,0 +1,32 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: Align
+Label: Align
+Suite: stable
+Codename: stable
+Date: Wed, 21 Oct 2026 16:19:31 +0000
+Architectures: amd64 arm64
+Components: main
+Description: Align compiler apt repository
+SHA256:
+ 3d422a3f1ab8a8c0b88a7a25a6fe943f31b8537e8aa99d7042df95c3c2843d58 668 main/binary-amd64/Packages
+ 848f340629e341ac270d9a45ccbe3c4febf5c98200ca0e61d02889f8c33b4fbe 464 main/binary-amd64/Packages.gz
+ 9473ecc24370a55857c055d373ac62ece2832896ba03629e308679b51b4e8fbf 668 main/binary-arm64/Packages
+ a1d366d56dd08df48630ef66a635613b7e4ddf1f8e668a0a9174b5d49e694408 462 main/binary-arm64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEE8MZuObV3jSSZCi57aYHn+bK8y+cFAmrY5hMACgkQaYHn+bK8
+y+dWdBAAiwbcFijBk3fjrZZHCwESUNNYVjpJ+wVz5Wv84DEiVdbCN734o5yw8qPj
+qG/RPx8ydYkWmPrcCybKv47OmWzurQL+4rJzugNUL27MoDAwu/IVBTcooKqRZnI6
+7b37ZwZUzNFsBRvFofACxb0qlZbQFF8Hyyd0ahSCAPYWxm8sIrV36pfXZG8X8c2X
+zUfD7drFLiIwXDaSB8Duhqz5KYX4xKdEZdc61GYgYsjDb6uol5uo0A0h6u8Qam9Z
+WQ1Kq/xkKkHnlL8kvQX9b6/Qof5/TF9hThTUiFdyf0pFDM44pQfAWu4KI20hRn+4
+xsIRKKjWoiABrOMcmEgGp9O2ft3gkF4r4wKUss9+iq3g6nVxLl3G2M/VKIY+w760
+SUnmNcrJcaSM79TnnnXXSCzueiAefajumAQwhPgF+rhp+de5Tv5iO0ooQ0iPgzbT
+zy00jNW1f8Qzf7bFN2GV/XCTX2qlVU5Ew6BSiYizjgZhx4IWAJWP4/BDDdMOXf0+
+NogRgwxmlHrz+WVaKRqB5daZBYez93/Gv7giKORWEhleAND44O4NO+Fd2iIvNwdW
+0+IpmFeJGxnXnwFHQrWErNbcCfxXc02vIQpptBgqqCZpnSUs94SYjlr8QgL0seeE
+cyjS+fhfQMPTRAHIVdgCqOaBnyY44Wl3vyqVwEeN/FI9B1P4YAY=
+=1B0i
+-----END PGP SIGNATURE-----
