@@ -36,6 +36,18 @@ Retire source-expression replay for completed structural constructors from null_
 
 New owner: deferred_aggregate_transfers, using bounded owned_fixture native execution. Reuse field_assignment_publication, assignment_target_liveness, owned_field_replacement, owned_tagged_payloads, owned_structs_arrays, fixed_array_fields, fixed_owned_strings, fixed_scalar_borrows and the relevant MIR ownership/control/depth owners. The author must map every applicable row to actual code/test before full code review.
 
+The R86 consumer residual is another instance of the structural-wrapper row:
+`Envelope { value: Some(value), digest: Some(value.text.clone()) }` retains
+`value` through the clone and then commits its transfer. The native owner now
+requires the exact nonempty JSON digest for this source and the original
+clone-before-move, reordered-field source in whole/per-unit/cache-hit modes.
+Requested-live accounting includes the JSON output and must return to zero;
+the realloc-grown output's free event has no matching counted allocation event.
+The completed-child `value: { Some(value) }` and post-statement reads still
+reject in both frontends. The old consumer rejection-only oracle for the fused
+constructor predates this capability; acceptance alone no longer demonstrates
+the historical empty-digest defect.
+
 ## Source-of-truth consistency
 
 Plan164 currently describes immediate transfer of wrapped bound operands into synthetic owners. Correct that implementation promise to the already-enforced semantic action boundary. Plan172's separately deferred producer gap becomes closed by this capability. No language decision or new public API is introduced. Record status once in HANDOFF. Independent adversarial strategy review is required before implementation because pending selected-source transfers change the internal ownership proof.

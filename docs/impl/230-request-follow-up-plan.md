@@ -22,6 +22,32 @@ invariants and prerequisites, acceptance owners and an implementation recommenda
 A public-contract or safety-strategy change then follows the ordinary ledger,
 closure-matrix and independent-review gates. Consumer adoption remains external.
 
+## Non-deferred request reconciliation (2026-10-21)
+
+The owner's follow-up selects every remaining request except deferred work.
+All three registers were reread. Plans231–236 below are already merged;
+their former provider-deferred assessments are superseded by those deliveries,
+not reasons to reimplement them. Upstream consumer qualification remains external,
+including voice V006's separate adoption receipt for an unpublished candidate.
+LLM R157 is delivered by [Plan229](229-out-slice-read-certification.md)/#1394,
+media AM-R21 by [Plan205](205-indexed-array-field-copy-reads.md)/#1395, and
+LLM R158 by [Plan237](237-json-doc-encoding.md)/#1404. Provider receipts belong
+in the affected request registers; consumer code and pins are outside this pass.
+
+R86's retained optional-record witness now prints the complete digest on main.
+[Plan173](173-deferred-aggregate-transfers.md)/#1320 already defers structural
+source transfers until the outer action completes. The exact JSON and completed-
+move negative controls extend its existing lifecycle/replay owner; accepting the
+fused constructor is no longer proof of the former empty-digest bug. This is
+provider regression evidence, not the consumer's task-attempt qualification.
+
+The K1/view and exclusive-owner boundaries below remain unselected. The R37,
+R49 and R80 source-packet investigations remain on hold for evidence, and R131
+has no reproducible current defect in its retained constructors. No unavailable
+witness, retired consumer, platform-only acceptance or unselected policy trial
+is converted into a completed repair. Other already adopted/qualified register
+entries retain their existing receipts and limits.
+
 ## Later capability queue
 
 | Requests | Value and investigation output |

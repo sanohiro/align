@@ -16,8 +16,11 @@ fn native_program() -> String {
     let mut source = String::from(
         r#"module main
 import model
+import core.json
 Record {text:string,n:i64}
 Pair {first:string,second:string}
+JsonRecord {text:string}
+JsonEnvelope {value:Option<JsonRecord>,digest:Option<string>}
 Tagged {Text(string), Empty}
 Choice {A,B}
 Fixed {values:[string;1],n:i64}
@@ -84,6 +87,10 @@ fn call_indirect()->i32 {function:=consume_text;text:="fresh".clone();return fun
 fn tuple_construct()->i32 {text:="fresh".clone(); value:=(text,text.len());if value.1!=5 {return 12};return 0}
 fn generic_record()->i32 {text:="fresh".clone(); value:=model.identity(Record{text:text,n:text.len()});if value.n!=5 {return 13};return 0}
 fn clone_source()->i32 {text:="fresh".clone();value:=Pair{first:text,second:text.clone()};if value.first!="fresh" || value.second!="fresh" {return 3};return 0}
+// R86: structural Some(value) retains its source until the enclosing action commits.
+fn json_pending_source()->i32 {value:=JsonRecord{text:"owned".clone()};packet:=JsonEnvelope{value:Some(value),digest:Some(value.text.clone())};encoded:=json.encode(packet) else {return 18};if encoded!="{\"value\":{\"text\":\"owned\"},\"digest\":\"owned\"}" {return 19};return 0}
+// Written initializer order still captures the clone before the reordered owner field.
+fn json_reordered_source()->i32 {value:=JsonRecord{text:"owned".clone()};packet:=JsonEnvelope{digest:Some(value.text.clone()),value:Some(value)};encoded:=json.encode(packet) else {return 18};if encoded!="{\"value\":{\"text\":\"owned\"},\"digest\":\"owned\"}" {return 19};return 0}
 fn projected()->i32 {root:=Pair{first:"fresh".clone(),second:"other".clone()}; value:=Record{text:root.first,n:root.first.len()};if value.n!=5 {return 4};return 0}
 fn tuple_projected()->i32 {root:=("fresh".clone(),0); value:=Record{text:root.0,n:root.0.len()};if value.n!=5 {return 5};return 0}
 fn retained_return(stop:bool)->string {text:="fresh".clone();value:=Record{text:if stop {text} else {"other".clone()},n:{if stop {return text};5}};return "ok".clone()}
@@ -118,8 +125,38 @@ fn exits()->i32 {a:=retained_return(true);b:=retained_return(false);if a!="fresh
     for (index, name) in names.iter().enumerate() {
         source.push_str(&format!("{{before:=unsafe {{align_rt_alloc_count()}}; before_free:=unsafe {{align_rt_free_count()}};status:={name}();if status!=0 {{return status}};allocated:=unsafe {{align_rt_alloc_count()}}-before;freed:=unsafe {{align_rt_free_count()}}-before_free;if allocated<=0 || allocated!=freed || live()!=0 {{return {}}}}}\n",40+index));
     }
+    // As in json_field_encode, realloc-grown output is included in live bytes and
+    // free_count but not alloc_count. Keep exact event parity for the owners above.
+    for name in ["json_pending_source", "json_reordered_source"] {
+        source.push_str(&format!("{{before:=unsafe {{align_rt_alloc_count()}};before_free:=unsafe {{align_rt_free_count()}};status:={name}();if status!=0 {{return status}};allocated:=unsafe {{align_rt_alloc_count()}}-before;freed:=unsafe {{align_rt_free_count()}}-before_free;if allocated<=0 || freed<allocated || live()!=0 {{return 20}}}}\n"));
+    }
     source.push_str("return 0}\n");
     source
+}
+
+#[test]
+fn optional_record_completed_moves_reject_later_reads() {
+    // A completed block child and an earlier statement have already transferred value.
+    for tail in [
+        "packet:=Envelope{value:{Some(value)},digest:Some(value.text.clone())}",
+        "packet:=Envelope{value:Some(value),digest:None}; unused:=value.text.clone()",
+        "packet:=Envelope{value:Some(value),digest:Some(value.text.clone())}; unused:=value.text.clone()",
+    ] {
+        let input = format!(
+            "Record {{text:string}}\nEnvelope {{value:Option<Record>,digest:Option<string>}}\nfn main() {{value:=Record{{text:\"owned\".clone()}};{tail}}}"
+        );
+        for per_unit in [false, true] {
+            let mut sources = SourceMap::new();
+            let diags = if per_unit {
+                align_driver::check_per_unit(&mut sources, "completed-move.align", &input).diags
+            } else {
+                check(&mut sources, "completed-move.align", &input).diags
+            };
+            assert!(diags.has_errors(), "accepted (per_unit={per_unit}) {input}");
+            let diagnostics = align_driver::format_diagnostics(&sources, &diags);
+            assert!(diagnostics.contains("moved"), "{diagnostics}");
+        }
+    }
 }
 
 #[test]
