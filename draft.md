@@ -1,8 +1,8 @@
 # Align Language Specification Draft v0.1
 
-**R69–R76 provider batch:**
-[Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns the exact next
-provider batch: retained raw link reading/followed metadata/exclusive symlink
+**R69–R76 provider implementation:**
+[Plan 54](docs/impl/54-r69-r76-prerequisite-batch-plan.md) owns the delivered
+provider capability: retained raw link reading/followed metadata/exclusive symlink
 creation, explicit real-ID access observations, `os.identity`, owned UTF-8
 replacement decoding and one-shot SHA-1. Its shared projection contract admits
 the existing directory/cursor owner leaves without Move extraction or mutable
@@ -16,13 +16,15 @@ observation, never an unsupported sentinel. The plan records platform evidence.
 
 ## 1. Vision
 
-Align is an AOT-compiled language where humans, AI, the compiler, and hardware can all face the same direction.
+Align is an AOT-compiled language designed for people and AI to write, compilers to analyze,
+and hardware to execute efficiently.
 
 Its goal is:
 
 > Write less. Predictably fast.
 
-Align does not aim to be "a language for writing optimization tricks"; it aims to be "a language where ordinary code naturally takes a form the compiler and hardware can optimize."
+Its data structures and pipeline operations expose memory layout and computation to the compiler,
+so common programs can be optimized without hand-written low-level loops.
 
 ---
 
@@ -68,9 +70,7 @@ string     = str / string / buffer / builder
 
 ### 3.2 Less Code, Fewer Bugs
 
-Less code means fewer bugs.
-
-However, the following are never hidden.
+Reduce boilerplate while keeping the following visible.
 
 ```text
 allocation
@@ -97,7 +97,8 @@ alignment
 
 ### 3.4 Hardware Friendly
 
-Make it easy to generate code that maps cleanly to modern CPU / GPU / Cache / SIMD / Branch Predictor.
+Use contiguous layouts and explicit data-parallel operations to support CPU caches and SIMD,
+while keeping future GPU execution possible.
 
 The data-oriented core is built so the *shape* of ordinary code avoids the usual stalls: arrays and
 slices are contiguous, so pipelines (`map` / `where` / `reduce`) walk memory **sequentially** (no
@@ -521,12 +522,10 @@ n_read := loop {
 }
 ```
 
-The division of labor is strict: **the pipeline owns the data path; `loop` owns the control
-path.** Traversing a collection is `map` / `where` / `reduce` — there is no `for`, no `while`, no
-counting loop, and `loop` does not change that (walking an array by index inside a `loop` is a
-lint, §16). `loop` exists for what a pipeline cannot express: iteration whose trip count is
-decided by the iteration itself — reading until EOF, retrying with backoff, driving a protocol,
-pumping a state machine to convergence.
+Use pipelines (`map` / `where` / `reduce`) for collection traversal and `loop` for sequential
+control: reading until EOF, retrying with backoff, driving a protocol or reaching convergence.
+There is no separate `for`, `while` or counting-loop syntax. An indexed collection walk can be
+written with `loop`; the proposed warning that recommends a pipeline is not implemented (§16).
 
 Rules:
 
@@ -1936,7 +1935,9 @@ counterpart of the `s[i]` gather / AoS `arr[i] = value`), for plain-data structs
 carry **`str` columns** — a `str` field lands in a 16-byte `{ptr,len}` view column, whether decoded
 (`json.decode`, the views borrowing the JSON input) or transposed (`.to_soa()`, the views borrowing
 the source array), so a str-bearing `soa` is region-tied to that borrow (it cannot escape it) while
-primitive columns still scan and reduce as usual; str columns are read-only (no `s[i].name = v`).
+primitive columns still scan and reduce as usual. A `mut` view also permits `s[i].name = v` and
+whole-row replacement with `str` fields; every stored view must outlive the destination storage.
+The store copies the view descriptor, never its bytes.
 Owned/nested columns and a multi-column `soa_slice<T>` sub-view (`s[a..b]` over every column)
 remain outside this surface.)*
 
@@ -2600,9 +2601,9 @@ encode_bounded
 ```
 
 That is the whole generated typed-schema surface: there is no `validate<T>` (decoding and
-discarding *is* validation — one way) and no public `field_table<T>`. `encode_bounded` is the
-accepted, not-yet-implemented fallible destination for the same generated encode plan. The compiler
-does hold per-field information (name, length, hash, first byte, offset, escape info) at compile
+discarding *is* validation — one way) and no public `field_table<T>`. The implemented
+`encode_bounded` applies a caller-supplied byte limit to the same generated encode plan and
+returns one independent owned string on success. The compiler holds per-field information (name, length, hash, first byte, offset, escape info) at compile
 time to drive the scanner, but it is an internal artifact with no source-level name. See §18.1
 `core.json`.
 
@@ -2924,22 +2925,20 @@ The official formatter is mandatory. It normalizes **only meaningless variation*
 
 ### Lint
 
-The standard lint detects:
+Implemented checks include:
 
 ```text
-allocation in loop
 huge struct copy
-unnecessary clone
-unnecessary heap
+unnecessary heap       (immediate reads and nonescaping read-only boxes)
 intermediate array before sum
-unhandled Result
-branch in hot loop
-string re-scan
-implicit copy
-lossy conversion       (narrowing / float->int / wide-int->float / char narrowing `as`)
-wasteful default type  (large literal array left to the i64/f64 default)
-index-walk in loop     (walking an array by index inside `loop` — write it as a pipeline, §4 Loop)
+unhandled Result      (a compile error when discarded as a statement)
+unused import
+lossy conversion      (narrowing / float->int / wide-int->float / char narrowing `as`)
+wasteful default type (large literal array left to the i64/f64 default)
 ```
+
+Allocation-in-loop, unnecessary-clone, branch-in-hot-loop, string re-scan, general implicit-copy
+and index-walk-in-loop warnings remain deferred candidates. They are not emitted by the current compiler.
 
 An integer cast warning is suppressed when finalized expression-local known
 bits prove that every possible source value fits the destination interval.
@@ -2957,8 +2956,6 @@ The exact admission, provenance and repetition contract is
 
 
 ### Convergence Over Expression
-
-Convergence is valued over expressiveness.
 
 The syntax limits equivalent forms so handwritten and generated code use the same conventions.
 
@@ -3390,8 +3387,8 @@ the builder's storage is heap memory grown in place, and `build` is a pointer+le
 retype into the `array<T>` — no element copy, and the array's own `Drop` frees the
 whole buffer (a deep free for `array<string>`).
 
-Crucially, the individually owned heap `array_builder` holds **no views** — nothing a growth reallocation
-could invalidate — which is exactly why a directly growable `array<T>` was rejected:
+The individually owned heap `array_builder` holds **no views** that growth could invalidate.
+This is why a directly growable `array<T>` was rejected:
 a live element/slice borrow would dangle across a `push`. The builder confines
 growth to a phase with no outstanding borrows, then freezes to the immutable,
 borrowable `array<T>`.
@@ -3412,8 +3409,10 @@ Fixed primitive fields add no child allocation or Drop obligation. A record whos
 size is zero retains that exact stride: heap construction/growth allocates no element payload,
 push counts initialized values without reading bytes, and freeze returns an array with that
 logical length. Counts and bounds remain checked. A complete fixed field can be read as an ordinary Copy value, for example
-`shape := values[i].shape`, then indexed or sliced through that local. Direct indexed-parent
-fixed-field operations and additional borrowed-payload admission remain separate. [Plan231](docs/impl/231-fixed-scalar-heap-fields.md) owns this composition.
+`shape := values[i].shape`, then indexed or sliced through that local. [Plan232](docs/impl/232-indexed-fixed-field-values.md)
+also admits direct independent Copy indexing such as `values[i].shape[j]` by taking the complete
+field snapshot before evaluating `j`. Retained indexed-field slices and additional borrowed-payload
+admission remain separate. [Plan231](docs/impl/231-fixed-scalar-heap-fields.md) owns heap-field storage.
 
 R78's request for payload-free enum fields remains deferred/PROPOSED; the
 closed enum-field exclusion above is unchanged. [Plan 56](docs/impl/56-r77-r83-composition-plan.md) records
@@ -3915,10 +3914,10 @@ allocation across refills, so exact-cap CRLF lines are independent of refill bou
 larger reservations and allocator spare are retained; the cap bounds body length, not total
 reserved memory (plan 102). The canonical loop
 starts with `mut buf := buffer(4096)` and is `loop { n := r.read_line(buf)?; if n == 0 { break };
-line := buf.bytes().as_str()?; … }`. The output must be that bare `mut` local. **Warning:** the
-per-iteration line view (`buf.bytes()` / its `as_str`) must **not** be hoisted across iterations — the
-next `read_line` overwrites `buf`, so a view kept from a previous line reads stale/overwritten bytes
-(a borrow-liveness gap not yet caught by the compiler; `.clone()` a line you need to keep).
+line := buf.bytes().as_str()?; … }`. The output must be that bare `mut` local. A
+per-iteration line view (`buf.bytes()` / its `as_str`) borrows the buffer generation. The next
+`read_line` overwrites or grows that storage, and the compiler rejects subsequent use of the old
+view. Use `.clone()` before the next read when an independently owned line must be retained.
 
 `bytes.as_str()` is the one validating bytes→text boundary op (the zero-copy **view** counterpart of a
 copying `bytes`→`string` conversion): it checks the bytes are UTF-8 and returns a `str` view of the same
@@ -4407,8 +4406,8 @@ The exact compiler/runtime closure and tests are in
 
 ### std.log
 
-`std.log` is an explicit level-gated line sink, not global process policy. This surface is designed
-and remains unimplemented until its post-`core.test` capability lands:
+`std.log` is the implemented explicit level-gated line sink. Each logger owns its writer and
+minimum level; it introduces no global process policy:
 
 ```text
 log.level { Debug, Info, Warn, Error, Off }

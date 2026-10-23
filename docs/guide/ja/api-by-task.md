@@ -24,16 +24,18 @@
 
 | やりたいこと | API・言語機能 | 使用例・解説 | 詳しい契約 |
 |---|---|---|---|
-| 値を絞り込み、変換し、集計する | `.where`, `.map`, `.sum`, `.fold` | [パイプライン](06-pipelines.md) | [配列・スライス・パイプライン](../../impl/core-design/ja/array-slice-pipeline.md) |
-| 2つの入力から、呼び出し側が持つ出力領域へ書く | `.zip`, `.map_into` | [完全な例](../../../examples/zip_map_into.align) | [配列・スライス・パイプライン](../../impl/core-design/ja/array-slice-pipeline.md) |
+| 値を絞り込み、変換し、集計する | `.where`, `.map`, `.sum`, `.reduce` | [パイプライン](06-pipelines.md) | [配列・スライス・パイプライン](../../impl/core-design/ja/array-slice-pipeline.md) |
+| 2つの入力から、呼び出し側が持つ出力領域へ書く | `zip`, `.map_into` | [完全な例](../../../examples/zip_map_into.align) | [配列・スライス・パイプライン](../../impl/core-design/ja/array-slice-pipeline.md) |
 | 所有配列をヘルパー関数で読み取る・更新する | `borrow`, `borrow mut`, `slice<T>` | [完全な例](../../../examples/borrowed_array.align) | [メモリと借用](05-memory.md) |
 | 列ごとに処理する・キー別に集計する | `soa<T>`, `.group_by` | [データ指向プログラミング](11-data-oriented.md) | [SoAとグループ集計](../../impl/core-design/ja/soa-groupby.md) |
-| 独立した純粋な計算を並列に行う | `.par_map`, `task_group`, `spawn`, `await` | [並列処理](10-closures-and-parallelism.md) | [言語仕様（英語）](../../../draft.md) |
+| 同じ Pure な関数を多数の要素へ並列に適用する | `.par_map` | [データ並列](10-closures-and-parallelism.md) | [言語仕様（英語）](../../../draft.md) |
+| I/O を含む独立した処理を並行して実行し、結果を集める | `task_group`, `spawn`, `wait`, `.get` | [タスク並列](10-closures-and-parallelism.md) | [言語仕様（英語）](../../../draft.md) |
 | 値がない場合や失敗を扱う | `Option`, `Result`, `else`, `?`, `match`, `.map_err` | [エラー](04-errors.md) | [OptionとResult](../../impl/core-design/ja/option-result.md) |
 
 結果を保存したい場合は、明示的に実体化する終端操作を選びます。借用ビューは所有者の
-寿命の範囲内で使います。並列クロージャにはPureが必要です。I/Oの並行処理には、
-各サービスAPIが提供する仕組みを使ってください。
+寿命の範囲内で使います。`par_map` に渡す関数には Pure が必要です。
+spawn したタスクは I/O を実行できますが、共有キャプチャはグループの join まで
+読み取り専用です。
 
 ## 文字列やデータ形式を扱う
 
@@ -43,6 +45,7 @@
 | 連結を繰り返さずに文字列を組み立てる | `builder`, `.write`, `.write_int`, `.to_string` | [builderの例](07-strings-and-text.md) | [文字列とbuilder](../../impl/core-design/ja/string.md) |
 | JSONから独立した所有フィールドを読み出す | `json.decode`, `string` / `array<T>` のレコードフィールド | [所有JSONの完全な例](../../../examples/json_owned.align) | [JSONの型と所有権](../../impl/core-design/ja/json.md) |
 | JSONを借用文字列や列として読む | `json.decode`, `str`, `soa<T>`, `arena` | [JSON](08-json.md) | [JSONの型と所有権](../../impl/core-design/ja/json.md) |
+| スキーマが未知の JSON を調べる・転送する | `json.doc`, `.get`, `.at`, `json.encode_options` | [ドキュメントビュー](08-json.md#スキーマが未知の場合) | [JSONの型と所有権](../../impl/core-design/ja/json.md) |
 | JSONを出力する・出力バイト数に上限を設ける | `json.encode`, `json.encode_bounded` | [エンコード](08-json.md) | [JSON](../../impl/core-design/ja/json.md) |
 | CSVを型付きの列へデコードする | `pkg.csv.decode`, `DecodeOptions` | [アプリ全体の例](practical-cli.md) | [CSV](../../impl/pkg-design/ja/csv.md) |
 | 型付きの列をバイナリ形式で受け渡す | `codec.encoder`, `codec.open` | [使用例](../../impl/core-design/ja/codec.md) | [列指向codec](../../impl/core-design/ja/codec.md) |

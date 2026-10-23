@@ -91,7 +91,7 @@ fn double4(xs: slice<i32>, out dst: slice<i32>, i: i64) {
 }
 ```
 
-`load` reads four consecutive elements; `store` writes four. Both are bounds-checked. The register is a value, but memory remains explicit at the boundary — and `store` must have somewhere to write, so the destination arrives as the caller's `out dst` (chapter 5), exactly as `map_into`'s did.
+`load` reads four consecutive elements; `store` writes four. Both are bounds-checked. The destination belongs to the caller and arrives as `out dst`, just as it did for `map_into` in chapter 5.
 
 ---
 
@@ -137,7 +137,7 @@ zero: vec4<i32> := [0, 0, 0, 0]
 select(m, w, zero)
 ```
 
-`[0, 0, 10, 13]`. Note the asymmetry against Q16: *arithmetic* broadcasts a scalar (`w * 3 + 1`), but `select` blends **two vectors** — `select(m, w, 0)` is a type error. A blend chooses between two things of the same shape; say the shape.
+`[0, 0, 10, 13]`. Q16's arithmetic broadcasts a scalar (`w * 3 + 1`), but `select` needs **two vectors**. `select(m, w, 0)` is a type error; give it vectors of the same type to choose between.
 
 ---
 
@@ -149,7 +149,7 @@ select(m, w, zero)
 
 **Q19.** A ten-element slice feeds `vec4`. Which full-width starting indices are safe if we walk without overlap?
 
-**A19.** `0` and `4`. Index `8` belongs to the scalar tail. Say the indices before writing the load; off-by-one errors are faster in SIMD too.
+**A19.** `0` and `4`. The elements from index `8` onward form the scalar tail. Check the indices before writing the load.
 
 ---
 

@@ -46,7 +46,7 @@ c.usage() -> string
 肝となる決定は次のとおり。
 
 - `command` と `parsed` は **Move 型** とし、内部に新たに `Ty::CliCommand` / `Ty::CliParsed` を設ける。どちらも内部にヒープバッファを所有する — 登録済みフラグのテーブルと、値が所有権を持つ（owned）`string` であるパース結果（name→value）マップである。したがって、Copy 可能な rng の系統ではなく、reader / writer / buffer と同じ Move の系統に属する。Drop 時にはこれら内部バッファ（所有権を持つ default / parsed 文字列を含むフラグテーブルのエントリ）を解放する。解放処理は `read_dir` の `array<string>`（#339）と同じ deep-drop であり、内部が所有する `string` を一つずつ解放していく（用語の確認: `str` は借用の read-only ビュー、`string` はヒープを所有する Move 型であり、これらのテーブルが所有するのは `string` の方である）。
-- **`parse` は `c` を借用するだけで、消費（consume）しない。** `c.parse(args)` は `c` を共有借用で受け取り、フラグテーブルを読むだけでコマンド自体をムーブしない。そのため `parse` の後でも `c.usage()` を呼ぶことができる。これは `Err` パスでも同様であり、まさにヘルプメッセージを表示したい場面で有用である。仮に `parse` が `c` を消費してしまうと、パース失敗時に usage を描画できなくなる — ここでこの点を明記しているのはそのためである。
+- `c.parse(args)` は共有借用でフラグテーブルを読む。パース後も `c.usage()` を呼べるため、`Err` の場合にもヘルプを表示できる。
 - どちらも array / slice / vec / box の要素型や Option / Result のペイロードとしては、`scalar_arg` という単一のチョークポイントで一律に拒否される — reader / writer と同じ扱いである（Slice 1 の前例）。ただし `parse` は `Result<parsed, Error>` を返すため、`parsed` は Result の `Ok` ペイロードとしては出現する。reader / writer が Option / Result のペイロード位置で例外的に許可されたのと同じ要領で、`parsed` も `Ok` 位置に限り許可される。buffer の `Scalar::Buffer`（#346）がそのテンプレートとなる。
 - `p.get_*` の戻り値について。`bool` / `i64` / `f64` と指定回数は Copy である。`get_str` は **パース結果の構造体を指すビュー** として `str` を返し、`p`（パース結果）にリージョン束縛される — `json.decode` のフィールドビューがデコード済みの arena / value に束縛されるのと同じ関係である。したがって `region_of(CliGetStr) = region_of(p)` であり、`p` の Drop の寿命を越えて `str` を持ち出すことはコンパイルエラーとして捕捉・拒否される。取り出して保持したければ `.clone()` でコピーする。Static リージョンを返してはならない — それは #297 で問題になったワイルドカード・トラップである。`region_of` の分岐を明示的に追加すること。
 

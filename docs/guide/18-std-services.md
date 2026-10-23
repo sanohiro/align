@@ -179,15 +179,27 @@ import std.compress
 
 pub fn main() -> Result<(), Error> {
     zipped := compress.gzip_compress("align", 6)?
-    plain := compress.gzip_decompress(zipped.bytes())?
-    print(plain.len())
+    plain := compress.gzip_decompress(zipped.bytes(), 1024)?
+    print(plain.len())    // 5
     return Ok(())
 }
 ```
 
-`gzip_*` and `zstd_*` share that byte-to-owned-buffer shape. Invalid or oversized compressed input is an error rather than an unbounded allocation.
+`gzip_*`, `zstd_*`, `zlib_*` and `deflate_raw_*` all borrow their input and return
+an independent owned buffer. Choose the framing required by the file or protocol:
+zlib adds its header and checksum, while raw DEFLATE has neither. Decoders require
+complete input and reject trailing junk. gzip and zstd accept concatenated
+members/frames; zlib and raw DEFLATE accept exactly one stream.
 
-`std.crypto` provides OS random bytes, SHA-256/512, HMAC-SHA256, HKDF-SHA256, Argon2id, AES-256-GCM, ChaCha20-Poly1305, and constant-time equality. It wraps OpenSSL instead of inventing cryptography. Argon2id requires the provider added in OpenSSL 3.2; on an older engine that operation returns `Error.Code` without producing output. AEAD open is all-or-nothing: authentication failure releases no plaintext. `constant_time_equal` is constant-time over equal-length contents; input length is public. BLAKE3 is not exposed until a suitable audited system engine exists.
+Every decoder accepts a trailing output-byte limit, as the 1024-byte limit above.
+Omitting it selects 1 GiB. The limit must be between zero and 1 GiB inclusive;
+an out-of-range limit aborts before decoding. Corrupt input or output exceeding
+the limit returns an error without a partial buffer. Exact fits succeed. The
+limit bounds decoded payload storage, not the native engine's workspace,
+allocator overhead or total process memory. See the
+[compression contract](../impl/std-design/compress.md) for framing and error details.
+
+`std.crypto` provides OS random bytes, SHA-256/512, HMAC-SHA256, HKDF-SHA256, Argon2id, AES-256-GCM, ChaCha20-Poly1305, and constant-time equality through OpenSSL. Argon2id requires the provider added in OpenSSL 3.2; on an older engine that operation returns `Error.Code` without producing output. AEAD open is all-or-nothing: authentication failure releases no plaintext. `constant_time_equal` is constant-time over equal-length contents; input length is public. BLAKE3 is not exposed until a suitable audited system engine exists.
 
 ### Hash a file incrementally
 

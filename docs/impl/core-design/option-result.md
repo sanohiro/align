@@ -1,16 +1,14 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — Option / Result / Error
 
 > 🌐 **English** · [Japanese](./ja/option-result.md)
 
 ## Overview
 
-The one optional model and the one error model (draft §5). `Option<T>` = maybe absent (a normal
-answer); `Result<T, E>` = failed with a reason. No null anywhere in the language; no exceptions;
-`?` is the only propagation. The surface is deliberately *narrow*: deconstruction is `match`,
-plus exactly three conveniences (`else`, `?`, `map_err`).
+`Option<T>` represents an optional value; `Result<T, E>` carries success or a
+failure reason (draft §5). Inspect either with `match`, use `else` for a fallback,
+propagate a failure with `?`, and convert an error with `map_err`. There are no
+exceptions or general null values. The unsafe raw-pointer boundary has an
+explicit `raw.null()` sentinel; it does not replace `Option`.
 
 ## Signatures (verified)
 
@@ -37,16 +35,20 @@ rejects the collision. No `import core` exists or is required.
 
 `Option<T>`/`Result<T,E>` are ordinary generic sum types (monomorphized). L1a/L1b in
 [`../17-library-boundary-prerequisites.md`](../17-library-boundary-prerequisites.md) are complete:
-one recursive tagged `DropPlan` admits finite non-recursive Move payloads, makes the tagged
+one recursive tagged `DropPlan` handles admitted Move payloads, makes the tagged
 container Move, drops only the active payload, and moves/nulls it through construction and
 owning-place `match`/`else`/`?`. An admitted borrowed-place `match` uses the existing borrow ABI to
 read the active payload in place and leaves the source owner unchanged; it is specified by
-[`26-borrowed-sum-projection-plan.md`](../26-borrowed-sum-projection-plan.md). Recursive types,
-arbitrary new Move-element collection layouts, and L2's dynamic path-selected return cleanup remain
-separately owned restrictions; new library handles must not add compiler-known exceptions.
+[`26-borrowed-sum-projection-plan.md`](../26-borrowed-sum-projection-plan.md).
+Path-dependent return cleanup is implemented: `ReturnCleanupAbi::DynamicBit`
+represents the cleanup obligation across direct, indirect and imported calls,
+separately from the result's lifetime provenance. Physical transport and
+drop-state optimizations follow [Plan71](../71-aggregate-layout-transport-drop-state-plan.md).
+Inline recursive cycles and unsupported collection-element layouts remain
+rejected by their ordinary type-formation rules; a new library handle does not
+bypass those rules.
 
-R82 shared-carrier completion is implemented on the consolidated provider
-branch. [Plan 56](../56-r77-r83-composition-plan.md) adds only
+R82 shared-carrier support is implemented. [Plan 56](../56-r77-r83-composition-plan.md) adds only
 `process.user_namespace` to the existing recursively admitted borrowed-payload
 grammar. Stable optional and record-contained shared matches retain the source
 owner; the existing explicit `inherit_namespace` call owns its native duplicate.
@@ -98,12 +100,9 @@ None of their own; a payload view (`str` in an `Ok`) keeps its own region.
   *stance*, not a gap-by-accident: `match` + `else` + `?` cover the uses without growing a
   second, combinator-flavored control-flow dialect. Adding any of them is a design decision
   (One-way review) — record in `open-questions.md` before implementing.
-- **Recursive tagged Move scope:** L1b-a implements direct existing-`Scalar` Move payloads per
-  tagged arm, including recursive `Drop`, `match`, `else`, `?`, and `map_err`. L1b-b additionally
-  implements multiple Move payload partial construction and requires one uniform allocation mode
-  across those payloads. L1b-c implements nested tagged payload representation such as
-  `Result<Option<T>, E>`. Arrays of arbitrary new Move-element layouts, recursive types, and L2
-  dynamic path-selected return cleanup remain separate.
+- Tagged payload support does not introduce new collection-element layouts or
+  allow inline recursive cycles. The existing formation, allocation-mode and
+  lifetime checks still apply to every nested payload.
 
 ## Pitfalls
 

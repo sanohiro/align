@@ -6,7 +6,7 @@ Align は、値キャプチャするクロージャと**純粋性の推論**に�
 
 ## ラムダ
 
-ラムダ式は、`fn` キーワード、パラメータ、そしてブロックで構成されます。これは [06](06-pipelines.md) 章のパイプライン処理で継続して使用してきたものです。
+ラムダ式は `fn`、パラメータ、ブロックで構成されます。[06](06-pipelines.md) 章のパイプラインでも使った形です。
 
 ```align
 [1, 2, 3].map(fn x { x * 2 }).sum()
@@ -124,6 +124,37 @@ fn main() -> Result<(), Error> {
 ```
 
 `wait()?` はすべてのタスクを join してから、spawn インデックスが最も低い失敗を通常の `Err` として伝播します。逐次コードと同じ伝播演算子を使います。
+
+### グループ終了後も所有結果を使う
+
+タスクの中で出力を作り、`wait` の後で受け取ります。この関数は、タスクが作った文字列を
+もう一度 clone せずに返します。
+
+```align
+fn make_label(name: str) -> string {
+    task_group {
+        task := spawn(fn {
+            text := builder()
+            text.write("hello, ")
+            text.write(name)
+            text.to_string()
+        })
+        wait()
+        task.get()
+    }
+}
+
+fn main() -> i32 {
+    label := make_label("Ada")
+    print(label)    // hello, Ada
+    return 0
+}
+```
+
+キャプチャした `name` は join まで借用されます。builder は独立した文字列を作り、
+`task.get()` が呼び出し側に所有権を移します。もう一度 `task.get()` を呼ぶと、
+ムーブ済みハンドルの再利用として拒否されます。`name` 自体を返すと結果に借用ビューが
+残るため、対応するタスク結果の型にはなりません。
 
 ## どちらを、いつ
 

@@ -3967,8 +3967,8 @@ protocol client cannot be written in Align source without it.
   exit; `break` cannot cross a lambda boundary. Per-iteration locals drop each pass; a `break`
   value must not borrow from one (block-value escape rule). Normative text: `draft.md` §4 "Loop".
 - **Boundary:** the pipeline owns the data path; `loop` owns the control path (EOF pumps, retry/
-  backoff, protocol drivers, convergence). Walking an array by index inside a `loop` is a lint
-  ("write it as a pipeline"). `loop` finally gives the deferred frequency-dependent M8 lints
+  backoff, protocol drivers, convergence). The proposed index-walk warning ("write it as a
+  pipeline") remains unimplemented. `loop` gives the deferred frequency-dependent M8 lints
   (allocation-in-loop, branch-in-hot-loop, `prefer-pipeline-over-vecN`) their firing surface.
 - **Recursion-with-TCO was rejected on structure, not taste** — it conflicts with four settled
   pillars: scope-end drops/region frees kill tail position (the Rust reason); `?` kills tail
@@ -5055,7 +5055,8 @@ fast-systems-programming needs that any Align user hits, not engine-specific.
    `[P; N]` for primitive Copy scalar P, including zero. No child allocation/Drop is added;
    zero-sized records preserve logical counts without heap payload storage. The existing whole-field
    Copy read exposes the stored dimensions after freeze. Other fixed elements, broader borrowed
-   payloads and direct indexed-parent fixed-field operations remain separate. Plan231 owns the closure.
+   payloads remain separate. Plan231 owns storage and cleanup; Plan232 admits direct indexed-parent
+   independent Copy reads through a complete field snapshot. Retained field slices remain deferred.
    **Region form SETTLED 2026-07-27 (required before `pkg.db`):**
    `array_builder<T>(out: region)` accepts recursively `RegionPlain` scalars/views/structs. It
    deliberately rejects the heap form's independently owned `string` element (copy it to a
@@ -5147,8 +5148,9 @@ mitigation convention (adopted during M11 crypto): recursive functions (`check_e
 `#[inline(never)]` free helpers, and wide MIR `Rvalue` payloads are boxed (debug builds reserve
 every arm's locals per frame, so one fat arm taxes every recursion level).
 
-### Module / import system — design SETTLED (2026-06-25), implementation in progress
-**The last big language-core gap.** Today `module`/`import` are *parsed* into `File.module`/`File.imports` but otherwise **ignored** (single-file compilation; `core.*`/`std.*` are compiler builtins). Decided:
+### Module / import system — SHIPPED
+**Original gap (2026-06-25; now closed):** `module`/`import` were parsed but otherwise ignored by
+single-file compilation. The implemented module system follows these decisions:
 
 - **core stays builtin (language-intrinsic), and so does std for now.** core members are intrinsically compiler-magic — `core.json`/`core.template` need compiler-generated static field tables (`non-goals.md`: "compile-time story is builtin-driven static data only"), `map`/`where`/`reduce` fuse into one MIR loop, `core.vec`/`core.mask` lower to SIMD. They are language semantics wearing a library name, not hand-writable library code. **std** bottoms out in `align_rt_*` calls today. FFI has shipped, but the remaining std-in-Align prerequisites below and a library-distribution boundary have not; std therefore stays builtin until those close, without changing its public module contracts.
   - **Preconditions for std-in-Align (recorded 2026-07-04, external design-note review adoption):** writing std in Align requires (a) function multiversioning — first candidate: compiler-automatic multiversioning of hot/pipeline fns + capability predicate builtins (NOT user-facing target-feature attributes; Align minimizes annotations), (b) arena-aware allocation from library code, (c) native soa layout access. Until then the C-ABI boundary costs (no inlining, fragile arena calls from Rust, hardcoded soa layouts) are the accepted tradeoff of the builtin approach.
@@ -5162,10 +5164,10 @@ every arm's locals per frame, so one fat arm taxes every recursion level).
   needs **no import** — requiring one would be requiring an import for syntax.
 - **User-authored modules are load-bearing** — `module foo` names a file's module; `import myproj.foo` resolves to another source file; `pub` controls cross-module visibility; names are mangled per module. This is the genuinely new machinery (multi-file discovery + resolution + visibility + cross-module name/type identity).
 
-Implementation slices: **A — builtin import validation — DONE (2026-06-25).** `collect_imports` validates every `import` against the `BUILTIN_MODULES` table (unknown / duplicate → error); the imported set threads into each `Checker`; `require_import` enforces `core.json` / `std.fs` / `std.io` at the `json.*` / `fs.read_file` / `io.stdout.write` dispatch sites (once per source function, skipped for monomorphs). Syntactic core needs no import. `tests/imports.rs` (7) + corpus updated (every existing json/fs/io program/example now carries its import). (Unused-import lint was deferred here until user modules existed — now **DONE**, see B-lint below.) **B — real multi-file user modules.** Resolution scheme decided (2026-06-25): **filename convention** — `import geom` → `geom.align` in the entry file's directory (its `module` decl must match the filename); chosen for simple+fast+predictable (no directory scan, only imported files are read) over scan-by-`module`-decl or a CLI file list. **B1 DONE (2026-06-25):** driver loads the entry + transitively-imported user modules (BFS, dedup, cycle-safe); sema's `check_file` → `check_program(&[Module])` checks them together; functions are **per-module mangled** (`module$fn`, entry module unmangled so single-file programs are byte-identical); bare calls resolve in the caller's module, `mod.fn(...)` resolves cross-module with **`pub` visibility**; the capability-import rule applies per file. `tests/modules.rs` (8), `examples/modules/`. **B2 (nested paths) DONE (2026-06-25):** `import util.math` → `util/math.align` (declaring `module util.math`), called `util.math.fn(...)`; the driver walks the directory tree, sema flattens the dotted receiver (`flatten_module_path`) to resolve the call. **B-types (cross-module type export) DONE (2026-06-26):** types are now **per-module namespaced** like functions — a non-entry module's type `T` has canonical name `module$T` (entry module unmangled, so single-file programs stay byte-identical), two modules may reuse a type name, and `type_table` (module → bare → canonical + `pub`) drives resolution. `pub` on a struct/enum exports it; an importer names it qualified (`geom.Point`, resolved with import + `pub` checks via `canonical_type_name`); a bare type resolves in the current module (so an imported type **must** be qualified). `StructLit.name` became a `Path` (the parser detects a dotted `Path { ident :`); `resolve_type` routes qualified paths through the table. **B-variant-ctor (qualified variant construction) DONE (2026-06-26):** an imported `pub` sum type's variant is constructed qualified — `pal.Color.Green` (tag-only, via `check_field_access`) and `pal.Color.Code(40)` (payload, via `check_call`). A unified `resolve_type_receiver` resolves a `Type.Variant` receiver as a bare type (current module) or `mod.Type` (imported `pub` type), used by both the tag-only and payload paths; a private cross-module type emits one clean error (3-state `Ok(Some)`/`Ok(None)`/`Err`, no cascade). So an exported sum type is now **fully** usable across modules (construct + hold + return + match). `tests/modules.rs` (now 19). **Still deferred:** cross-module **field/payload types** (a field `f: other.T`) — but note this is mostly blocked on **nested struct/enum fields not existing yet** (`is_field_ok` allows only scalar/str), not on module plumbing; the only live slice is an enum payload of an imported struct (passes 0b/0c resolve with `no_imports` — would need the import table built before the type passes). **B-lint (unused-import lint) DONE (2026-06-26):** an `import` never referenced in a file is a **warning** (tidiness, not a hard error — unlike unhandled `Result`, which is a correctness error). Detection is a syntactic AST walk (`collect_refs` → `walk_expr`/`walk_type`/`walk_block`) collecting every qualified reference's dotted prefix, independent of the resolution code so signatures / bodies / constants are covered uniformly; an import is used iff some prefix equals it or starts with it + "." (a builtin `core.json` matches its `json.*` namespace). The walk over-approximates "used" (a local shadowing a module name still counts), so the lint never wrongly fires. `tests/unused_import.rs` (7). Still deferred: project-root config (entry dir is the root). Record: `draft.md` §17, `impl/02-frontend.md`, `tests/modules.rs`, `tests/imports.rs`, `tests/unused_import.rs`.
+Implementation slices: **A — builtin import validation — DONE (2026-06-25).** `collect_imports` validates every `import` against the `BUILTIN_MODULES` table (unknown / duplicate → error); the imported set threads into each `Checker`; `require_import` enforces `core.json` / `std.fs` / `std.io` at the `json.*` / `fs.read_file` / `io.stdout.write` dispatch sites (once per source function, skipped for monomorphs). Syntactic core needs no import. `tests/imports.rs` (7) + corpus updated (every existing json/fs/io program/example now carries its import). (Unused-import lint was deferred here until user modules existed — now **DONE**, see B-lint below.) **B — real multi-file user modules.** Resolution scheme decided (2026-06-25): **filename convention** — `import geom` → `geom.align` in the entry file's directory (its `module` decl must match the filename); chosen for simple+fast+predictable (no directory scan, only imported files are read) over scan-by-`module`-decl or a CLI file list. **B1 DONE (2026-06-25):** driver loads the entry + transitively-imported user modules (BFS, dedup, cycle-safe); sema's `check_file` → `check_program(&[Module])` checks them together; functions are **per-module mangled** (`module$fn`, entry module unmangled so single-file programs are byte-identical); bare calls resolve in the caller's module, `mod.fn(...)` resolves cross-module with **`pub` visibility**; the capability-import rule applies per file. `tests/modules.rs` (8), `examples/modules/`. **B2 (nested paths) DONE (2026-06-25):** `import util.math` → `util/math.align` (declaring `module util.math`), called `util.math.fn(...)`; the driver walks the directory tree, sema flattens the dotted receiver (`flatten_module_path`) to resolve the call. **B-types (cross-module type export) DONE (2026-06-26):** types are now **per-module namespaced** like functions — a non-entry module's type `T` has canonical name `module$T` (entry module unmangled, so single-file programs stay byte-identical), two modules may reuse a type name, and `type_table` (module → bare → canonical + `pub`) drives resolution. `pub` on a struct/enum exports it; an importer names it qualified (`geom.Point`, resolved with import + `pub` checks via `canonical_type_name`); a bare type resolves in the current module (so an imported type **must** be qualified). `StructLit.name` became a `Path` (the parser detects a dotted `Path { ident :`); `resolve_type` routes qualified paths through the table. **B-variant-ctor (qualified variant construction) DONE (2026-06-26):** an imported `pub` sum type's variant is constructed qualified — `pal.Color.Green` (tag-only, via `check_field_access`) and `pal.Color.Code(40)` (payload, via `check_call`). A unified `resolve_type_receiver` resolves a `Type.Variant` receiver as a bare type (current module) or `mod.Type` (imported `pub` type), used by both the tag-only and payload paths; a private cross-module type emits one clean error (3-state `Ok(Some)`/`Ok(None)`/`Err`, no cascade). So an exported sum type is now **fully** usable across modules (construct + hold + return + match). `tests/modules.rs` (now 19). **Cross-module field/payload types are implemented:** an imported public record may appear in an ordinary record field or sum payload, under the existing placement and visibility rules. The earlier pre-nested-record restriction is closed; whole-program and per-unit checking resolve these qualified types. **B-lint (unused-import lint) DONE (2026-06-26):** an `import` never referenced in a file is a **warning** (tidiness, not a hard error — unlike unhandled `Result`, which is a correctness error). Detection is a syntactic AST walk (`collect_refs` → `walk_expr`/`walk_type`/`walk_block`) collecting every qualified reference's dotted prefix, independent of the resolution code so signatures / bodies / constants are covered uniformly; an import is used iff some prefix equals it or starts with it + "." (a builtin `core.json` matches its `json.*` namespace). The walk over-approximates "used" (a local shadowing a module name still counts), so the lint never wrongly fires. `tests/unused_import.rs` (7). Still deferred: project-root config (entry dir is the root). Record: `draft.md` §17, `impl/02-frontend.md`, `tests/modules.rs`, `tests/imports.rs`, `tests/unused_import.rs`.
 
 ### Generics (minimal system) — DONE / CLOSED (4c)
-**This feature is closed in scope; its shipped core is complete and L7 composition is scheduled.**
+**This feature is closed in scope; its core, L7 composition and A1 abstract-SoA boundary are implemented.**
 Generics is deliberately a *minimal*, supporting feature
 (`CLAUDE.md`: "approach minimally", "no Rust-trait complexity", "AI-friendliness is a constraint —
 avoid complex generics"). Align is **data-oriented** — arrays/slices are the protagonist, not
@@ -5238,7 +5240,7 @@ and variant construction (`Opt.Some(7)`) infers the type arguments from the payl
 then monomorphizes. A no-payload variant (`Opt.None`) is uninferable on its own (no expected-type
 decomposition yet). Payloads are scalars / plain structs (same as a non-generic enum).
 
-**L7 nested package composition — SETTLED 2026-07-27.**
+**L7 nested package composition — SETTLED 2026-07-27; IMPLEMENTED.**
 Ordinary first-party packages need generic functions whose signatures and locals contain
 `array<R>`, `slice<R>`, and top-level generic struct/sum/resource applications such as
 `query<P,R>`, `stmt<P,R>`, and `rows<R>`. `Ty::Param` therefore composes recursively through those
@@ -5248,7 +5250,7 @@ and monomorphization keys encode the canonical nested type applications and boun
 and interface-only instantiation must agree. No user traits, runtime dictionaries, reflection,
 turbofish, nested declarations, or newly legal concrete container element categories are added.
 
-**A1 abstract SoA boundary — SETTLED 2026-08-10.** D13's `batch_soa<R>` needs one symbolic
+**A1 abstract SoA boundary — SETTLED 2026-08-10; IMPLEMENTED.** D13's `batch_soa<R>` needs one symbolic
 `soa<R>` return without widening concrete SoA or adding DB-named compiler behavior. Add the closed
 structural `SoaPlain` bound, satisfied exactly by a nonempty struct of integer/float/`bool`/`char`/
 `str` fields. It grants only template formation of `soa<R>`; concrete substitution reuses the
@@ -5523,7 +5525,13 @@ and its closure matrix are in `docs/impl/30-borrowed-string-array-index-plan.md`
 ### Exposing SIMD intrinsics in std
 In addition to auto-vectorization, whether to place explicit intrinsics in std (`impl/04-mir.md` §9).
 
-### SoA (struct-of-arrays) layout — design now, implement ~M6
+### SoA (struct-of-arrays) layout — SHIPPED in M6
+
+**Current surface:** `soa<T>` views, explicit `to_soa` materialization and column pipelines are
+implemented for the admitted plain-field records. `soa_slice<T>` and owned columns remain
+deferred; the roadmap's post-M6 backlog owns those limits. The following records the original
+layout decision and groundwork.
+
 **Leaning: an explicit `soa array<T>` modifier (annotation), not auto-detection.** A column-oriented array lowers `users[i].field` to an index into the matching column array instead of an AoS GEP. **Retrofit-sensitive**: this changes AST/HIR/MIR field-access resolution and the array ABI, so the array / struct-array type representation and field-access lowering should stay **layout-parametric** (treat AoS vs SoA as a property of the array type) *now*, while the array machinery is still being built — even though the `soa` surface + SoA codegen ship at M6 (its payoff is SIMD auto-vectorization of column scans). Still open: whether to also allow auto-SoA under a heuristic. (Digested from `work/proposals/next-draft.md` §1.2, `optimization-milestones.md` §1.1.)
 **Groundwork landed (pre-M6):** `Ty::DynStructArray(id, Layout)` now carries a `Layout` (only `Aos` today; `Soa` joins at M6) — layout is a property of the array *type*, so adding `Layout::Soa` makes every site that must handle it a compile error (it can't be silently forgotten). All struct-array element-field addressing is funneled through one MIR seam (`lower_field_access`), where the SoA column-index branch will hook in — localized, not a cross-cutting retrofit. (`Scalar::DynStructArray` stays layout-free — an SoA array as an Option/Result payload is a later concern.)
 Record: `impl/05-backend-llvm.md` §2, `design-notes.md` (hardware-friendly).
@@ -5676,16 +5684,17 @@ depth versus compiler-stack gap remains open above; a larger compiler stack is n
 optimization. Full result: `impl/12-pipeline-closure-memory-io-simd-audit.md` §4.5 and
 `bench/deep_pipeline/`.
 
-### Tuples / multi-value returns — design SETTLED (see Settled); implementation in progress
+### Tuples / multi-value returns — foundation SHIPPED
 The *design* is settled (first-class anonymous tuples; multi-value return = returning a tuple —
 see "Tuples / multi-value returns" under Settled). The **foundation is implemented**: the
 `(T, U, …)` type, literals, destructuring `(a, b) :=`, positional `.N`, tuple params/returns, for
 primitive scalars, `str` (region-tracked), and **owned `string`/`array<T>`** elements (a Move
 tuple — including **bound to a variable**, with per-element `Drop` in codegen), and the first
 consumer **`partition`** (`(array<T>, array<T>)`), and **partial field moves** (`a := t.0` moves
-one owned element out of a bound tuple, per-field move tracking). What remains is purely additive
-*implementation*, not design: one more potential consumer — `min_with_index`-style
-`(value, index)` reductions.
+one owned element out of a bound tuple, per-field move tracking). [Plan190](impl/190-tuple-carrier-composition.md) also composes existing
+flat tuples through supported tagged payloads, record fields and function values. A possible
+`min_with_index`-style `(value, index)` reduction is a separate consumer, not an unfinished tuple
+foundation.
 
 ### Arena checkpoint / rollback — SETTLED 2026-07-11: API rejected-with-reopen-trigger; scoped reuse instead
 A lightweight `cp := arena.checkpoint()` / `arena.rollback(cp)` for `O(1)` bulk-free of everything allocated since a checkpoint, for long-running loops (event loops, packet/stream parsers) that must keep a flat memory footprint while reusing the same blocks. (Digested from `work/proposals/library-foundations.md` §3 + the `http-optimization.md` §5 streaming-parse story; the consumer arrived 2026-07-09 — the gateway per-request reset.)
@@ -6200,7 +6209,7 @@ compatibility decoder or second runtime route is added. A103 and A80 keep their 
 admitting owned kinds 8/9 only from a validated V2 graph. Exact bytes, precedence, C6 fixture scope,
 and the implementation closure matrix are fixed in `impl/25-recursive-owned-json-plan.md`.
 
-**T3 — streaming: `json.scan` (SETTLED → SHIPPED as J5, #546 + #547; Request 6 safety gate pending).** NDJSON /
+**T3 — streaming: `json.scan` (SHIPPED as J5, #546 + #547; Request 6 safety gate implemented).** NDJSON /
 top-level-array streaming typed by the binding annotation (`rows: json.scanner<Row> :=
 json.scan(view)` — the schema-selector residual resolves the same way `decode` does; never a
 turbofish). The scanner is a **pipeline source only** (fused terminals:
@@ -6213,11 +6222,11 @@ input) + the full streaming reducer family `sum`/`count`/`reduce`/`any`/`all`/`m
 set (`.field`/`.where(.field)`/`.where(pred)`/`.map`), one scanner covering both a JSON array and NDJSON.
 Materializing terminals over a stream are rejected in sema. draft.md §18.1 + language-spec.md already
 described the shipped streaming surface exactly (design ran ahead; the implementation matched).
-The streaming feature is shipped, but its safety completion still requires the Request 6
-scanner-only ownership gate below; until that implementation merges, the current compiler's
-owning-row acceptance is a known gap rather than shipped contract.
+The Request 6 scanner-only ownership gate below is implemented in semantic checking and
+revalidated before MIR construction, including imported and cached bodies. Owning rows are
+rejected before a reusable scanner row slot can be constructed.
 
-**Request 6 — scanner row ownership (DESIGN SETTLED 2026-08-03; implementation pending).** A
+**Request 6 — scanner row ownership (SETTLED 2026-08-03; IMPLEMENTED).** A
 `json.scanner<Row>` is a Copy input view and decodes every declared field into one reusable row slot.
 The accepted row graph must therefore be recursively Copy under the canonical `DropPlan`; among rows
 admitted by the existing JSON Decode schema, any direct or transitive owned field is rejected during
@@ -6448,12 +6457,11 @@ Tests: `m5.rs` `json_doc_elems_materialize_and_iterate` (materialize → index �
 **pipeline fusion** over a `slice<json.doc>` (closures taking `json.doc`) — index + len + recursion
 already cover level iteration. →
 **J5** `json.scan` — **SHIPPED** (#546 slice 1 `sum`/`count`, #547 slice 2 `reduce`/`any`/`all`/`min`/
-`max`; streaming typed rows, `Result<T,Error>` terminals). **Request 6 design sync recorded above:**
-`draft.md` §18.1, `language-spec.md`, and the authoritative JSON design now describe the pending
-scanner-row safety gate; implementation remains a separate hardening slice. The JSON-completeness arc's
-implementation is shipped, while the Request 6 scanner-row safety gate remains pending.
-sweep (draft §14 two-tier framing done at design time; per-slice updates as they land). Each slice
-ships ideal-form or defers per CLAUDE.md.
+`max`; streaming typed rows, `Result<T,Error>` terminals). **Request 6 safety completion is also
+implemented:** the recursive Copy row gate agrees with `draft.md` §18.1, `language-spec.md`, and
+the authoritative JSON design. Source, malformed-HIR, generic/imported and cache regression owners
+are recorded in `impl/core-design/json.md`. This does not admit per-row owning cleanup or unresolved
+generic scanner row types.
 
 ### Details (settled during implementation)
 ```text
@@ -6787,9 +6795,9 @@ zero-copy mmap of arena images. Record now so the recursive-types design starts 
 Provenance: surfaced by an external idea review (2026-07-02); verified.
 
 ### M8 lint candidates (consolidated, gathered across reviews)
-The formatter is M8's first deliverable (in progress, see "Additional perf levers" above); these are
-the lint candidates that have accumulated around it, gathered here so they aren't scattered across
-individual review entries. None block anything; pick up when the lint suite is actually built.
+The formatter and initial lint suite shipped in M8. These entries preserve their decisions and
+later candidates; each item's latest status distinguishes shipped checks from deferred work.
+Remaining candidates do not reopen the completed M8 milestone.
 ```text
 - Wasteful i64/f64 default on a large array/soa/pipeline literal: an unconstrained-width literal
   defaults to i64/f64 (Settled, "Numeric literal typing"), which is fine for a scalar but doubles
@@ -6903,7 +6911,7 @@ These ride on the core capabilities (arena, views, FFI, task_group, zero-copy I/
 are downstream consumers, scheduled after the core + std foundations, and are recorded here
 only so the vision is not lost when `work/proposals/` is discarded.
 
-### std.rand (Future)
+### std.rand — SHIPPED in M10
 
 **Design direction (recorded 2026-07-04, external design-note review adoption):** seed from the OS
 (`getrandom`/`urandom` — never raw `RDRAND`/`RNDR`: not in the x86-64-v2/armv8-a baseline, `SIGILL`
@@ -6913,9 +6921,10 @@ at baseline). Non-cryptographic per `draft.md` §18.
 **Status update (2026-07-04, M10 scope decision):** this direction is now the M10 Slice 2 design —
 full signatures settled in `draft.md` §18.2 (`rand.seed`/`seed_with`/`r.next`/`r.range`/`r.shuffle`/
 `r.sample`, a Copy `rng` value), scheduled in `impl/07-roadmap.md` M10. No longer purely a Future
-direction; implementation is next.
+direction. The M10 implementation is complete; the current signatures and later RNG composition
+are recorded in `draft.md` §18.2 and [Plan175](impl/175-rng-record-composition.md).
 
-### std.crypto (Future)
+### std.crypto — SHIPPED in M11, extended after pkg.db
 
 **Hard requirement (recorded 2026-07-04, scoped exactly 2026-08-30):** cryptographic primitive paths
 over already-admitted secret material MUST be constant-time with respect to secret contents (no

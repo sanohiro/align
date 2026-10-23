@@ -2,14 +2,10 @@
 
 > 🌐 [English](../regex.md) · **日本語**
 
-状態: **COMPLETE 2026-07-24** — 最初のスライス（2026-07-23）に加え、第二の API 面
-（find_all / split / replace / replace_all / captures / group_count / group_index / caps.group）
-まで実装・ビルド・テスト・IR 検証を完了した。ランタイムアーカイブには `regex` 1.13.1 を含む。
-`regex_tests` と `std_regex.rs` があらゆる操作を網羅する（範囲、Unicode オフセット、空一致での
-終端、split の空フィールド、`$`-展開と名前付きグループ、非参加グループ、範囲外アボート、
-`block`/`if`/`match`/loop をまたぐ Move/Drop の健全性）。`clippy -D warnings` はクリーン。
-正規表現まわりで延期が残るのは以下の周辺拡張のみで（captures イテレータ、クロージャコールバック
-置換、`rx"..."` リテラル）、いずれもまだ利用者がいない。
+状態: **2026-07-24 実装済み**。以下の両 API 群は、反復、置換、分割、キャプチャの取得を
+含めて実装済みである。ランタイムアーカイブは `regex` 1.13.1 を含み、`regex_tests` と
+`std_regex.rs` が各操作の所有権とエラー処理を検証する。キャプチャの反復、コールバックに
+よる置換、`rx"..."` リテラルは実装範囲に含まれない。
 
 ## 配置と目的
 
@@ -100,9 +96,8 @@ non-entry module が local `regex_match` を宣言しない限り bare alias を
 
 ## 第二の API 面 — 反復・置換・split・キャプチャ（2026-07-24 に設計確定）
 
-延期していた機能はいずれも既存の配線の上に理想形のまま載る。**新たな言語機能ゲートは不要**で、
-新しい不透明 Move ハンドル型を追加するのは `captures` の 1 つだけである（機構的には `regex`
-ハンドルそのものと同一）。
+これらの操作は既存のコンパイラとランタイムの機能を使う。`captures` は `regex` と同じ
+所有権モデルの不透明な Move ハンドルを追加する。
 
 ```text
 re.find_all(text: str)               -> array<regex_match>     // owned Move; leftmost, non-overlapping

@@ -6,7 +6,7 @@ Align uses closures with value capture and **inferred purity** to control shared
 
 ## Lambdas
 
-A lambda is `fn` + parameters + a block; you have been using them in pipelines since chapter [06](06-pipelines.md):
+A lambda consists of `fn`, parameters and a block. The pipelines in chapter [06](06-pipelines.md) use this form:
 
 ```align
 [1, 2, 3].map(fn x { x * 2 }).sum()
@@ -127,6 +127,37 @@ fn main() -> Result<(), Error> {
 ```
 
 `wait()?` joins every task, then propagates the failure with the lowest spawn index as an ordinary `Err`. It uses the same propagation operator as sequential code.
+
+### Keeping an owned result after the group
+
+Create the output inside the task and take it after `wait`. This function returns
+the task's string without cloning it again:
+
+```align
+fn make_label(name: str) -> string {
+    task_group {
+        task := spawn(fn {
+            text := builder()
+            text.write("hello, ")
+            text.write(name)
+            text.to_string()
+        })
+        wait()
+        task.get()
+    }
+}
+
+fn main() -> i32 {
+    label := make_label("Ada")
+    print(label)    // hello, Ada
+    return 0
+}
+```
+
+The captured `name` is borrowed until the join. The builder creates independent
+text, and `task.get()` transfers that text to the caller. A second `task.get()`
+would reuse a moved handle and is rejected. Returning `name` itself would leave a
+borrowed view in the task result, which is outside the supported result types.
 
 ## Which one, when
 

@@ -82,7 +82,7 @@ items := [
 
 **Q12.** `where` と `map` はパイプラインを共有できますか？
 
-**A12.** はい、そのために設計されています:
+**A12.** はい。
 
 ```align
 items.where(.active).price.map(fn p { p * 108 / 100 }).sum()

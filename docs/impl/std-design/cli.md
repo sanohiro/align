@@ -55,10 +55,8 @@ The load-bearing decision:
   `read_dir`'s `array<string>` (#339): each owned `string` inside is freed. (Terminology: `str` is
   a borrowed read-only view; `string` is the heap-owned Move type — the values these tables own are
   `string`s.)
-- **`parse` borrows `c`, it does NOT consume it.** `c.parse(args)` takes `c` by shared borrow (it
-  reads the flag table; it does not move the command). So `c.usage()` stays callable *after* parse
-  — including on the `Err` path, which is exactly when you want to print help. (If parse consumed
-  `c`, a parse failure would leave you unable to render usage — the reason this is called out.)
+- `c.parse(args)` reads the flag table through a shared borrow. `c.usage()` remains
+  callable afterward, including when parsing returns `Err` and help needs to be displayed.
 - They are rejected as array/slice/vec/box element types and as Option/Result payloads at the
   single `scalar_arg` choke point — same as reader/writer (Slice 1 precedent). (`parse` returns
   `Result<parsed, Error>`, so `parsed` DOES appear as a Result Ok payload — allow `parsed` in the

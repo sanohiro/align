@@ -30,7 +30,7 @@ How many owned strings exist now?
 
 **Q3.** Then what does `print(a.len())` do, right after?
 
-**A3.** It does not compile: *use of moved value `a`*. The old name is dead. One buffer, one owner, no exceptions.
+**A3.** It does not compile: *use of moved value `a`*. The buffer now belongs to `b`.
 
 ---
 
@@ -152,7 +152,7 @@ Which names may still be used?
 
 **Q18.** Now `d := b`. Which names own strings?
 
-**A18.** `c` and `d`. The original buffer moved from `b` to `d`; the cloned buffer stayed with `c`. Draw arrows if you must, but never draw two arrows to one owned buffer.
+**A18.** `c` and `d`. The original buffer moved from `b` to `d`; the cloned buffer stayed with `c`.
 
 ---
 
@@ -185,7 +185,7 @@ arena {
 }
 ```
 
-Do not heap-own all ten in case one survives. Group the phase; copy the one value that crosses its boundary.
+Keep the temporaries in the arena and clone the one string needed after it ends.
 
 ---
 

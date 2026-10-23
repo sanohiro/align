@@ -1,21 +1,18 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — arena / heap.new / box
 
 > 🌐 **English** · [Japanese](./ja/arena-heap.md)
 
 ## Overview
 
-The two visible allocation homes (draft §6): `arena {}` — the batch lifetime — and `heap.new` —
-the single explicit allocation, arena-resident. Everything else in the memory model (Move types,
-regions, drops) is language, not library; this file covers the library-shaped surface and its
-current, deliberately tight, limits.
+This file covers `arena {}`, scalar boxes allocated by `heap.new`, and their
+region and escape rules (draft §6). An arena groups allocations under one
+lifetime. `heap.new` allocates one scalar box within that arena. Ordinary owned
+strings, arrays and buffers retain their own allocation and Drop rules.
 
 ## Signatures (verified)
 
 ```text
-arena { … }                 // expression block; all arena allocations freed at }, O(1)
+arena { … }                 // expression block; release its allocations and mappings at }
 heap.new(x)   -> box<T>     // ONE arg; must be inside an arena {}; T = primitive scalar only
 b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
@@ -24,7 +21,11 @@ b.clone()     -> box<T>     // deep-copy the box; both remain valid
 `out` is contextual: `out: region` names the capability parameter, while `out dst: slice<T>` is an
 out-mode parameter. Parsing uses token lookahead, not whitespace.
 
-That is the entire box surface — no `.set()`, no deref operator.
+Arena exit releases each backing chunk and registered file mapping. It does not
+free each bump-allocated value separately, but its work grows with the number of
+chunks and mappings; cleanup is not generally O(1).
+
+Boxes have no `.set()` method or dereference operator.
 
 Named-region form (required L4, **shipped**):
 
@@ -51,8 +52,9 @@ anonymous/named arenas share the same begin/end and bulk cleanup. Full contract:
 
 ## Effects
 
-Pure. Arena allocation is a bump; nothing here touches the OS (the arena's backing pages come
-from the runtime allocator with verified `noalias`/`nounwind` attributes, #301).
+Pure. Arena allocation and cleanup are memory-management operations, not
+language-level I/O effects. The runtime allocator supplies backing chunks;
+individual allocations normally advance a bump cursor within a chunk.
 
 ## Errors & aborts
 
@@ -83,9 +85,9 @@ all shipped — F-B region materialization is complete through L4 and L6.)
 
 ## Pitfalls
 
-- P1 — the **unnecessary-heap lint** (#323) fires on a box that is only ever `.get()`-read and
-  never escapes; the guide teaches that lint as the norm. If a change makes the lint fire on
-  idiomatic code, the change is wrong, not the lint.
+- P1 — the **unnecessary-heap lint** (#323) flags a box that is only `.get()`-read
+  and never escapes. Its suggested replacement uses the scalar value directly;
+  preserve those cases when changing box lowering.
 - P2 — `heap.new(x).get()` is arena-regioned, not a Move synthetic-owner case
   (`v: i32 := heap.new(7).get()` is a pinned test). General unbound Move cleanup now also composes,
   but through path-local ownership flags; do not merge the two lifetime mechanisms.

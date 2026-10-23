@@ -1,17 +1,15 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — json
 
 > 🌐 **English** · [Japanese](./ja/json.md)
 
 ## Overview
 
-JSON across typed and schema-unknown boundaries (draft §14). The surface has five operations:
-typed/document `encode` / `encode_bounded`, typed `decode`, lazy schema-unknown `doc`, and streaming typed-row `scan`. Target and row
-types are carried by **inference, never a written type argument** (settled: Align has no
-expression-position type-argument syntax / no turbofish). Requires `import core.json` (the
-capability-header rule applies to core.json exactly like std modules).
+`core.json` encodes typed values and document views with `encode` and
+`encode_bounded`, decodes typed values with `decode`, exposes schema-unknown
+views with `doc`, and streams typed rows with `scan` (draft §14).
+`json.encode_options` selects document spacing and string re-escaping.
+Target and row types are inferred from context; calls do not take written type
+arguments. Every operation requires `import core.json`.
 
 ## Document subtree encoding (R158)
 

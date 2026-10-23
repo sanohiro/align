@@ -9,10 +9,9 @@ These specifications define the contract for each module's implementation.
 
 ## Overview
 
-gzip, zstd (draft §18.2). The keystone library strategy: **own the memory wrappers, borrow the
-mathematical engine** (draft §15) — wrap `libz`/`libzstd` via `extern "C" link("z"|"zstd")` rather
-than reimplementing tuned DEFLATE/zstd. Align allocates the output (arena/buffer); the C engine
-fills it.
+gzip, zlib, raw DEFLATE and zstd compression/decompression (draft §18.2).
+Runtime wrappers call `libz`/`libzstd`; Align owns the output buffer and the native
+engine fills it.
 
 ## Signatures
 
@@ -41,7 +40,7 @@ owns this extension.
 
 ## Type & ownership classification
 
-Pure byte→byte. Input `bytes` (borrowed view → its data ptr crosses FFI, length passed
+Byte→byte transformation. Input `bytes` (borrowed view → its data ptr crosses FFI, length passed
 separately, per draft §15 FFI rules). Output owned `buffer` (Align allocates via the buffer
 machinery; the C engine writes into it). No new Move type — reuses `buffer` (#346).
 
@@ -92,15 +91,13 @@ out-of-range levels abort before native initialization, as for gzip. The source
 arguments evaluate in order. No streaming API, dictionary API
 or PNG policy is added. [Plan226](../226-deflate-framing.md) owns this completion.
 
-## New machinery required
+## Runtime and dependencies
 
-The FFI `link()` path (exists, M8 #265-269) + safe unsafe wrappers that: allocate the output
-buffer, call the C fn with (in_ptr, in_len, out_ptr, out_cap), handle the "output too small →
-grow + retry" loop, return owned buffer. The build must link `-lz`/`-lzstd` (driver link step — a
-new external dependency; document that libz/libzstd must be present. Consider making the module
-opt-in / feature-gated if the lib is absent).
+Runtime wrappers own native codec state, checked output growth and cleanup, and
+return an owned buffer on success. Programs using compression link `-lz`/`-lzstd`;
+both libraries are required build dependencies.
 
-## Slice breakdown
+## Original M11 slices (completed)
 
 1. gzip (libz) — compress+decompress+size-cap.
 2. zstd (libzstd) — same shape.
@@ -109,19 +106,17 @@ opt-in / feature-gated if the lib is absent).
 
 - **P1 (FFI memory safety — the align-self-review Gate 2 core)**: i64→usize via `try_from` (no
   `as usize`), `checked_mul` on buffer sizing, null-guard before `from_raw_parts`, the
-  output-grow-retry loop must not overflow. Highest risk — this is exactly the FFI/alloc bug
-  class the review skill exists for.
-- **P2 (decompress bomb)**: a tiny input can decompress to gigabytes. Cap aggregate output at 1 GiB → `Error.Invalid` on exceed. Don't allocate unboundedly from attacker-controlled input.
+  output-growth loop must not overflow.
+- **P2 (decompress bomb)**: enforce the caller's aggregate output cap, defaulting to 1 GiB; excess output returns `Error.Invalid`.
 - **P3 (external lib dependency)**: libz/libzstd must be linked; the driver's link step needs
-  -lz/-lzstd. If absent, build fails — document the dependency; consider feature-gating so a build
-  without the lib still works (compress simply unavailable).
+  -lz/-lzstd. If absent, linking a compression program fails.
 - **P4 (view → FFI ptr)**: `bytes` input lowers to its data ptr only (draft §15); length passed
   separately. A view is not a valid FFI return type (C ptr → raw). Output must be an owned
   buffer, not a view.
 
 ## Test checklist
 
-- round-trip gzip/zstd over empty / small / 1MB random / highly-compressible data →
+- round-trip gzip/zlib/raw DEFLATE/zstd over empty / small / 1MB random / highly-compressible data →
   `decompress(compress(x)) == x`
 - concatenated members/frames, empty members, and all sixteen skippable frame tags
 - corrupt/truncated later input, wrong format, legacy zstd and trailing bytes → `Error.Invalid`
@@ -130,4 +125,4 @@ opt-in / feature-gated if the lib is absent).
 - level bounds
 - buffer owned + Drop-freed
 - import-required
-- (Tests require libz/libzstd present — gate the test on availability.)
+- Tests require libz/libzstd; these are part of the supported build environment.

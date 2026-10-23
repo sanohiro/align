@@ -164,13 +164,24 @@ import std.compress
 
 pub fn main() -> Result<(), Error> {
     zipped := compress.gzip_compress("align", 6)?
-    plain := compress.gzip_decompress(zipped.bytes())?
-    print(plain.len())
+    plain := compress.gzip_decompress(zipped.bytes(), 1024)?
+    print(plain.len())    // 5
     return Ok(())
 }
 ```
 
-`gzip_*` と `zstd_*` はどちらも、バイト列を受け取り、所有権のあるバッファを返します。不正な圧縮データやサイズ上限を超える入力はエラーになり、無制限にメモリを確保することはありません。
+`gzip_*`、`zstd_*`、`zlib_*`、`deflate_raw_*` は入力を借用し、独立した所有バッファを
+返します。ファイルやプロトコルが要求する形式を選びます。zlib にはヘッダーとチェックサムが
+ありますが、raw DEFLATE にはありません。デコーダは入力全体を検証し、末尾の余分なバイトを
+拒否します。gzip と zstd は連結されたメンバーやフレームを受け付けますが、zlib と
+raw DEFLATE は1つのストリームだけを受け付けます。
+
+どのデコーダも、上の 1024 バイトの例のように、末尾の引数で出力バイト数の上限を指定できます。
+省略時は 1 GiB です。上限はゼロ以上 1 GiB 以下でなければならず、範囲外ならデコード前に
+abort します。不正な入力や出力の上限超過では、部分バッファを返さずエラーになります。
+ちょうど上限と同じ出力は成功します。制限されるのは展開後のデータ領域であり、ネイティブ
+エンジンの作業領域、アロケータの追加領域、プロセス全体のメモリ量は含みません。
+形式とエラーの詳細は[圧縮の契約](../../impl/std-design/ja/compress.md)を参照してください。
 
 `std.crypto` は OS の乱数、SHA-256/512、HMAC-SHA256、HKDF-SHA256、Argon2id、AES-256-GCM、ChaCha20-Poly1305、定数時間の比較を提供します。暗号処理には OpenSSL を使います。
 

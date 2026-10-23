@@ -22,6 +22,8 @@ v.min() / v.max()                -> T            // horizontal reduce
 a.min(b) / a.max(b)              -> vecN<T>      // element-wise
 v.sqrt()/abs()/floor()/ceil()/round()/round_even()/trunc()    // per-lane float math
 v.exp()/exp2()/log()/log2()/log10()             // レーン単位の float math; scalarize され得る
+v.expm1()/log1p()                             // 各レーンの幅に一致するスカラー libm 呼び出し
+v.sin()/cos(), y.atan2(x)                      // 各レーンをラジアンで計算; atan2 の両辺は同じ型
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
 select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
@@ -43,10 +45,20 @@ align(N) Struct { ... }                           // over-align struct; stride p
 
 一つのベクタ演算が一つの機械命令になるとは限らない。LLVM の命令選択はレーン型・幅・
 ターゲットに依存し、ベクタ命令、複数命令、スカラーコードのいずれにもなり得る。
-上記の五つの初等関数は LLVM へ vector intrinsic として渡る。
+`exp`、`exp2`、`log`、`log2`、`log10`、`sin`、`cos`、`atan2` は LLVM へ vector intrinsic として渡る。
 `emit-llvm --stage optimized` と `explain-opt` で命令選択前の状態を確認する。
 provider のない retained vector IR は後段でも scalarize され得るため、最終的な
 machine SIMD は出力 object の検査で確かめる。[Plan 75](../../75-portable-math-plan.md) がこの境界を定める。
+
+`expm1` と `log1p` は、各レーンの幅に一致するスカラー libm 関数を呼ぶ。
+LLVM 22 に対応するベクタ intrinsic はなく、このフォールバックは `explain-opt` に表示される。
+`x.expm1()` と `x.log1p()` は、レシーバの精度で先に `exp(x) - 1` や `log(1 + x)` を
+計算すると生じる桁落ちを避ける。`y.atan2(x)` の引数はレシーバと同じベクタ型で、
+スカラーのブロードキャストは行わない。結果は [-pi, pi] のラジアン値になる。
+これらはスカラー f32/f64 でも使える。全入力に対する ULP 上限やターゲット間のビット一致は
+保証しない。特殊値の規則とネイティブ実行の検証範囲は
+[Plan234](../../234-cancellation-sensitive-math.md) と
+[Plan235](../../235-trigonometric-math.md) に定める。
 
 整数の `vec2/4/8/16` は `&`、`|`、`^`、`<<`、`>>` と単項 `~` をレーンごとに適用できる。
 符号付き・符号なしの 8/16/32/64 ビット整数が対象で、二項演算は同じ型のベクトル同士、

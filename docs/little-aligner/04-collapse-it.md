@@ -150,7 +150,7 @@ pair := [2, 4, 6].reduce((0, 0), fn acc, x {
 totals := [3, -5, 4, 2].scan(0, fn acc, x { acc + x })
 ```
 
-No `to_array` in sight: `scan` already built the array (A9). Asking for one again would allocate the same answer twice.
+`scan` already built the array (A9), so `to_array()` is unnecessary. Calling it would allocate another array.
 
 ---
 
@@ -169,6 +169,18 @@ No `to_array` in sight: `scan` already built the array (A9). Asking for one agai
 **Q22.** Do empty `min()` and `max()` return `None`?
 
 **A22.** No. They return their fold identities: `min()` yields the element type's largest integer or positive infinity for floats; `max()` yields its smallest integer or negative infinity. These are ordinary values, not an absence marker. If “no readings” needs a different answer, check for emptiness explicitly before using the extreme.
+
+---
+
+**Q23.** Q12 sorted by negating each key. Does that work for every `i64`, including its minimum value?
+
+**A23.** No. Negating the minimum wraps back to itself. Compare the values directly instead:
+
+```align
+[10, 21, 32, 3].sort_by(fn a, b { a > b })
+```
+
+The answer is still `[32, 21, 10, 3]`, and the comparison also works at the integer limits. The callable returns `true` when `a` belongs before `b`; it returns `false` for equal values. Use a consistent strict order, not `>=`. The sort is stable: values equivalent under that order keep their input order. `sort_by_key` names a key; `sort_by` states how two elements are ordered.
 
 ---
 

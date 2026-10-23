@@ -1,25 +1,18 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — library design docs
 
 > 🌐 **English** · [Japanese](./ja/README.md)
 
 ## Why this directory exists
 
-`std` got per-module implementable design specs (`../std-design/`) *before* implementation.
-`core` grew the other way: it shipped milestone by milestone (M0–M10), its normative surface is
-scattered across `draft.md` (§5 Option/Result, §7 array/slice, §8 data processing, §9 SIMD, §12
-string, §13 template, §14 JSON, §18.1 catalog), and §18.1 is a thin name catalog that can run
-**ahead** of the implementation (for example, `split`; `json.scan` has since shipped). These docs close that gap: one
-file per core area, recording the **implemented, test-pinned surface** at std-design depth, plus
-an explicit *spec'd-but-not-implemented* section so drift is visible instead of ambient.
+These files collect the current `core` library signatures, ownership and effect
+rules, errors, and test coverage by area. Each file distinguishes implemented
+operations from specified operations that have not shipped, such as string
+`split`.
 
-Precedence: `draft.md` stays the language-level source of truth for *semantics and direction*;
-these docs are the source of truth for the **current library surface** — exact signatures,
-ownership/effect/region classification, abort-vs-`Result` policy, and which tests pin each
-behavior. When implementing or changing a core area, update the matching file here in the same
-PR (same rule as std-design).
+`draft.md` remains authoritative for language semantics and design decisions.
+These references give the detailed library contracts and implementation limits.
+Update the relevant reference when its public contract changes; an internal
+implementation change does not require restating that contract.
 
 ## The files
 

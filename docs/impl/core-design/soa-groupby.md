@@ -8,9 +8,9 @@ ownership and effect classification, error policy, pitfalls, and related tests.
 ## Overview
 
 The columnar layer: `soa<T>` stores one contiguous column per struct field (draft §9); `group_by`
-is the grouped-fold primitive; `dict_encode` interns a `str` key column once for reuse. This is
-the layer that makes "decode → filter → aggregate" run at columnar-database speed from ordinary
-code; the M6 benches pin ~8–10× over AoS scans for column-touch workloads.
+is the grouped-fold primitive; `dict_encode` interns a `str` key column once for reuse.
+Column projection lets a scan read the fields it needs without loading whole rows.
+The benchmarks linked below record the measured layout and grouping costs.
 
 ## Signatures (verified)
 
@@ -56,10 +56,11 @@ can run, not their effect class.
 
 ## Errors & aborts
 
-No `Result` anywhere in this area: invalid shapes are **compile errors** (wrong source type,
+The direct SoA and grouping operations do not return `Result`. Invalid shapes are **compile errors** (wrong source type,
 non-i64 aggregate value, unknown aggregate name, empty `.agg()`, bare `group_by` with no
-aggregate, `sum(.strfield)`), and there is no runtime failure mode (hash tables grow; empty
-input yields empty key/value columns).
+aggregate, `sum(.strfield)`). Bounds and allocation failures use the ordinary abort
+paths; empty grouping input yields empty key/value columns. `json.decode` remains
+fallible and returns the `Result` shown above.
 
 ## Regions
 

@@ -1,13 +1,14 @@
-このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
-シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
-
 # core — json
 
 > 🌐 [English](../json.md) · **日本語**
 
 ## Overview
 
-JSON を型付き境界とスキーマ未知境界の両方で扱う（draft §14）。表面は、型付き値と文書を受け取る `encode` / `encode_bounded`、型付きの `decode`、遅延スキーマ未知ビューの `doc`、型付き行をストリーム処理する `scan` の5操作である。対象型と行型は **明示的な型引数ではなく型推論によって** 決定される（決定済: Align には式位置での型引数構文、つまり turbofish のような記法は存在しない）。使用には `import core.json` が必要である（capability-header のルールは `core.json` に対しても std モジュールと全く同様に適用される）。
+`core.json` は `encode` と `encode_bounded` で型付き値や文書ビューを出力し、
+`decode` で型付き値へ変換する。`doc` はスキーマ未知のビューを、`scan` は型付き行の
+ストリームを提供する（draft §14）。`json.encode_options` で文書の空白と文字列の
+再エスケープを指定する。対象型と行型は文脈から推論し、呼び出しに型引数は書かない。
+いずれの操作にも `import core.json` が必要である。
 
 ## 文書の部分木エンコード（R158）
 

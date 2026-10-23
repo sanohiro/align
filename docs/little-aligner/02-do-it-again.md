@@ -176,7 +176,7 @@ The lambda captures `offset` from the surrounding scope.
 fn move_right(x: i64) -> i64 = x + 7
 ```
 
-Then use `.map(move_right)`. Inline lambdas are for local thoughts; named functions are for repeated thoughts. The pipeline does not care which spelling supplied the callable.
+Then use `.map(move_right)`. A lambda keeps a one-off transformation next to the pipeline. A named function lets several pipelines use the same definition.
 
 ---
 

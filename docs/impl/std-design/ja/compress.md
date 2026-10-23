@@ -9,7 +9,9 @@
 
 ## Overview
 
-gzip および zstd による圧縮・展開（draft §18.2）。要となるライブラリ戦略は、**メモリのラッパーは自前で用意し、数学的な計算エンジンは外部から借りる** というものである（draft §15）。チューニング済みの DEFLATE や zstd を自前で書き直すのではなく、`extern "C" link("z"|"zstd")` 経由で `libz` / `libzstd` をラップする。出力バッファの確保は Align 側（arena / buffer）が担い、C のエンジンがそこへ書き込む形をとる。
+gzip・zlib・raw DEFLATE・zstd による圧縮・展開（draft §18.2）。
+ランタイムのラッパーが `libz` / `libzstd` を呼び、Align が所有する出力バッファへ
+ネイティブのエンジンが書き込む。
 
 ## Signatures
 
@@ -35,7 +37,7 @@ compress.deflate_raw_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Res
 
 ## Type & ownership classification
 
-純粋な byte → byte 処理である。入力の `bytes` は借用ビューであり、そのデータポインタが FFI を越えて渡され、長さは別途渡される（draft §15 の FFI ルールに従う）。出力は所有権を持つ `buffer` であり、Align が buffer 機構を通じてメモリを確保し、C のエンジンがそこへ書き込む。新しい Move 型を追加する必要はない — 既存の `buffer`（#346）を再利用する。
+バイト列をバイト列へ変換する処理である。入力の `bytes` は借用ビューであり、そのデータポインタが FFI を越えて渡され、長さは別途渡される（draft §15 の FFI ルールに従う）。出力は所有権を持つ `buffer` であり、Align が buffer 機構を通じてメモリを確保し、C のエンジンがそこへ書き込む。既存の Move 型 `buffer`（#346）を使う。
 
 ## Effect classification
 
@@ -67,26 +69,27 @@ zlib は不正な Adler-32 とプリセット辞書を拒否する。呼び出�
 ストリーミング API・辞書 API・PNG 方針は追加しない。
 [Plan226](../../226-deflate-framing.md) が正確な契約を定める。
 
-## New machinery required
+## Runtime and dependencies
 
-既存の FFI の `link()` 経路（M8 #265-269）に加えて、以下を行う safe な unsafe ラッパーが必要である。出力バッファを確保し、C の関数を `(in_ptr, in_len, out_ptr, out_cap)` の形式で呼び出し、「出力先の容量が足りない場合はバッファを拡大してリトライする」ループを処理し、最終的に所有権を持つ buffer を返す。ビルド時には `-lz` / `-lzstd` をリンクする必要がある（ドライバのリンクステップ）。これは新しい外部依存となるため、ビルド環境に libz / libzstd が存在している必要があることを文書化する。
-ライブラリが存在しない環境向けに、このモジュールをオプトイン（フィーチャーゲート化）にすることも検討する。
+ランタイムのラッパーがネイティブの状態、上限を確認した出力領域の拡張、解放を管理し、
+成功時に所有 buffer を返す。圧縮を使うプログラムは `-lz` / `-lzstd` をリンクする。
+どちらもビルド環境の必須依存ライブラリである。
 
-## Slice breakdown
+## Original M11 slices (completed)
 
 1. gzip (libz) — compress + decompress + サイズ上限の適用。
 2. zstd (libzstd) — 同様の構成。
 
 ## Pitfalls
 
-- **P1 (FFI memory safety — the align-self-review Gate 2 core)**: i64 から usize への変換には `as usize` ではなく `try_from` を使用する。バッファサイズの計算には `checked_mul` を使う。`from_raw_parts` を呼び出す前には null ガードを入れる。出力を拡大してリトライするループで、バッファサイズをオーバーフローさせないこと。これらは最もリスクの高い箇所であり — そもそも FFI やメモリアロケーションに関するバグを防ぐためにレビュースキルが存在する、まさにその核心部分である。
-- **P2 (decompress bomb)**: ごく小さな入力データが、ギガバイト規模に展開される可能性がある。合計出力ペイロードを 1 GiB 以下に制限し、超過した場合は `Error.Invalid` を返すようにする。攻撃者が制御可能な入力データから無制限に（青天井に）メモリを確保してはならない。
-- **P3 (external lib dependency)**: libz / libzstd はリンク可能でなければならず、ドライバのリンクステップにおいて `-lz` / `-lzstd` が必要になる。存在しない場合はビルドに失敗する。この依存関係を明確に文書化すること。ライブラリが存在しなくてもビルドが通るようにフィーチャーゲート化する（単に compress モジュールが使えなくなるだけにする）ことも検討する。
+- **P1 (FFI memory safety — the align-self-review Gate 2 core)**: i64 から usize への変換には `try_from` を使う。バッファサイズの計算には `checked_mul`、`from_raw_parts` の前には null ガードが必要。出力領域の拡張時もサイズのオーバーフローを検査する。
+- **P2 (decompress bomb)**: 合計出力には呼び出し側の上限（省略時は 1 GiB）を適用し、超過は `Error.Invalid` にする。
+- **P3 (external lib dependency)**: 圧縮を使うプログラムは `-lz` / `-lzstd` をリンクする。ライブラリがなければリンクに失敗する。
 - **P4 (view → FFI ptr)**: `bytes` の入力はデータポインタのみに切り詰められる（draft §15）。長さは別途渡す必要がある。ビュー自体は C 言語の raw ポインタとなるため、FFI の戻り値の型としては使用できない。出力はビューではなく、所有権を持つ buffer でなければならない。
 
 ## Test checklist
 
-- 空 / 小さいデータ / 1MB のランダムデータ / 高圧縮率のデータ に対する gzip / zstd の往復処理 → `decompress(compress(x)) == x`
+- 空 / 小さいデータ / 1MB のランダムデータ / 高圧縮率のデータ に対する gzip / zlib / raw DEFLATE / zstd の往復処理 → `decompress(compress(x)) == x`
 - メンバー・フレームの連結、空メンバー、16 種類すべてのスキップ可能フレーム
 - 後続部分の破損・切り詰め、別形式、旧 zstd、末尾の余分なバイト → `Error.Invalid`
 - 合計上限と上限ちょうどでの空の後続部分。失敗時は部分 buffer を返さない
@@ -94,4 +97,4 @@ zlib は不正な Adler-32 とプリセット辞書を拒否する。呼び出�
 - level 指定の境界値チェック
 - buffer が所有権を持ち、Drop 時に正しく解放されること
 - モジュールの使用に import が必須であること
-- （テストの実行には libz / libzstd の存在が必要となるため、利用可能かどうかに応じてテストの実行をゲートすること）
+- テストには libz / libzstd が必要であり、対応するビルド環境に含める。

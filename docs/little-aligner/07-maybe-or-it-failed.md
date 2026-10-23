@@ -36,7 +36,7 @@ We will write `safe_head` ourselves in Q20.
 
 **Q6.** What is the difference between `Option` and `Result`?
 
-**A6.** `None` is a normal answer ("no first even number" — fine). `Err` is a failure with a story (`NotFound`, `Denied`…). If absence is ordinary, `Option`. If someone may need to know *why*, `Result`.
+**A6.** `None` reports absence, such as “there is no first even number.” `Err` reports a failure and its reason (`NotFound`, `Denied`…). Use `Option` for an optional value and `Result` when the caller needs a failure reason.
 
 ---
 
@@ -59,7 +59,7 @@ What is the `?` doing?
 
 **Q8.** So who eventually *handles* the error?
 
-**A8.** Whoever can. Each layer either passes it up (`?`) or sits down with a `match`. At the very top, `main() -> Result<(), Error>` maps an escaped `Err` to the exit status described in Q10. The error travels as a value through each caller. There is no exception unwinding.
+**A8.** The caller that can decide what to do with it. Use `?` to pass it upward, or `match` to inspect the reason and act. An `Err` that reaches `main() -> Result<(), Error>` becomes the exit status described in Q10. There is no exception unwinding.
 
 ---
 
@@ -133,7 +133,7 @@ fn load_score(path: str) -> Result<i64, Error> {
 
 **Q16.** The file is missing. Does `parse_score` run?
 
-**A16.** No. The first `?` returns the file's `Err` from `load_score` immediately. Later work is not half-done; it is not begun.
+**A16.** No. The first `?` returns the file's `Err` from `load_score` before `parse_score` runs.
 
 ---
 

@@ -6,7 +6,7 @@ The compiler checks view lifetimes, moves, and purity to prevent dangling views,
 
 ## `unsafe {}` and `raw.*`
 
-`raw` is a bare pointer type; the six `raw.*` operations are the only way to touch one, and they are legal **only** inside `unsafe`:
+`raw` is a bare pointer type. Its `raw.*` operations are legal **only** inside `unsafe`:
 
 ```align
 fn main() -> i32 {
@@ -23,7 +23,7 @@ fn main() -> i32 {
 }
 ```
 
-The raw-pointer operations are `null`, `alloc`, `free`, `load`, `store` and `offset`. A `resource` type also has representation operations such as `resource.from_raw`, `.into_raw` and `.view_from_raw`, restricted to that type's privileged `unsafe` code. `raw.null()` supplies a native-ABI null sentinel. A `raw` is a Copy value that may be held and passed in safe code; operating on it requires `unsafe`.
+The raw-pointer operations are `null`, `alloc`, `try_alloc`, `free`, `load`, `store` and `offset`. A `resource` type also has representation operations such as `resource.from_raw`, `.into_raw` and `.view_from_raw`, restricted to that type's privileged `unsafe` code. `raw.null()` supplies a native-ABI null sentinel. A `raw` is a Copy value that may be held and passed in safe code; operating on it requires `unsafe`.
 
 `load` and `store` admit primitive scalars, `raw` pointers, and eligible `layout(C)` structs. A
 native wrapper can therefore keep a C handle in a package-owned state block without casting the

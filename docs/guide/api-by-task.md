@@ -25,16 +25,18 @@ name, such as `pkg.csv.decode`, after `import pkg.csv`. Follow the complete
 
 | I want to… | API or language feature | Start here | Exact contract |
 |---|---|---|---|
-| Filter, transform, and sum values | `.where`, `.map`, `.sum`, `.fold` | [Pipelines](06-pipelines.md) | [Arrays, slices, and pipelines](../impl/core-design/array-slice-pipeline.md) |
-| Combine two inputs into caller-owned output | `.zip`, `.map_into` | [Complete example](../../examples/zip_map_into.align) | [Arrays, slices, and pipelines](../impl/core-design/array-slice-pipeline.md) |
+| Filter, transform, and sum values | `.where`, `.map`, `.sum`, `.reduce` | [Pipelines](06-pipelines.md) | [Arrays, slices, and pipelines](../impl/core-design/array-slice-pipeline.md) |
+| Combine two inputs into caller-owned output | `zip`, `.map_into` | [Complete example](../../examples/zip_map_into.align) | [Arrays, slices, and pipelines](../impl/core-design/array-slice-pipeline.md) |
 | Read or update an owned array through a helper | `borrow`, `borrow mut`, `slice<T>` | [Complete example](../../examples/borrowed_array.align) | [Memory and borrowing](05-memory.md) |
 | Work in columns or aggregate by key | `soa<T>`, `.group_by` | [Data-oriented programming](11-data-oriented.md) | [SoA and grouped aggregation](../impl/core-design/soa-groupby.md) |
-| Run independent pure computations in parallel | `.par_map`, `task_group`, `spawn`, `await` | [Parallelism](10-closures-and-parallelism.md) | [Language specification](../../draft.md) |
+| Apply one Pure function to many elements in parallel | `.par_map` | [Data parallelism](10-closures-and-parallelism.md#par_map--data-parallelism) | [Language specification](../../draft.md) |
+| Run independent jobs, including I/O, and collect their results | `task_group`, `spawn`, `wait`, `.get` | [Task parallelism](10-closures-and-parallelism.md#task_group--task-parallelism) | [Language specification](../../draft.md) |
 | Handle a missing value or a fallible operation | `Option`, `Result`, `else`, `?`, `match`, `.map_err` | [Errors](04-errors.md) | [Option and Result](../impl/core-design/option-result.md) |
 
 Choose an explicit materialization terminal when you need stored output.
-Borrowed views must stay within their owner's lifetime. Parallel closures must
-be Pure; use the service APIs' own concurrency facilities for I/O.
+Borrowed views must stay within their owner's lifetime. `par_map` requires a
+Pure callable. Spawned tasks may perform I/O, but shared captures remain read-only
+until the group joins.
 
 ## Handle text and data formats
 
@@ -44,6 +46,7 @@ be Pure; use the service APIs' own concurrency facilities for I/O.
 | Assemble text without repeated concatenation | `builder`, `.write`, `.write_int`, `.to_string` | [Builder examples](07-strings-and-text.md#the-builder) | [Strings and builders](../impl/core-design/string.md) |
 | Decode JSON with independently owned fields | `json.decode`, record fields of `string` / `array<T>` | [Complete owned JSON example](../../examples/json_owned.align) | [JSON types and ownership](../impl/core-design/json.md) |
 | Read JSON through borrowed text or columns | `json.decode`, `str`, `soa<T>`, `arena` | [JSON](08-json.md) | [JSON types and ownership](../impl/core-design/json.md) |
+| Inspect or forward JSON whose schema is not known | `json.doc`, `.get`, `.at`, `json.encode_options` | [Document views](08-json.md#when-the-schema-is-not-known) | [JSON types and ownership](../impl/core-design/json.md) |
 | Write JSON, optionally with a byte cap | `json.encode`, `json.encode_bounded` | [Encoding](08-json.md#encoding) | [JSON](../impl/core-design/json.md) |
 | Decode CSV into typed columns | `pkg.csv.decode`, `DecodeOptions` | [Complete app](practical-cli.md) | [CSV](../impl/pkg-design/csv.md) |
 | Exchange a typed columnar binary batch | `codec.encoder`, `codec.open` | [Usage examples](../impl/core-design/codec.md#source-surface) | [Columnar codec](../impl/core-design/codec.md) |

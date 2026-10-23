@@ -1,14 +1,13 @@
-このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
-シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
-
 # core — Option / Result / Error
 
 > 🌐 [English](../option-result.md) · **日本語**
 
 ## Overview
 
-唯一の optional モデルと唯一のエラーモデルである（draft §5）。`Option<T>` = 値が存在しない可能性がある（それも正常な答えのひとつ）。`Result<T, E>` = 理由を伴って失敗した。言語内に null や例外（exception）は一切存在しない。エラーの伝播手段は `?` 演算子のみである。
-インターフェースの表面は意図的に *狭く* 絞ってある — 分解の基本は `match` であり、そこにわずか 3 つのユーティリティ機能（`else`、`?`、`map_err`）を追加しているのみである。
+`Option<T>` は値の有無を、`Result<T, E>` は成功または失敗の理由を表す（draft §5）。
+`match` で内容を調べ、`else` で代替値を選び、`?` で失敗を伝播し、`map_err` でエラーを
+変換する。例外や一般的な null 値はない。unsafe な raw ポインター境界には明示的な
+`raw.null()` があるが、`Option` の代わりにはならない。
 
 ## Signatures (verified)
 
@@ -33,9 +32,9 @@ non-entry module は独自の `Error` を宣言でき、その場合 bare lookup
 
 ## Type & ownership classification
 
-`Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b は完了している。ひとつの再帰的なタグ付き `DropPlan` が有限かつ非再帰な Move payloadを受け入れ、tagged container自体をMoveとし、活性payloadだけをDropし、構築および owning-place の `match` / `else` / `?` でmove元を無効化する。admitted borrowed-place の `match` は既存の borrow ABI で活性payloadをその場で読み、source ownerを変更しない。この契約は [`26-borrowed-sum-projection-plan.md`](../../26-borrowed-sum-projection-plan.md) が定める。recursive type、任意の新しいMove-element collection layout、L2のdynamic path-selected return cleanupは別の担当restrictionとして残る。新しいlibrary handleへcompiler-known exceptionを追加してはならない。
+`Option<T>` / `Result<T,E>` は通常のジェネリックな sum 型である（モノモルフィゼーションされる）。[`../../17-library-boundary-prerequisites.md`](../../17-library-boundary-prerequisites.md) の L1a/L1b は完了している。ひとつの再帰的なタグ付き `DropPlan` が許可された Move payload を扱い、tagged container自体をMoveとし、活性payloadだけをDropし、構築および owning-place の `match` / `else` / `?` でmove元を無効化する。admitted borrowed-place の `match` は既存の borrow ABI で活性payloadをその場で読み、source ownerを変更しない。この契約は [`26-borrowed-sum-projection-plan.md`](../../26-borrowed-sum-projection-plan.md) が定める。経路に依存する戻り値の cleanup は実装済みである。`ReturnCleanupAbi::DynamicBit` が直接・間接・import 済みの呼び出しを通る解放義務を表し、結果の lifetime provenance とは区別する。物理的な受け渡しと drop-state の最適化は [Plan71](../../71-aggregate-layout-transport-drop-state-plan.md) に従う。インラインの再帰循環や未対応の collection-element layout は通常の型形成規則で拒否し、新しいライブラリハンドルもこの規則を迂回しない。
 
-R82 の shared-carrier 対応は統合 provider branch に実装済みである。
+R82 の shared-carrier 対応は実装済みである。
 [Plan 56](../../56-r77-r83-composition-plan.md) は既存の再帰的 borrowed-payload grammar に
 `process.user_namespace` だけを追加する。安定した optional/record-contained place の
 shared match は source owner を保持し、既存の明示的 `inherit_namespace` 呼び出しが
@@ -78,7 +77,7 @@ Pure な機構である。`?` は制御フローであってエフェクトで�
 ## 仕様先行(未実装)
 
 - **コンビネータメソッドは存在しない**: `.map`、`.and_then`、`.unwrap_or`、`.ok()`、`.is_some` / `.is_none` / `.is_ok` / `.is_err` などのメソッドは存在しない — メソッドテーブルは `map_err` だけで打ち止めとなっている。これは現時点では実装漏れではなく、意図的な *設計上のスタンス* である。`match`、`else`、`?` が揃っていれば、コンビネータ風の第 2 の制御フロー言語（方言）を増やすことなく用途はまかなえる。これらのいずれかを追加する場合は設計上の判断（一方向の One-way レビュー）を伴うため、実装の前に `open-questions.md` で議論・記録すること。
-- **再帰的なタグ付き Move の範囲**: L1b-a は、タグ付き arm で既存の `Scalar` で直接表現できる Move ペイロードを受け入れ、再帰的な `Drop`、`match`、`else`、`?`、`map_err` を実装する。L1b-b は複数 Move ペイロードの部分構築も実装し、それらに一様な所有モードを要求する。L1b-c は `Result<Option<T>, E>` のようなタグ付き型を入れ子にする表現を実装する。任意の新しい Move 要素レイアウトを持つ配列、再帰型、および L2 の動的なパス選択型 return cleanup は別の課題として残る。
+- タグ付き payload の対応によって、新しい collection-element layout やインラインの再帰循環を許可するわけではない。入れ子の各 payload に、既存の型形成・割り当てモード・寿命の検査を適用する。
 
 ## Pitfalls
 
