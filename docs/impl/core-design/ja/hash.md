@@ -7,8 +7,9 @@
 
 ## Overview
 
-バイトビュー（byte views）に対する非暗号学的ハッシュについて（draft §18.1）: 標準のミキサーは 1 つ（wyhash、`align_hash` クレート）であり、フリー関数として提供されるインターフェースも 1 つだけである。**`Hash` トレイトは意図的に存在しない** — ハッシュ化の対象は任意の値ではなくバイト列であり、ある値からどのようにバイトビューを生成するかは呼び出し側が明示的に管理すべき事柄である。
-なお、このファイルにはスカラー演算（scalar math）メソッドのインターフェースも併記している（単独のファイルにするほどの規模ではないため）。
+バイトビューに対する非暗号学的ハッシュ（draft §18.1）は、`align_hash` クレートの
+wyhash を使う。呼び出し側がバイトビューを明示的に渡し、任意の値を対象とする
+`Hash` トレイトは設けない。このファイルにはスカラー演算のメソッドも記載する。
 
 ## Signatures (verified)
 
@@ -21,6 +22,7 @@ x.abs()                          // signed int / float; identity on unsigned
 a.min(b) / a.max(b)              // pairwise; int = llvm.{s,u}min/max, float = NaN-propagating minimum/maximum
 x.sqrt() / .floor() / .ceil() / .round() / .round_even() / .trunc()   // float-only; round = ties away from zero
 x.exp() / .exp2() / .log() / .log2() / .log10()     // float 専用; float vector にもレーン単位で適用
+x.expm1() / .log1p() / .sin() / .cos(), y.atan2(x) // 同じ float scalar/vector 型; atan2 は y, x の順
 b.pow(e)                         // float-only
 fma(a, b, c)                     // free builtin; float scalar or float vector; one rounding
 ```
@@ -52,14 +54,15 @@ Pure。ハッシュ結果は、与えられた入力に対して **1 つのビ�
 
 - **契約には含まれない事項:** *ビルド間やバージョン間* でのハッシュ出力の安定性 — 固定シードを持つ wyhash は現状たまたま安定しているが、§18.1 ではこれを明示的に「オンディスクやワイヤーフォーマットとして安定したものではない」と定めている。テストやユーザー側で、特定の正確なハッシュ値を API の仕様として固定（pin）することを許してはならない（ドライバのテストで固定するのは、決定性、レーンの等価性、ビューの受理といった *プロパティ* のみである）。
 - DoS 耐性はなく、暗号用途でもない — 実装済みの [`std.crypto`](../../std-design/crypto.md) が暗号操作を提供する。セキュリティが要求される場面で「手軽に hash64 で済ませる」という方法は拒否すること。
-- 初等関数 `exp`/`exp2`/`log`/`log2`/`log10` は plan 75 に従って一括して実装済み。LLVM の scalar/vector intrinsic へ直接 lower し、ULP または cross-target の bit 同一性は保証しない。命令選択前の scalarize は可視化し、provider のない retained IR には後段でも scalarize され得ると警告する。最終的な machine SIMD は object の検査で確認する。三角関数は引き続き未提供。
+- 初等関数 `exp`/`exp2`/`log`/`log2`/`log10` は plan 75 に従って実装済み。LLVM のスカラー／ベクタ intrinsic へ直接変換する。全入力に対する ULP 上限やターゲット間のビット一致は保証しない。命令選択前のスカラー化は診断に表示するが、ベクタ IR が残っていても後段でスカラー化され得る。最終的な SIMD 命令は出力オブジェクトを検査して確認する。
+- `expm1`/`log1p` は各値の幅に一致するスカラー libm 関数を呼び、ベクタでは各レーンに適用する（[Plan234](../../234-cancellation-sensitive-math.md)）。`sin`/`cos`/`atan2` は LLVM のスカラー／ベクタ intrinsic を使う（[Plan235](../../235-trigonometric-math.md)）。すべて Pure で Align の領域を確保せず、精度とベクタ化には上記の制限がある。`atan2` の両辺は同じ型で、スカラーのブロードキャストは行わない。結果は [-pi, pi] のラジアン値になる。
 - `core.bitset`（§18.1 に隣接する要素） — 未実装。ビット操作は整数演算子で行う。そのメモリレイアウトの問題は packed-bool な soa カラムと密接に関連しているため、一緒に決着させること。
 
 ## Pitfalls
 
 - P1 — 内部で使われる wyhash（group_by の interning、dict_encode、JSON の PHF — #321 でこれらを `align_hash` に収束させた）と、ユーザー向けの `hash64` は **意図的に同じミキサー** に統一されている。構造的な振る舞い（例えば PHF のバイトマッチング）が、ユーザーが計算できるハッシュとは *異なる* ハッシュに依存してはならない。ミキサーを変更するなら一元的に変更すべきであり、部分的な変更は許されない。
 - P2 — `hash128.0 == hash64` は固定されたプロパティである。もし将来のミキサーがこのレーン関係を壊すようなことがあれば、それは内部実装の変更ではなく API の破壊的変更（API break）を意味する。
-- P3 — float の `min`/`max` は NaN-*伝播（propagating）*（`minnum/maxnum` ではなく `llvm.minimum/maximum` を使用）である。ベクタレーンの `min`/`max` もスカラーの挙動と一致し続けなければならない — レーンとスカラーでの挙動の乖離はまさに、differential fuzzer が検出を目的としているバグクラスである。
+- P3 — float の `min`/`max` は NaN を伝播する（`llvm.minimum/maximum` を使用）。ベクタの各レーンもスカラーと同じ規則に従い、差分ファザーで一致を検査する。
 
 ## Test anchors
 

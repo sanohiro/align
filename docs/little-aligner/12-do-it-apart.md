@@ -57,13 +57,13 @@ factor := 3
 ys := xs.par_map(fn x { x * factor })
 ```
 
-**A7.** Yes. The closure captures `factor` by value. Every task receives a fact, not a shared box that another task may change.
+**A7.** Yes. The closure copies `factor` when it is created. Other tasks cannot change that captured value.
 
 ---
 
 **Q8.** What if `factor` was a `mut` binding and changes later?
 
-**A8.** The closure still holds the value captured when it was made. Chapter 2's little rule has become a parallel safety rule: no shared mutable environment exists.
+**A8.** The closure still holds the value captured when it was made, just as in chapter 2. Changing the outer binding does not change that copy.
 
 ---
 
@@ -75,7 +75,7 @@ ys := xs.par_map(fn x { x * factor })
 
 **Q10.** A thousand independent images, each needing a costly transform. `par_map`?
 
-**A10.** A good candidate, if measurement agrees. Parallelism has an entrance fee; expensive Pure work gives it time to pay the fee back.
+**A10.** `par_map` is a candidate. Each Pure transformation may do enough work to outweigh the scheduling cost. Measure it against the sequential version.
 
 ---
 
@@ -102,7 +102,7 @@ The three partial answers are `3`, `7`, and `11`; the final answer is `21`.
 
 **Q12.** Why make chunks instead of one task per number?
 
-**A12.** A task needs enough work to repay scheduling. A chunk also keeps nearby data together. Grain size is the bridge between the algorithm's many elements and the machine's few workers.
+**A12.** Each task needs enough work to outweigh its scheduling cost. A chunk also keeps nearby data together. Its size determines how much work we assign to a worker at a time.
 
 ---
 
@@ -165,6 +165,29 @@ task_group {
 **Q20.** How large should each chunk be?
 
 **A20.** Measure several sizes against the sequential version on representative inputs. Too little work per chunk can cost more to schedule than to compute; too few chunks can leave workers idle. Include the short final chunk, output allocation when present, and the final reduction in the comparison. More workers cannot make memory bandwidth unlimited.
+
+---
+
+**Q21.** May a task produce owned text that we keep after the group ends?
+
+**A21.** Yes:
+
+```align
+message := task_group {
+    task := spawn(fn { "ready".clone() })
+    wait()
+    task.get()
+}
+print(message)
+```
+
+It prints `ready`. The task creates an owned `string`; after the join, `get()` transfers that owner to the caller. The string can outlive the group. Returning just `"ready"` would return a borrowed `str`, which is not an admitted task result, even for a literal. Task results must contain self-contained data; the [parallelism guide](../guide/10-closures-and-parallelism.md) describes the supported shapes.
+
+---
+
+**Q22.** May we call `task.get()` twice to get two owned strings?
+
+**A22.** No. Getting a Move result consumes the task handle. To keep two strings, clone the retrieved string explicitly. Q15's `i64` results are Copy and may be read repeatedly after a successful wait. If an owned result is never taken, the group drops it after joining its tasks. Chapter 8's rule still holds: each owned value has one owner.
 
 ---
 

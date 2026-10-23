@@ -43,13 +43,13 @@ Read it once. Do not hurry.
 
 **Q5.** How many loops are hidden in `where(.valid).score.sum()`?
 
-**A5.** One fused loop. But do not say the whole function is one pass: decoding the text is work of its own, followed by the fused pass over the columns. Count the work that is really there, neither more nor less.
+**A5.** One fused loop. The function also decodes the text before scanning the columns, so we need to count that work separately.
 
 ---
 
 **Q6.** Suppose `Record` also had `name`, `email`, and `notes`. Which columns would the fused pass read?
 
-**A6.** `valid` and `score`. The other columns exist, but this question never touches them. Chapter 9's sideways layout and chapter 5's fusion are the same story now.
+**A6.** `valid` and `score`. The other columns exist, but this calculation does not read them. We are using chapter 9's column layout together with chapter 5's pipeline fusion.
 
 ---
 
@@ -148,7 +148,7 @@ return Ok(rows
     .count())
 ```
 
-If you wrote that from the sentence without copying an earlier chain, the pipeline chapters have become a tool.
+Which stage checks validity, which tests the score, and which counts the survivors?
 
 ---
 

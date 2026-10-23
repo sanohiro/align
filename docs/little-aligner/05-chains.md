@@ -36,7 +36,7 @@ xs.map(fn x { x - 10 }).where(fn x { x > 0 }).count()
 xs.where(fn x { x > 0 }).map(fn x { x - 10 }).count()
 ```
 
-**A4.** Different answers! With `xs := [5, 15]`: the first subtracts then keeps positives — count `1`. The second keeps positives then subtracts — count `2` (a `where` after which nothing filters again). A chain is a sentence; word order is meaning.
+**A4.** Different answers. With `xs := [5, 15]`, the first subtracts ten and then keeps positive values, giving a count of `1`. The second keeps positive values before subtracting ten, giving a count of `2`.
 
 ---
 
@@ -116,9 +116,9 @@ fn double_into(src: slice<i64>, out dst: slice<i64>) {
 
 ---
 
-**Q12.** The habit, then. You are about to write a loop. What do you ask first?
+**Q12.** Before writing a loop, what do you ask?
 
-**A12.** *"What is the transformation?"* Then you write it as stages: change-each → keep-some → collapse. If you cannot name the stages, chapter 11 (`loop`) is waiting — but ask the question first, every time.
+**A12.** “What happens to each element, and what result do I need?” If the work is a transformation, filter, or reduction over the input, we can write it as a pipeline. Chapter 11 covers the repetitions that need `loop`.
 
 ---
 
@@ -202,7 +202,7 @@ fn scale_into(src: slice<i64>, out dst: slice<i64>) {
 
 **Q20.** The chain is getting hard to read. Should we break it into half-pipelines?
 
-**A20.** No. Name callables, or lay the chain across lines, but keep the data sentence whole:
+**A20.** Name the callables or lay the chain across lines, keeping it connected to its ending:
 
 ```align
 answer := xs

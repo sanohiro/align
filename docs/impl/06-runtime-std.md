@@ -12,8 +12,10 @@ core is close to the language  write it in Align itself as much as possible. dro
 std is the OS boundary       std is a thin wrapper over OS syscalls. built on core
 ```
 
-Historical bootstrap proposals are retained where useful; current per-module surfaces live in
-`core-design/` and `std-design/`. Remaining policy questions are listed in §11.
+Current per-module surfaces live in `core-design/` and `std-design/`.
+The [runtime ABI ledger](20-runtime-abi-ledger.md), typed registry and declaration golden
+own the exact native signatures; the sections below summarize their roles.
+The original bootstrap order is retained in §10.
 
 ---
 
@@ -25,7 +27,7 @@ worker pool. The driver links it with the object (`01`/`05`).
 
 ```text
 align_runtime
-  start          entry (_start / main equivalent). calls main and returns the exit code
+  entry helpers  argv construction / error reporting for the compiler-generated main wrapper
   arena          bump allocator + bulk reset
   heap           explicit heap (thin wrapper over the malloc family)
   par            data-parallel runtime (work-stealing or chunk splitting)
@@ -48,8 +50,7 @@ it lets us write each variant's body *portably* (one source compiling to SSE/AVX
 target features), but the per-feature variants + the runtime selector are still explicit. In practice
 the cheapest path is to lean on crates that already do this internally (`memchr` etc.); we add our own
 multi-versioned routine only where no crate fits. Either way **no hand-written per-architecture
-intrinsics**, and x86-64 + aarch64 are covered from one source. (Build lands with the std/runtime
-layer; the policy is fixed.)
+intrinsics**, and x86-64 + aarch64 are covered from one source.
 
 `// OPEN:` whether to pin static linking, and how far to depend on libc (`05 §10`). Whether to hit the OS directly (syscalls) or go through libc is a decision shared with std.
 
@@ -57,17 +58,22 @@ layer; the policy is fixed.)
 
 ## 2. Value ABI (the contract between compiler and runtime)
 
-Match the MIR/codegen layout (`05 §1`). The runtime receives these shapes by assumption.
+Match the MIR/codegen layout (`05 §1`). Views and finished arrays use pointer/length
+pairs; mutable builders and buffers are opaque runtime handles.
 
 ```text
 slice<T>     { T* ptr, i64 len }
-array<T>     { T* ptr, i64 len, i64 cap }
+array<T>     { T* ptr, i64 len }
 str          { u8* ptr, i64 len }
-builder      { u8* ptr, i64 len, i64 cap, Arena* arena? }   // described below
+string       { u8* ptr, i64 len }         // owned bytes
+builder       Builder*                  // opaque growable state
+buffer        Buffer*                   // opaque mutable byte storage
 arena handle  Arena*   (opaque pointer. its contents are runtime-private)
 ```
 
-All small headers passable by value. The actual memory is past the ptr (arena/heap/static).
+Native signatures specify whether a header passes by value, through separate
+pointer/length arguments, or through an output cell. Capacity belongs to mutable
+runtime state, not to the finished `array<T>` header.
 
 ---
 
@@ -82,7 +88,9 @@ void   align_rt_arena_reset(Arena*)        // bulk-release all allocations. no i
 void   align_rt_arena_end(Arena*)          // return the arena itself
 ```
 
-Implementation: take a large block from the OS in chunk units and just advance the pointer (O(1) allocation). `reset` returns the pointer to the start (freeing/pooling chunks if needed). `alloc` rounds up to the requested align (SIMD alignment, `draft.md` §3.4).
+Allocation advances a pointer within a chunk, acquiring another chunk when needed.
+`alloc` rounds up to the requested alignment. `reset` releases retained file mappings
+and chunks while keeping the arena handle; `end` also releases the handle.
 
 codegen correspondence (`05 §4`):
 
@@ -92,18 +100,25 @@ arena { .. }  →  a = arena_begin(); ...body (alloc is arena_alloc(a,..))...; a
 
 Because typecheck has verified that a view inside the arena does not escape (`03 §7`), the runtime tracks no lifetimes at all.
 
-`// OPEN:` chunk sharing/reuse for nested arenas, and the API when an explicit allocator (`arena a {}`, open-questions) is used.
+Named `arena a {}` and explicit region placement are implemented. Their lifetime
+and allocation rules are in [core-design/arena-heap.md](core-design/arena-heap.md).
 
 ---
 
 ## 4. heap
 
 ```text
-void* align_rt_heap_alloc(i64 size, i64 align)
-void  align_rt_heap_free(void* ptr)
+void* align_rt_alloc(i64 size)
+void  align_rt_free(void* ptr)
+i32   align_rt_raw_try_alloc(i64 size, void** out)
 ```
 
-Normal code does not manually free (`draft.md` §6.5). The release point comes from MIR's `Drop` (derived from the move check, `04 §1`), and codegen emits `heap_free`. raw alloc is `unsafe` only (`draft.md` §6.5) and goes through a separate thin API.
+MIR's `Drop` determines ordinary release points; codegen calls the appropriate
+typed cleanup or `align_rt_free`. Source `raw.alloc` and `raw.free` require
+`unsafe` and use the same flat allocator family. `raw.try_alloc` uses the
+status/output-cell entry to return allocation refusal as `Result<raw, Error>`;
+the caller still owns initialization and release. [Plan236](236-fallible-raw-carriers.md)
+fixes its status and size rules.
 
 ---
 
@@ -152,16 +167,18 @@ i64 align_rt_par_map_reduce(
   expressions, unsupported aggregate layouts, and other unsupported layouts remain on the sequential
   path. A
   compiler-recognised invariant `str.contains` filter uses the same stable count/scatter path. A
-  `chunks` source uses the
-  ordinary range kernel with `slice<T>` element headers; the chunk-header allocation is still
-  materialized by `align_rt_chunks` and freed by the synchronous consumer.
+  materialized `chunks` source uses the ordinary range kernel with `slice<T>`
+  element headers. Immediate stage-free chunk sources selected for range
+  materialization instead derive each header in the kernel without allocating
+  the header array ([Plan32 §11](32-post-xml-consolidation-plan.md#11-o0--virtual-chunks-for-direct-explicit-parallelism)).
 - `align_rt_par_map_reduce` is the specialized direct, stage-free integer
   `par_map(f).sum()` path. It allocates one 8-byte-aligned partial slot per claimed range rather
   than an element-sized output array, invokes the same caller-draining range scheduler, and combines
   the `result_stride`-wide wrapping integer partials in range order. `result_stride` is 1, 2, 4, or
   8 bytes. The kernel must store exactly one integer partial at its supplied `partial` pointer;
   worker panics are joined and resumed before partials are read. Scalar and `chunks` sources share
-  this entry point; for `chunks`, only the owned header array remains as producer storage. This is
+  this entry point; immediate stage-free chunks derive their headers in the kernel,
+  while materialized chunk values retain their owned header array. This is
   not a generic parallel reduction contract: staged pipelines, floating-point sums, and arbitrary
   reducers remain outside this entry point.
 
@@ -172,14 +189,18 @@ i64 align_rt_par_map_reduce(
 ```text
 TaskGroup* align_rt_tg_begin()
 void*      align_rt_tg_alloc(TaskGroup*, i64 size, i64 align)
-void       align_rt_tg_register(TaskGroup*, tramp, thunk, env, result_slot, error_slot)
+void       align_rt_tg_register(TaskGroup*, tramp, thunk, env, result_slot, error_slot, cleanup)
 void*      align_rt_tg_wait(TaskGroup*)   // lowest-index error slot, or null
 void       align_rt_tg_end(TaskGroup*)
 ```
 
 I/O-wait concurrency (`draft.md` §11). Spawn snapshots captures into the task-group region; `wait`
-joins registered tasks using the persistent shared pool and reports the failure from the lowest spawn index. There is no
-async/await (`non-goals.md`).
+joins registered tasks using the persistent shared pool and reports the failure from the lowest spawn index.
+The caller also claims work, so nested groups can progress without a free worker.
+Owned result slots supply a cleanup thunk and an initialized flag: `get()` transfers
+one owned result, and group exit drops untaken results after joining. Cleanup remains
+registered across waits. Copy results allow repeated reads. The result and capture
+domains are fixed by [Plan228](228-task-owned-results.md). There is no async/await.
 
 ---
 
@@ -188,31 +209,41 @@ async/await (`non-goals.md`).
 The foundation for string output and template desugaring (`04 §2.5`).
 
 ```text
-Builder align_rt_builder_new(Arena* a?)        // can be tied to an arena
+Builder* align_rt_builder_new(Arena* a, i64 capacity)  // optional arena destination
 void    align_rt_builder_write(Builder*, u8* ptr, i64 len)   // static part (memcpy)
 void    align_rt_builder_write_int(Builder*, i64)
 void    align_rt_builder_write_f64(Builder*, f64)
-str     align_rt_builder_finish(Builder*)
+{ ptr, len } align_rt_builder_finish(Builder*)       // consuming arena-view finish
+{ ptr, len } align_rt_builder_into_string(Builder*)  // consuming independently owned finish
 ```
 
-`template "Hello {name}"` is static part → `builder_write` (length known from string meta, `03`/`05 §6`), value part → per-type `write_*`. If the total static-part length is known, preallocate capacity at `builder_new` time (1 `Alloc`, `04 §2.5`). Keep separate escaping `write`s for `html`/`json`.
+`template "Hello {name}"` lowers its literal parts to `builder_write` and values
+to per-type writers. Known output bounds can supply initial capacity. Nonescaping
+headers also have stack-storage entries; the growable byte storage remains explicit
+in the runtime. Plain language templates, JSON encoding and `pkg.template` HTML
+escaping retain their separate documented output policies.
 
 ---
 
 ## 8. panic / traps
 
 ```text
-noreturn void align_rt_panic(str msg, SrcLoc loc)
+noreturn void align_rt_div_fail(void)
+noreturn void align_rt_bounds_fail(i64 index, i64 len)
+noreturn void align_rt_alloc_size_fail(void)
 ```
 
-Called for arithmetic errors other than overflow such as divide-by-zero (`draft.md` §5), and for unrecovered invariant violations. The location comes from Span (`05 §9`). overflow defaults to wrap, so it is not normally called (only on optional checks in dev builds). `panic` prints the message + location to stderr and aborts. `// OPEN:` whether to provide a catch boundary that converts panic into a Result (current: none = immediate abort).
+Operation-specific failure entries print a diagnostic and abort. Integer arithmetic
+wraps on overflow in every profile; division by zero, failed bounds checks and invalid
+allocation extents use explicit failure paths. Fatal errors have no unwind or catch
+boundary. Source debug information is separate from these native signatures.
 
 ---
 
 ## 9. Entry point
 
 ```text
-i32 align_rt_start(i32 argc, char** argv):
+i32 main(i32 argc, char** argv):     // compiler-generated wrapper, not a runtime export
   reject any non-UTF-8 argument (including argv[0]) with Invalid report/exit 2
   args = allocate owned array<str> headers borrowing process-lifetime argv bytes
   r = user_main(args)               // pub fn main(args) -> Result<(), Error>
@@ -221,7 +252,10 @@ i32 align_rt_start(i32 argc, char** argv):
     Err(e)  => report(e); return non-zero
 ```
 
-Maps `main`'s return (`draft.md` §17) to the exit code. The display format of `Error` is settled in the error type design (`03`/M2). Both `fn main() -> i32` and the `Result`/argv entry forms are shipped; the M0→M2 sequence below is retained as bootstrap history.
+The wrapper calls `align_rt_args_build` for an argv-taking entry and
+`align_rt_report_error` for a failed builtin-Error result. It maps `main`'s return
+to the exit code; unit success is zero. The accepted signatures and exit mappings
+are in [core-design/option-result.md](core-design/option-result.md).
 
 ---
 
@@ -262,9 +296,7 @@ self-hosting work.
 
 ```text
 - static linking / scope of libc dependence / whether direct syscalls are allowed (common with 05 §10)
-- whether to provide a panic catch boundary (current: immediate abort)
 - the boundary for writing core in Align (how far to drop to intrinsics)
-- optional named/explicit allocator API (ordinary nested arena ordering is implemented)
 ```
 
 Generic parallel reduction is a future surface, not an unfinished runtime promise. Builtin `Error`

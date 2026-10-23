@@ -12,7 +12,7 @@ total := prices.map(with_tax).where(in_stock).sum()
 
 Read left to right: transform each price, keep the values that pass the predicate, and add them. `map`, `where`, and `sum` fuse into one loop, passing each value straight to the next operation. **No intermediate arrays are created.**
 
-A pipeline must **end** — in a reduction (`sum`, `count`, `reduce`, …) or a materialization (`to_array`, `map_into`). A dangling `xs.map(f)` with no terminal is a compile error, because a lazy value you can pass around would be a hidden cost.
+A pipeline ends with a reduction (`sum`, `count`, `reduce`, …) or materialization (`to_array`, `map_into`). An unfinished `xs.map(f)` is a compile error; pipeline stages cannot be stored or passed as lazy values.
 
 > **Cost:** A fused reduction is O(n) and allocates no intermediate collection. `to_array` makes at most one result allocation (sized to the source upper bound when filtering); `map_into` writes caller-provided storage and allocates nothing.
 
@@ -26,7 +26,7 @@ xs.price           // field projection: array<Item> → the price of each
 xs.scan(0, add)    // running accumulation — a stage, not a terminal
 ```
 
-Functions passed to stages are named functions or inline lambdas — `fn x { x * 2 }`, with the parameter before the brace. (Lambdas capture surrounding values too; the full story is chapter [10](10-closures-and-parallelism.md).)
+Functions passed to stages are named functions or inline lambdas — `fn x { x * 2 }`, with the parameter before the brace. Lambdas can also capture surrounding values; chapter [10](10-closures-and-parallelism.md) covers their lifetime and effect rules.
 
 ## Multiple sources with `zip`
 

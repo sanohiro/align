@@ -73,7 +73,7 @@ For a regular, non-empty file, this uses an OS-level memory map (`mmap`), avoidi
 
 ---
 
-**Q10.** Let's put it all together in one breath.
+**Q10.** Put those steps into one program.
 
 **A10.**
 ```align
@@ -107,7 +107,7 @@ fn main() -> Result<(), Error> {
 
 **Q12.** What happens when the `arena` block ends?
 
-**A12.** The mapped view is unmapped and the batch storage is released at the boundary. The block determines when that storage is released.
+**A12.** The file is unmapped, and the decoded columns and other arena storage are released.
 
 ---
 

@@ -180,52 +180,28 @@ slashes and leaves URI canonicalization to the consumer.
 
 ## Why Align exists
 
-Align is not an attempt to invent new syntax.
-
-Align exists because modern software development has changed.
-
-The old model:
-
-```text
-Human -> Code -> Compiler
-```
-
-The new model:
-
-```text
-Human -> AI -> Code -> Compiler
-```
-
-Language design must reflect this reality.
+People increasingly write and review code with AI assistance. Align uses a small set of source
+forms and explicit resource operations so both can reason about the same program. Compiler
+analysis and hardware execution constrain those forms alongside readability.
 
 ---
 
 ## The four-way alignment
 
-Align seeks to align the following four parties.
+A design must work for all four participants:
 
 ```text
-Human
-AI
-Compiler
-Hardware
+Human     readable behavior and visible costs
+AI        consistent syntax and limited equivalent forms
+Compiler  explicit data flow, ownership and effects
+Hardware  contiguous storage and data-parallel work
 ```
-
-Most languages optimize for humans alone.
-
-Align treats all four as first-class citizens.
 
 ---
 
 ## The central observation
 
-Modern CPUs are extremely fast.
-
-Modern compilers are extremely sophisticated.
-
-Modern AI can write code.
-
-Yet developers still hand-optimize the following.
+Compiler optimization depends on program structure. Developers still need to choose:
 
 ```text
 allocation
@@ -235,19 +211,14 @@ branch prediction
 parallelism
 ```
 
-Align seeks to make the optimal path the default path.
+Align gives these choices direct source forms: arrays, SoA, pipelines, arenas and structured tasks.
 
 ---
 
 ## Less code
 
-One of the founding beliefs.
-
-> Less code means fewer bugs.
-
-A language should remove boilerplate wherever possible.
-
-But it does not hide the following.
+Removing boilerplate reduces the code that must be written and reviewed. Resource operations
+and failure paths still need to be visible:
 
 ```text
 allocation
@@ -256,31 +227,18 @@ parallelism
 unsafe operations
 ```
 
-These stay visible.
-
 ---
 
 ## Convergence over expressiveness
 
-Many modern languages maximize expressiveness.
-
-Align maximizes convergence.
-
-The goal:
-
-```text
-different developers
-different AI models
-different codebases
-```
-
-naturally arrive at similar solutions.
+Equivalent programs should use similar structures across authors, tools and codebases. Align
+limits alternate syntax and competing mechanisms to keep those structures recognizable.
 
 ---
 
 ## One way
 
-Align strongly prefers the following.
+Align uses:
 
 ```text
 one error model
@@ -289,39 +247,24 @@ one ownership model
 one parallel model
 ```
 
-Converge on one rather than several competing approaches.
-
 This also applies to empty option lists. `[]` is not a second polymorphic "empty collection" type:
 when a function or binding expects `slice<T>`, that context supplies `T` and the literal follows the
 ordinary fixed-array-to-slice borrow path. With no expected element type it is rejected. The empty
 case allocates nothing and needs no database- or package-specific compiler exception.
 
-This is why **multi-value return is just returning a tuple**, not a separate mechanism. A
-Go-style "multiple return values" feature produces several values that are not themselves a
-value (you can't store, nest, or array them) — a second, special-cased way to hand back more
-than one thing. Align instead has one first-class anonymous product type, the tuple `(T, U)`,
-the positional companion of the keyword-less named struct: a named struct for a domain type, a
-tuple for an ad-hoc result. A tuple's ownership falls out of its elements (the same rule as a
-struct), so it adds no new ownership concept either.
+Multiple return values use an ordinary tuple `(T, U)`. The result can be bound and passed as
+one value, and its ownership derives from its elements, as for a record. Use a named record for
+a domain type and a tuple for an ad-hoc group of values.
 
-It is also why there is **one filtering operation, `where`** — not both `where` and `filter`.
-The two would be exact synonyms (keep the elements a predicate selects), and two names for one
-operation is precisely the divergence Align rejects: different code would arrive at different
-spellings of the same thing. `where` wins because it reads naturally with field selectors
-(`users.where(.active)`) and fits the data-oriented, query-like core. (`filter` was dropped from
-the function list for this reason.)
+`where` is the filtering operation: it keeps elements selected by a predicate or field selector,
+as in `users.where(.active)`. The synonym `filter` was removed to keep one spelling.
 
 ---
 
 ## Compiler-friendly first
 
-Align is intentionally restrictive.
-
-Restriction is not a weakness.
-
-Restriction becomes information for the compiler.
-
-The compiler should be able to infer the following.
+Language restrictions let the compiler infer the following without written lifetime annotations
+or user-supplied alias proofs:
 
 ```text
 contiguous memory
@@ -331,21 +274,12 @@ arena lifetime
 non-null values
 ```
 
-without requiring complex annotations.
-
 ---
 
 ## Hardware-friendly first
 
-Performance begins with the cache.
-
-Before SIMD.
-
-Before GPU.
-
-Before parallelization.
-
-Key concepts:
+Data layout determines which bytes a program loads and how often it loads them. Align makes
+these layout and traversal choices explicit:
 
 ```text
 contiguous memory
@@ -357,18 +291,11 @@ chunk processing
 
 ### Why the default struct layout is unspecified (field reordering)
 
-A normal struct's field order is the compiler's business, not the source's: fields are laid out in
-descending alignment so padding disappears (`{ a: i8, b: i64, c: i8 }` is 16 bytes, not the 24 that
-declaration order would waste). This is the cache-density lever applied to the *element* level — a
-tighter struct means more elements per cache line, fewer bytes streamed, better use of every load —
-and it is exactly the reasoning behind `soa<T>` and the arena, one layer down. It costs nothing: safe
-Align has no field-address-taking, so the physical order is semantically unobservable (access is by
-name), and there is a well-worn precedent — Rust reorders struct fields by default for the same
-reason. The one place a fixed byte layout matters — crossing to C, `raw` memory, JSON's byte
-contract, by-value register passing — already has its marker, `layout(C)`, which pins declaration
-order. So the default optimizes for the machine, and the escape hatch is explicit and visible where a
-human or an ABI actually needs the bytes nailed down: hardware-friendly by default, "nothing hidden"
-where it counts. A concrete C record may also hold an opaque `raw` field (plan137):
+The compiler lays out ordinary record fields in descending alignment to reduce padding:
+`{ a: i8, b: i64, c: i8 }` takes 16 bytes instead of the 24 required in declaration order.
+Smaller records place more elements in each cache line. Safe field access uses names, so it does
+not depend on physical order. Native interfaces that require a fixed representation use
+`layout(C)`, which preserves declaration order and the target C ABI. A concrete C record may also hold an opaque `raw` field (plan137):
 the existing native pointer representation needs neither an integer-address encoding
 nor a new ownership model. Copying the record copies the pointer, with pointee
 validity and lifetime still governed by explicit unsafe operations.
@@ -874,11 +801,11 @@ The Task handle carries a separate compiler-only origin for the group and genera
 handle is Move, transparent local/control moves preserve that origin; opaque boundaries do not.
 Nested groups push a new identity without hiding outer facts. Therefore an inner Wait cannot
 authorize an outer Task, but an outer Wait Result handled inside the inner group updates the outer
-fact. `get()` consults that origin rather than the current nesting position. Current primitive
-results are copied out without consuming the handle. Group exit filters proofs by group identity:
-an inner Wait Result carried out as the block value loses its inner proof and cannot authorize an
-outer Task, while proofs naming still-active outer groups remain. Owned task results are a later
-extension.
+fact. `get()` consults that origin rather than the current nesting position. Independent Copy
+results are copied out without consuming the handle; self-contained Move results consume it and
+transfer their storage once. Group exit filters proofs by group identity: an inner Wait Result
+carried out as the block value loses its inner proof and cannot authorize an outer Task, while
+proofs naming still-active outer groups remain. Plan228 supplies the owned-result lifecycle below.
 Ordinary sequential pipeline callables may also be Impure: deterministic input/stage order and
 `where` guards preserve their observable behavior. Their inferred effect is optimization evidence,
 not a rejection rule. Purity is inferred, never annotated, and is still weaker than
@@ -926,7 +853,7 @@ decisions:
    recursion is a known bug source for both humans and models, while `loop` + `mut` state is not.
    Recursion-as-iteration loses on all four alignment axes at once.
 
-Recursion itself remains legal — a parser or a tree walk is genuinely recursive — but it is for
+Recursion remains useful for parsers and tree walks; it is for
 recursive *problems*, never a substitute for iteration, and Align guarantees no TCO.
 
 **Why not `while`?** `while cond` is a second loop form that cannot yield a value; `loop` with
@@ -935,10 +862,9 @@ recursive *problems*, never a substitute for iteration, and Align guarantees no 
 body, and a nested loop needing a two-level exit is a function waiting to be extracted. Both can
 be revisited on real-code evidence; starting without them is the smaller regret.
 
-The boundary is enforced, not hoped for: walking an array by index inside a `loop` draws a
-"write it as a pipeline" lint — the same pattern as the unnecessary-heap and unhandled-`Result`
-lints. `loop` also finally gives the deferred frequency-dependent lints
-(allocation-in-loop, branch-in-hot-loop, `prefer-pipeline-over-vecN`) their firing surface.
+A warning that recommends a pipeline for an indexed collection walk is planned but not
+implemented. The `loop` surface also makes allocation-in-loop, branch-in-hot-loop and
+`prefer-pipeline-over-vecN` diagnostics possible; their detection rules remain deferred.
 
 ---
 
@@ -1156,8 +1082,8 @@ Decode is **strict and exactly-once**: every declared field must appear once; a 
 declared field is an `Err`, never a serde-style silent last-wins (undeclared keys are the only thing
 skipped). The reason is the one error model: decoding into a fixed struct, a duplicate key is a data
 error, and surfacing it as a value beats a silent partial decode — "nothing hidden". This is the
-intended contract; the current decoder's speculative fast-path has one known narrow deviation, tracked
-as a pre-freeze gap in `open-questions.md`. (Settled 2026-06-29.)
+contract of both the fallback and speculative paths. The speculative duplicate-key gap was closed
+on 2026-07-02; `open-questions.md` retains the fix and regression record. (Settled 2026-06-29.)
 
 **Completeness has three tiers, not one type (settled 2026-07-18).** "Complete JSON" is typed
 decode/encode over the full type matrix (schema known), a lazy `json.doc` view (schema unknown),
@@ -1264,21 +1190,8 @@ A declared non-Unit return is also a control-flow obligation. The compiler accep
 it produces the declared value or provably does not continue; it never repairs reachable
 fallthrough with an ABI-dependent implicit value.
 
-```text
-Rust
-Zig
-```
-
-The position:
-
-```text
-safer than Zig
-simpler than Rust
-```
-
-Normal code should be safe.
-
-Dangerous code should be isolated.
+Safe code relies on compiler-checked ownership and regions. Raw memory access and native calls
+require an explicit `unsafe` block, keeping the obligations outside those checks visible.
 
 ---
 
@@ -1290,34 +1203,26 @@ Stated by the owner (2026-07-11, the optimization consultation): the ideal is th
 
 Three consequences shape every performance decision:
 
-- **Constraints buy information.** The reason a pipeline can fuse, vectorize, and skip bounds
-  checks is that `map/where/sum` LEAVES the intent standing — a hand-written loop destroys it and
-  forces rediscovery. Every "one way" restriction is a promise kept to the optimizer (and, dually,
-  to the adversarial reviewer: the same legibility that enables optimization makes verification
-  converge).
-- **Data movement before instruction execution.** Align optimizes what is read, in what order,
-  from how few cache lines — before it optimizes how it is computed. The measured wins bear this
-  out: the soa column scan beats Rust 8–10× as a *cache* win, not a SIMD win. Contiguous by
-  default; indirection visible in the type; only needed fields loaded; hot and cold data apart;
-  memory traffic weighed alongside asymptotic complexity.
-- **The benchmark target is a triple.** Align-normal vs Rust-normal vs Rust-expert. Winning every
-  case against Rust-expert is not the bar (both end in the same LLVM); the bar is
-  **Align-normal ≈ Rust-expert at a fraction of the effort** — with the receipts (benches, and
-  eventually the per-build optimization report) checked in.
+- **Preserve operation structure.** `map`, `where` and `sum` identify traversal, selection and
+  reduction before optimization. This gives the compiler direct opportunities for fusion,
+  vectorization and bounds-check elimination.
+- **Measure data movement.** Read order, record width and unused fields affect memory traffic.
+  The recorded SoA column-scan benchmarks attribute their gains to cache use; they do not
+  establish a general speed advantage for the language.
+- **Compare three implementations.** Benchmarks compare ordinary Align, ordinary Rust and tuned
+  Rust. The design target is for ordinary Align to approach the tuned implementation while
+  requiring less source-level optimization. Keep the programs and measurements reproducible.
 
-Speed alone is not the moat — expert Rust catches up. The moat is speed that is **explainable**
-(the compiler says why a loop did or didn't vectorize), **verifiable** (shape tests pin the fast
-form), and **non-regressable** (CI gates on allocation/fusion counts). Fast, and provably so.
+`explain-opt` reports vectorization decisions, IR tests check lowering shapes, and allocation
+owners check explicit resource promises. These checks detect specific regressions; benchmark
+results still depend on the target and workload.
 
 ---
 
 ## The AI philosophy
 
-AI-friendliness is not a feature.
-
-It is a design constraint.
-
-What it avoids:
+Code should be straightforward to generate, read and revise. This constrains the language
+against:
 
 ```text
 complex lifetime systems
@@ -1326,7 +1231,7 @@ multiple paradigms
 excessive abstraction
 ```
 
-What it prefers:
+The priorities are:
 
 ```text
 predictability
@@ -1423,8 +1328,8 @@ An `array<Option<T>>` or `array<array<T>>` would instead need a new composite-el
 element move-out/indexing rules, interface and ABI representation, and generic/pipeline coverage.
 Admitting that larger family merely because the words “recursive array” suggest it would violate
 compiler-friendly restriction and add an unconsumed second failure domain. The smaller closed
-grammar therefore preserves one typed builder and one Drop mechanism while leaving the genuinely
-new array representation for a consumer that needs it.
+grammar preserves one typed builder and one Drop mechanism. A new array representation requires
+a consumer that needs it.
 
 ---
 

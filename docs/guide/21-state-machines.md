@@ -24,7 +24,7 @@ This struct can represent inconsistent states. What should happen if `isConnecte
 
 ## Making Invalid States Unrepresentable
 
-In Align, we use a sum type to explicitly define exactly which states are possible, and we attach only the payload relevant to that specific state:
+A sum type lists the possible states and the data each state carries:
 
 ```align
 ConnectionState {
@@ -83,10 +83,8 @@ fn next(state: ConnectionState, event: Event) -> ConnectionState {
 
 ## Checking and testing transitions
 
-This is a **finite state machine**. Representing it as data and a transition function gives us:
+This finite state machine can be checked and tested in three ways:
 
 1. **Exhaustive cases:** `match` must cover every variant; the compiler rejects a missing arm. A wildcard explicitly handles any remaining cases.
 2. **Testable:** Call `next(state, event)` and check its result without opening a socket.
 3. **Data-Oriented:** We can store an array of thousands of `ConnectionState` in memory and update them in bulk using a pipeline: `states.map(fn s { next(s, ev) }).to_array()`.
-
-The transition logic can now be tested independently and applied to many states through the same pipeline.

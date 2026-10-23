@@ -206,11 +206,12 @@ stream type は parallel element/result または closure/task capture にでき
   オーバーラップ**(理想 ≈ degree)、**同 degree の Rust スレッドプールの 1.01×**(同等)。正確な報告のための
   但し書き（caveat）はベンチマークの README に記載されている(degree とコア数を添えて引用すること)。R6 はこれで完全に満たされた。
 
-## New machinery required
+## 実装の構成
 
-上記の Move 型 + net のソケット上での HTTP/1.1 のパース/シリアライズ + コネクションプールの再利用。新しい
-I/O パスは要らない(net の reader/writer を使う)。TLS ラッパーは先送り(HTTPS を塞ぐ)。ヘッダーのパース
-は **R2** に従い memchr 裏打ちのスキャンとする(完全な構造的スキャン/バイト分類器への格上げは後日に記録)。
+上記の Move 型、net ソケット上の HTTP/1.1 のパースとシリアライズ、明示的な
+クライアント接続プールを組み合わせる。実装済みのクライアント TLS ラッパーは
+OpenSSL libssl を使う。サーバー側 TLS は未実装である。ヘッダーのパースには
+**R2** で説明する memchr ベースの走査を使う。
 
 ## Slice breakdown
 

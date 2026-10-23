@@ -6,7 +6,7 @@
 
 ## `unsafe {}` と `raw.*`
 
-`raw` は生ポインタを表す型です。これに触れる手段は6つの `raw.*` 操作に限られており、しかもそれらは **`unsafe` ブロックの内側でのみ** 呼び出しが許可されています。
+`raw` は生ポインタを表す型です。`raw.*` 操作は **`unsafe` ブロックの内側でのみ** 呼び出せます。
 
 ```align
 fn main() -> i32 {
@@ -23,7 +23,7 @@ fn main() -> i32 {
 }
 ```
 
-raw ポインタの操作は `null`、`alloc`、`free`、`load`、`store`、`offset` です。`resource` 型には `resource.from_raw`、`.into_raw`、`.view_from_raw` などの内部表現操作もあり、その型の権限を持つ `unsafe` コードに限定されます。`raw.null()` はネイティブ ABI の null ポインタを作ります。
+raw ポインタの操作は `null`、`alloc`、`try_alloc`、`free`、`load`、`store`、`offset` です。`resource` 型には `resource.from_raw`、`.into_raw`、`.view_from_raw` などの内部表現操作もあり、その型の権限を持つ `unsafe` コードに限定されます。`raw.null()` はネイティブ ABI の null ポインタを作ります。
 
 `raw` 値を**保持して受け渡すこと**は安全です。`raw` は Copy 型なので、そのために `unsafe` は要りません。`raw.*` 操作を行うときにブロックが必要になります。
 

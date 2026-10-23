@@ -27,12 +27,12 @@ Char              i32 (Unicode scalar)
 Unit              void for a function return; it has no ordinary SSA value
 Vec(n, T)         <n x T'>      ← maps directly to LLVM vector type
 Mask(T)           <n x i1>
-Bitset            iN / [iW]
 [T; N]            [N x T]                        inline, contiguous, including as a struct field
 owned array<T>    { T* ptr, i64 len }            owned, contiguous
 Slice(T, _)       { T* ptr, i64 len }            view (Region does not surface in the type)
 Str               { i8* ptr, i64 len }           (+ meta is separate, §6)
-String/Buffer     { i8* ptr, i64 len }            owned headers
+String            { i8* ptr, i64 len }           owned bytes
+Buffer            pointer to runtime buffer state
 Builder           pointer to runtime builder state
 Named(struct)     %struct.S = type { each field }   (layout is §2)
 Named(sum)        { i32 tag, union storage }      tag = declaration ordinal
@@ -53,15 +53,14 @@ structurally equal but distinct LLVM types for one Align type makes `insertvalue
 arguments ill-formed; #670 did exactly that for nested tagged values and it went unnoticed until
 #730 made `--rt-lto`, whose merged-module verifier was the pipeline's only one, the default.
 
-Plan 71 PR 1 replaces the current flattened tagged bodies with one explicit tag
+[Plan 71](71-aggregate-layout-transport-drop-state-plan.md) replaced flattened tagged bodies with one explicit tag
 and max-variant union storage. The storage has the maximum payload size and
 alignment; construction writes only the active payload, and projection and Drop
 switch on the tag before accessing it. Inactive bytes and padding are
 unspecified and unobservable. Unit and other zero-sized, Drop-free payloads
 have explicit omitted mappings and synthesize their valueless/empty result
-without storage. There is no niche representation. Until that PR
-lands, the implementation still uses the older flattened bodies; plan 71 is the
-authoritative replacement contract and owns the transition matrix.
+without storage. There is no niche representation. Plan 71 owns the representation,
+transport and cleanup contract and its regression matrix.
 
 ### Target-selected indirect results
 
@@ -581,9 +580,13 @@ codegen adds a defensive rejection for a
 direct `ArenaHandle` in handcrafted `ParMapParallel` and `ParMapReduce` MIR before context layout,
 kernel/global publication or a runtime declaration/call; malformed nested function environments
 belong to the earlier checked-HIR gate rather than an opaque MIR guess.
-A chunk source is an owned array of borrowed `{ptr,len}` slice headers, so the same typed
-loop passes one `slice<T>` value to the chunk function and the caller drops the header buffer after
-the synchronous runtime call. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses
+A materialized chunk source is an owned array of borrowed `{ptr,len}` slice headers;
+the caller drops that header buffer after the synchronous runtime call. An immediate,
+stage-free `chunks(...).par_map(...)` source selected for range materialization or
+direct integer reduction instead derives each slice header inside the kernel and
+allocates no header array. Named or escaping chunk values and unsupported staged
+forms retain materialized headers. [Plan32 §11](32-post-xml-consolidation-plan.md#11-o0--virtual-chunks-for-direct-explicit-parallelism)
+owns this boundary. For `ParMapReduce`, the typed loop keeps an integer accumulator, uses
 plain wrapping addition, and stores one partial at the range output pointer; the runtime combines the
 partials and returns the result bits. Primitive-scalar length-preserving `map` stages are emitted in
 the same ordered range kernel. Callable primitive-scalar `where` stages emit a count kernel and a
@@ -619,8 +622,8 @@ no generic parallel-reduce lowering in the current surface. The ABI is in `06`.
 
 ```text
 - generate DWARF/CodeView line info from Span (align_span). introduce at least step-debug-capable level in stages across M
-- traps such as divide-by-zero (03/draft §5): to a runtime abort (align_rt_panic). message + location
-- overflow defaults to wrap, so no check is emitted (optionally insert a check in dev builds only)
+- traps such as divide-by-zero (03/draft §5): operation-specific runtime entries such as align_rt_div_fail print a diagnostic and abort
+- integer overflow wraps in every profile; checked and saturating operations are explicit
 ```
 
 ---

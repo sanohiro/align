@@ -48,7 +48,7 @@ Group by one field, fold another.
 
 **Q6.** May `group_by` stand alone — grouping now, aggregating later?
 
-**A6.** No — same law as chapter 5: a bare `group_by` is an unfinished sentence (a hidden table of pieces). Say what to fold, in the same breath.
+**A6.** No. As in chapter 5, the expression needs an ending. Follow `group_by` immediately with the aggregate to compute.
 
 ---
 

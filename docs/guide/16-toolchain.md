@@ -180,17 +180,22 @@ Every check and build runs the lint suite. There is no per-file suppression surf
 unhandled Result        handle it with ?, match, else, or a binding
 ```
 
-**Warnings** expose deterministic costs without blocking a build:
+**Warnings** report conversions, avoidable storage and unused imports without blocking a build:
 
 ```text
 lossy conversion        an `as` that can discard information
 huge struct copy        a by-value copy larger than about two cache lines
-unnecessary heap        a narrow allocate-then-immediately-read shape
+unnecessary heap        a box read through `.get()` that never escapes
+intermediate array      `.to_array().sum()` when a fused sum can avoid storage
 wasteful default        a large literal array using a wider inferred element than needed
 unused import           an imported capability unused by that file
 ```
 
-These warnings identify costs and conversions at specific source lines. Check whether a different data layout or operation would address them. If you keep a performance warning, use `explain-opt`, `size`, and a representative benchmark to measure the effect.
+Warnings identify the relevant source lines. Check whether a different operation
+or data layout would address the issue. A performance warning is a reason to
+measure with `explain-opt`, `size`, and a representative benchmark; it does not
+prove a runtime regression. General loop-allocation, clone and indexed-loop
+warnings are not implemented.
 
 ## Tests with `core.test`
 

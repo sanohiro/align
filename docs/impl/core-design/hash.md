@@ -7,10 +7,9 @@ ownership and effect classification, error policy, pitfalls, and related tests.
 
 ## Overview
 
-Non-cryptographic hashing over byte views (draft §18.1): one canonical mixer (wyhash, the
-`align_hash` crate), one free-function surface. There is deliberately **no `Hash` trait** — you
-hash bytes, not arbitrary values; a value's byte view is the caller's explicit business. This
-file also records the scalar-math method surface (small enough to not warrant its own file).
+Non-cryptographic hashing over byte views (draft §18.1) uses wyhash from the
+`align_hash` crate. Callers supply an explicit byte view; there is no `Hash` trait
+for arbitrary values. This file also records the scalar-math methods.
 
 ## Signatures (verified)
 
@@ -23,6 +22,7 @@ x.abs()                          // signed int / float; identity on unsigned
 a.min(b) / a.max(b)              // pairwise; int = llvm.{s,u}min/max, float = NaN-propagating minimum/maximum
 x.sqrt() / .floor() / .ceil() / .round() / .round_even() / .trunc()   // float-only; round = ties away from zero
 x.exp() / .exp2() / .log() / .log2() / .log10()     // float-only; also lane-wise on float vectors
+x.expm1() / .log1p() / .sin() / .cos(), y.atan2(x) // same float scalar/vector type; atan2 takes y then x
 b.pow(e)                         // float-only
 fma(a, b, c)                     // free builtin; float scalar or float vector; one rounding
 ```
@@ -67,7 +67,12 @@ None — values in, values out.
   cross-target bit-identity promise, visibility of pre-instruction-selection
   scalarization, and a warning that retained provider-less IR may still
   scalarize later. Final machine SIMD requires object inspection.
-  Trigonometric functions remain unavailable.
+- `expm1`/`log1p` use width-exact scalar libm calls, including per-lane vector
+  fallback ([Plan234](../234-cancellation-sensitive-math.md)). `sin`/`cos`/`atan2`
+  use LLVM scalar/vector intrinsics ([Plan235](../235-trigonometric-math.md)).
+  All are Pure, allocate no Align storage, and retain the target math accuracy
+  and vectorization limits above. `atan2` requires exactly matching operand
+  types, with no scalar broadcast, and returns radians in [-pi, pi].
 - `core.bitset` (§18.1 neighbor) — not implemented; bit work uses integer operators. Its layout
   question is tied to packed-bool soa columns; settle together.
 

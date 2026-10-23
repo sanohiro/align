@@ -210,11 +210,12 @@ the rest of std already follows. Concretely:
   honest-reporting caveats in the bench README (quote with degree + core count). R6 is now met in
   full.
 
-## New machinery required
+## Implementation components
 
-Move types above + HTTP/1.1 parse/serialize over net sockets + connection pool reuse. NO new I/O
-path (net's reader/writer). TLS wrapper deferred (blocks HTTPS). Header parsing = memchr-backed
-scan per **R2** (the full structural-scan/byte-classifier upgrade recorded for later).
+The implementation combines the Move types above, HTTP/1.1 parsing and
+serialization over net sockets, and explicit client connection pooling.
+The shipped client TLS wrapper uses OpenSSL libssl; server-side TLS remains
+deferred. Header parsing uses the memchr-backed scan described in **R2**.
 
 ## Slice breakdown
 

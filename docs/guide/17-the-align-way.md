@@ -31,7 +31,7 @@ Consider `soa<T>` when a hot path scans a few fields across many records. `to_so
 
 ## Choose between data parallelism and tasks
 
-Use `par_map` when the per-element function is expensive; measure first, because a vectorized sequential pipeline may be faster. Its callable must be Pure and cannot mutate captured backing. Use `task_group`/`spawn` for independent jobs, including I/O: tasks may be Impure, but captured views remain read-only until the group joins. Use `wait()` for primitive results and `wait()?` to propagate fallible task results. Both forms enforce capture and lifetime rules without user-written purity annotations.
+Use `par_map` when the per-element function is expensive; measure first, because a vectorized sequential pipeline may be faster. Its callable must be Pure and cannot mutate captured backing. Use `task_group`/`spawn` for independent jobs, including I/O: tasks may be Impure, but captured views remain read-only until the group joins. Use `wait()` when no task returns `Result`, and `wait()?` to propagate fallible task results. After a successful wait, `.get()` reads a Copy result or transfers an owned result once. Both forms enforce capture and lifetime rules without user-written purity annotations.
 
 ## Let the compiler see the shape
 

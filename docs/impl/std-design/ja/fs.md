@@ -27,7 +27,7 @@ receiver は共有借用、入力の借用は呼び出し中だけ。実 UID/GID
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20` として merge）。align-llm の adoption gate は未完了。
 > Request 18 の retained-root regular-file access は実装済みである。Request 55 の retained-root
 > single-link open も実装済みであり、align-llm 側の adoption は外部作業として残る。Request 56 の
-> private temporary-directory lifecycle は実装済みであり、release と align-llm 側 adoption が残る。
+> private temporary-directory lifecycle は実装済みである。利用側の導入状況は外部の request register で管理する。
 
 ## 既存バッファへの範囲指定読み込み
 

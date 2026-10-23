@@ -1,9 +1,8 @@
 # std.time wire formats and path encoding
 
-This ledger owns the cloud prerequisite selected on 2026-09-08 after the
-post-XML and consumer-boundary investigations. One implementation PR delivers
-the complete named-format family and slash-preserving encoding. `pkg.s3`
-and SigV4 are the next consumer; this capability performs no network work.
+This ledger defines the implemented named time formats, their parsers, and
+slash-preserving path encoding. The shipped `pkg.s3` signer uses these
+operations for SigV4. The operations themselves perform no network I/O.
 
 ## Public contract
 

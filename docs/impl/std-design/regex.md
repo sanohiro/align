@@ -2,14 +2,11 @@
 
 > 🌐 **English** · [Japanese](./ja/regex.md)
 
-Status: **COMPLETE 2026-07-24** — the first slice (2026-07-23) plus the whole second surface
-(find_all / split / replace / replace_all / captures / group_count / group_index / caps.group) are
-shipped, built, tested, and IR-verified. `regex` 1.13.1 in the runtime archive; `regex_tests` +
-`std_regex.rs` cover every operation (spans, Unicode offsets, empty-match termination, split empty
-fields, `$`-expansion + named groups, non-participating groups, out-of-range abort, Move/Drop
-soundness across `block`/`if`/`match`/loop). `clippy -D warnings` clean. Nothing regex-shaped remains
-deferred except the adjacent extras noted below (captures-iterator, closure-callback replace,
-`rx"..."` literals) — none has a consumer yet.
+Status: **implemented 2026-07-24**. Both surfaces below ship, including iteration,
+replacement, splitting and capture access. The runtime archive contains `regex`
+1.13.1; `regex_tests` and `std_regex.rs` cover the operations and their ownership
+and error behavior. Capture iteration, callback replacement and `rx"..."`
+literals remain outside the implemented surface.
 
 ## Placement and goals
 
@@ -97,9 +94,8 @@ runtime archive.
 
 ## Second surface — iteration, replacement, split, captures (design locked 2026-07-24)
 
-The deferred features all ship in their ideal form on existing plumbing; **no new
-language-capability gate is required**, and only `captures` adds one small opaque Move handle type
-(mechanically identical to the `regex` handle itself).
+These operations use the existing compiler and runtime support. `captures`
+adds an opaque Move handle with the same ownership model as `regex`.
 
 ```text
 re.find_all(text: str)               -> array<regex_match>     // owned Move; leftmost, non-overlapping

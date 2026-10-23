@@ -26,6 +26,8 @@ v.min() / v.max()                -> T            // horizontal reduce
 a.min(b) / a.max(b)              -> vecN<T>      // element-wise
 v.sqrt()/abs()/floor()/ceil()/round()/round_even()/trunc()    // per-lane float math
 v.exp()/exp2()/log()/log2()/log10()             // per-lane float math; may scalarize
+v.expm1()/log1p()                             // per-lane, width-exact scalar libm calls
+v.sin()/cos(), y.atan2(x)                      // per-lane radians; atan2 operands have the same type
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
 select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
@@ -53,10 +55,20 @@ MIR producer validator alike, so no layer can disagree about a blend.
 
 One vector operation does not promise one machine instruction: lane type, width and target
 determine whether LLVM selects vector instructions, multiple instructions or scalar code.
-The five elementary functions above reach LLVM as vector intrinsics. Use
+`exp`, `exp2`, `log`, `log2`, `log10`, `sin`, `cos` and `atan2` reach LLVM as vector intrinsics. Use
 `emit-llvm --stage optimized` and `explain-opt` to inspect their disposition before instruction
 selection; retained vector IR without a provider can still scalarize later. Inspect the emitted
 object to establish final machine SIMD. [Plan 75](../75-portable-math-plan.md) owns this boundary.
+
+`expm1` and `log1p` use width-exact scalar libm calls for each lane; LLVM 22 has
+no corresponding vector intrinsic. `explain-opt` reports this fallback.
+`x.expm1()` and `x.log1p()` avoid the cancellation caused by first computing
+`exp(x) - 1` or `log(1 + x)` at the receiver width. `y.atan2(x)` takes an exactly
+matching vector, without scalar broadcast, and returns angles in radians in
+[-pi, pi]. These methods are also available on scalar f32/f64. No universal ULP
+bound or cross-target bit identity is promised. Exact special-value rules and
+native qualification are in [Plan234](../234-cancellation-sensitive-math.md)
+and [Plan235](../235-trigonometric-math.md).
 
 Integer vectors also support lane-wise `&`, `|`, `^`, `<<`, `>>` and unary `~` for
 all signed/unsigned 8/16/32/64-bit elements and all four vector widths. Binary

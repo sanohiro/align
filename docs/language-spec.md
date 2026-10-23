@@ -388,8 +388,8 @@ loop with that value (bare `break` = `()`); all breaks in one loop unify like `m
 `break` value obeys the return-escape rule, so it may not borrow a per-iteration local (`.clone()`
 to carry one out); a `break` lexically inside an `arena {}` / `task_group {}` **nested in the loop**
 is rejected today — restructure so the region ends before the `break`.
-The pipeline owns the data path; `loop` owns the control path (EOF pumps, retry, convergence) —
-walking an array by index inside a `loop` is a lint. Recursion stays legal for recursive problems
+Pipelines are the collection-traversal idiom; `loop` serves sequential control (EOF pumps, retry,
+convergence). An index-walk warning is planned but not implemented. Recursion stays legal for recursive problems
 (parsers, trees) but is not iteration: no tail-call optimization is guaranteed. See `draft.md` §4
 "Loop".
 
@@ -913,7 +913,9 @@ inspection rules; `explain-opt` reports these operations using the existing
 three-state visibility contract.
 
 `array<T>` is row-major (array-of-structs); `soa<T>` is the explicit column-major (struct-of-arrays)
-layout, so a field-wise pipeline reads contiguous values from the selected columns.
+layout, so a field-wise pipeline reads contiguous values from the selected columns. A `mut` SoA
+view supports scalar/`str` field stores and whole-row replacement. Stored `str` descriptors retain
+their input lifetime; a shorter-lived view cannot be stored into longer-lived columns.
 Build one with `.to_soa()` (transpose an `array<Struct>`) or decode JSON into one
 (`s: soa<User> := json.decode(d)?` counts the rows, allocates the columns, and fills them directly
 without an AoS intermediate or transpose), both arena-allocated. `json.decode`'s field contract is strict and
@@ -1641,11 +1643,11 @@ The official formatter is **mandatory**. It normalizes only meaningless variatio
 placement, trailing commas, alignment — and deliberately does not force the one-line versus
 multi-line choice.
 
-The standard lint set is twelve checks: allocation in loop, huge struct copy, unnecessary clone,
-unnecessary heap, intermediate array before sum, unhandled `Result`, branch in hot loop, string re-scan, implicit copy, lossy
-conversion (narrowing / float→int / wide-int→float / `char`-narrowing `as`), wasteful default type
-(a large literal array left at the `i64`/`f64` default), and index-walk in loop (walking an array by
-index inside a `loop` instead of writing a pipeline). (`draft.md` §16.)
+Implemented checks cover huge struct copies, unnecessary heap allocation for immediate reads or
+non-escaping read-only boxes, intermediate arrays before sum, unused imports, lossy conversions,
+and wasteful default array element types. Discarding a `Result` as a statement is a compile error.
+Allocation-in-loop, unnecessary-clone, branch-in-hot-loop, string re-scan, general implicit-copy
+and index-walk-in-loop warnings remain deferred. (`draft.md` §16.)
 
 An immediate numeric `.to_array().sum()` without intervening stages emits
 structural advice at the materializing source expression. Named/indirect arrays
@@ -1758,8 +1760,10 @@ Fixed primitive fields add no child allocation or Drop obligation. A record whos
 size is zero retains that exact stride: heap construction/growth allocates no element payload,
 push counts initialized values without reading bytes, and freeze returns an array with that
 logical length. Counts and bounds remain checked. A complete fixed field can be read as an ordinary Copy value, for example
-`shape := values[i].shape`, then indexed or sliced through that local. Direct indexed-parent
-fixed-field operations and additional borrowed-payload admission remain separate. [Plan231](impl/231-fixed-scalar-heap-fields.md) owns this composition.
+`shape := values[i].shape`, then indexed or sliced through that local. [Plan232](impl/232-indexed-fixed-field-values.md)
+also admits direct independent Copy indexing such as `values[i].shape[j]` by taking the complete
+field snapshot before evaluating `j`. Retained indexed-field slices and additional borrowed-payload
+admission remain separate. [Plan231](impl/231-fixed-scalar-heap-fields.md) owns heap-field storage.
 
 R78's request for payload-free enum fields remains deferred/PROPOSED; the
 closed enum-field exclusion above is unchanged. [Plan 56](impl/56-r77-r83-composition-plan.md) records
@@ -2198,7 +2202,7 @@ are consumed verbatim, and last-value-wins remains. Unknown names and wrong-kind
 getters abort; scalar observations borrow synchronously and allocate nothing.
 [Plan181](impl/181-cli-float-occurrences.md) owns exact grammar and closure.
 
-`std.log` is a designed, not-yet-implemented explicit line sink. `log.level` is the Copy closed
+`std.log` is the implemented explicit level-gated line sink. `log.level` is the Copy closed
 order `Debug < Info < Warn < Error < Off`; `log.new(writer, minimum) -> log.logger` consumes the
 writer into one nominal Move owner while preserving its exact descriptor provenance and region. An
 owning writer still closes its fd, a static standard-stream writer still borrows its process fd,

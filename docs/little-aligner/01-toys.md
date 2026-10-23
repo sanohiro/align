@@ -168,7 +168,7 @@ print(y)
 
 **Q22.** Change only `x := 4` to `x := 5`. Now?
 
-**A22.** `16`. Same program shape, other arm. Tiny changes are where reading becomes a habit.
+**A22.** `16`. This time the `else` arm supplies the value.
 
 ---
 

@@ -1,6 +1,6 @@
 # Native process observation and control
 
-Status: **IMPLEMENTING — common child capability and explicit signal subscription**.
+Status: **IMPLEMENTED — common child capability and explicit signal subscription**.
 Baseline: `4cb14895a06e67f32ee72383b53afe72cd8e5555`.
 This ledger owns the common Linux/macOS capability selected from R65. It refines
 [plan 48](48-process-portability-and-lifecycle-plan.md). No administrator account, registered service, privileged helper, VM,

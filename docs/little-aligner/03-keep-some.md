@@ -82,13 +82,13 @@ Which prices are active?
 
 **Q12.** May `where` and `map` share a pipeline?
 
-**A12.** They were made for it:
+**A12.** Yes:
 
 ```align
 items.where(.active).price.map(fn p { p * 108 / 100 }).sum()
 ```
 
-`324` — the active prices, taxed, summed. Read it left to right and it says what it does.
+`324` — the active prices, taxed, summed.
 
 ---
 
@@ -140,7 +140,7 @@ The answer is `[12]`. The second predicate still receives a `Reading`, because p
 readings.where(.valid).value.where(fn x { x > 10 }).to_array()
 ```
 
-Same answer. Now the second predicate receives an `i64`. Choose the order that says the thought most plainly.
+Same answer. Now the second predicate receives an `i64`. Choose the order that makes clear which data each condition tests.
 
 ---
 

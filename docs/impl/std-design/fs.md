@@ -30,7 +30,8 @@ baseline; application tree policy remains application code.
 > `3c2edd2f399c9e2c9551b4227c61b36d6a041e20`). The align-llm adoption gate is
 > pending. Request 18 retained-root regular-file access is IMPLEMENTED. Request 55 retained-root
 > single-link open is IMPLEMENTED; align-llm adoption remains external. Request 56 private
-> temporary-directory lifecycle is IMPLEMENTED; release and align-llm adoption remain pending.
+> temporary-directory lifecycle is IMPLEMENTED. Consumer adoption is tracked in
+> the external request registers.
 
 ## R65 sealed storage contract
 

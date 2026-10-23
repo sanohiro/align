@@ -18,7 +18,7 @@ fn main() -> i32 {
 }                       // scope ends, values are simply gone
 ```
 
-When a struct gets big, passing it by value starts to cost — the compiler warns (`huge struct copy`) past two cache lines. That is your cue to reach for a slice, an arena, or SoA (chapter [11](11-data-oriented.md)) instead of copying.
+Passing a large struct by value copies all its fields. The compiler warns (`huge struct copy`) when the size exceeds two cache lines. Use a shared `borrow` parameter for a helper that only reads it; consider slices or SoA (chapter [11](11-data-oriented.md)) for field-wise collection processing.
 
 ## Move types — ownership in the type
 

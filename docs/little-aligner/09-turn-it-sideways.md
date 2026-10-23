@@ -117,9 +117,9 @@ The parser fills columns as it reads, without an intermediate array of rows. Une
 
 ---
 
-**Q15.** Say the habit.
+**Q15.** What should we remember when we need to scan columns?
 
-**A15.** *When I scan fields in bulk, I turn the data sideways at the door* — `to_soa()`, or `json.decode` straight into `soa<T>` — *and speak in columns from then on.*
+**A15.** Choose the layout before those scans. Convert with `to_soa()`, or use `json.decode` directly into `soa<T>`, then work on its columns.
 
 ---
 
@@ -129,9 +129,9 @@ The parser fills columns as it reads, without an intermediate array of rows. Une
 
 ---
 
-**Q17.** Then what does “at the door” really mean?
+**Q17.** At what point should we choose the layout?
 
-**A17.** Choose the layout once, before the repeated work begins. If JSON is the door, decode into `soa<T>` and avoid constructing a row-shaped middle. If an AoS already exists, transpose only when the coming field-wise passes justify it. Layout is a decision, not a reflex.
+**A17.** Before the repeated work begins. When reading JSON, decode directly into `soa<T>` to avoid an intermediate array of rows. If an AoS already exists, consider whether the coming column scans will repay the conversion.
 
 ---
 
@@ -158,7 +158,7 @@ orders
     .sum()
 ```
 
-Read the shape of it: `map(fn o { … })` is handed a whole **row**, so this pipeline wants AoS — `orders` is an `array<Order>`. Turn it sideways and the compiler stops you, and says why: a whole-struct `map` over `soa<Order>` would gather every column to rebuild the row that SoA just took apart. Sideways you speak in columns instead — bind `s.price` and `s.quantity`, pair them with `zip` (chapter 13), and reduce. Only `where(.field)` survives whole-row on a soa, because filtering by one column is still columnar work (A8).
+`map(fn o { … })` receives a whole **row**, so `orders` here is an AoS `array<Order>`. This form of `map` is rejected on `soa<Order>` because it would gather every column to rebuild each row. With SoA, bind `s.price` and `s.quantity`, pair them with `zip` (chapter 13), and reduce. `where(.field)` also works on SoA: it tests one column without rebuilding the row (A8).
 
 ---
 

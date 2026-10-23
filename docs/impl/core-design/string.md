@@ -1,6 +1,3 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — str / string / builder / template
 
 > 🌐 **English** · [Japanese](./ja/string.md)
@@ -140,8 +137,8 @@ Frame-regioned `str` (owned-structs work).
 - P2 — `str + str` is a settled hard error, not a pipeline-lambda-only rule. Use builder; do not
   weaken it to a lint or revive the stale arena-concat implementation.
 - P3 — `builder.to_string` is the only finisher; adding `finish()` aliases violates One-way.
-- P4 — `eq_ignore_ascii_case` is ASCII-only by name and by design; a Unicode case-fold is a
-  different (locale-infested) feature — reject as out of scope, per non-goals.
+- P4 — `eq_ignore_ascii_case` folds ASCII only. Unicode case folding requires
+  its own library contract and must not change this method's byte semantics.
 
 ## Test anchors
 

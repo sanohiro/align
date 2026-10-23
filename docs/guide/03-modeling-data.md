@@ -47,7 +47,7 @@ fn main() -> i32 {
 }
 ```
 
-Recursive structs (`Node { next: Node }`) are rejected: an inline value cannot contain itself with a finite size. Use indices into separate storage for linked structures. A struct with an owning field (say `name: string`) is legal and turns the whole struct into a Move type; that story is chapter [05](05-memory.md).
+Recursive structs (`Node { next: Node }`) are rejected: an inline value cannot contain itself with a finite size. Use indices into separate storage for linked structures. A struct with an owning field (say `name: string`) is legal and turns the whole struct into a Move type; chapter [05](05-memory.md) covers its ownership rules.
 
 ## Fixed arrays inside records
 
@@ -88,7 +88,7 @@ fn main() -> i32 {
 }
 ```
 
-Construction is qualified — `Shape.Rect(3, 4)`, `Shape.Dot` — so a reader always knows which type a variant belongs to. Payloads are positional. They may be scalars, borrowed `str` views, structs, sums, owned strings, or supported owned arrays. Owned payloads make the whole sum value a Move value; only the live arm is recursively dropped. Multiple owned payloads in one variant must share one allocation mode. Nested tagged payloads such as `Result<Option<T>, E>` work too, reusing the same one error model and one ownership model rather than a second mechanism.
+Construction is qualified — `Shape.Rect(3, 4)`, `Shape.Dot` — so a reader always knows which type a variant belongs to. Payloads are positional. They may be scalars, borrowed `str` views, structs, sums, owned strings, or supported owned arrays. Owned payloads make the whole sum value a Move value; only the live arm is recursively dropped. Multiple owned payloads in one variant must share one allocation mode. Nested tagged payloads such as `Result<Option<T>, E>` follow the same ownership and error rules.
 
 ## `match`
 

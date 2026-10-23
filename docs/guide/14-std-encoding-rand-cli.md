@@ -24,7 +24,7 @@ pub fn main() -> Result<(), Error> {
 }
 ```
 
-The types state the trust boundary. **Encoding** can't fail → returns `string` directly. **Decoding** is parsing untrusted input → returns `Result<buffer, Error>`, and the payload is a `buffer` — raw bytes — because decoded data carries no UTF-8 guarantee; use `.as_str()?` to obtain a validated text view, or pass it to a byte-oriented API. `base64url_*` uses the URL-safe alphabet without padding, and hex decoding accepts both cases.
+Encoding returns an owned `string`. Decoding validates its input and returns `Result<buffer, Error>`. The resulting bytes may not be valid UTF-8; use `.as_str()?` to obtain a validated text view, or pass them to a byte-oriented API. `base64url_*` uses the URL-safe alphabet without padding, and hex decoding accepts both cases.
 
 `encoding.html_escape(data: str) -> string` accepts text; an owned `string`
 auto-borrows. Use `.as_str()?` to validate raw bytes before escaping:

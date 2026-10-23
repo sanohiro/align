@@ -2,7 +2,9 @@
 
 > 🌐 [English](../08-json.md) · **日本語**
 
-`core.json` は JSON テキストと型付きのレコードを相互に変換します。主に使う関数は `json.encode` と `json.decode` の2つです。
+`core.json` は `json.encode` と `json.decode` で JSON テキストと型付きの値を相互に変換します。
+スキーマが未知の場合は、arena を使うドキュメントビュー `json.doc` により、レコード型を
+宣言せずに内容を調べたり、エンコードしたりできます。
 
 ## エンコード
 
@@ -25,7 +27,7 @@ fn main() -> Result<(), Error> {
 出力は入力と外側の arena より長く保持でき、文字列フィールドは自動で escape されます。
 [詳細契約](../../impl/47-json-numeric-contract.md) を参照してください。
 
-内部的には [07](07-strings-and-text.md) 章で解説した文字列 `builder` が使用されており、実行時リフレクションや中間表現（DOM）は一切使用していません。
+型付きのエンコードは [07](07-strings-and-text.md) 章の文字列 `builder` に直接書き込み、実行時リフレクションや中間 DOM を使いません。
 
 ## デコード ― 型は注釈から来る
 
@@ -48,7 +50,7 @@ fn main() -> Result<(), Error> {
 }
 ```
 
-`json.decode<User>(...)` のような呼び出し形式は意図的に排除されています。Align では式の中で型引数を指定する構文をサポートしていないためです。変数への型注釈がパース対象の型を決定し、`?` 演算子と組み合わせることで自然なコードとして読み下せます。
+`json.decode<User>(...)` のように呼び出し側で型引数を書く構文はありません。束縛に対象型を注釈します。`?` を使う場合も、その注釈がデコードの期待型を与えます。
 
 入力の文法エラー、フィールドの欠落、型の不一致、数値の範囲超過は `Err` を返します。
 
@@ -119,6 +121,64 @@ fn main() -> Result<(), Error> {
 
 対応済みの再帰的なレコード構造では、optional なテキストや配列を含めて `str` と `string` を混在できます。`string` はそれぞれのバイト列を所有します。エスケープのない `str` は入力を借用し、エスケープを含む `str` には明示的な外側の arena が必要です。arena がないと、選択されたエスケープ付き `str` のデコードは `Error.Code(1)` を返します。混在する結果は入力と外側の arena の両方に依存します。配列本体を所有していても、借用テキストを所有することにはなりません。どちらの形式も、エンコード結果は独立した所有文字列になります。対応する型とエラー規則の全体は [JSON の設計](../../impl/core-design/ja/json.md)を参照してください。
 
+## スキーマが未知の場合
+
+フィールドの形が決まっている場合は型付きデコードを使います。任意の JSON を扱う場合は、
+arena 内で `json.doc` にパースし、必要な値を選びます。
+
+```align
+import core.json
+
+fn forward_payload(input: str) -> Result<string, Error> {
+    return arena {
+        document := json.doc(input)?
+        payload := document.get("payload")
+        json.encode_bounded(payload, 4096)
+    }
+}
+
+fn main() -> Result<(), Error> {
+    output := forward_payload("{\"payload\": [1e999, null, \"hi\"]}")?
+    print(output)    // [1e999,null,"hi"] — the parse arena is already gone
+    return Ok(())
+}
+```
+
+`get(name)` はオブジェクトのメンバー、`at(index)` は配列の要素を選びます。
+存在しないメンバー、異なるコンテナ型、範囲外の添字は Missing ドキュメントとなり、
+例外を起こさずに探索を続けられます。末端の `as_str()`、`as_i64()`、`as_f64()`、
+`as_bool()` は `Option` を返します。たとえば
+`payload.get("title").as_str() else "untitled"` はデフォルト値を与えます。
+欠落、null、型の違いを区別する場合は `kind()` を使います。
+
+ドキュメントやそのビューを使う間は、入力とパースした arena を生かしておきます。
+オブジェクトの `keys()` と `elems()` は、対応するスライスを外側の arena に実体化します。
+順序と重複キーは元のドキュメントどおりです。エンコードする部分は上の `payload` のように
+名前を付けて束縛します。Missing のエンコードは `Error.Invalid` となりますが、JSON の
+null は有効な値です。
+
+ドキュメントのエンコード結果は、独立した所有文字列です。デフォルトでは構造上の空白を
+取り除き、数値トークン、元の文字列エスケープ、メンバー順、重複を維持します。
+そのため `1e999` も機械の浮動小数点数へ変換せずに転送できます。区切りの空白や文字列の
+再エスケープを選ぶには、ドキュメントと同じ arena 内で明示的な最終引数を渡します。
+
+```align
+options := json.encode_options {
+    space_after_comma: true,
+    space_after_colon: true,
+    reescape_strings: true,
+}
+output := json.encode_bounded(payload, 4096, options)?
+```
+
+3つのフィールドはすべて必須です。options 引数を省略するとすべて false になります。
+再エスケープでは JSON エスケープをデコードし、通常の JSON 文字列エスケープと UTF-8 で
+書き直します。Unicode 正規化や HTML エスケープは行いません。数値トークンは変わりません。
+options はドキュメントのエンコードに使い、型付きエンコードの形式は従来どおりです。
+空白やエスケープを含む全出力バイトが、指定値以下という上限に数えられます。負の上限や
+上限超過は、部分出力を返さず `Error.Invalid` になります。この上限はパース用 arena や
+ネイティブアロケータの追加領域を制限しません。
+
 ## JSON プログラムのかたち
 
-入力時に JSON をレコード型へデコードし、そのレコードをパイプラインで処理して、出力時にエンコードします。こうすると JSON の扱いを入出力部分にまとめられます。主な計算では `soa<User>` や `array<i64>` を使います。処理するデータに合わせてレコード型を宣言してください。
+形が既知の JSON は入力時にレコード型へデコードし、そのレコードをパイプラインで処理して、出力時にエンコードします。こうすると JSON の扱いを入出力部分にまとめられます。主な計算では `soa<User>` や `array<i64>` を使います。スキーマが未知の内容を調べたり転送したりする場合は、ドキュメントビューを使います。

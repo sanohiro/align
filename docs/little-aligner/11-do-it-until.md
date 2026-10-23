@@ -59,19 +59,19 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 **Q6.** May `?` and `loop` share a function, as in Q3?
 
-**A6.** They just did. `?` exits the **function** — any failure returns `Err` out of the whole affair at once. `break` exits the **loop**. Two doors, clearly labeled, never the same door.
+**A6.** Yes. On failure, `?` returns `Err` from the **function**. `break` exits the **loop**. They leave different scopes.
 
 ---
 
 **Q7.** Where is `continue`?
 
-**A7.** There isn't one. To skip to the next round, wrap the rest of the body in an `if`. To exit two loops at once — that inner loop wants to be a function. One door out: `break`.
+**A7.** There isn't one. To skip the rest of an iteration, put that work inside an `if`. To leave nested loops together, put the nested work in a function and use `return`. A `break` leaves its own loop.
 
 ---
 
-**Q8.** You are counting `i` from `0` to `len` inside a `loop`, doing the same thing to `xs[i]` each round. What have you done?
+**Q8.** You are counting `i` from `0` to `len` inside a `loop`, doing the same thing to `xs[i]` each round. How else could you write it?
 
-**A8.** Written a `for` loop in a funny hat. Take it off — that one was `xs.map(...)` all along. The pipeline owns the *data*; `loop` owns the *control*. The specification calls for a lint that says so too — `alignc` does not raise it yet, so for now the habit is yours to keep.
+**A8.** With a pipeline such as `xs.map(...)`. It describes the operation on each element without managing an index. The specification calls for a lint to suggest this rewrite, but `alignc` does not raise it yet.
 
 ---
 
@@ -111,7 +111,7 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 **Q13.** This code counts from zero to `xs.len()` and adds `xs[i]`. Rewrite the thought.
 
-**A13.** `xs.sum()`. If the loop's state is only an index and an accumulator, a reducer was probably waiting underneath it.
+**A13.** `xs.sum()`. When the loop only needs an index and an accumulator, check whether a reducer expresses the same calculation.
 
 ---
 
@@ -123,7 +123,7 @@ The answer-so-far lives in a `mut` local declared *before* the loop; `break tota
 
 **Q15.** A loop reads blocks. For every block, every byte must be transformed. One tool or two?
 
-**A15.** Two shapes, nested honestly: `loop` owns “until EOF”; a pipeline over the block owns “for each byte.” Control on the outside, data flow on the inside.
+**A15.** Two. The outer `loop` reads until EOF; the pipeline inside it transforms each byte in the block.
 
 ---
 

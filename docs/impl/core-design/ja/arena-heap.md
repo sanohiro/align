@@ -1,18 +1,18 @@
-このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
-シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
-
 # core — arena / heap.new / box
 
 > 🌐 [English](../arena-heap.md) · **日本語**
 
 ## Overview
 
-ユーザーから見えるメモリアロケーションの場所は 2 つある（draft §6）。`arena {}`（バッチのライフタイム）と、単一の明示的なアロケーションで arena に常駐する `heap.new` である。メモリモデルのそれ以外の部分（Move 型、region、drop）は言語自体の機能であり、ライブラリではない。このファイルでは、ライブラリとして提供されている機能の表面と、現時点で意図的に厳しく制限されている仕様について扱う。
+`arena {}`、`heap.new` が確保するスカラーボックス、およびそれらの region と escape の
+規則を扱う（draft §6）。arena は複数の確保領域を同じ寿命にまとめる。`heap.new` は
+その arena 内にスカラーのボックスを1つ確保する。通常の所有する string、array、buffer
+には、それぞれの確保と Drop の規則がある。
 
 ## Signatures (verified)
 
 ```text
-arena { … }                 // expression block; all arena allocations freed at }, O(1)
+arena { … }                 // expression block; release its allocations and mappings at }
 heap.new(x)   -> box<T>     // ONE arg; must be inside an arena {}; T = primitive scalar only
 b.get()       -> T          // copy the payload out
 b.clone()     -> box<T>     // deep-copy the box; both remain valid
@@ -21,7 +21,11 @@ b.clone()     -> box<T>     // deep-copy the box; both remain valid
 `out` はcontextualである。`out: region` はcapability parameter名、`out dst: slice<T>` は
 out-mode parameterで、whitespaceではなくtoken lookaheadで区別する。
 
-box の表面はこれで全部である — `.set()` も deref 演算子もない。
+arena の終了時には、各 backing chunk と登録済みのファイルマッピングを解放する。
+バンプ確保した値ごとに解放するわけではないが、処理量は chunk と mapping の数に応じて
+増えるため、一般に O(1) ではない。
+
+box には `.set()` メソッドも参照外し演算子もない。
 
 名前付き region の形式（必須L4、**実装済み**）:
 
@@ -46,7 +50,9 @@ v.clone_in(out)             // view を名前付き arena へコピーする
 
 ## Effects
 
-Pure。arena の確保はバンプアロケーションであり、ここでは OS との直接的なやり取りは発生しない（arena のバッキングページは、検証済みの `noalias`/`nounwind` 属性を持つランタイムアロケータから提供される、#301）。
+Pure。arena の確保と解放はメモリ管理であり、言語上の I/O effect には含まれない。
+ランタイムのアロケータが backing chunk を供給し、個々の確保は通常、その chunk 内の
+バンプカーソルを進める。
 
 ## Errors & aborts
 
@@ -67,7 +73,7 @@ region モデルの参照実装である: `region_of(box) = Arena(depth)`、`reg
 
 ## Pitfalls
 
-- P1 — **unnecessary-heap lint**（#323）は、`.get()` で読み取られるだけで一度も escape しない box に対して発火する。ガイドではこの lint を標準的なものとして教えている。もしある変更によってこの lint が idiomatic なコードに対して発火するようになったなら、間違っているのは lint ではなく変更のほうである。
+- P1 — **unnecessary-heap lint**（#323）は、`.get()` で読むだけで escape しない box を指摘し、スカラー値を直接使うよう勧める。box の lowering を変えるときも、この検出を維持する。
 - P2 — `heap.new(x).get()` は arena に region 付けされたものであり、Move の合成的なオーナー（synthetic-owner）のケースではない（`v: i32 := heap.new(7).get()` は固定されたテストである）。一般的な束縛なしの Move のクリーンアップも現在では合成可能になっているが、それはパスローカルな所有権フラグを通じたものである。これら 2 つのライフタイム機構を混同してはならない。
 - P3 — arena ブロックはネストする。escape チェックを駆動するのは region depth の比較であり、ブロックの同一性ではない。スコープを開く新しい構文（例えば将来の `soa` ビルダー）は、並行する新しい機構を追加するのではなく、depth の仕組みと統合しなければならない。
 - P4 — 新しいライブラリのアロケーションを arena を迂回して行わないこと（ランタイムヘルパー内に隠れた `malloc` など）。ユーザーコードのために実行されるランタイムでのすべてのアロケーションは、arena、オーナー、またはビルダーのいずれかに属していなければならない。「何も隠されていない（nothing hidden）」という audit 表面はこれに依存している。

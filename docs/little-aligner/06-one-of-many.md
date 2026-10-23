@@ -152,7 +152,7 @@ The two zeroes have different meanings even when they share an answer.
 
 **Q15.** May we shorten the last two arms to `_ => 0`?
 
-**A15.** Yes, and today the result is the same. But the explicit arms will force a decision if `Reading` later gains `Stale(i64)`. A wildcard buys brevity by giving up that future question.
+**A15.** Yes. If `Reading` later gains `Stale(i64)`, the explicit arms will require us to handle it. With `_ => 0`, the new variant would return `0` too.
 
 ---
 
@@ -212,7 +212,7 @@ Same answer. Prefer `where(...).count()` when the thought is “which elements?�
 
 **Q20.** What question should we ask before inventing a sum type?
 
-**A20.** “What impossible combination am I trying to make unwriteable?” If the answer is “a reading cannot be Good and Missing at once,” the variants are doing real modeling work. If the states can coexist, they may be fields instead.
+**A20.** “Which states cannot occur together?” A reading cannot be Good and Missing at once, so we give those states separate variants. Properties that can coexist may belong in struct fields instead.
 
 ---
 

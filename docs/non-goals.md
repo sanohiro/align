@@ -1,6 +1,6 @@
 # Align Non-Goals
 
-The following are intentionally not goals.
+These boundaries keep Align focused on data-oriented programs with explicit resource costs.
 
 ## Not a replacement for C++
 
@@ -15,7 +15,7 @@ Align does not optimize for the following.
 ```text
 metaprogramming
 DSL creation
-advanced type wizardry
+user-defined type-level computation
 ```
 
 This includes a **general compile-time execution model** (Zig-style `comptime` / user-defined CTFE
@@ -28,9 +28,7 @@ by user `comptime` code. (Considered and declined in the 2026-06-24 language sto
 
 ## Not OOP-first
 
-Align is not object-oriented.
-
-There is no goal to support the following.
+Align models data with records and sums. It does not provide:
 
 ```text
 class hierarchies
@@ -42,22 +40,20 @@ deep object graphs
 
 ## No runtime magic
 
-What it avoids:
+These operations must remain visible:
 
 ```text
-hidden allocation
-hidden exceptions
-hidden thread creation
-hidden copying
+allocation
+error propagation
+thread creation
+copying
 ```
 
 ---
 
 ## Not async everywhere
 
-Align does not build the language around async/await.
-
-Primary model:
+Data parallelism uses pipelines; I/O concurrency uses structured task groups:
 
 ```text
 map
@@ -70,13 +66,14 @@ task_group
 
 ## No trait complexity
 
-Avoids Rust-style complexity.
+Generic constraints are closed builtin bounds. User-defined trait systems are outside the scope.
 
 ---
 
 ## No template complexity
 
-Avoids C++-style template complexity.
+Generics use type parameters and monomorphization. Macro-based substitution and template
+metaprogramming are outside the scope.
 
 ---
 
@@ -88,17 +85,14 @@ Align is not a garbage-collection-centric design.
 
 ## Not framework-driven
 
-Web frameworks, ORMs, cloud SDKs, and AI SDKs belong to packages.
-
-Not in core.
+Web frameworks, ORMs, cloud SDKs, and AI SDKs belong to `pkg`, outside the language core.
 
 ---
 
 ## Not GPU-only
 
-Align is GPU-compatible.
-
-Not GPU-centric.
+The data-oriented core keeps future GPU execution possible. CPU programs remain primary; a GPU
+backend is not implemented.
 
 ---
 
