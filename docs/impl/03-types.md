@@ -308,7 +308,7 @@ Each named-function parameter has one mode:
 ByValue     existing rule; a Move argument is consumed
 Out         writable non-alias slice destination
 Borrow      shared access; caller retains ownership
-BorrowMut   exclusive access; caller retains ownership and the old generation ends
+BorrowMut   exclusive access; caller retains ownership; replacement ends old owned storage
 ```
 
 For `Borrow`, the callee cannot move, replace, or drop the parameter. A returned view may be tied
@@ -317,12 +317,30 @@ writable bound place. Every other argument is checked, whether its mode is `ByVa
 `BorrowMut`, or `Out`. Direct place overlap or any recursively embedded view, resource reference,
 dependent-resource parent, or aggregate provenance rooted in the invalidated generation rejects
 the call, including two distinct holder aggregates. The check is structural and never recognizes a
-package-specific Row name. The owner's previous
-generation becomes dead before the call; returned views belong to the new generation. An unbound
+package-specific Row name. A possible owned replacement ends the owner's previous
+generation; returned views then belong to the new generation. Copy-element writes
+through a view preserve its backing allocation while invalidating affected byte
+observations. An unbound
 temporary is rejected for either borrow mode. Shared `Borrow` accepts a stable bound Copy or Move
 place; Copy preserves ownership by value but explicit borrow avoids the structural copy while
 retaining the same checked-place and pointer ABI. `BorrowMut` also accepts a writable Copy place so field mutation
 updates the caller instead of a discarded copy.
+
+Plan 240 derives view authority from validated types and modes. Value parameters,
+captures and ordinary results have read-only slice/SoA leaves. Only a top-level
+`BorrowMut`/`Out` view parameter receives writable backing; nested view contents
+remain read-only. Owning headers keep their own write authority. Descriptor-local
+restrictions propagate through projections and materialization without changing
+the backing generation's other observers. A proved no-rebind mutable view retains
+its caller authority; a possible rebind does not.
+
+At each normal exit, including early and error returns, validate temporal
+observations in returned values and mutable output contents. Caller publication
+maps their backing identities to fresh UTF-8/codec observations without reviving
+older observations. Pipeline callbacks and `map_err` use the same result rule;
+`map_err` forwards the Ok branch unchanged. All facts are independently rederived
+for checked HIR. Existing modes and summaries suffice for interfaces; compiler
+executable identity invalidates caches across this change.
 
 The source mode does not expose cleanup transport. Plan 71 derives a
 per-function effect for droppable `BorrowMut`: a body that cannot change

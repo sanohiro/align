@@ -1178,6 +1178,31 @@ headers can still address the same storage. Same-field, ancestor/descendant, and
 conflicts remain errors. Mutation or replacement of one field preserves observations of proved
 independent sibling storage. Plan 65 owns the exact path and backing contract.
 
+Ordinary function boundaries restrict non-owning views (`slice<T>` and SoA).
+Views passed by value, captured by a closure, or returned from a function are
+read-only, including view leaves inside records, sums and collections. A top-level
+view parameter declared `borrow mut` or `out` requires writable backing and may
+write its elements. That permission does not extend to views stored inside those
+elements. Owning arguments and results retain authority over their owned storage;
+passing an owned container does not grant authority over its embedded views.
+Access through a read-only outer view remains read-only through all projections.
+These restrictions belong to each descriptor: returning a view does not make the
+caller's original owner or writable alias read-only.
+
+A mutable view argument keeps its caller authority when the callee is proved not
+to rebind its descriptor. A replaced or possibly replaced view returns read-only.
+Element writes alone do not rebind a descriptor. An ordinary returned view is
+read-only even when its source parameter was mutable; write through the caller's
+owner or pass the selected view as an explicit mutable argument. `mut` on a local
+binding does not grant access to otherwise read-only storage.
+
+Validated text and codec readers must remain valid whenever a function publishes
+them, through a return value or mutable output, including early and `Err` returns.
+The caller tracks their backing bytes. A later write invalidates the readers;
+validating new contents never revives an older reader. Calls, callbacks, and
+separate compilation obey the same rules. Plan 240 records the boundary and its
+consumer evidence; allocation, copying, ownership and Drop are unchanged.
+
 A borrowed pointee remains caller-owned and receives no callee function-exit cleanup. If
 `borrow mut` replaces an owned value, however, the old value's ordinary Drop plan runs before the
 store and the caller's path-local cleanup bit is updated to the replacement's bit. The unchanged

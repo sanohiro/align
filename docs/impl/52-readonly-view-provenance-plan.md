@@ -1,7 +1,8 @@
 # Read-only view provenance
 
 Status: local capability and read-only text-byte origins are implemented.
-Interprocedural capability remains deferred.
+Plan 240 owns ordinary call boundaries and supersedes boundary 2 below with
+structural view authority derived from existing parameter modes and result types.
 
 ## Existing contract and reproduced failures
 
@@ -47,12 +48,11 @@ slice parameter (`docs/open-questions.md`, aggregate constants follow-up).
    producer and checked-HIR replay use the same analysis. This is independently
    useful: it closes direct local laundering without changing interfaces or
    requiring a dormant cross-unit producer.
-2. **Interprocedural writability obligations.** A subsequent capability supplies
-   exact argument-write and result/mutable-output provenance across named,
-   imported and higher-order calls. It needs its own reviewed interface record,
-   unknown-target rule and cache identity. The local capability must not pretend
-   that absence of a known read-only origin proves writable storage. Existing
-   ordinary-call laundering remains explicitly unresolved until this capability.
+2. **Ordinary call boundaries.** [Plan 240](240-call-boundary-view-authority.md)
+   makes value/capture/result view leaves read-only and requires explicit mutable
+   modes for writers. It retains lifetime, source timing, no-rebind and backing
+   identity checks, including validated text and codec observations. This uses
+   existing interfaces rather than transporting correlated permission families.
 3. Resume Request 46 only after its proposed implementation's write authority is
    established. Do not add a new source write path while its underlying view
    safety remains unqualified.
@@ -274,11 +274,12 @@ existing strategy. Both are covered by the revised owner matrices:
   and explicit owned-byte-copy twins.
   Checked-HIR replay includes the same fixed-to-slice producer mutation.
 - Reduce/scan callback results do not inherit a source element's read-only
-  property from a lifetime union. An empty reduce can return its initial
-  accumulator directly, so that local alternative remains. Scan emits only
-  post-callback values. `readonly_origin_accumulator_matrix` covers both
-  terminals, projected sources, writable initial values and the read-only
-  empty-reduce initial value. Initial field paths apply only to static properties:
+  property from a lifetime union. Plan240 additionally makes every callback's
+  returned view leaves read-only. An empty reduce can return its initial
+  accumulator directly, so that local alternative remains; a possible callback
+  result still restricts the joined view. Scan's owned result storage remains
+  writable. `readonly_origin_accumulator_matrix` covers these distinctions.
+  Initial field paths apply only to static properties:
   callbacks may swap fields, so lifetime roots still flatten conservatively.
   The accumulator owner pins the exported two-parameter lifetime union after a
   swapping reducer. Callback writability provenance remains boundary 2.

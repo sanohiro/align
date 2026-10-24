@@ -73,6 +73,14 @@ L2b-a2-am-b1 through am-b4. It is normative for handcrafted checked HIR at the
 HIR-to-MIR boundary. `crates/align_sema/src/hir.rs` remains the Rust storage
 definition; this ledger fixes which stored combinations are producer-valid.
 
+[Plan 240](240-call-boundary-view-authority.md) adds the ordinary call-boundary
+authority check to body-fact replay. Reconstruct read-only value/capture/result
+view leaves from authenticated types and modes, preserve owned-storage authority,
+and require writable backing for explicit mutable/out views. Recompute no-rebind
+effects and temporal observations at every result or mutable-output publication.
+Neither imported permission bits nor producer-supplied observations are trusted.
+These facts are analysis-local; the interface and runtime layouts are unchanged.
+
 “Producer-valid” means that the stored combination can be emitted by semantic
 checking for some source input. Checked HIR does not retain annotation presence,
 original token spelling, or the complete source AST, so this boundary does not

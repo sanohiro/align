@@ -251,6 +251,40 @@ The elements live inside the record. `Table` is Copy because its elements are Co
 
 To see the ownership changes as diagrams, read the guide's [memory chapter](../guide/05-memory.md). It follows Move, borrowing, and a string copied out of an arena.
 
+---
+
+**Q26.** May this function change the first byte?
+
+```align
+fn first(bytes: slice<u8>) -> u8 = bytes[0]
+```
+
+**A26.** It may read it. A value slice parameter is read-only.
+
+**Q27.** Then how do we ask a function to change it?
+
+**A27.** Say so in the parameter:
+
+```align
+fn mark(borrow mut bytes: slice<u8>) {
+    bytes[0] = 65
+}
+```
+
+Give `mark` a mutable view of owned storage. It writes a byte and leaves the view
+in place. You may use the same view for the next call.
+
+**Q28.** What if a function returns that view? May we write through the result?
+
+**A28.** No. Returned views are read-only. The caller's original writable view
+still works. A returned owner, such as an `array<u8>`, owns its storage and may
+be changed.
+
+**Q29.** Could we hide the view in a record to make it writable?
+
+**A29.** No. A view inside a parameter or result follows the same rule. Pass the
+selected view itself to `mark`. We need a mutable parameter.
+
 > **The Eighth Commandment**
 >
 > *One owner at a time. Group values with the same lifetime in an arena. When you need another copy of a string, write `.clone()`.*

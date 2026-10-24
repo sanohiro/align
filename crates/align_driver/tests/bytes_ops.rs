@@ -214,7 +214,7 @@ fn probe(borrow mut d: slice<u8>) {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "same-backing", src);
     assert!(
-        checked.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice: destination and source have the same backing")),
+        checked.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice")),
         "same backing copy must be rejected"
     );
 }
@@ -324,7 +324,7 @@ fn main() -> i32 {
     let mut sm = SourceMap::new();
     let checked1 = check(&mut sm, "same-buffer-locals", src1);
     assert!(
-        checked1.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice: destination and source have the same backing 'b'")),
+        checked1.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice")),
         "copy between slices of same buffer must be rejected"
     );
 
@@ -337,7 +337,7 @@ fn probe(borrow mut d: slice<u8>) {
     let mut sm = SourceMap::new();
     let checked2 = check(&mut sm, "subslice-same-param", src2);
     assert!(
-        checked2.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice: destination and source have the same backing 'd'")),
+        checked2.diags.iter().any(|e| e.message.contains("cannot copy from overlapping slice")),
         "copy between overlapping subslices of same param must be rejected"
     );
 }

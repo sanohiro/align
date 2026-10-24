@@ -331,8 +331,8 @@ complete-field Copy observation. Media AM-R16's independent fixed-field indexing
 is implemented by [Plan232](docs/impl/232-indexed-fixed-field-values.md), including
 chained record fields and an eager Copy snapshot before the inner index. The outer
 receiver's backing must remain live through its read. Retained indexed-field
-slices still require interprocedural authority and lifetime closure; the current
-shared-helper-return witness loses read-only authority in both frontends.
+slices still need their own producer and lifetime closure. Plan240 supplies the
+ordinary-call authority boundary, including shared-helper returns.
 [Plan233](docs/impl/233-c-record-fixed-arrays.md) implements AM-R17's positive
 numeric fixed fields in C records, including raw storage and both native
 by-value ABI families. [Plan234](docs/impl/234-cancellation-sensitive-math.md)
@@ -349,29 +349,25 @@ from implementation gaps; broad scope alone does not justify deferral.
 
 ## Deferred work and capability boundaries
 
-Full K1 and adoption of the parked
-[plan61 implementation](docs/impl/61-interprocedural-view-access-plan.md) and the
-separately parked general aggregate-provenance experiment remain unselected.
-The narrower HIR reuse candidate lacks
-an established finite abstraction for recursive selected view origins;
-whole-parameter lifetime roots lose independent field authority. Known
-interprocedural write-authority and temporal-validation gaps remain.
+[Plan240](docs/impl/240-call-boundary-view-authority.md) implements K1 through
+structural call boundaries: value parameters, captures and returned view leaves
+are read-only; explicit mutable view parameters retain proved writable backing.
+It checks temporal observations at returns and mutable outputs, and preserves
+Request160's retained copy views across loops over independent owned fields.
+Whole/per-unit, cache, native copy and current consumer-module checks cover this
+boundary. Consumer adoption remains external.
 
-The owner's 2026-10-20 direction selects the independent AM-R16 reads first
-and a K1 scope/difficulty assessment before implementation.
-[Plan230's assessment](docs/impl/230-request-follow-up-plan.md#k1-scope-and-difficulty-assessment-2026-10-20)
-separates return/call authority, generation/validation transport, partial-owner
-cleanup and active-payload exclusivity. A finite selected-origin representation
-and a complete cross-unit proof remain the main K1 uncertainties. Neither parked
-implementation is selected. Keep parked source and evidence archived outside the
-active worktree; their adoption is not a prerequisite for independent work.
+The parked [plan61 implementation](docs/impl/61-interprocedural-view-access-plan.md),
+general aggregate-provenance experiment and K1 relational-solver investigation
+remain preserved. Their broader writable-return and correlated permission
+machinery is not selected. Partial-owner cleanup, active-payload exclusivity and
+new native view producers remain separate capabilities.
 
 - Request28's independent Copy typed-builder reads ship under Plan209.
   [Plan210](docs/impl/210-text-builder-byte-views.md) confirms that text-byte
-  views cannot reuse the current summaries: helper returns lose read-only
-  authority. The complete view capability remains behind the interprocedural
-  access prerequisite; this assessment does not resume K1. View-bearing typed
-  elements remain separate.
+  views need a dedicated producer and lifetime contract. Plan240 now preserves
+  read-only authority across helper returns; it does not implement those new
+  builder views. View-bearing typed elements remain separate.
 - [Plan196](docs/impl/196-indexed-array-field-length.md) implements R137's scalar
   `rows[index].ids.len()` observation across stable fixed/dynamic AoS and slice
   bases. The parent remains owned, checked bounds precede the read, and the i64

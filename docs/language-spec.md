@@ -649,6 +649,22 @@ alone do not prove independent backing. Same-field, ancestor/descendant and unkn
 conflicts still reject. Updating a field preserves observations of proved independent sibling
 storage. Plan 65 owns the detailed access contract.
 
+Value parameters, captures and ordinary function results carry read-only
+`slice<T>`/SoA view leaves, recursively through aggregates and collections.
+Top-level `borrow mut` and `out` view parameters require writable backing and
+authorize element writes; embedded views remain read-only. Owning values retain
+authority over owned storage. A read-only outer view restricts every projection,
+including access to an owned element. Authority belongs to the descriptor, so a
+returned alias does not restrict the caller's original writable alias.
+
+A mutable view argument retains its authority only when its descriptor is proved
+unchanged. A possible rebind makes it read-only on return; element writes alone
+do not. Ordinary returned views are always read-only. Validated text/codec readers
+must be valid at every return or mutable-output publication, including early and
+`Err` exits. Later writes invalidate them; a fresh validation never revives an old
+reader. Direct, indirect, callback and imported calls use this same boundary.
+No allocation, implicit copy or runtime permission check is added (plan 240).
+
 `array<T>.truncate(new_len: i64) -> ()` shortens an exclusively accessible dynamic array in place.
 It accepts stable mutable locals and admitted exclusive array/record-field places. The count must
 be in `0..=old_len`; invalid counts abort before Drop or mutation. Removed owned elements are
