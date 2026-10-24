@@ -36104,6 +36104,9 @@ impl<'a> MoveCheck<'a> {
             Ty::StructArray(id, _)
             | Ty::DynStructArray(id, Layout::Aos)
             | Ty::Soa(id) => Some(Ty::Struct(id)),
+            Ty::DynSliceArray(element) => Some(Ty::Slice(prim_to_scalar(element))),
+            Ty::DynFixedArray(element, length) => Some(Ty::Array(element, length)),
+            Ty::DynFixedStructArray(id, length) => Some(Ty::StructArray(id, length)),
             // The id is a symbolic row parameter, not a concrete StructDef index.
             Ty::SoaParam(_) => None,
             Ty::DynStructArray(_, Layout::Soa) => None,
@@ -36202,11 +36205,8 @@ impl<'a> MoveCheck<'a> {
                 }),
             });
         }
-        if formations.is_empty() {
-            return;
-        }
         let context = self.storage_type_context();
-        if let Ok(commit) = self.borrows.storage.try_form_headers(
+        if !formations.is_empty() && let Ok(commit) = self.borrows.storage.try_form_headers(
             ty,
             formations,
             context,
@@ -36221,9 +36221,18 @@ impl<'a> MoveCheck<'a> {
         }
         let boundary = self.call_boundary_view_fact(ty, matches!(mode,
             ast::ParamMode::BorrowMut | ast::ParamMode::Out));
-        if let Some(headers) = self.borrows.headers.get_mut(&local) {
-            Self::restrict_boundary_headers(headers, &boundary);
+        let mut headers = self.local_headers(local);
+        for header in self.call_boundary_header_paths(ty) {
+            if header.kind == StorageHeaderKind::View
+                && boundary.project_path(&header.path).direct.contains(&BorrowRoot::ReadOnly)
+            {
+                headers.leaves.entry(header.path).or_insert_with(|| StorageHeaderLeaf::unknown_typed(
+                    [BorrowRoot::Param(position)].into(),
+                    StorageHeaderDescriptor { ty: header.ty, kind: header.kind }));
+            }
         }
+        Self::restrict_boundary_headers(&mut headers, &boundary);
+        if !headers.leaves.is_empty() { self.borrows.headers.insert(local, headers); }
     }
 
     fn finish_function_tail(&mut self, falls_through: bool) {
@@ -36309,6 +36318,8 @@ impl<'a> MoveCheck<'a> {
                 self.borrows.mutable_backing.insert(local, backing);
             }
             let local_ty = self.f.locals.get(local as usize).map(|local| local.ty);
+            let boundary = local_ty.map(|ty| self.call_boundary_view_fact(ty, matches!(mode,
+                ast::ParamMode::BorrowMut | ast::ParamMode::Out))).unwrap_or_default();
             let tracks_dynamic_storage = local_ty.is_some_and(|ty| {
                 ty.is_array_builder()
                     || matches!(
@@ -36318,6 +36329,7 @@ impl<'a> MoveCheck<'a> {
             });
             if !self.local_may_borrow(local)
                 && !tracks_dynamic_storage
+                && boundary.is_empty()
                 && !matches!(
                     mode,
                     ast::ParamMode::Borrow
@@ -36336,8 +36348,7 @@ impl<'a> MoveCheck<'a> {
             }
             let ty = self.f.locals[local as usize].ty;
             let fact = self.normalize_borrow_fact(ty, BorrowFact::from_direct(roots))
-                .join(&self.call_boundary_view_fact(ty, matches!(mode,
-                    ast::ParamMode::BorrowMut | ast::ParamMode::Out)));
+                .join(&boundary);
             self.borrows.assign(local, fact);
         }
         let mut moved: MovedSet = std::collections::HashSet::new();
@@ -38129,12 +38140,9 @@ impl<'a> MoveCheck<'a> {
         }
         self.borrows.mutable_backing.extend(backing_updates);
 
-        let output_validations = destinations.iter().filter_map(|(index, _, _, _, _, _, _, sources)| {
-            let dependency = sources.iter().filter_map(|source| {
-                validation_argument_backings.get(source.index()).and_then(Option::as_ref)
-            }).cloned().reduce(|left, right| left.join(&right))?;
-            Some((*index, dependency))
-        }).collect::<Vec<_>>();
+        let output_validations = destinations.iter()
+            .map(|(index, mode, _, _, _, _, _, sources)| (*index, *mode, sources.clone()))
+            .collect::<Vec<_>>();
         for (index, mode, _, backing, replacement, observers, retains_contents, sources) in destinations {
             if let Some(argument) = args.get(index) {
                 let mut incoming = self.mutable_retention_fact(
@@ -38223,9 +38231,17 @@ impl<'a> MoveCheck<'a> {
             }
         }
         self.borrows.local_origin_places.extend(preserved_view_origins);
-        for (index, dependency) in output_validations {
-            if let Some(argument) = args.get(index) {
-                self.publish_mutable_output_observations(action_key, index, argument, dependency);
+        for (index, mode, sources) in output_validations {
+            let dependency = sources.iter().filter_map(|source| {
+                let index = source.index();
+                let prior = validation_argument_backings.get(index).cloned().flatten();
+                let current = args.get(index).filter(|_| modes.get(index) == Some(&ast::ParamMode::BorrowMut))
+                    .and_then(|argument| self.current_validation_source_backing(argument));
+                prior.into_iter().chain(current).reduce(|left, right| left.join(&right))
+            }).reduce(|left, right| left.join(&right));
+            if let Some((argument, dependency)) = args.get(index).zip(dependency) {
+                self.publish_mutable_output_observations(action_key, index, argument,
+                    mode == ast::ParamMode::BorrowMut, dependency);
             }
         }
         if self.completion_snapshot_needed(action) {
@@ -39325,13 +39341,40 @@ impl<'a> MoveCheck<'a> {
         )
     }
 
+    fn call_boundary_header_paths(&self, ty: Ty) -> Vec<StorageTypedPath> {
+        let paths = storage_type_paths(ty, self.storage_type_context());
+        let mut headers = paths.headers;
+        // Carriers store dependency headers without an owning header of their own. Their
+        // normalized element paths still cross the same view boundary as ordinary aggregates.
+        for path in paths.carriers {
+            let nested = match self.projected_storage_result_ty(ty, &path) {
+                Some(Ty::DynSliceArray(element)) => vec![StorageTypedPath {
+                    path: Vec::new(), kind: StorageHeaderKind::View,
+                    ty: Ty::Slice(prim_to_scalar(element)),
+                }],
+                Some(Ty::DynFixedArray(element, length)) =>
+                    storage_type_paths(Ty::Array(element, length), self.storage_type_context()).headers,
+                Some(Ty::DynFixedStructArray(id, length)) =>
+                    storage_type_paths(Ty::StructArray(id, length), self.storage_type_context()).headers,
+                _ => Vec::new(),
+            };
+            headers.extend(nested.into_iter().map(|mut header| {
+                let mut prefix = path.clone();
+                prefix.extend(header.path);
+                header.path = prefix;
+                header
+            }));
+        }
+        headers
+    }
+
     /// Ordinary boundaries never infer writable borrowed storage from the caller's value.
     /// Only a top-level explicitly mutable view parameter receives that authority.
     fn call_boundary_view_fact(&self, ty: Ty, mutable_parameter: bool) -> BorrowFact {
         let mut fact = BorrowFact::default();
-        for header in storage_type_paths(ty, self.storage_type_context()).headers {
+        for header in self.call_boundary_header_paths(ty) {
             if header.kind == StorageHeaderKind::View
-                && !(mutable_parameter && header.path.is_empty())
+                && !(mutable_parameter && header.path.is_empty() && self.caller_backed_view_ty(ty))
             {
                 if header.path.is_empty() {
                     fact.direct.insert(BorrowRoot::ReadOnly);
@@ -39366,6 +39409,18 @@ impl<'a> MoveCheck<'a> {
         }).collect()
     }
 
+    fn type_has_validation_bytes(&self, ty: Ty) -> bool {
+        ty_contains_leaf(ty, self.structs, self.tuples, self.enums, self.tagged_types,
+            |ty| match ty {
+                Ty::Buffer | Ty::Soa(_) | Ty::SoaParam(_) => true,
+                Ty::Slice(element) | Ty::Array(element, _) | Ty::DynArray(element) =>
+                    matches!(element, Scalar::Int(_) | Scalar::Float(_)),
+                Ty::DynSliceArray(element) =>
+                    matches!(prim_to_scalar(element), Scalar::Int(_) | Scalar::Float(_)),
+                _ => false,
+            })
+    }
+
     fn validation_source_backing(&self, source: &Expr) -> Option<ByteValidationBacking> {
         let mut result: Option<ByteValidationBacking> = None;
         let roots = self.completed_value_fact(source).flatten();
@@ -39379,12 +39434,15 @@ impl<'a> MoveCheck<'a> {
                 result = Some(result.as_ref().map_or(backing.clone(), |current| current.join(&backing)));
             }
         }
-        if ty_contains_leaf(source.ty, self.structs, self.tuples, self.enums, self.tagged_types,
-            |ty| matches!(ty, Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_) | Ty::Buffer
-                | Ty::Array(..) | Ty::StructArray(..) | Ty::DynArray(_) | Ty::DynStructArray(..))
-                || matches!(ty, Ty::Fn(id) if self.callable_targets.get(id as usize)
+        // A collection of str descriptors is not the bytes those strings validate. Retain its
+        // existing observations above, but create raw-byte dependencies only for byte-capable
+        // storage (including numeric reinterpretations and carriers of slice descriptors).
+        if self.type_has_validation_bytes(source.ty)
+            || ty_contains_leaf(source.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+                |ty| matches!(ty, Ty::Fn(id) if self.callable_targets.get(id as usize)
                     .is_none_or(|targets| targets.is_empty())
-                    || self.completed_headers(source).leaves.values().any(|leaf| leaf.descriptor.is_some())))
+                    || self.completed_headers(source).leaves.values().any(|leaf|
+                        leaf.descriptor.is_some_and(|descriptor| self.type_has_validation_bytes(descriptor.ty)))))
         {
             let backing = self.completed_byte_call_backing(source);
             result = Some(result.as_ref().map_or(backing.clone(), |current| current.join(&backing)));
@@ -39392,10 +39450,24 @@ impl<'a> MoveCheck<'a> {
         result
     }
 
+    fn current_validation_source_backing(&self, source: &Expr) -> Option<ByteValidationBacking> {
+        if !self.type_has_validation_bytes(source.ty) { return None; }
+        let place = Self::mutable_actual_place(source)?;
+        let path = place.path.iter().copied().map(BorrowProjection::StructField).collect::<StoragePath>();
+        let headers = self.local_headers(place.root).project_path(&path);
+        let storage = self.local_borrow_fact(place.root).project_path(&path);
+        let backing = self.local_mutable_backing(place.root);
+        let bytes = self.byte_backing(&headers, &storage, &backing);
+        Some(self.reachable_byte_backing(headers, bytes))
+    }
+
     fn publish_mutable_output_observations(
-        &mut self, action: usize, destination: usize, argument: &Expr, dependency: ByteValidationBacking,
+        &mut self, action: usize, destination: usize, argument: &Expr,
+        by_reference: bool, dependency: ByteValidationBacking,
     ) {
-        let place = Self::mutable_actual_place(argument);
+        let place = Self::mutable_actual_place(argument).filter(|_| by_reference
+            || self.mutable_actual_observes_completion(argument,
+                &self.completed_backing_fact(argument), &self.completed_storage_fact(argument)));
         let prefix = place.as_ref().map_or_else(Vec::new, |place| place.path.iter()
             .copied().map(BorrowProjection::StructField).collect::<StoragePath>());
         for kind in [ByteValidationKind::Utf8, ByteValidationKind::Codec] {
@@ -39412,7 +39484,7 @@ impl<'a> MoveCheck<'a> {
             });
             self.borrows.storage.contents.entries.insert(generation.clone(), MoveValueFact::default());
             let observation = BorrowFact::from_direct([BorrowRoot::Observation(generation)].into());
-            let headers = place.as_ref().map_or_else(|| self.completed_headers(argument),
+            let headers = place.as_ref().filter(|_| by_reference).map_or_else(|| self.completed_headers(argument),
                 |place| self.local_headers(place.root).project_path(&prefix));
             let mut local_fact = place.as_ref().and_then(|place| self.borrows.facts.get(&place.root))
                 .cloned().unwrap_or_default();
@@ -39441,28 +39513,42 @@ impl<'a> MoveCheck<'a> {
     /// A callee has checked its published readers at every normal exit. Map their possible
     /// byte sources independently of lifetime roots; an unresolved source stays unknown.
     fn call_validation_backing(&self, expression: &Expr) -> Option<ByteValidationBacking> {
-        let selection = call_storage_selection(expression, self.named_return_borrow, self.callable_targets);
         let (args, callee): (&[Expr], Option<&Expr>) = match &expression.kind {
             ExprKind::Call { args, .. } | ExprKind::RawCall { args, .. } => (args, None),
             ExprKind::CallFnValue { args, callee } => (args, Some(callee.as_ref())),
             ExprKind::ResultMapErr { result, f } => (std::slice::from_ref(result.as_ref()), Some(f.as_ref())),
             _ => return None,
         };
+        let callable_headers = callee.map(|callee| self.completed_headers(callee));
+        let selection = self.completed_call_storage_selection(expression, args.len(), callable_headers.as_ref());
+        let mutable_parameter = |index: usize| match &expression.kind {
+            ExprKind::Call { func, .. } => self.named_param_modes.get(func)
+                .and_then(|modes| modes.get(index)) == Some(&ast::ParamMode::BorrowMut),
+            ExprKind::RawCall { param_modes, .. } => param_modes.get(index) == Some(&ast::ParamMode::BorrowMut),
+            ExprKind::CallFnValue { callee, .. } => match callee.ty {
+                Ty::Fn(id) => self.fn_types.get(id as usize).and_then(|definition| definition.params.get(index))
+                    .is_some_and(|(mode, _)| *mode == ast::ParamMode::BorrowMut),
+                _ => false,
+            },
+            _ => false,
+        };
         let mut result: Option<ByteValidationBacking> = None;
-        let mut add = |source: &Expr| {
-            if let Some(backing) = self.validation_source_backing(source) {
+        let mut add = |source: &Expr, mutable: bool| {
+            let prior = self.validation_source_backing(source);
+            let current = mutable.then(|| self.current_validation_source_backing(source)).flatten();
+            for backing in prior.into_iter().chain(current) {
                 result = Some(result.as_ref().map_or(backing.clone(), |current| current.join(&backing)));
             }
         };
         for (index, argument) in args.iter().enumerate() {
             if selection.fallback_all || selection.sources.contains(&CallSelectedSource::Argument(index)) {
-                add(argument);
+                add(argument, mutable_parameter(index));
             }
         }
         if let Some(callee) = callee
             && (selection.fallback_all || selection.sources.iter().any(|source| matches!(source, CallSelectedSource::Capture { .. })))
         {
-            add(callee);
+            add(callee, false);
         }
         result
     }
@@ -40359,7 +40445,7 @@ impl<'a> MoveCheck<'a> {
             if let Some(ty) = selected_ty {
                 let boundary = self.call_boundary_view_fact(ty, false);
                 selected.non_storage = selected.non_storage.join(&boundary);
-                let fallback = self.completed_value_fact(recv).live_roots();
+                let fallback = self.completed_value_fact(recv).without_readonly_origin().live_roots();
                 for header in storage_type_paths(ty, self.storage_type_context()).headers {
                     selected.headers.leaves.entry(header.path).or_insert_with(|| {
                         StorageHeaderLeaf::unknown_typed(fallback.clone(),
@@ -40378,15 +40464,47 @@ impl<'a> MoveCheck<'a> {
         selected
     }
 
+    fn completed_call_storage_selection(
+        &self, expression: &Expr, args_len: usize, callable_headers: Option<&ProjectedHeaderFact>,
+    ) -> CallStorageSelection {
+        let mut selection = call_storage_selection(expression, self.named_return_borrow, self.callable_targets);
+        if let Some(callable) = callable_headers {
+            extend_call_storage_selection_from_targets(
+                &mut selection,
+                callable.leaves.keys().filter_map(|path| match path.first() {
+                    Some(BorrowProjection::ClosureTarget(target)) => Some(*target),
+                    _ => None,
+                }),
+                args_len,
+                self.named_return_borrow,
+                self.callable_target_ids,
+            );
+        }
+        if !selection.fallback_all
+            && selection.sources.iter().any(|source| match source {
+                CallSelectedSource::Capture { target, capture } => callable_headers
+                    .is_none_or(|headers| {
+                        let path = [
+                            BorrowProjection::ClosureTarget(*target),
+                            BorrowProjection::ClosureCapture(*capture),
+                        ];
+                        !headers
+                            .leaves
+                            .keys()
+                            .any(|candidate| candidate.starts_with(&path))
+                    }),
+                CallSelectedSource::Argument(_) => false,
+            })
+        {
+            selection.fallback_all = true;
+        }
+        selection
+    }
+
     fn selected_move_call_headers(
         &self,
         expression: &Expr,
     ) -> (ProjectedHeaderFact, bool) {
-        let mut selection = call_storage_selection(
-            expression,
-            self.named_return_borrow,
-            self.callable_targets,
-        );
         let (mut argument_headers, callee) = match &expression.kind {
             ExprKind::Call { args, .. } | ExprKind::RawCall { args, .. } => (
                 args.iter()
@@ -40412,37 +40530,8 @@ impl<'a> MoveCheck<'a> {
         for headers in argument_headers.iter_mut().chain(callable_headers.iter_mut()) {
             headers.erase_readonly_origins();
         }
-        if let Some(callable) = &callable_headers {
-            extend_call_storage_selection_from_targets(
-                &mut selection,
-                callable.leaves.keys().filter_map(|path| match path.first() {
-                    Some(BorrowProjection::ClosureTarget(target)) => Some(*target),
-                    _ => None,
-                }),
-                argument_headers.len(),
-                self.named_return_borrow,
-                self.callable_target_ids,
-            );
-        }
-        if !selection.fallback_all
-            && selection.sources.iter().any(|source| match source {
-                CallSelectedSource::Capture { target, capture } => callable_headers
-                    .as_ref()
-                    .is_none_or(|headers| {
-                        let path = [
-                            BorrowProjection::ClosureTarget(*target),
-                            BorrowProjection::ClosureCapture(*capture),
-                        ];
-                        !headers
-                            .leaves
-                            .keys()
-                            .any(|candidate| candidate.starts_with(&path))
-                    }),
-                CallSelectedSource::Argument(_) => false,
-            })
-        {
-            selection.fallback_all = true;
-        }
+        let selection = self.completed_call_storage_selection(expression,
+            argument_headers.len(), callable_headers.as_ref());
         let mut headers = ProjectedHeaderFact::default();
         if selection.fallback_all {
             for argument in &argument_headers {
@@ -44380,8 +44469,12 @@ impl<'a> MoveCheck<'a> {
     /// reachable-storage effect, unlike a local element store which writes only its selected
     /// collection backing. Freeze the complete finite header graph before any call transition.
     fn completed_byte_call_backing(&self, expression: &Expr) -> ByteValidationBacking {
-        let mut result = self.completed_byte_backing(expression);
-        let headers = self.completed_headers(expression);
+        self.reachable_byte_backing(self.completed_headers(expression), self.completed_byte_backing(expression))
+    }
+
+    fn reachable_byte_backing(
+        &self, headers: ProjectedHeaderFact, mut result: ByteValidationBacking,
+    ) -> ByteValidationBacking {
         let root_authenticated = !result.unknown;
         let mut pending = headers
             .leaves
@@ -47720,7 +47813,7 @@ impl<'a> MoveCheck<'a> {
         if let ExprKind::ArrayMapInto { dst, .. } = &expression.kind
             && let Some(dependency) = self.pipeline_validation_backing(expression)
         {
-            self.publish_mutable_output_observations(Self::expr_key(expression), 0, dst, dependency);
+            self.publish_mutable_output_observations(Self::expr_key(expression), 0, dst, false, dependency);
         }
     }
 

@@ -83,6 +83,85 @@ fn copy_operand_identities_survive_later_rebinding() {
     });
 }
 
+#[test]
+fn completed_call_publications() {
+    owned_fixture::run("completed_call_publications", |_| {
+        for mapped in [false, true] {
+            for joined in [false, true] {
+                for stale in [false, true] {
+                    let parameter = if mapped { "x: i64" } else { "" };
+                    let replacement = format!("read = fn {parameter} {{ bytes.as_str() else {{ \"invalid\" }} }}");
+                    let replace = if joined { format!("if true {{ {replacement} }}") } else { replacement };
+                    let call = if mapped { "input: Result<(), i64> := Err(0); result := input.map_err(read); text := match result { Ok(_) => \"safe\", Err(text) => text }" }
+                        else { "text := read()" };
+                    let write = if stale { "bytes[0] = 255;" } else { "" };
+                    verdict("frozen-callable", "",
+                        &format!("fn main() {{ owner := [(65 as u8)].to_array(); mut bytes: slice<u8> := owner; mut read := fn {parameter} {{ \"safe\" }}; {replace}; {call}; {write} print(text) }}"),
+                        stale.then_some("validated bytes were modified"));
+                }
+            }
+        }
+        for observed in ["first", "second"] {
+            for stale in [false, true] {
+                let write = if stale { "alias[0] = 255;" } else { "" };
+                verdict("frozen-output", "pub fn publish(out target: slice<str>, bytes: slice<u8>, tag: i64) { target[0] = bytes.as_str() else { return } }",
+                    &format!("fn main() {{ owner := [(65 as u8)].to_array(); mut alias: slice<u8> := owner; mut first := [\"initial\"].to_array(); mut second := [\"other\"].to_array(); mut output: slice<str> := first; helper.publish(output, alias, {{ output = second; 0 }}); {write} print({observed}[0]) }}"),
+                    (stale && observed == "first").then_some("validated bytes were modified"));
+            }
+        }
+        for codec in [false, true] {
+            for output in [false, true] {
+                for stale in [false, true] {
+                    let reader = if codec { "codec.batch" } else { "str" };
+                    let validate = if codec { "codec.open(bytes)" } else { "bytes.as_str()" };
+                    let (provider, invoke, observe) = if output {
+                        (format!("import core.codec\npub Holder {{ text: {reader} }}\npub fn publish(borrow mut target: Holder, borrow mut owner: array<u8>) {{ owner[0] = 65; bytes: slice<u8> := owner; target.text = {validate} else {{ return }} }}"),
+                         format!("initial := {validate} else {{ return }}; mut target := helper.Holder {{ text: initial }}; helper.publish(target, owner)"), "target.text")
+                    } else {
+                        (format!("import core.codec\npub fn publish(borrow mut owner: array<u8>) -> Result<{reader}, Error> {{ owner[0] = 65; bytes: slice<u8> := owner; {validate} }}"),
+                         "value := helper.publish(owner) else { return }".to_string(), "value")
+                    };
+                    let write = if stale { "owner[0] = 255;" } else { "" };
+                    let observation = if codec { format!("{observe}.rows()") } else { observe.to_string() };
+                    // The initial output reader has independent storage; the helper installs
+                    // the reader of the mutable owner whose post-call generation is tested.
+                    verdict("post-call-owner", &provider,
+                        &format!("import core.codec\nfn main() {{ mut owner := [(65 as u8)].to_array(); seed := [(65 as u8)].to_array(); bytes: slice<u8> := seed; {invoke}; {write} print({observation}) }}"),
+                        stale.then_some(if codec { "validated codec bytes were modified" } else { "validated bytes were modified" }));
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn carrier_view_boundaries() {
+    owned_fixture::run("carrier_view_boundaries", |_| {
+        for literal in [false, true] {
+            for write in [false, true] {
+                let source = if literal { "\"x\".bytes()" } else { "owner" };
+                let action = if write { "selected[0] = 1" } else { "print(selected[0])" };
+                verdict("returned-chunks", "pub fn chunks(bytes: slice<u8>) -> array<slice<u8>> = bytes.chunks(1)",
+                    &format!("fn main() {{ owner := [(0 as u8)].to_array(); pieces := helper.chunks({source}); mut selected := pieces[0]; {action} }}"),
+                    write.then_some("read-only view"));
+            }
+        }
+        verdict("uncalled-chunk-writer", "pub fn write(pieces: array<slice<u8>>) { mut selected := pieces[0]; selected[0] = 1 }", "fn main() {}", Some("read-only view"));
+        for write in [false, true] {
+            let action = if write { "mut selected := row[0].view; selected[0] = 1" }
+                else { "row[0].number = 1" };
+            verdict("fixed-carrier", &format!("pub Holder {{ view: slice<u8>, number: i64 }}\npub fn change(items: array<[Holder; 2]>) {{ mut row := items[0]; {action} }}"),
+                "fn main() {}", write.then_some("read-only view"));
+        }
+        for stale in [false, true] {
+            let write = if stale { "alias[0] = 255;" } else { "" };
+            verdict("chunk-validation", "pub fn read(bytes: slice<u8>) -> str = bytes.as_str() else { \"invalid\" }",
+                &format!("fn main() {{ owner := [(65 as u8)].to_array(); mut alias: slice<u8> := owner; pieces := alias.chunks(1); texts := pieces.map(helper.read).to_array(); {write} print(texts[0]) }}"),
+                stale.then_some("validated bytes were modified"));
+        }
+    });
+}
+
 fn copy_program(intrinsic: bool, reverse: bool, nested: bool, fresh: bool) -> (String, String) {
     let parameters = if reverse { "borrow mut target: slice<u8>, borrow source: slice<u8>, at: i64" }
         else { "borrow source: slice<u8>, borrow mut target: slice<u8>, at: i64" };

@@ -119,6 +119,10 @@ operations are unchanged.
 | Malformed HIR and native admission | Clear/reinfer/compare the same facts, then retain actual-MIR/native checks. Never rely on a type/mode supplied by an unchecked caller. | Forged mode, missing readonly fact, forged result or effect; cold/hit interface consistency. |
 | Consumer qualification | Copy current source into provider-owned scratch with source hashes. Consumer trees remain read-only. | LLM cursor copy and source parsers; media raster/PNG/tokenizer modules; voice tokenizer/array owners; whole and per-unit checks, native CPU witnesses where available. |
 | Allocation and lifetime parity | Analysis changes no generated data representation or implicit operation. | Reuse exact byte-copy and ownership/Drop counters for touched paths. No new performance promise or benchmark gate. |
+| Frozen callable identity | Return-source selection includes the concrete targets in the completed closure environment, even after compatible function-value assignment. Storage and validation use one selector. | Reassigned and branch-joined validators through direct calls and `map_err`, with fresh/stale reader pairs. |
+| Frozen output destination | `out` and `map_into` publish into the completed descriptor's backing. A subsequently rebound local receives the observation only if it still denotes that backing. `borrow mut` publishes through its referenced post-call place. | Later scalar argument rebinds the output descriptor; stale reads of the original output reject while independent replacement-array reads pass. |
+| Carrier element inventory | Apply the view rule to carrier dependencies as well as ordinary headers, including slice and fixed-aggregate carriers. Distinguish raw numeric backing from storage of already validated reader descriptors. | Chunk parameters/results and mapped validation; literal-backed refusal and reader controls; existing fixed-text-array mutation owners. |
+| Mutable source generations | Fresh publications depend on completed source backing and possible post-call mutable backing. Keep both when a mutable view rebind can leave the original allocation alive. Old observations keep their old identity. | Returned and stored UTF-8/codec readers from a mutable owned array, paired with fresh and stale caller reads. |
 
 One compiler PR must connect formation, caller checks, effects, result publication
 and independent replay. A dormant producer-only change would leave the original
@@ -142,8 +146,9 @@ prototype's relational permission solver.
 The contract is recorded in `draft.md`, `docs/language-spec.md`,
 `docs/design-notes.md`, the Settled ownership/call decisions in
 `docs/open-questions.md`, `docs/impl/03-types.md` and the checked-HIR contract in
-`docs/impl/19-hir-validation-ledger.md`. The memory chapters of `docs/guide/` and `docs/little-aligner/`, together with their Japanese
-mirrors, describe the same rules. Examples
+`docs/impl/19-hir-validation-ledger.md`. The memory chapters of `docs/guide/` and
+`docs/little-aligner/`, together with their Japanese mirrors, describe the same
+rules. Examples
 that intentionally exercise writable value parameters must use the explicit
 mutable mode or become refusal tests; preserved research negatives remain intact.
 
@@ -156,7 +161,8 @@ materialization preserve both through `MoveValueFact::through_reference` and
 `collection_generation_content`. A direct local field replacement installs its
 actual authority; unknown indexed contents retain the conservative default.
 
-`record_value_completion` applies ordinary result authority and establishes new
+`completed_call_storage_selection` uses frozen callable targets for both storage
+and validation. `record_value_completion` applies ordinary result authority and establishes new
 validation observations. `collect_borrow_mut_exit_roots` checks all mutable
 outputs before return; `publish_mutable_output_observations` maps the retained
 backing into the caller. `pipeline_validation_backing` covers callback-produced
@@ -178,6 +184,8 @@ proof.
 | Normal/early/error exits, fresh and stale text, mutable static/dynamic outputs | `call_boundary_mutable_output_observation_matrix`, `call_boundary_returned_observation_matrix`, `call_boundary_published_output_observation_matrix`; driver `imported_publication_domains` |
 | Callback results/captures, `map_err`, mapped output storage | `call_boundary_callback_observation_matrix`, `readonly_origin_accumulator_matrix`; existing task callback owners |
 | Exclusive modes, disjoint inputs, overlapping peers | `call_boundary_exclusive_input_matrix`, `disjoint_field_borrows` |
+| Frozen callable/output identities and mutable-source generations | `completed_call_publications`, including direct/branch/`map_err` and UTF-8/codec result/output pairs |
+| Carrier view leaves and raw bytes versus reader descriptors | `carrier_view_boundaries`, existing `fixed_text_borrow_producer_matrix` and `fixed_text_borrows_execute_and_replay` |
 | Forged modes/effects and independent rederivation | `mutable_access_checked_hir_rejects_forged_facts`, existing readonly checked-HIR replay owners |
 | Retained-copy loop, source timing, imports/generics, whole/per-unit, cache rehydration | `call_boundary_retained_sibling_copy_loop`; driver `call_boundary_views` |
 | Native byte result and unchanged allocation/cleanup | `retained_copy_native_and_cache` checks helper/intrinsic copies at counts 0, 1 and 8 in both frontends; existing `bytes_ops` and ownership owners |
