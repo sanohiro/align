@@ -1161,12 +1161,11 @@ template is sound but a smaller win), `str`/struct elements, and folded-*express
 Record: `draft.md` §3 (Constants) / §12, `docs/language-spec.md`, `docs/design-notes.md` (Memory model v2),
 `impl/02-frontend.md` §3, `impl/13-…` §8.4, `tests/constants_aggregate.rs`, `tests/per_unit.rs`, `tests/cache_codegen.rs`, `align_interface/tests/summary.rs`
 
-**Open follow-up (pre-existing, exposed here):** the read-only-view write check flags *compile-time
-constant* provenance (`ConstArray`, a string literal's bytes) traced within a function. The broader
-call-boundary analogue — a constant or **non-writable arena `mmap` view** laundered through
-an ordinary function result or a plain slice parameter — still needs interprocedural
-buffer-writability provenance. Local mapped-view origins are checked. Plan 52 records the
-separate interface-backed follow-up; absence of a local origin is not proof of writability.
+**Call-boundary rule:** plan 240 closes the ordinary parameter/result path with
+read-only view leaves at value, capture and result boundaries. Mutable view
+parameters require explicit `borrow mut` or `out` and proved writable backing.
+Local mapped-view origins remain checked; absence of a local origin is not proof
+of writability.
 
 ### Bitwise & shift operators (DONE 2026-06-26)
 **Decision: integer operators `& | ^ << >>` + unary `~`, NOT bitset methods.** Bit work on integers
@@ -5361,6 +5360,17 @@ as `clone_in(out)`. The complete surface, interface summary, MIR requirements, a
 order are in `impl/17-library-boundary-prerequisites.md` §§2, 4, and 7.
 
 ### Borrowed parameters and package-defined opaque resources — Settled 2026-07-27
+
+Plan 240 settles view authority at ordinary function boundaries. Value parameters,
+captures and results have read-only slice/SoA leaves, recursively through stored
+contents. A top-level mutable/out view parameter may write proved writable
+backing; that permission does not extend to embedded views. Owning values keep
+authority over their owned storage. Restrictions are descriptor-local and follow
+every projection through a read-only outer view. A proved unchanged mutable view
+keeps its caller authority; a possible rebind returns read-only. Every normal exit
+checks validated text/codec readers in results and mutable outputs. Caller-side
+observations retain byte dependencies, and fresh validation never revives old
+readers. This uses existing modes without new annotations or implicit copies.
 
 Library code may declare `borrow x: T` and `borrow mut x: T` parameters. Shared borrow accepts a
 stable bound Copy or Move place: it preserves caller ownership, avoids a by-value aggregate copy,

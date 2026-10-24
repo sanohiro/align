@@ -98,6 +98,37 @@ sequenceDiagram
 
 These calls return an integer and Unit. A function that returns a view can leave the caller with a reference into `p`; that view remains subject to `p`'s lifetime and mutation rules.
 
+### Writing through a view
+
+A value parameter such as `bytes: slice<u8>` is read-only. Give a writing helper
+an explicit mutable parameter:
+
+```align
+fn mark(borrow mut bytes: slice<u8>) {
+    bytes[0] = 65
+}
+
+fn main() {
+    owner := buffer.filled(4, 0)
+    mut bytes := owner.bytes()
+    mark(bytes)
+    print(bytes[0])    // 65
+}
+```
+
+`mut bytes` allows local updates; it cannot make a string's bytes writable.
+Returned views and captured views are read-only, as are views stored inside a
+parameter's records or collections. An owning array or buffer still owns its
+storage and may be updated. To write through a selected embedded view, pass that
+view itself to a mutable parameter. A returned alias does not change the
+authority of the original local view.
+
+The helper above changes an element and leaves the descriptor alone, so `bytes`
+can be reused for another call or loop iteration. A helper that may replace the
+descriptor leaves it read-only. Text obtained with `as_str()` also depends on
+the bytes: after writing them, validate again before reading text. A fresh result
+does not make an older text view valid again.
+
 ### Moving a complete owned field
 
 A bound record can transfer a complete direct owned field, including an array, nested record or

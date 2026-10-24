@@ -3084,8 +3084,8 @@ fn mutable_retention_in_memory_imports_reject_malformed_records() {
 
 #[test]
 fn mutable_access_changes_interface_identity_and_survives_round_trip() {
-    let read = one("pub fn access(values: slice<i64>) -> i64 = values[0]\nfn main() -> i32 = 0");
-    let write = one("pub fn access(values: slice<i64>) -> i64 { mut alias := values; alias[0] = 9; return values[0] }\nfn main() -> i32 = 0");
+    let read = one("pub fn access(borrow mut values: slice<i64>) -> i64 = values[0]\nfn main() -> i32 = 0");
+    let write = one("pub fn access(borrow mut values: slice<i64>) -> i64 { mut alias := values; alias[0] = 9; return values[0] }\nfn main() -> i32 = 0");
     let read = &read[0];
     let write = &write[0];
     let read_function = read.fns.iter().find(|function| function.name == "access").unwrap();

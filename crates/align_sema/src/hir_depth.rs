@@ -2610,6 +2610,7 @@ mod tests {
                         borrow_mut_place_snapshots: std::collections::HashSet::new(),
                         value_snapshot_frames: Vec::new(),
                         value_snapshot_places: std::collections::HashMap::new(),
+                        completed_origin_places: std::collections::HashMap::new(),
                         reported_invalid_value_actions: std::collections::HashSet::new(),
                         loop_iter_drops: Vec::new(),
                         arena_depth: 0,

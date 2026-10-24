@@ -1,5 +1,20 @@
 # Align Design Notes
 
+Function boundaries make view mutation explicit. A value slice parameter or
+captured view is read-only; a helper that writes uses `borrow mut` or `out`.
+Ordinary returned views are read-only too. This rule removes the need to prove
+correlations between callback identity, descriptor choice and write permission.
+It does not remove lifetime, alias, evaluation-order or validated-byte checks.
+Owned values keep their own storage authority, and descriptor-local restrictions
+do not downgrade a caller's retained writable alias.
+
+The consumer comparison in [plan 240](impl/240-call-boundary-view-authority.md)
+requires no rewrite of the inspected LLM, media or voice modules. Their writers
+already use explicit mutable parameters. LLM's repeated row copy does require
+stable disjoint-buffer identities across loop joins, so the implementation keeps
+that precision. Reacquiring every view inside the loop would add work to the
+source without clarifying its ownership.
+
 Whole-input decompression must not silently accept a valid prefix and discard later bytes.
 `std.compress` therefore concatenates every gzip member or current ordinary/skippable zstd frame,
 validates later checksums and suffixes, and publishes owned output only after complete success.

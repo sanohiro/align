@@ -40,10 +40,12 @@ pub fn value(route: model.Route) -> i64 {
   task_group { task := spawn(fn { copied := route; handler := copied.handler; values := [40, 2]; handler(model.Ctx { prefix: copied.prefix, body: values[..] }) }); wait(); return task.get() }
 }
 "#;
+// Value-view writers are refused at their declaration. This writer changes a
+// local fixed array, preserving callback transport coverage with an admitted body.
 const HELPERS: &str = r#"
 fn read(c: model.Ctx) -> i64 = c.body[0] + c.body[1]
-fn write(c: model.Ctx) -> i64 { mut view := c.body; view[0] = 40; return view[0] + view[1] }
-fn change(values: slice<i64>) { mut view := values; view[0] = 9 }
+fn write(c: model.Ctx) -> i64 { mut local := [c.body[0], c.body[1]]; local[0] = 40; return local[0] + local[1] }
+fn change(borrow mut values: slice<i64>) { mut view := values; view[0] = 9 }
 fn poison(borrow mut rows: [model.Route; 1], values: slice<i64>) -> slice<i64> {
   rows[0].handler = write
   return values
@@ -86,7 +88,7 @@ fn check_modes(stage: &Path, label: &str, body: &str, valid: bool) {
     );
     if !valid {
         assert!(
-            diagnostics.contains("callback") || diagnostics.contains("spawned task"),
+            diagnostics.contains("task callback") || diagnostics.contains("callback may modify shared task backing") || diagnostics.contains("spawned task") || diagnostics.contains("read-only view") || diagnostics.contains("invalidated"),
             "whole {label}: unrelated rejection: {diagnostics}"
         );
     }
@@ -106,7 +108,7 @@ fn check_modes(stage: &Path, label: &str, body: &str, valid: bool) {
     );
     if !valid {
         assert!(
-            diagnostics.contains("callback") || diagnostics.contains("spawned task"),
+            diagnostics.contains("task callback") || diagnostics.contains("callback may modify shared task backing") || diagnostics.contains("spawned task") || diagnostics.contains("read-only view") || diagnostics.contains("invalidated"),
             "per-unit {label}: unrelated rejection: {diagnostics}"
         );
     }
@@ -165,9 +167,9 @@ fn callback_readers_and_request_local_writes_cross_units() {
 }
 
 #[test]
-fn shared_callback_writes_and_replaced_aliases_reject() {
+fn callback_storage_updates_and_captured_view_refusals() {
     owned_fixture::run(
-        "shared_callback_writes_and_replaced_aliases_reject",
+        "callback_storage_updates_and_captured_view_refusals",
         |stage| {
             put(stage, "model.align", TYPES);
             put(stage, "constructors.align", CONSTRUCTORS);
@@ -179,7 +181,7 @@ fn shared_callback_writes_and_replaced_aliases_reject() {
                 ),
                 (
                     "captured-writer",
-                    "values := [40, 2]; view := values[..]; handler := fn c: model.Ctx { change(view); 0 }; rows := [constructors.route(\"/\", handler)]; _ := runner.local(rows[..])",
+                    "values := [40, 2]; view := values[..]; handler := fn c: model.Ctx { mut selected := view; change(selected); 0 }; rows := [constructors.route(\"/\", handler)]; _ := runner.local(rows[..])",
                 ),
                 (
                     "joined-writer",
@@ -214,7 +216,7 @@ fn shared_callback_writes_and_replaced_aliases_reject() {
                     "values := [40, 2]; mut rows := [constructors.route(\"/\", read)]; _ := runner.shared(replaced_view(rows), values[..])",
                 ),
             ] {
-                check_modes(stage, label, body, false);
+                check_modes(stage, label, body, matches!(label, "argument-writer" | "joined-writer" | "known-and-formal-join"));
             }
         },
     );
@@ -256,7 +258,7 @@ fn callback_sources_survive_each_control_carrier() {
                 "row := loop { if values[0] == 40 { break incoming }; break constructors.route(\"/\", read) }",
             ),
         ] {
-            for (callback, valid) in [("read", true), ("write", false)] {
+            for (callback, valid) in [("read", true), ("write", true)] {
                 let body = format!(
                     "values := [40, 2]; incoming := constructors.route(\"/\", {callback}); {carrier}; rows := [row]; _ := runner.shared(rows[..], values[..])"
                 );
@@ -381,7 +383,7 @@ fn cached_constructor_effects_follow_private_callback_edits() {
                 let diagnostics = align_driver::format_diagnostics(&sources, &build.diags);
                 assert_eq!(!build.diags.has_errors(), valid, "{label}: {diagnostics}");
                 if !valid {
-                    assert!(diagnostics.contains("callback"), "{label}: {diagnostics}");
+                    assert!(diagnostics.contains("read-only view"), "{label}: {diagnostics}");
                     continue;
                 }
                 assert_eq!(build.units.len(), 4, "{label}: complete module graph");
