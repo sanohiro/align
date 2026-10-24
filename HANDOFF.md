@@ -8,14 +8,23 @@ record adoption of that compiler on 2026-10-25, within their named native
 acceptance boundaries. Do not restart the relational-solver investigation or
 interpret its older handoff as unfinished production work.
 
-The owner's 2026-10-25 instruction selects the remaining assessed work except
-R132 and R142: AM-R24, AM-R22, R28 text-builder views, AM-R16/R137 retained
-indexed-field views, AM-R23 and AM-R07, plus evidence-dependent R37/R49/R80
-investigations. Start with AM-R24, then bounded HTTP writes, read-only views,
-connection observation and external writable reads; adapt order to proven
-dependencies. Complete verification, review and merge for each capability before
-starting the next. Missing evidence is not a completed fix. Consumer adoption
-remains external, and this batch does not select the wider long-term backlog.
+The owner ended this machine's implementation session after AM-R24 on
+2026-10-25. The remaining work moves to another machine; do not start another
+capability here. AM-R24 is delivered by #1410:
+raw-loaded Copy C records with inline numeric fixed arrays can return directly
+or through a bound local. Genuine slices borrowing local inline storage still
+reject. No language, ownership or ABI contract changed. Semantic, native C,
+whole/per-unit/cache owners, independent review, the bounded gate, Clippy and
+local PostgreSQL verification passed. The final
+`cargo build --release --workspace` also passed; no versioned release was
+requested. Consumer adoption remains pending.
+
+The earlier authorization selects the remaining assessed work except R132 and
+R142. The queue below is continuation scope, not work completed in this session.
+Missing evidence or a passing older provider PR is not a completed fix. The wider
+long-term backlog is unselected. Reconcile current main and all three consumer
+registers on the receiving machine before implementing; finish each independently
+useful capability through its normal review, verification and merge boundary.
 
 Preserve the existing language specification where practical. The owner permits
 a small specification revision when it substantially reduces compiler complexity
@@ -65,24 +74,24 @@ also remain parked. Broader writable returns are not a queued requirement.
 
 ## Selected work and remaining prerequisites
 
-The selected batch follows the scope above; R132/R142 below are explicitly
-excluded. [Plan230](docs/impl/230-request-follow-up-plan.md) retains the historical
-request reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
+The remaining batch follows the scope above; R132/R142 below are explicitly
+excluded. AM-R24 is complete at the provider boundary.
+[Plan230](docs/impl/230-request-follow-up-plan.md) retains the historical request
+reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
 
-- Media AM-R24 reports refusal to return a raw-loaded Copy C record containing
-  fixed numeric arrays. Its register includes a reduced source and explicit
-  reconstruction control. Recheck both on current main before classifying the
-  repair; the recorded failure uses an older compiler. Preserve genuine borrowed
-  escape refusals and qualify whole/per-unit/native return transport.
 - Media AM-R22 requests bounded, HEAD-correct HTTP response writes. AM-R23
   requests non-consuming connection observation before response. Both are
-  non-blocking drafts with current workarounds; the register still lacks shared
-  reproducer URLs. Exact deadline, half-close, connection reuse and cleanup
-  contracts precede implementation. Connection observation does not itself
+  non-blocking drafts with current workarounds. The register's older missing-URL
+  note is supplemented by the private committed-source location below; no timed
+  HEAD or connection-observation acceptance is claimed. Exact deadline, half-close,
+  connection reuse and cleanup contracts precede implementation. Connection observation does not itself
   deliver model cancellation or GPU cleanup.
 - R28 text-builder byte views and AM-R16/R137 retained indexed owning-field views
   still need dedicated producers and lifetime/invalidation proofs. Plan240
   supplies ordinary-call read-only authority; it does not deliver these views.
+  Plan210 rejected its original strategy; refresh its ledger and independently
+  review the new producer/invalidation boundary instead of treating it as an
+  already-approved implementation plan.
   Independent Copy builder reads, indexed Copy reads and scalar lengths already
   ship. Consult Plans209/210, 232 and 196/205 without reopening those deliveries.
 - R132 exclusive owned-subrecord borrowing remains unshipped and is reobserved
@@ -97,10 +106,65 @@ request reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
   producer, initialization/bounds/overlap/resource-lifetime proof and matching
   positional-read semantics. K1 and fallible raw allocation do not supply these
   permissions or establish a pinned-memory speedup.
-- LLM R37/R49/R80 remain evidence-dependent investigations under Plan230. Obtain
-  their exact source/log packets and recheck current main before choosing a fix;
-  do not infer closure from K1. R37 reports roughly 79.5 GiB peak memory at its
+- LLM R37/R49/R80 remain investigations under Plan230. Their historical
+  source/log packet was found and authenticated on 2026-10-25 (below); recheck
+  current main before choosing a fix; do not infer closure from K1. R37 reports roughly 79.5 GiB peak memory at its
   recorded revision, so reproduction needs explicit resource limits.
+
+### Recommended order and rough difficulty
+
+These are pre-design scope estimates, not delivery-time commitments. K1's
+completed call-boundary authority is a prerequisite to reuse, not a solver port
+to repeat. No implementation or new public-contract design below was started.
+
+| Order | Capability | Rough scale / difficulty | First closure decision |
+| --- | --- | --- | --- |
+| 1 | AM-R22 bounded HEAD-correct responses | Medium / medium | Specify one finite logical write budget, partial-write cleanup and eligible keep-alive reuse; reuse existing timed native write machinery. API spelling is not selected. |
+| 2 | R28 text-builder byte views | Medium to large / high | New read-only producer plus invalidation on write/growth/build/move/replacement/Drop. Ordinary-call authority comes from Plan240; view-bearing builder elements are separate. |
+| 3 | AM-R16/R137 retained indexed fields | Large / high | Preserve parent generation, selected field backing and bounds across readers and returns without an implicit Copy snapshot. Use Plans232/196/205. |
+| 4 | AM-R23 connection observation | Medium / medium to high | Define exactly what a non-consuming bounded observation can establish, including half-close, buffered/pipelined data, errors and races; cancellation policy stays in the consumer. |
+| 5 | AM-R07 external writable positional reads | Large / high | Close exclusive native-view creation, initialization, bounds/overlap, external resource lifetime and synchronous short-read/error semantics together. No pinned-memory speed claim. |
+| Evidence lane | R37/R49/R80 | Unknown until reproduction / potentially high | Recheck the exact packets early under resource bounds. Separate checker precision from MIR/emission cost; do not assume that K1 fixed them. |
+
+R28, retained indexed views and external writable reads need preparation comparable
+to ownership work; they should not be treated as diagnostic-guard removals. If a
+small specification restriction would materially simplify one, compare it with
+preserving the existing behavior, report consumer impact, and follow the language
+policy and review gates above. Difficulty alone does not select a restriction.
+
+### Evidence transfer to the receiving machine
+
+The private LLM packet is now available on this machine under the common Git
+directory as `handoff/2026-10-25-private-request-evidence.tar.gz` (832,473 bytes;
+SHA-256 `38125adc4a41127f2e348d2688f3b850d84d7459da2511a16e69d26a073e3402`).
+It is deliberately outside the public repository and is **not transferred by a
+Git fetch**. Copy it privately to the receiving machine and verify `SHA256SUMS`
+after extraction. It contains the authenticated 362-file consumer source snapshot,
+three exact failing variants, passing borrow controls, compact original logs and
+replay instructions. No current-compiler reproduction was run in this session.
+
+The source binding names private `align-llm` commit
+`33e4d3ff40f45f48a4edf2a2f155a9e7966aeaed`; all 362 committed source hashes match.
+R37's inline builder variant and R49's mutable-helper variant replace
+`src/expert_trace.align`. R80's FILE_SET variant replaces
+`src/prompt_source_trust.align`, with `src/prompt_source_trust_smoke.align` as the
+check entry. Work in an Align-owned copy. R37 recorded 83,309,188 kB VmHWM:
+check headroom, enforce a memory cap, and isolate check/MIR/emission before any
+build. The packet also retains the newer R80 nested-loop MTP witness; its own
+import revision still needs authentication before replay, and the old snapshot
+must not be substituted for that evidence.
+
+AM-R22/23's current source is committed in private `align-media` at
+`f9948006c965ead29865d0008c86061919e21cf0`, verified present on GitHub with a clean
+matching local tree. Read `src/image_http.align`, `src/image_server.align`,
+`src/image-http-owner.align` and `validation/image-http-owners.py` from that
+commit on the receiving machine. This supplies portable source evidence while
+the register's older request draft still says its URLs are missing. The current
+owner qualifies the HEAD-close workaround, not a timed HEAD response or model
+cancellation. Use an Align-owned source copy for provider reproduction; follow
+the request register for subsequent consumer acceptance. Do not upload private
+consumer source into public Align docs or tests. Consumer pins, code, tests and
+adoption remain external.
 
 Unknown/multiple-target mutable outputs, fully escaping function values and
 view-bearing builder elements retain their own unselected boundaries. R78 enum
