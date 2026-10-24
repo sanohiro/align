@@ -179,6 +179,8 @@ fn copy_program(intrinsic: bool, reverse: bool, nested: bool, fresh: bool) -> (S
     let repeated = if fresh { &views } else { "" };
     let source = format!(r#"module main
 import helper
+extern "C" fn align_rt_alloc_count() -> i64
+extern "C" fn align_rt_free_count() -> i64
 {declaration}
 fn run(borrow mut pair: Pair, count: i64) {{
   {retained}
@@ -187,7 +189,10 @@ fn run(borrow mut pair: Pair, count: i64) {{
 }}
 fn check_count(count: i64) -> bool {{
   mut pair := {initialization}
+  allocated := unsafe {{ align_rt_alloc_count() }}
+  freed := unsafe {{ align_rt_free_count() }}
   run(pair, count)
+  if unsafe {{ align_rt_alloc_count() }} != allocated || unsafe {{ align_rt_free_count() }} != freed {{ return false }}
   result := {right}.bytes()
   mut at := 0
   loop {{
@@ -198,7 +203,13 @@ fn check_count(count: i64) -> bool {{
   }}
   return true
 }}
-fn main() -> i32 {{ if check_count(0) && check_count(1) && check_count(8) {{ 0 }} else {{ 1 }} }}
+fn main() -> i32 {{
+  allocated := unsafe {{ align_rt_alloc_count() }}
+  freed := unsafe {{ align_rt_free_count() }}
+  correct := check_count(0) && check_count(1) && check_count(8)
+  balanced := unsafe {{ align_rt_alloc_count() }} - allocated == unsafe {{ align_rt_free_count() }} - freed
+  if correct && balanced {{ 0 }} else {{ 1 }}
+}}
 "#);
     (provider, source)
 }

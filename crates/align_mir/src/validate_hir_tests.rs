@@ -20219,7 +20219,7 @@ fn readonly_origin_checked_hir_replay() -> Result<(), &'static str> {
                 _ => "mut view := input",
             };
             let sink = if write { "view[0] = 65" } else { "print(view[0])" };
-            let source = format!("Holder {{ view: slice<u8> }}\nfn probe(input: slice<u8>) {{ readonly := \"xx\".bytes(); {construction}; {sink} }}\nfn main() -> i32 = 0\n");
+            let source = format!("Holder {{ view: slice<u8> }}\nfn probe(borrow mut input: slice<u8>) {{ readonly := \"xx\".bytes(); {construction}; {sink} }}\nfn main() -> i32 = 0\n");
             let mut program = checked_source_program(&source);
             assert!(align_sema::checked_hir_body_facts_are_valid(&program));
             let function = program.fns.iter_mut().find(|f| f.name == "probe").ok_or("missing probe fixture")?;
@@ -20380,7 +20380,7 @@ fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
     ] {
         for write in [false, true] {
             let sink = if write { "bytes[0] = 65" } else { "print(bytes[0])" };
-            let source = format!("fn probe(input: slice<u8>, {receiver}) {{ published := {publication}; mut bytes := input; {sink} }}\nfn main() -> i32 = 0\n");
+            let source = format!("fn probe(borrow mut input: slice<u8>, {receiver}) {{ published := {publication}; mut bytes := input; {sink} }}\nfn main() -> i32 = 0\n");
             let mut program = checked_source_program(&source);
             assert!(align_sema::checked_hir_body_facts_are_valid(&program));
             let function = program.fns.iter_mut().find(|f| f.name == "probe").ok_or("publication probe")?;

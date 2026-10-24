@@ -26913,8 +26913,8 @@ mod tests {
         for method in ["descriptor_id", "sqlite_sql", "postgres_sql"] {
             for write in [false, true] {
                 let sink = if write { "bytes[0] = 65" } else { "print(bytes[0])" };
-                let db = format!("module pkg.db\nimport pkg.db.internal.descriptor\npub command<P> {{}}\npub fn probe<P>(statement: command<P>, input: slice<u8>) {{ unsafe {{ static_text := pkg.db.internal.descriptor.{method}(statement); static_bytes := static_text.bytes(); mut bytes := input; {sink} }} }}\n");
-                let main = "module main\nimport pkg.db\nParams { value: i64 }\nfn witness(statement: pkg.db.command<Params>, input: slice<u8>) { pkg.db.probe(statement, input) }\nfn main() -> i32 = 0\n";
+                let db = format!("module pkg.db\nimport pkg.db.internal.descriptor\npub command<P> {{}}\npub fn probe<P>(statement: command<P>, borrow mut input: slice<u8>) {{ unsafe {{ static_text := pkg.db.internal.descriptor.{method}(statement); static_bytes := static_text.bytes(); mut bytes := input; {sink} }} }}\n");
+                let main = "module main\nimport pkg.db\nParams { value: i64 }\nfn witness(statement: pkg.db.command<Params>, borrow mut input: slice<u8>) { pkg.db.probe(statement, input) }\nfn main() -> i32 = 0\n";
                 let (mut hir, diagnostics) = check_modules(&[
                     ("pkg.db.internal.descriptor", false, "module pkg.db.internal.descriptor\n"),
                     ("pkg.db", false, &db),
