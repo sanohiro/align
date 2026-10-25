@@ -21553,6 +21553,42 @@ fn indexed_field_view_hir_matrix() -> Result<(), String> {
 }
 
 #[test]
+fn indexed_field_view_rejects_temporary_hir_parents() -> Result<(), String> {
+    for (field, data) in [("[i64; 2]", "[1, 2]"), ("array<i64>", "[1, 2].to_array()")] {
+        for (parent, temporary) in [
+            ("[R; 1]", format!("[R {{ data: {data} }}]")),
+            ("array<R>", "make()".to_string()),
+            ("slice<R>", "identity(rows)".to_string()),
+        ] {
+            for used in [false, true] {
+                let tail = if used { "print(selected.len())" } else { "" };
+                let source = format!("R {{ data: {field} }}\nfn make() -> array<R> {{ mut b: array_builder<R> := array_builder(); b.push(R {{ data: {data} }}); b.build() }}\nfn identity(borrow rows: slice<R>) -> slice<R> = rows\nfn view(borrow rows: {parent}, i: i64) {{ temporary := {temporary}; selected := rows[i].data[..]; {tail} }}\nfn main() {{}}");
+                let original = checked_source_program(&source);
+                assert!(body_core_metadata_is_valid(&original));
+                let mut bad = original.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name == "view").ok_or("view")?;
+                let parent_ty = function.locals.first().ok_or("parent local")?.ty;
+                let temporary = function.body.stmts.iter().find_map(|statement| match statement {
+                    hir::Stmt::Let { init, .. } if init.ty == parent_ty => Some(init.clone()),
+                    _ => None,
+                }).ok_or("temporary parent")?;
+                let selected = function.body.stmts.iter_mut().find_map(|statement| match statement {
+                    hir::Stmt::Let { init, .. } if matches!(init.kind, hir::ExprKind::SliceRange { .. }) => Some(init),
+                    _ => None,
+                }).ok_or("selected view")?;
+                let hir::ExprKind::SliceRange { recv, .. } = &mut selected.kind else { return Err("range".into()); };
+                let hir::ExprKind::ArrayToSlice(field) = &mut recv.kind else { return Err("view".into()); };
+                let hir::ExprKind::ElemField { recv: receiver, .. } = &mut field.kind else { return Err("field".into()); };
+                **receiver = temporary;
+                assert!(!body_core_metadata_is_valid(&bad), "accepted temporary {parent}/{used}");
+                assert_body_entrypoints_empty("temporary indexed view parent", &bad);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn indexed_view_retention_replays_field_retirement() -> Result<(), &'static str> {
     let prefix = "Row { data: array<i64> }\nOuter { rows: array<Row>, other: array<i64> }\nfn rows() -> array<Row> { mut b: array_builder<Row> := array_builder(); b.push(Row { data: [7].to_array() }); b.build() }\nfn make() -> Outer = Outer { rows: rows(), other: [9].to_array() }\nfn view(borrow outer: Outer) -> slice<i64> = outer.rows[0].data[..]\nfn publish(borrow mut target: slice<i64>, borrow outer: Outer) { target = outer.rows[0].data[..] }\n";
     for setup in ["value := view(outer)", "initial := [0]; mut value: slice<i64> := initial; publish(value, outer)"] {

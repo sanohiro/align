@@ -11499,6 +11499,11 @@ impl<'a> BodyValidator<'a> {
                     && align_sema::indexed_field_view_element(leaf, &self.program.structs,
                         &self.program.tuples, &self.program.enums, &self.program.tagged_types).is_some()
                     && matches!(recv.kind, hir::ExprKind::Local(_) | hir::ExprKind::Field { .. });
+                // A retained view requires a stable parent even when the selected field is
+                // Copy and therefore bypasses the ordinary indexed Move-field restrictions.
+                if context.allow_indexed_field_view && !retained_view {
+                    return None;
+                }
                 // Shared fixed-field calls retain their literal-index restriction. Immediate
                 // length/independent-Copy observations use the guarded descriptor for each base;
                 // a malformed context must not widen ordinary indexed Move reads.
