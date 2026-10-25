@@ -470,6 +470,18 @@ inline backing that materializes elsewhere; sibling ownership remains independen
 completes this composition without widening field formation, deeper extraction or exclusive
 partial-field borrowing.
 
+**Exclusive owned projections remain restricted for 1.0.** The owner retained
+R132's owned-subrecord and R142's matched owned-payload restrictions on
+2026-10-25. A general `borrow mut` helper may replace its argument, even when
+a motivating example only changes a scalar. R132 therefore needs replacement
+and heap/arena cleanup to remain correct for the selected field and its siblings;
+R142 additionally needs active-variant authority and exclusion of conflicting
+parent replacement. These are separate design problems, not automatic benefits
+of K1. Keep the existing admission rules and avoid making either capability a
+1.0 implementation obligation. Future widening requires the evidence-driven
+reopening protocol in [Plan23](impl/23-friction-ledger.md), followed by a complete
+design without user-written lifetime or cleanup annotations.
+
 **Owned array fields retain the existing indexed-store model.** An owned dynamic
 array field already identifies its allocation and release owner. Plan194 composes
 that evidence with the existing Copy-element store instead of introducing a numeric

@@ -444,6 +444,13 @@ payloads and arbitrary exclusive partial-field calls remain rejected. Growth
 ends earlier buffer views from the complete owner, including sibling buffer
 views; fresh views and independently backed slice fields remain usable.
 
+For 1.0, exclusive owned-subrecord borrowing (R132) and exclusive borrowing of
+matched owned sum payloads (R142) are deliberate language restrictions, not
+queued implementation work. Existing complete-owner borrows, direct owning-field
+extraction and admitted buffer/writer operations retain their rules. The
+[settled disposition](docs/open-questions.md#borrow-safe-sum-and-dynamic-aggregate-projection--settled-2026-08-18-extended-2026-08-19-and-2026-08-31)
+records the rationale and reopening condition.
+
 
 Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
 region-bearing Copy field, including direct or nested `str` and `slice<T>` fields, keeps
