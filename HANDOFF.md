@@ -12,8 +12,8 @@ The owner resumed the selected batch on 2026-10-25 and authorized merging
 completed capability PRs. The five selected provider capabilities and the
 private-evidence investigations are complete at the boundaries below. AM-R24
 was delivered by #1410 before this batch. Consumer adoption remains pending;
-R132/R142 stay excluded. The selected R37 and both R80 repairs are implemented
-under Plans245–248 without a language restriction.
+R132/R142 are settled 1.0 language restrictions. The selected R37 and both R80
+repairs are implemented under Plans245–248 without a language restriction.
 When external evidence or a machine dependency is unavailable, request the
 specific missing input and continue other selected work.
 
@@ -93,9 +93,11 @@ or cross-machine promises. Consumer repinning and runtime qualification remain
 external. No missing evidence request remains open for these repairs.
 
 R132 exclusive owned-subrecord access and R142 exclusive matched owned payloads
-remain excluded. Projection, replacement, active-tag authority and exactly-once
-cleanup require their own complete design; do not remove diagnostic guards or
-perform consumer adoption to close them.
+are deliberate 1.0 language restrictions, selected by the owner on 2026-10-25,
+not unfinished implementation work. Do not automatically requeue them. Any
+future widening follows the friction-ledger reopening protocol and must settle
+projection, replacement, active-tag authority and exactly-once cleanup together.
+The existing complete-owner and admitted field-operation rules remain unchanged.
 
 The private source archive remains in the common Git directory as
 `handoff/2026-10-25-private-request-evidence.tar.gz`, SHA-256

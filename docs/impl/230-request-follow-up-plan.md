@@ -34,6 +34,19 @@ The source-packet investigations led to the selected repairs in Plans245–248:
 #1420 closes the R37 module memory witness, and Plan248 closes its separate
 whole-project producer CPU witness. No language restriction was required.
 
+## Settled R132/R142 disposition (2026-10-25)
+
+The owner retained exclusive owned-subrecord borrowing (R132) and exclusive
+matched owned-payload borrowing (R142) as deliberate language restrictions for
+1.0. They are removed from the implementation queue, not waiting for another K1
+repair or a larger implementation budget. Existing admission and cleanup rules
+remain unchanged. The historical witnesses and proof gaps below remain evidence,
+not scheduled work. Reconsideration requires the [Plan23](23-friction-ledger.md)
+reopening protocol and a complete design; neither a current rejection nor an
+existing workaround alone selects implementation. R132's field replacement and
+allocation-mode problem and R142's exclusive active-payload problem remain
+separate capabilities.
+
 ## Authenticated request investigation (2026-10-25)
 
 The previously missing source packet is now available privately and verified:
@@ -156,7 +169,7 @@ entries retain their existing receipts and limits.
 | Media AM-R14 and AM-R20 | [Plan235](235-trigonometric-math.md) implements sin/cos/atan2 on scalar and explicit vector f32/f64 through exact LLVM intrinsics. Signed axes, quadrants, nonfinite cases, native helper compatibility and vector disposition have independent owners. Three-target numerical qualification establishes concrete samples, not a cross-target bitwise contract. Consumer rotary/guide adoption remains pending. |
 | Media AM-R15 and LLM R34 | [Plan236](236-fallible-raw-carriers.md) implements unsafe `raw.try_alloc(i64) -> Result<raw, Error>` and non-owning raw transport through Option/Result, sums, flat tuples and ordinary fields. Invalid/zero/refused/success outcomes, allocation provenance, explicit free or resource transfer, native ABI and partial resource cleanup have deterministic owners. Raw remains Copy/Static; no automatic pointee cleanup or new access authority is inferred. Consumer adoption remains pending; retired ggml examples are not revived. |
 | Media AM-R07 | External writable read destinations remain separate. K1 plus an explicit exclusive-view formation, initialization, bounds/overlap, native lifetime and synchronous I/O contract are prerequisites. Fallible allocation does not create these permissions or establish a pinned-memory performance claim. |
-| LLM R28/R132/R137/R142 and related media view composition | Reconcile the current remaining portions against shipped builder Copy reads, owning-field extraction and indexed independent Copy observations. Use [Plan61](61-interprocedural-view-access-plan.md), [Plan196](196-indexed-array-field-length.md) and [Plan210](210-text-builder-byte-views.md) to identify the exact missing interprocedural read-only/writable authority and retained-view proof. Do not reopen already delivered portions or widen a readable header into writable/owned backing. |
+| LLM R28/R137 and related media view composition | Reconcile the current remaining portions against shipped builder Copy reads, owning-field extraction and indexed independent Copy observations. Use [Plan61](61-interprocedural-view-access-plan.md), [Plan196](196-indexed-array-field-length.md) and [Plan210](210-text-builder-byte-views.md) to identify the exact missing interprocedural read-only/writable authority and retained-view proof. Do not reopen already delivered portions or widen a readable header into writable/owned backing. R132/R142 have the settled restriction disposition above. |
 
 ## Historical K1 scope and difficulty assessment (2026-10-20)
 

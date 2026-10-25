@@ -5499,6 +5499,18 @@ payloads and arbitrary exclusive partial-field calls remain rejected. Growth
 ends earlier buffer views from the complete owner, including sibling buffer
 views; fresh views and independently backed slice fields remain usable.
 
+Disposition reaffirmed by the owner on 2026-10-25: exclusive owned-subrecord
+borrowing (R132) and exclusive borrowing of matched owned sum payloads (R142)
+are deliberate language restrictions for 1.0, not deferred implementation
+requirements. A `borrow mut` helper may replace the complete argument; permitting
+a projection must preserve sibling allocation/cleanup rules and, for a sum,
+active-variant authority and exclusion of conflicting parent replacement.
+The current complete-owner, direct owning-field extraction and admitted
+buffer/writer rules remain unchanged. Neither K1 completion nor a scalar-only
+motivating helper selects these capabilities. Any future widening follows the
+[friction-ledger reopening protocol](impl/23-friction-ledger.md); these requests
+must not automatically return to the implementation queue.
+
 
 Ordinary indexing of an admitted `array<str>` or AoS array of Copy records with any admitted
 region-bearing Copy field, including direct or nested `str` and `slice<T>` fields,
