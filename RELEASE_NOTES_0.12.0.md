@@ -22,7 +22,7 @@ Align v0.12.0 completes the selected call-boundary view-safety repair, adds boun
 
 ## Compatibility and known limits
 
-- This release enforces the explicit writable-call boundary. Code that writes through an ordinary parameter or a returned read-only view must move the write into a helper with an admitted explicit mutable parameter. General writable returns are not introduced.
+- This release enforces the explicit writable-call boundary. Code that writes through a non-owning view received via an ordinary value parameter, or through a returned read-only view, must move the write into a helper with an admitted explicit mutable parameter. Transferred owning storage remains writable. General writable returns are not introduced.
 - Exclusive access through a partial owned subrecord (R132) or a matched owned payload (R142) remains a deliberate 1.0 language restriction. Use the supported complete-owner and field-operation rules. These are not pending implementation promises.
 - Native operations and compiler artifact identities changed. Install `alignc`, `align-repl` and the matching runtime archive together, and rebuild generated programs; do not mix compiler/runtime versions.
 - Provider delivery is separate from consumer adoption. The selected K1 compiler has recorded acceptance in all three consumers within their named native boundaries; adoption and application qualification for the later capabilities remain consumer-owned.
