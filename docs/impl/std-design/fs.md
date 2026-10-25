@@ -35,7 +35,7 @@ baseline; application tree policy remains application code.
 
 ## R65 sealed storage contract
 
-[Plan 50](../50-r65-process-capability-handoff.md), designed and ready for implementation, owns
+The implemented [Plan 50](../50-r65-process-capability-handoff.md) owns
 the explicit memory_kind, memory_writer and sealed_file declarations, native
 seals, positional writable-out reads, ownership, ABI and acceptance. These are
 Linux-only OS facilities with a defined unsupported-host error; ordinary native
