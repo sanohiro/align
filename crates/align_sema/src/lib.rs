@@ -35812,8 +35812,11 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn active_storage_advances(&self) -> StorageGenerationRenames {
-        StorageGenerationRenames::from_origins(self.value_snapshot_frames.iter().flat_map(
+    /// A break edge is relative to the innermost loop entry. Advances before that entry
+    /// must not age an enclosing iteration's still-live Current into its ended Prior.
+    fn active_loop_storage_advances(&self) -> StorageGenerationRenames {
+        StorageGenerationRenames::from_origins(self.value_snapshot_frames.iter().rev()
+            .take_while(|frame| !matches!(frame, MoveTransientFrame::Loop(_))).flat_map(
             |frame| match frame {
                 MoveTransientFrame::Storage(advances) => {
                     advances.origins.iter().cloned().collect::<Vec<_>>()
@@ -45835,7 +45838,7 @@ impl<'a> MoveCheck<'a> {
                             let depth = self.loop_iter_drops.len() as u32;
                             Self::invalidate_iteration_drops(&mut at_break, drops, depth);
                         }
-                        let advances = self.active_storage_advances();
+                        let advances = self.active_loop_storage_advances();
                         if let Some(frame) = self.loop_breaks.last_mut() {
                             frame.push(MoveControlEdge {
                                 moved: moved.clone(),
@@ -49160,7 +49163,7 @@ impl<'a> MoveCheck<'a> {
                                 depth,
                             );
                         }
-                        let advances = self.active_storage_advances();
+                        let advances = self.active_loop_storage_advances();
                         if let Some(frame) = self.loop_breaks.last_mut() {
                             frame.push(MoveControlEdge {
                                 moved: moved.clone(),
@@ -83830,6 +83833,35 @@ fn main() -> i32 = 0
             Some(BorrowEnd::Dropped),
             "the exact loop edge ends depth-two IterTemp without touching its outer sibling",
         );
+
+        let mut sink = Diagnostics::new();
+        let mut checker = checker!(harness, &mut sink);
+        let origins = (0..4).map(|local| StorageOrigin::inline_place(local, &[]))
+            .collect::<Vec<_>>();
+        checker.begin_storage_advance_frame();
+        checker.record_storage_advances(&StorageGenerationRenames::from_origins([origins[0].clone()]));
+        checker.begin_loop_scope(100);
+        checker.begin_storage_advance_frame();
+        checker.record_storage_advances(&StorageGenerationRenames::from_origins([origins[1].clone()]));
+        checker.begin_loop_scope(200);
+        checker.begin_storage_advance_frame();
+        checker.record_storage_advances(&StorageGenerationRenames::from_origins([origins[2].clone()]));
+        checker.begin_storage_advance_frame();
+        checker.record_storage_advances(&StorageGenerationRenames::from_origins([origins[3].clone()]));
+        assert_eq!(checker.active_loop_storage_advances().origins,
+            origins[2..].iter().cloned().collect(),
+            "a break includes its nested branch frames but excludes producers before this loop");
+        let branch = checker.finish_storage_advance_frame();
+        checker.propagate_storage_advances(&branch);
+        let inner = checker.finish_storage_advance_frame();
+        checker.finish_loop_scope(200);
+        checker.propagate_storage_advances(&inner);
+        assert_eq!(checker.active_loop_storage_advances().origins,
+            origins[1..].iter().cloned().collect(),
+            "an outer break includes the completed inner loop's advances, not function-entry advances");
+        checker.finish_storage_advance_frame();
+        checker.finish_loop_scope(100);
+        checker.finish_storage_advance_frame();
 
         let mut sink = Diagnostics::new();
         let mut checker = checker!(harness, &mut sink);
