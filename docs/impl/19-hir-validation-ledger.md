@@ -2558,3 +2558,12 @@ interface records and the executable compiler fingerprint remain sufficient.
 ## Plan244: external writable windows
 
 ResourceViewKind::SliceMut uses an owning mutable Local, including BorrowMut, while shared Slice/StrUtf8 use ResourceRef. Independent HIR shape, replay and publication gates authenticate exact resource/view types and local authority. FileReadAt requires Local File, i64 offset and writable u8 view. Depth/replay order is file, offset, destination. Native StrUtf8 construction records validation over the complete resource and parent backing; byte writes expire validation without ending resource generation. Driver external_view_hir_shape and external_view_mir_shape own used/discarded malformed boundaries; Plan244 maps the remaining owners.
+
+
+Plan244 raw comparison classifications (the detector remains unchanged):
+
+| Exact site | Classification and reason |
+| --- | --- |
+| `owner.ty == view.owner_ty(*resource)` | Split-free nominal identity: owner_ty returns exactly Resource(resource) or ResourceRef(resource) from the node's existing resource id. It derives no generic struct/enum shape. Preserve exact resource identity. |
+| `owner.ty != view.owner_ty(*resource)` | Same split-free identity check at independent body-flow derivation; do not structurally equate unrelated resources. |
+| `!local(file, Ty::File) || offset.ty != i64 || destination.ty != bytes` | Split-free closed primitives: i64 is signed 64-bit Int and bytes is Slice(unsigned 8-bit Int), both defined locally; File is a fixed native handle. No nominal payload can split. |

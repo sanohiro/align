@@ -1865,10 +1865,13 @@ fn raw_nominal_comparisons(source: &str) -> Vec<RawComparison> {
 
 /// Every such comparison that exists today, each one classified in
 /// `docs/impl/19-hir-validation-ledger.md`'s delegation matrix as same-derivation or split-free.
-const RAW_NOMINAL_COMPARISON_ALLOWLIST: [&str; 26] = [
+const RAW_NOMINAL_COMPARISON_ALLOWLIST: [&str; 29] = [
     r#"&& *elem == align_sema::scalar_to_ty(scalar)"#,
     r#"&& expression.ty == expected"#,
     r#"&& expression.ty == local.ty"#,
+    r#"&& owner.ty == view.owner_ty(*resource)"#,
+    r#"|| owner.ty != view.owner_ty(*resource)"#,
+    r#"if !local(file, Ty::File) || offset.ty != i64 || destination.ty != bytes"#,
     r#"(capture_flows[0].ty == needle.ty && needle.ty == Ty::Str).then_some(current)"#,
     r#"(stage.out_ty == field_ty).then_some(field_ty)"#,
     r#".is_some_and(|local| local.id == id && local.is_mut && self.body_ty_ok(local.ty))"#,
