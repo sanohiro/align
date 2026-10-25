@@ -49678,6 +49678,77 @@ impl<'a> MoveCheck<'a> {
     }
 
     #[inline(never)]
+    /// An inactive payload of a fresh temporary cannot release storage on this arm.
+    /// Refine only the producer's initial staging association, never its generation or
+    /// an owner to which it has subsequently moved. Activity is a union across headers.
+    fn refine_inactive_match_temporary(
+        &mut self,
+        scrutinee_ty: Ty,
+        headers: &ProjectedHeaderFact,
+        variants: &[u32],
+        preceding: &[MatchArm],
+    ) {
+        let root = expand_tagged_ty(scrutinee_ty, self.tagged_types);
+        let variant_count = match root {
+            Ty::Option(_) | Ty::Result(..) => 2,
+            Ty::Enum(id) => match usize::try_from(id).ok().and_then(|id| self.enums.get(id)) {
+                Some(definition) => definition.variants.len(),
+                None => return,
+            },
+            _ => return,
+        };
+        if variants.iter().chain(preceding.iter().flat_map(|arm| &arm.variants)).any(|variant| {
+            usize::try_from(*variant).ok().is_none_or(|index| index >= variant_count)
+        }) || preceding.iter().any(|arm| arm.variants.is_empty() || !arm.values.is_empty())
+            || headers.leaves.values().any(|leaf| !leaf.known || !leaf.fallback_roots.is_empty()) {
+            return;
+        }
+        let mut inactive = std::collections::BTreeSet::new();
+        let mut protected = std::collections::BTreeSet::new();
+        for (path, leaf) in &headers.leaves {
+            let variant = match (root, path.first()) {
+                (Ty::Option(_), Some(BorrowProjection::OptionSome))
+                | (Ty::Result(..), Some(BorrowProjection::ResultOk)) => Some(0),
+                (Ty::Result(..), Some(BorrowProjection::ResultErr)) => Some(1),
+                (Ty::Enum(_), Some(BorrowProjection::EnumPayload { variant, .. }))
+                    if usize::try_from(*variant).ok().is_some_and(|index| index < variant_count) => Some(*variant),
+                _ => None,
+            };
+            for reference in &leaf.generations {
+                let entry = self.borrows.storage.directory.entries.get(&reference.generation);
+                // A wildcard reaches the complement of preceding explicit arms.
+                let proved_inactive = variant.is_some_and(|variant| if variants.is_empty() {
+                    preceding.iter().any(|arm| arm.variants.contains(&variant))
+                } else { !variants.contains(&variant) })
+                    && reference.content_path.is_empty() && !reference.erase_readonly
+                    && leaf.descriptor.is_some_and(|descriptor| descriptor.kind.owns_storage())
+                    && entry.is_some_and(|entry| entry.descriptor == leaf.descriptor && entry.ended.is_none());
+                if proved_inactive {
+                    inactive.insert(reference.generation.clone());
+                } else {
+                    protected.insert(reference.generation.clone());
+                }
+            }
+        }
+        for generation in inactive.difference(&protected) {
+            let StorageGeneration::Current(StorageOrigin::Producer { expression, result_path }) = generation else {
+                continue;
+            };
+            let loop_depth = u32::try_from(self.loop_iter_drops.len()).ok();
+            if let Some(entry) = self.borrows.storage.directory.entries.get_mut(generation) {
+                entry.releases.retain(|release| !match release {
+                    MoveReleasePlace::Staging { action, path, .. } =>
+                        action == expression && path.as_slice() == result_path.as_ref(),
+                    MoveReleasePlace::IterTemp { depth, expression: action, path } =>
+                        *depth != 0 && Some(*depth) == loop_depth
+                            && action == expression && path.as_slice() == result_path.as_ref(),
+                    _ => false,
+                });
+            }
+        }
+    }
+
+    #[inline(never)]
     fn move_match(
         &mut self,
         expression: &'a Expr,
@@ -49721,7 +49792,7 @@ impl<'a> MoveCheck<'a> {
         let scrutinee_source = self.direct_storage_move_source(scrutinee);
         let scrutinee_origin = self.expr_origin_place(scrutinee);
         let mut joined: Option<MoveControlEdge> = None;
-        for arm in arms {
+        for (arm_index, arm) in arms.iter().enumerate() {
             let arm_moves_payload = self.arm_moves_payload(arm);
             let mut arm_moved = if arm_moves_payload {
                 consumed
@@ -49739,6 +49810,9 @@ impl<'a> MoveCheck<'a> {
             } else {
                 evaluated_borrows.clone()
             };
+            if has_move_binding {
+                self.refine_inactive_match_temporary(scrutinee.ty, &scrutinee_headers, &arm.variants, &arms[..arm_index]);
+            }
             for (binding_index, binding) in arm.bindings.iter().enumerate() {
                 let borrowed = arm
                     .borrowed_bindings
@@ -83862,6 +83936,73 @@ fn main() -> i32 = 0
         checker.finish_storage_advance_frame();
         checker.finish_loop_scope(100);
         checker.finish_storage_advance_frame();
+
+        // Retire one impossible initial staging alternative, never another owner,
+        // a previous iteration, contents, provenance, or pre-existing ending evidence.
+        for case in ["inactive", "iteration", "active", "shared-active", "unknown", "fallback",
+            "untyped", "mismatch", "selected", "readonly-erased", "unknown-path",
+            "ended", "prior", "parameter", "caller", "bad-variant", "wildcard"] {
+            let mut sink = Diagnostics::new();
+            let mut checker = checker!(harness, &mut sink);
+            if case == "iteration" { checker.loop_iter_drops.push(Vec::new()); }
+            let path = vec![BorrowProjection::ResultOk];
+            let origin = StorageOrigin::Producer { expression: 100, result_path: path.clone().into() };
+            let generation = match case {
+                "prior" => StorageGeneration::prior(origin),
+                "parameter" => StorageGeneration::parameter_value(0, &path),
+                "caller" => StorageGeneration::caller_storage(0, &path),
+                _ => StorageGeneration::current(origin),
+            };
+            let descriptor = StorageHeaderDescriptor { ty: source_ty, kind: StorageHeaderKind::OwnedDynamic };
+            let initial = MoveReleasePlace::Staging { action: 100, operand: 0, path: path.clone() };
+            let other_releases = [
+                MoveReleasePlace::Staging { action: 101, operand: 0, path: path.clone() },
+                MoveReleasePlace::Staging { action: 100, operand: 0, path: vec![BorrowProjection::ResultErr] },
+                MoveReleasePlace::Local { local: source, path: path.clone() },
+                MoveReleasePlace::IterTemp { depth: 1, expression: 100, path: path.clone() },
+                MoveReleasePlace::IterTemp { depth: 2, expression: 100, path: path.clone() },
+                MoveReleasePlace::IterTemp { depth: 0, expression: 100, path: path.clone() },
+                MoveReleasePlace::IterTemp { depth: 1, expression: 101, path: path.clone() },
+                MoveReleasePlace::IterTemp { depth: 1, expression: 100, path: vec![BorrowProjection::ResultErr] },
+                MoveReleasePlace::LoopResult { loop_expr: 100, path: path.clone() },
+                MoveReleasePlace::ArenaScope { arena: MoveArenaScope::Anonymous(100) },
+                MoveReleasePlace::Returned { path: path.clone() },
+            ];
+            let mut entry = MoveGenerationEntry::new(&generation, Some(descriptor),
+                other_releases.into_iter().chain([initial.clone()]).collect());
+            entry.caller_origins.insert(9);
+            entry.exact_cell_count = Some(7);
+            if case == "ended" { entry.ended = Some(BorrowEnd::Dropped); }
+            if case == "mismatch" { entry.descriptor = None; }
+            checker.borrows.storage.directory.entries.insert(generation.clone(), entry);
+            let mut leaf = StorageHeaderLeaf::known_typed(generation.clone(), descriptor);
+            match case {
+                "unknown" => leaf.known = false,
+                "fallback" => { leaf.fallback_roots.insert(BorrowRoot::IterTemp(1)); }
+                "untyped" => leaf.descriptor = None,
+                "selected" => { leaf.generations = [StorageGenerationRef::selected(generation.clone(), vec![BorrowProjection::ArrayElement(0)])].into(); }
+                "readonly-erased" => {
+                    let mut reference = StorageGenerationRef::root(generation.clone());
+                    reference.erase_readonly = true;
+                    leaf.generations = [reference].into();
+                }
+                _ => {}
+            }
+            let mut headers = ProjectedHeaderFact::from_leaf(
+                if case == "unknown-path" { Vec::new() } else { path.clone() }, leaf.clone());
+            if case == "shared-active" { headers.leaves.insert(vec![BorrowProjection::ResultErr], leaf); }
+            let value = MoveValueFact { headers: headers.clone(), ..Default::default() };
+            checker.borrows.storage.contents.entries.insert(generation.clone(), value);
+            let mut expected = checker.borrows.clone();
+            if matches!(case, "inactive" | "iteration") { expected.storage.directory.entries.get_mut(&generation).unwrap().releases.remove(&initial); }
+            if case == "iteration" {
+                expected.storage.directory.entries.get_mut(&generation).unwrap().releases.remove(
+                    &MoveReleasePlace::IterTemp { depth: 1, expression: 100, path: path.clone() });
+            }
+            let variants: &[u32] = match case { "active" => &[0], "bad-variant" => &[2], "wildcard" => &[], _ => &[1] };
+            checker.refine_inactive_match_temporary(Ty::Result(Scalar::DynArray(PrimScalar::Int(IntTy { bits: 64, signed: true })), int), &headers, variants, &[]);
+            assert!(checker.borrows == expected, "{case}: only the impossible initial staging association may change");
+        }
 
         let mut sink = Diagnostics::new();
         let mut checker = checker!(harness, &mut sink);
