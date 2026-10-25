@@ -72,6 +72,28 @@ valid. [Plan 140](../140-builder-length-plan.md) owns the source/native contract
   frame-bounded views over hidden scoped `string` owners; static-only templates are pooled literals
   ([audit 13](../13-string-array-allocation-short-input-audit.md#33-fixed-2026-07-15--arena-free-template-and-jsonencode-have-scoped-owners)).
 
+## Unfinished builder bytes
+
+`b.bytes() -> slice<u8>` on a bound `builder` borrows its exact initialized
+UTF-8 prefix, including embedded NUL. It takes no arguments, evaluates its
+receiver once, and is Pure, nonconsuming and allocation-free. Empty views are
+valid; capacity is never exposed. Immutable locals and admitted shared,
+exclusive or by-value parameters may read; bind temporary/control receivers
+first. The view is always read-only, including through returned values,
+subranges, typed reinterpretation and admitted view carriers/captures.
+
+Every reached `write*`, including an empty write, invalidates previous views of
+that builder. Finish, move, replacement and actual Drop also end them. A fresh
+view after writing is valid; independent builders, copied scalars and explicitly
+owned copies remain usable. The same rules apply through helpers and control
+flow. A helper may return a view of a borrowed caller-owned builder, with its
+inferred lifetime; it cannot return a view of its own local builder. Writes
+reserve the selected receiver through eager argument evaluation. A diverging
+argument performs no write, and a still-aliasing text argument is rejected
+before code generation rather than implicitly copied. Builder aggregate/capture/
+function-value admission and typed-builder element rules are unchanged.
+[Plan210](../210-text-builder-byte-views.md) owns the complete contract.
+
 ## Effects
 
 Pure (no I/O). The *allocation-visibility* rules are enforced structurally, not via effects:

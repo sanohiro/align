@@ -955,6 +955,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             Some(value) => format!("buffer_try_filled({}, {}, {}, {}, -> _{out})", operand_str(capacity), operand_str(value), operand_str(alignment), operand_str(pages)),
             None => format!("buffer_try_new({}, {}, {}, -> _{out})", operand_str(capacity), operand_str(alignment), operand_str(pages)),
         },
+        Rvalue::BuilderBytes(owner) => format!("builder_bytes({})", operand_str(owner)),
         Rvalue::BufferBytes(buf) => format!("buffer_bytes({})", operand_str(buf)),
         Rvalue::BufferLen(buf) => format!("buffer_len({})", operand_str(buf)),
         Rvalue::BufferCapacity(buf) => format!("buffer_capacity({})", operand_str(buf)),

@@ -1384,6 +1384,8 @@ pub enum ExprKind {
     BuilderToString(Box<Expr>),
     /// Nonconsuming initialized UTF-8 byte count of a stable builder; Pure, Static i64.
     BuilderLen { builder: Box<Expr> },
+    /// Read-only initialized UTF-8 prefix, borrowing the live builder storage.
+    BuilderBytes { builder: Box<Expr> },
     /// `[e1, e2, ...]` — a fixed-length array literal. `elem` is the element type
     /// (a scalar, or a struct for an array-of-structs whose elements are `StructLit`s).
     /// `pooled` (doc-13 §8.4, S3) is set only at a qualifying `let` binding whose every element

@@ -18,7 +18,9 @@ continue other selected work.
 
 [Plan241](docs/impl/241-bounded-http-responses.md) implements AM-R22's positive
 ordinary response budget with HEAD framing, bounded native writes and checked
-keep-alive restoration. The remaining selected queue below is separate work.
+keep-alive restoration. Plan210 implements R28 text-builder bytes with read-only
+access and mutation/owner-generation invalidation. The remaining selected queue
+below is separate work.
 Missing evidence or a passing older provider PR is not a completed fix; the
 wider long-term backlog is unselected.
 
@@ -82,14 +84,14 @@ reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
   HEAD or connection observation remains external. AM-R23 still needs its exact
   half-close, connection reuse and cleanup contract. Connection observation does not itself
   deliver model cancellation or GPU cleanup.
-- R28 text-builder byte views and AM-R16/R137 retained indexed owning-field views
-  still need dedicated producers and lifetime/invalidation proofs. Plan240
-  supplies ordinary-call read-only authority; it does not deliver these views.
-  Plan210 rejected its original strategy; refresh its ledger and independently
-  review the new producer/invalidation boundary instead of treating it as an
-  already-approved implementation plan.
-  Independent Copy builder reads, indexed Copy reads and scalar lengths already
-  ship. Consult Plans209/210, 232 and 196/205 without reopening those deliveries.
+- Plan210 implements R28 `builder.bytes()` as an allocation-free read-only view
+  of initialized bytes. Every write, finish, move, replacement and Drop ends
+  earlier views; shared readers may return caller-borrowed views. Plan240 supplies
+  ordinary-call authority. Consumer adoption remains external.
+- AM-R16/R137 retained indexed owning-field views still need their producer and
+  lifetime/invalidation proof. Independent Copy builder reads, indexed Copy reads
+  and scalar lengths already ship. Consult Plans232 and 196/205 without reopening
+  those deliveries.
 - R132 exclusive owned-subrecord borrowing remains unshipped and is reobserved
   by current MTP and structured-decoding consumers. Projection/replacement must
   preserve sibling cleanup and heap-versus-arena allocation authority. This is
@@ -102,10 +104,14 @@ reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
   producer, initialization/bounds/overlap/resource-lifetime proof and matching
   positional-read semantics. K1 and fallible raw allocation do not supply these
   permissions or establish a pinned-memory speedup.
-- LLM R37/R49/R80 remain investigations under Plan230. Their historical
-  source/log packet was found and authenticated on 2026-10-25 (below); recheck
-  current main before choosing a fix; do not infer closure from K1. R37 reports roughly 79.5 GiB peak memory at its
-  recorded revision, so reproduction needs explicit resource limits.
+- Plan210 also repairs R49's headerless-owner loop precision: mutations of an
+  independent builder preserve validated text. The authenticated original helper
+  and immutable control pass both check modes; actual-source mutation negatives
+  remain rejected. Consumer verification is pending.
+- LLM R37/R80 remain investigations under Plan230. Their historical source/log
+  packet was found and authenticated on 2026-10-25 (below). R37 reports roughly
+  79.5 GiB peak memory at its recorded revision, so reproduction needs explicit
+  resource limits; do not infer closure from K1.
 
 ### Recommended order and rough difficulty
 
@@ -117,13 +123,13 @@ remain separate capabilities.
 | Order | Capability | Rough scale / difficulty | First closure decision |
 | --- | --- | --- | --- |
 | 1 | AM-R22 bounded HEAD-correct responses | Medium / medium | Plan241 implements `respond_timeout_ns` with one finite budget, partial-write cleanup and eligible keep-alive reuse. |
-| 2 | R28 text-builder byte views | Medium to large / high | New read-only producer plus invalidation on write/growth/build/move/replacement/Drop. Ordinary-call authority comes from Plan240; view-bearing builder elements are separate. |
+| 2 | R28 text-builder byte views | Medium to large / high | Plan210 implements the read-only prefix and exact invalidation; consumer adoption and view-bearing typed-builder elements are separate. |
 | 3 | AM-R16/R137 retained indexed fields | Large / high | Preserve parent generation, selected field backing and bounds across readers and returns without an implicit Copy snapshot. Use Plans232/196/205. |
 | 4 | AM-R23 connection observation | Medium / medium to high | Define exactly what a non-consuming bounded observation can establish, including half-close, buffered/pipelined data, errors and races; cancellation policy stays in the consumer. |
 | 5 | AM-R07 external writable positional reads | Large / high | Close exclusive native-view creation, initialization, bounds/overlap, external resource lifetime and synchronous short-read/error semantics together. No pinned-memory speed claim. |
 | Evidence lane | R37/R49/R80 | Unknown until reproduction / potentially high | Recheck the exact packets early under resource bounds. Separate checker precision from MIR/emission cost; do not assume that K1 fixed them. |
 
-R28, retained indexed views and external writable reads need preparation comparable
+Retained indexed views and external writable reads need preparation comparable
 to ownership work; they should not be treated as diagnostic-guard removals. If a
 small specification restriction would materially simplify one, compare it with
 preserving the existing behavior, report consumer impact, and follow the language

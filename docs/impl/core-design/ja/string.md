@@ -67,6 +67,25 @@ handle の引数渡し自体はアロケーションしない。aggregate への
 
 Pure（I/O なし）。*アロケーションの可視性* というルールはエフェクトシステムではなく構造的に強制される — `str + str` はあらゆる場所においてハードエラーとなる（決定済みの仕様）。arena 外での `template` 式の結果はパイプラインのラムダ内でローカルに消費できるが、そのフレーム境界ビューをラムダの戻り値として返すことはできない（`lambda.rs`）。チェッカーは一律の文字列連結ルールを強制しており、古い MIR の連結パスも削除された（audit 13 §3.2、2026-07-15 修正済み）。
 
+## 未完了 builder のバイト参照
+
+束縛済み `builder` の `b.bytes() -> slice<u8>` は、埋め込み NUL を含む
+初期化済み UTF-8 prefix を借用する。引数・既定値はなく、receiver を1回評価する。
+Pure・非消費・allocation-free で、空の view も有効。capacity は公開しない。
+immutable local と既存の shared・exclusive・by-value parameter で読める。
+一時値・制御式の receiver は先に束縛する。返却値・subslice・型の再解釈・既存の
+view carrier/capture を通っても読み取り専用を維持する。
+
+空文字を含む到達した全 `write*` は、その builder の旧 view を無効にする。
+finish・move・置換・実際の Drop でも寿命が終わる。書き込み後の新しい view、
+別の builder、コピー済み scalar、明示的な所有コピーは使える。helper と制御フローも
+同じ規則に従う。借用した caller 所有 builder の view は推論された寿命で返せるが、
+helper 自身の local builder の view は返せない。write は引数評価中も選択済みの
+receiver を予約する。引数が途中終了した場合は write しない。同じ backing をまだ
+借用する文字列の自己追加はコード生成前に拒否し、暗黙にコピーしない。
+builder の aggregate/capture/関数値への格納や typed-builder の要素規則は変更しない。
+[Plan210](../../210-text-builder-byte-views.md) が完全な契約を管理する。
+
 ## Errors & aborts
 
 整数変換は `Result<i64, Error>` を返し、不正な形式や範囲外の入力は `Error.Invalid` となる。`s[a..b]` における範囲外アクセス（out of bounds）は abort を引き起こす。非 UTF-8 な *入力* のエラー処理は `std` 境界での関心事である（`fs.read_file` → `Error.Invalid`）。core の文字列操作は不変条件が満たされている前提でバイト指向を保つ。範囲の部分ビュー作成（range lowering）は、仕様どおり O(1) で両端の UTF-8 スカラー境界チェックを行い、違反時は abort する（audit 13 §3.1、2026-07-13 修正済み）。

@@ -13,6 +13,16 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Unfinished text-builder byte views (SETTLED 2026-10-25)
+
+A bound `builder.bytes()` returns a read-only borrowed `slice<u8>` over the
+initialized UTF-8 prefix without allocation or consumption. Every write,
+including empty writes, plus finish/move/replacement/Drop ends earlier views;
+explicit copies and independent owners remain valid. Helpers preserve lifetime,
+permission and selected storage identity. Self-append never receives a hidden
+copy. [Plan210](impl/210-text-builder-byte-views.md) owns the exact public ledger
+and closure matrix; builder formation and view-bearing typed elements do not widen.
+
 ### Bounded ordinary HTTP responses (SETTLED 2026-10-25)
 
 `ctx.respond_timeout_ns(rb: response_builder, timeout_ns: i64) -> Result<(), Error>`

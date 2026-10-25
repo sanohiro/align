@@ -23,6 +23,8 @@ mod buffer_self_append_tests;
 #[cfg(test)]
 mod builder_length_tests;
 #[cfg(test)]
+mod builder_byte_view_tests;
+#[cfg(test)]
 mod array_builder_read_tests;
 #[cfg(test)]
 mod sse_storage_tests;
@@ -3235,6 +3237,19 @@ fn initialized_builder_len(count: usize) -> i64 {
 pub unsafe extern "C" fn align_rt_builder_len(b: *mut Builder) -> i64 {
     if b.is_null() { return 0; }
     initialized_builder_len(unsafe { (*b).buf.len })
+}
+
+/// Observe the initialized UTF-8 prefix without allocation or owner transfer.
+/// Every write, finish, replacement or destruction ends this read-only view.
+///
+/// # Safety
+/// `b` must address a live aligned Builder; `out` must be a writable AlignStr slot
+/// disjoint from the builder and its payload. Neither mutation nor destruction
+/// may overlap this observation or later use of the returned bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_builder_bytes(b: *const Builder, out: *mut AlignStr) {
+    let bytes = unsafe { &*b }.buf.as_slice();
+    unsafe { *out = AlignStr { ptr: bytes.as_ptr(), len: initialized_builder_len(bytes.len()) } };
 }
 
 fn builder_value(arena: *mut Arena, capacity: i64) -> Builder {

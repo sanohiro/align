@@ -13066,7 +13066,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // RawTryAlloc adds the atomic non-owning Result allocation producer.
         // HttpRespondTimeoutNs adds one checked three-operand native action.
         variants,
-        361,
+        362,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -20378,9 +20378,15 @@ fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
         ("context", "borrow source: http_request_ctx", "source.body()"),
         ("stdout", "borrow source: run_bytes", "source.stdout()"),
         ("stderr", "borrow source: run_bytes", "source.stderr()"),
+        ("builder", "borrow source: builder", "source.bytes()"),
     ] {
-        for write in [false, true] {
-            let sink = if write { "bytes[0] = 65" } else { "print(bytes[0])" };
+        for (sink, write) in [
+            ("print(bytes[0])", false),
+            ("bytes[0] = 65", true),
+            ("bytes.set_u8(0, 65)", true),
+            ("bytes.fill(65)", true),
+            ("copy_source := buffer.filled(2, 0); bytes.copy_from(copy_source.bytes())", true),
+        ] {
             let source = format!("fn probe(borrow mut input: slice<u8>, {receiver}) {{ published := {publication}; mut bytes := input; {sink} }}\nfn main() -> i32 = 0\n");
             let mut program = checked_source_program(&source);
             assert!(align_sema::checked_hir_body_facts_are_valid(&program));
@@ -20396,7 +20402,17 @@ fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
             *init = origin;
             assert!(body_core_metadata_is_valid(&program), "{name}/{write} must remain structurally valid");
             assert_eq!(align_sema::checked_hir_body_facts_are_valid(&program), !write, "{name}/{write}");
-            assert_eq!(lower_program_checked(&program, false, None).is_ok(), !write, "{name}/{write}");
+            for per_unit in [false, true] {
+                assert_eq!(lower_program_checked(&program, per_unit, None).is_ok(), !write,
+                    "{name}/{sink}/{per_unit}");
+            }
+            if write {
+                let sources = SourceMap::new();
+                for lowered in [lower_program(&program), lower_program_located(&program, &sources),
+                    lower_program_per_unit(&program), lower_program_per_unit_located(&program, &sources)] {
+                    assert!(is_empty(&lowered), "{name}/{sink}: readonly write published MIR");
+                }
+            }
         }
     }
     Ok(())
@@ -21838,6 +21854,29 @@ fn json_doc_options_checked_nominal_and_child_matrix() -> Result<(), &'static st
                 }
             }
         });
+    }
+    Ok(())
+}
+
+#[test]
+fn builder_bytes_hir_rejects_forged_receiver_and_result() -> Result<(), &'static str> {
+    let base = checked_source_program("fn prefix(borrow value: builder) -> slice<u8> = value.bytes()\nfn main() {}\n");
+    assert!(validate_hir::body_only_metadata_is_valid(&base));
+    assert!(lower_program_checked(&base, false, None).is_ok());
+    for mutation in 0..6 {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "prefix").ok_or("prefix")?;
+        let expression = function.body.value.as_mut().ok_or("prefix result")?;
+        let hir::ExprKind::BuilderBytes { builder } = &mut expression.kind else { return Err("byte getter") };
+        match mutation {
+            0 => builder.ty = Ty::Buffer,
+            1 => builder.kind = hir::ExprKind::Bool(false),
+            2 => builder.kind = hir::ExprKind::Local(u32::MAX),
+            3 => { expression.ty = Ty::Str; function.ret = Ty::Str; }
+            4 => builder.kind = hir::ExprKind::BuilderNew { capacity: None },
+            _ => expression.kind = hir::ExprKind::BufferBytes { buffer: builder.clone() },
+        }
+        assert_body_entrypoints_empty(&format!("builder-bytes-{mutation}"), &bad);
     }
     Ok(())
 }
