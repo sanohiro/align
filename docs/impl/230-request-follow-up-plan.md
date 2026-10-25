@@ -22,26 +22,99 @@ invariants and prerequisites, acceptance owners and an implementation recommenda
 A public-contract or safety-strategy change then follows the ordinary ledger,
 closure-matrix and independent-review gates. Consumer adoption remains external.
 
-## Current continuation (2026-10-25)
+## Completed selected batch (2026-10-25)
 
 Plan240/#1409 delivers K1's selected call-boundary repair, with all three
-consumer adoption receipts. The owner selected the remaining assessed requests
-except R132/R142 and resumed the batch after AM-R24/#1410. Plan241 implements
-AM-R22; the remaining capabilities and evidence investigations stay selected.
-The live [HANDOFF](../../HANDOFF.md) owns the receiving-machine queue, rough
-scope and difficulty, specification preference and evidence-transfer instructions.
-The historical assessments below do not reopen K1 or override that selection.
+consumer adoption receipts. The resumed batch delivers AM-R22 in Plan241/#1412,
+R28 and the authentic R49 precision repair in Plan210/#1413, AM-R16/R137 in
+Plan242/#1414, AM-R23 in Plan243/#1415, and AM-R07 in Plan244/#1416. AM-R24/#1410
+preceded this batch. Consumer adoption remains separate; R132/R142 were excluded.
+The source-packet investigations below are complete at the evidence/reproduction
+boundary. R37 resource growth and both R80 precision witnesses remain unfixed.
 
-The exact R37/R49/R80 historical source/log packet was found locally and
-hash-authenticated on 2026-10-25. All 362 source entries agree with private
-align-llm commit `33e4d3ff40f45f48a4edf2a2f155a9e7966aeaed`; the failing variant
-hashes agree with their retained receipts. A compact private transfer archive
-retains that snapshot, variants, passing controls and replay instructions.
-The archive is outside public Git. Its private transfer to this checkout and
-all 379 internal checksums were verified on 2026-10-25. No
-current-compiler reproduction or repair is claimed. R37 still requires explicit
-memory limits and phase isolation; the later R80 nested-loop MTP witness needs
-its separate import revision authenticated before replay.
+## Authenticated request investigation (2026-10-25)
+
+The previously missing source packet is now available privately and verified:
+archive SHA-256 `38125adc4a41127f2e348d2688f3b850d84d7459da2511a16e69d26a073e3402`,
+832,473 bytes, all 379 internal checksums. The 362-file source snapshot binds to
+consumer commit `33e4d3ff40f45f48a4edf2a2f155a9e7966aeaed`; two missing imported
+sources were restored from that exact commit, with separate hashes. Private
+source and raw logs remain under `.git/handoff`, outside Git/PR publication.
+
+| Request | Reproduced boundary and completed investigation result | Remaining work |
+| --- | --- | --- |
+| R49 mutable-builder helper precision | The authentic helper previously rejected an unchanged text owner after an independent builder mutation. Plan210/#1413 repairs lost identity for statically headerless owners without weakening unknown collection proofs. Original helper and immutable control pass both check modes on the final Plan210 compiler; mutation negatives still reject. | Consumer verification remains external. |
+| R37 compiler resource growth | On macOS arm64 with opt-level-1 compiler and a supervised 3 GiB RSS cap, the complete inline-builder program passes whole-program check in 19.783 s (sampled peak 292,656 KiB), but MIR emission reaches the cap in 18.621 s. A reduced imported module reaches the same cap in 7.372 s for emission and 8.719 s for per-unit check; the shared-helper control emits in 2.970 s / 114,688 KiB. Samples place the reduced frontend cost in checked-HIR body analysis/MoveCheck loop replay. Whole-program control emission has a separate 240 s bounded stop with active CPU at 605,232 KiB in native producer analysis. | This closes the missing-evidence/reproduction task, not the compiler complexity defect. Separate frontend replay growth from whole-program native-producer cost before changing a solver; preserve the cap and owner comparison. No speed or asymptotic repair is claimed. |
+| R80 optional owned-array assignment | The authentic old FILE_SET branch witness rejects in both frontends while its immutable control passes. A synthetic loop-free reduction also rejects: assign a Result-match payload array into a mutable Option local and return it. Scalar/string controls, immutable conditional binding and else-unwrap assignment pass; a record containing an array fails. The reduced matrix still reproduces on the final Plan242 compiler. | Investigate branch-local active payload/release ownership before any precision fix. Merely ignoring a staging release when a joined Local release also exists is not a sound repair. The separately authenticated nested-MTP witness is reproduced below; its loop-depth defect must not be conflated with this branch-local Option assignment. |
+
+The R37 figures are bounded observations, not benchmark claims: RSS was sampled
+at 100 ms, cap overshoot is possible, and the compiler/source bindings
+and per-run hashes are preserved in the private result manifests. R49 final
+replay and R80 final reduction have their own compiler hashes; an earlier R37
+measurement is not silently relabeled as a final-batch measurement. Historical
+high-RSS R37 logs justify the bounded supervisor, not reproducing that allocation
+on the current 16 GiB machine. No receiving application was changed or adopted.
+
+### Additional R80: authenticated nested-loop MTP witness
+
+The owner confirmed reproduction base `2be36e7669df822c6ddd8516c1b926fe6687197a`
+from the dated manifest and evidence index. The original log predates that commit:
+execution is inferred from Git history/timestamps as
+`8fb5e72ba94bf1ce313846e7f48c16f3c804e3fc` plus uncommitted changes, using compiler
+`b39d9ee88d42ddd47966ce8c6b0c070ea4efd56c`. That inference is recorded separately
+from the authenticated reproduction base; it is not an exact historical checkout.
+
+On candidate `32b99f385716ae427895ce109fe32e3a325eaa6a`, an Align-owned copy of
+the confirmed commit passes both check modes with its `run_case` comparison.
+Replacing only `src/native_cuda_mtp_probe.align` with the retained failing source
+reproduces the expired `expected` diagnostics in both modes. Whole check takes
+6.955 s / 120,208 KiB for control and 10.512 s / 126,480 KiB for the witness;
+per-unit takes 14.465 s / 254,464 KiB and 31.643 s / 221,216 KiB respectively.
+These are sampled bounded observations, not performance promises. No cap fired.
+Compiler/source/log hashes and every base source hash are retained privately.
+
+Synthetic isolation removes GPU/native dependencies entirely. An array created
+inside an outer loop is incorrectly expired when borrowed inside two further
+nested loops. One/two loop levels pass, three fail in both frontends. No conditional
+owner construction, optional payload, fallible producer, mutable session or fixed width table
+is required. Moving the array outside all loops passes; scalar and owned-string
+controls also pass. Simplifying the real baseline and replay bodies independently
+and together retains the refusal. This is a separate reproducible loop-generation
+precision boundary, not proof of the earlier Option-assignment root cause.
+
+```align
+fn read(borrow expected: array<i64>) { print(expected.len()) }
+fn main() {
+  mut i := 0
+  loop {
+    if i >= 2 { break }
+    expected := [1].to_array()
+    mut j := 0
+    loop {
+      if j >= 2 { break }
+      mut k := 0
+      loop {
+        if k >= 2 { break }
+        read(expected)
+        k = k + 1
+      }
+      j = j + 1
+    }
+    read(expected)
+    i = i + 1
+  }
+}
+```
+
+Recommended implementation boundary: loop-scope generation advancement and release
+ownership in sema, independently replayed checked HIR, without weakening actual
+iteration-owned temporary or escaped-view rejection. A closure matrix must cross
+one/two/three/deeper loops, owner declaration depth, normal/back/break/return/`?`
+edges, owning array versus string/scalar controls, helper extraction, imported
+whole/per-unit paths, and real local/temporary expiration negatives. First prove
+which scope owns each release before adjusting `invalidate_iteration_drops`,
+iteration release handling or loop-head joins. R37 and both R80 reductions remain
+unfixed; their selected evidence/reproduction investigations are complete.
 
 ## Historical non-deferred reconciliation (2026-10-21)
 

@@ -9,20 +9,12 @@ acceptance boundaries. Do not restart the relational-solver investigation or
 interpret its older handoff as unfinished production work.
 
 The owner resumed the selected batch on 2026-10-25 and authorized merging
-completed capability PRs. AM-R24 is delivered by #1410; consumer adoption remains
-pending. R132 and R142 stay excluded. Finish each independently useful capability
-through its normal review, local verification and merge boundary, then run the
-batch release build without creating a versioned release. When external evidence
-or a machine dependency is unavailable, request the specific missing input and
-continue other selected work.
-
-[Plan241](docs/impl/241-bounded-http-responses.md) implements AM-R22's positive
-ordinary response budget with HEAD framing, bounded native writes and checked
-keep-alive restoration. Plan210 implements R28 text-builder bytes with read-only
-access and mutation/owner-generation invalidation. Plan242 implements retained read-only
-indexed-field ranges for AM-R16/R137. The remaining selected queue below is separate work.
-Missing evidence or a passing older provider PR is not a completed fix; the
-wider long-term backlog is unselected.
+completed capability PRs. The five selected provider capabilities and the
+private-evidence investigations are complete at the boundaries below. AM-R24
+was delivered by #1410 before this batch. Consumer adoption remains pending;
+R132/R142 stay excluded. R37 and both R80 defects are reproduced, not repaired.
+When external evidence or a machine dependency is unavailable, request the
+specific missing input and continue other selected work.
 
 Preserve the existing language specification where practical. The owner permits
 a small specification revision when it substantially reduces compiler complexity
@@ -70,108 +62,44 @@ The original Plan239 relational model and its checkpoints remain preserved on
 port. The older Plan61 implementation and general aggregate-provenance experiment
 also remain parked. Broader writable returns are not a queued requirement.
 
-## Selected work and remaining prerequisites
+## Completed batch and next repair boundaries
 
-The remaining batch follows the scope above; R132/R142 below are explicitly
-excluded. AM-R24 is complete at the provider boundary; Plan241 owns AM-R22.
-[Plan230](docs/impl/230-request-follow-up-plan.md) retains the historical request
-reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
+The selected provider capabilities are implemented:
 
-- Plan241 implements AM-R22 bounded, HEAD-correct HTTP response writes.
-  [Plan243](docs/impl/243-peer-eof-observation.md) implements AM-R23 as
-  `ctx.peer_eof() -> Result<bool, Error>`: one nonblocking receive peek, shared
-  context borrow, no allocation or retry. True includes send-half-close; false
-  is not liveness. Queued kernel bytes can hide EOF, while co-read application
-  bytes and request views survive. Consumer adoption, cancellation and GPU
-  cleanup remain external.
-- Plan210 implements R28 `builder.bytes()` as an allocation-free read-only view
-  of initialized bytes. Every write, finish, move, replacement and Drop ends
-  earlier views; shared readers may return caller-borrowed views. Plan240 supplies
-  ordinary-call authority. Consumer adoption remains external.
-- [Plan242](docs/impl/242-indexed-field-views.md) implements AM-R16/R137 explicit
-  read-only ranges into independent fixed/dynamic indexed array fields. It retains
-  parent and selected backing without a field snapshot; Plan240 owns call authority.
-  Independent Copy reads and lengths keep their existing semantics. Consumer
-  adoption remains external. Whole fixed record-array call producer limits and
-  unresolved returned byte-backing precision remain explicitly scoped in the plan.
-- R132 exclusive owned-subrecord borrowing remains unshipped and is reobserved
-  by current MTP and structured-decoding consumers. Projection/replacement must
-  preserve sibling cleanup and heap-versus-arena allocation authority. This is
-  a distinct large ownership capability, not removal of a diagnostic guard.
-- R142 exclusive matched owned payloads remain unshipped. Active-tag authority,
-  conflicting replacement, aliases and exactly-once cleanup need a separate
-  complete design; nested owning fields may also encounter R132. The retired
-  Qwen2 dispatcher is not current adoption evidence.
-- [Plan244](docs/impl/244-external-writable-file-windows.md) implements AM-R07
-  with unsafe privileged `resource.view_mut_from_raw` and synchronous File
-  `read_at` into an initialized writable view. Owner/parent lifetimes survive
-  byte writes; overlapping UTF-8 observations expire. Ordinary returned views
-  remain read-only. Consumer pinned-memory initialization, transfer completion,
-  adoption and GPU performance qualification remain external.
-- Plan210 also repairs R49's headerless-owner loop precision: mutations of an
-  independent builder preserve validated text. The authenticated original helper
-  and immutable control pass both check modes; actual-source mutation negatives
-  remain rejected. Consumer verification is pending.
-- LLM R37/R80 remain investigations under Plan230. Their historical source/log
-  packet was found and authenticated on 2026-10-25 (below). R37 reports roughly
-  79.5 GiB peak memory at its recorded revision, so reproduction needs explicit
-  resource limits; do not infer closure from K1.
+| Request | Delivery | Consumer-owned work |
+| --- | --- | --- |
+| AM-R22 | [Plan241](docs/impl/241-bounded-http-responses.md), #1412: positive total response budget, HEAD framing and checked keep-alive restoration. | Media adoption and native receiving qualification. |
+| R28 / R49 | [Plan210](docs/impl/210-text-builder-byte-views.md), #1413: read-only builder bytes and independent headerless-owner precision; authentic helper/control pass both frontends. | Repinning and actual application verification. |
+| AM-R16 / R137 | [Plan242](docs/impl/242-indexed-field-views.md), #1414: retained read-only fixed/dynamic indexed-field ranges. | Consumer integration; the plan's wider producer limits remain. |
+| AM-R23 | [Plan243](docs/impl/243-peer-eof-observation.md), #1415: one nonblocking, nonconsuming receive-EOF peek. | Cancellation policy and GPU cleanup; false is not liveness and true includes half-close. |
+| AM-R07 | [Plan244](docs/impl/244-external-writable-file-windows.md), #1416: unsafe initialized external views and synchronous File.read_at windows. | Native initialization/unique ownership, transfer completion, adoption and GPU performance qualification. |
 
-### Recommended order and rough difficulty
+[Plan230](docs/impl/230-request-follow-up-plan.md) records the authenticated
+private packet, exact compiler/source bindings, bounded measurements, synthetic
+reductions and recommended repair boundaries. R37 still grows in frontend replay
+and separately in whole-program native-producer analysis; preserve the 3 GiB
+supervisor and phase isolation. The original R80 Option-array branch witness and
+the separately authenticated MTP three-loop array witness both remain rejected.
+The latter uses reproduction base `2be36e7669df822c6ddd8516c1b926fe6687197a`;
+its comparison passes both frontends. No external evidence request remains open
+for those reproductions. These completed investigations are not compiler fixes.
 
-These are pre-design scope estimates, not delivery-time commitments. K1's
-completed call-boundary authority is a prerequisite to reuse, not a solver port
-to repeat. AM-R22 now has its implementation and public contract in Plan241; later rows
-remain separate capabilities.
+R132 exclusive owned-subrecord access and R142 exclusive matched owned payloads
+remain excluded. Projection, replacement, active-tag authority and exactly-once
+cleanup require their own complete design; do not remove diagnostic guards or
+perform consumer adoption to close them.
 
-| Order | Capability | Rough scale / difficulty | First closure decision |
-| --- | --- | --- | --- |
-| 1 | AM-R22 bounded HEAD-correct responses | Medium / medium | Plan241 implements `respond_timeout_ns` with one finite budget, partial-write cleanup and eligible keep-alive reuse. |
-| 2 | R28 text-builder byte views | Medium to large / high | Plan210 implements the read-only prefix and exact invalidation; consumer adoption and view-bearing typed-builder elements are separate. |
-| 3 | AM-R16/R137 retained indexed fields | Large / high | Plan242 implements explicit read-only ranges with parent/selected-storage lifetime and exact outer producer proof. |
-| 4 | AM-R23 connection observation | Medium / medium to high | Plan243 implements one nonblocking incoming EOF observation, including half-close, buffered/pipelined data, native errors and races; cancellation policy stays in the consumer. |
-| 5 | AM-R07 external writable positional reads | Large / high | Close exclusive native-view creation, initialization, bounds/overlap, external resource lifetime and synchronous short-read/error semantics together. No pinned-memory speed claim. |
-| Evidence lane | R37/R49/R80 | Unknown until reproduction / potentially high | Recheck the exact packets early under resource bounds. Separate checker precision from MIR/emission cost; do not assume that K1 fixed them. |
-
-Retained indexed views and external writable reads need preparation comparable
-to ownership work; they should not be treated as diagnostic-guard removals. If a
-small specification restriction would materially simplify one, compare it with
-preserving the existing behavior, report consumer impact, and follow the language
-policy and review gates above. Difficulty alone does not select a restriction.
-
-### Evidence transfer to the receiving machine
-
-The private LLM packet is now available on this machine under the common Git
-directory as `handoff/2026-10-25-private-request-evidence.tar.gz` (832,473 bytes;
-SHA-256 `38125adc4a41127f2e348d2688f3b850d84d7459da2511a16e69d26a073e3402`).
-It is deliberately outside the public repository and is **not transferred by a
-Git fetch**. It was copied privately to this checkout and its archive hash plus all 379
-internal checksums were verified on 2026-10-25. It contains the authenticated 362-file consumer source snapshot,
-three exact failing variants, passing borrow controls, compact original logs and
-replay instructions. Current-compiler reproduction remains pending.
-
-The source binding names private `align-llm` commit
-`33e4d3ff40f45f48a4edf2a2f155a9e7966aeaed`; all 362 committed source hashes match.
-R37's inline builder variant and R49's mutable-helper variant replace
-`src/expert_trace.align`. R80's FILE_SET variant replaces
-`src/prompt_source_trust.align`, with `src/prompt_source_trust_smoke.align` as the
-check entry. Work in an Align-owned copy. R37 recorded 83,309,188 kB VmHWM:
-check headroom, enforce a memory cap, and isolate check/MIR/emission before any
-build. The packet also retains the newer R80 nested-loop MTP witness; its own
-import revision still needs authentication before replay, and the old snapshot
-must not be substituted for that evidence.
-
-AM-R22/23's current source is committed in private `align-media` at
-`f9948006c965ead29865d0008c86061919e21cf0`, verified present on GitHub with a clean
-matching local tree. Read `src/image_http.align`, `src/image_server.align`,
-`src/image-http-owner.align` and `validation/image-http-owners.py` from that
-commit on the receiving machine. This supplies portable source evidence while
-the register's older request draft still says its URLs are missing. The current
-owner qualifies the HEAD-close workaround, not a timed HEAD response or model
-cancellation. Use an Align-owned source copy for provider reproduction; follow
-the request register for subsequent consumer acceptance. Do not upload private
-consumer source into public Align docs or tests. Consumer pins, code, tests and
-adoption remain external.
+The private source archive remains in the common Git directory as
+`handoff/2026-10-25-private-request-evidence.tar.gz`, SHA-256
+`38125adc4a41127f2e348d2688f3b850d84d7459da2511a16e69d26a073e3402`.
+Its 379 internal checksums were verified. It is not transferred by git fetch.
+The newer MTP source binding, bounded run manifests and synthetic matrix are
+retained separately under `handoff/r80-nested-recheck`. Its exact source copy and
+replay scripts are archived in `handoff/2026-10-25-r80-nested-replay.tar.gz`,
+SHA-256 `403ccfa88190705944ed08fee66b717e7192bc477026da6b1ac210e0d7f0e91a`
+(939,476 bytes; 537 file checksums verified). The expanded source and copied
+compiler were removed after verification. Keep private consumer source out of
+public Git; publish only independently authored reductions.
 
 Unknown/multiple-target mutable outputs, fully escaping function values and
 view-bearing builder elements retain their own unselected boundaries. R78 enum
