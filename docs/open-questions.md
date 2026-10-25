@@ -551,13 +551,13 @@ explicit empty body and emits Content-Length for the latter. The contract is imp
 
 ### HTTP client package composition — SETTLED 2026-09-09
 
-The next cloud prerequisite names the existing `http_client`, `http_request` and
+The implemented cloud prerequisite names the existing `http_client`, `http_request` and
 `http_response` owners and closes helper/carrier ownership as one capability.
 It preserves the existing Move/borrow/Drop model and wire/transport policy.
 Shared client network helpers preserve the existing shared stream loan;
-configuration and request setters require exclusive borrowed authority. The
-general bound-owner value-carrying `if` gap remains deferred. The exact accepted
-contract, review closure and implementation gate are recorded in
+configuration and request setters require exclusive borrowed authority. A
+value-carrying `if` can select a bound owner under the general Move rule; use
+after a possible move is rejected. The exact contract and acceptance owners are recorded in
 `docs/impl/std-design/http-client-composition.md`.
 
 

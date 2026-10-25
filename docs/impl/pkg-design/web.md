@@ -70,28 +70,24 @@ must be ≈ zero; plus a same-machine Go Fiber comparison — the target is
 ## Surface (Fiber-informed, Align-idiomatic)
 
 > **Call convention (owner-decided 2026-07-20):** call sites are **fully qualified** — `pkg.web.get(...)`,
-> `pkg.web.param(c, "id")`, `c: pkg.web.Ctx` — per §17 D3 (no import aliases; provenance visible at
-> every use). The bare `web.` / `web.Ctx` in the examples below is shorthand for `pkg.web.` and will be
-> spelled out when the public surface lands (W2). This was reconciled when F0 settled D3.
+> `pkg.web.param(c, "id")`, `c: pkg.web.types.Ctx` — per §17 D3 (no import aliases; provenance visible at
+> every use). Import `pkg.web.types` to name `Ctx`. Prose and signature tables abbreviate `pkg.web.`
+> as `web.`; the Align examples use the implemented paths.
 
 ```align
 import pkg.web
+import pkg.web.types
 
-// handlers: ONE signature — fn(c: web.Ctx) -> Result<response_builder, Error>
+// Whole-body handlers: fn(c: pkg.web.types.Ctx) -> Result<response_builder, Error>
 // The handler BUILDS a response and hands it back; the framework writes it.
-fn get_model(c: web.Ctx) -> Result<response_builder, Error> {
-  id := web.param(c, "id")               // str view into the request path
-  m := lookup(id)?                        // `?` works: a failure becomes a 500
-  web.json(json.encode(m))
+fn get_model(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {
+  id := pkg.web.param(c, "id")              // str view into the request path
+  return pkg.web.text(id)
 }
 
 fn main() -> Result<(), Error> {
-  routes := [
-    web.get("/v1/models", list_models),
-    web.get("/v1/models/:id", get_model),
-    web.post("/v1/chat/completions", chat),
-  ]
-  web.serve("127.0.0.1", 8080, routes, 4)
+  routes := [pkg.web.get("/v1/models/:id", get_model)]
+  return pkg.web.serve("127.0.0.1", 8080, routes[..], 1)
 }
 ```
 
@@ -172,7 +168,7 @@ web.status(code)             -> Result<response_builder, Error>  // status + emp
 
 ```text
 // types
-web.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, the matched
+pkg.web.types.Ctx    — the per-request context: a **Copy** struct of views (method, path, query, the matched
              pattern, the body view, and the detached header-table view). It owns nothing; `serve`
              retains the request handle across prepare and pump. The trailing Copy
              `upgrade_ready: bool` is true exactly for an HTTP/1.1 request with no parser residual.
@@ -234,7 +230,7 @@ param names remain build-time aborts.
 
 ## Foundations (compiler / std — shipped)
 
-- **F1 — field-eligibility widening.** Shipped for the shapes `web.Ctx` and `Route` require:
+- **F1 — field-eligibility widening.** Shipped for the shapes `pkg.web.types.Ctx` and `Route` require:
   ① a **fn value** field (Copy pointer — `Route.handler`; effects flow through `FnTy`), ② a
   detached **`http_headers` view** field inside Copy `Ctx`, and ③ a region-tracked **`slice<str>`**
   field for parameter slots. Capturing escaping closures remain outside this
@@ -249,7 +245,7 @@ param names remain build-time aborts.
 ```text
 Route / route table   Copy data (str view of a literal + tag + fn pointer); Static; never dropped
 the radix tree        built once inside serve (arena- or startup-heap-owned; freed at serve exit)
-web.Ctx               Copy struct of request views; serve retains the request handle and keeps
+pkg.web.types.Ctx               Copy struct of request views; serve retains the request handle and keeps
                       every view valid through middleware/handler/pump completion
 web.serve             Impure; borrows the table; runs until setup-Err
 accessors             Pure; views region-bound to serve's retained request owner
@@ -295,7 +291,7 @@ redirects, preflight responses, and other pre-handler policies; stateful middlew
 an escaping closure-environment design.
 
 
-## Streaming (SSE + generic) — designed 2026-07-21, lands W6
+## Streaming (SSE + generic) — implemented (W6)
 
 **The problem.** A handler is `fn(Ctx) -> Result<response_builder, Error>` — it builds ONE complete
 response. SSE and LLM token streams instead hold the connection and write incrementally, so
@@ -307,18 +303,20 @@ framework's ability to answer differently (404/405/500) has ended anyway. Nothin
 ### Surface
 
 ```align
-// The second (and last) handler signature, scoped to stream routes. Borrows the request through
+import pkg.web
+import pkg.web.types
+
+// The stream handler signature. Borrows the request through
 // `c` (valid for the whole call — serve still holds the handle) and OWNS the response stream.
 fn events(c: pkg.web.types.Ctx, s: http_stream) -> Result<(), Error> {
   s.send_event("tick")?
-  s.finish()
+  return s.finish()
 }
 
-routes := [
-  web.get("/v1/models", list_models),
-  web.sse("/v1/events", events),                                   // GET; text/event-stream
-  web.stream("POST", "/v1/chat/completions", "application/x-ndjson", chat),
-]
+fn main() -> Result<(), Error> {
+  routes := [pkg.web.sse("/v1/events", events)] // GET; text/event-stream
+  return pkg.web.serve("127.0.0.1", 8080, routes[..], 1)
+}
 ```
 
 ```text
@@ -331,14 +329,11 @@ s.send_event(data)       -> Result<(), Error>           // one `data: {data}\n\n
 ```
 
 **`send_event` is a `http_stream` METHOD, not a `web.*` free fn** (revised while shipping enabler
-5 — the surface was first sketched as `web.send_event(s, data)`). Two reasons, one decisive: a
-pkg-level free fn takes a Move handle BY VALUE — Align has no user-fn borrow params (borrowing is
-the std bound-receiver mechanism, the recorded `io.copy` restriction) — so
-`web.send_event(s, …)?; s.finish()` cannot compile: the wrapper would consume the very stream the
-pump still has to finish. And SSE event framing was already committed as a std.http floor item
-("SSE event framing (WHATWG) when the first streaming consumer lands", Prerequisites above), so
-the framing lives with the other stream writes — `send` / `send_event` / `finish` / `reject`, one
-method family on one handle. pkg.web ships NO wrapper (the `web.header` no-duplication rule).
+5 — the surface was first sketched as `web.send_event(s, data)`). A by-value wrapper would consume
+the stream before the pump could finish it. User functions now support explicit borrowed
+parameters, but that does not call for a second event-framing API: SSE framing belongs to
+std.http with the other stream writes — `send` / `send_event` / `finish` / `reject`, one method
+family on one handle. pkg.web ships NO wrapper (the `web.header` no-duplication rule).
 
 ### Types
 
@@ -759,7 +754,7 @@ This seam is active with `pkg.ws`. Exact cross-package ledger and closure matrix
 - **W1 — router core. DONE.** Pattern parse + validation; the **radix tree** (static/param/wildcard
   nodes, priority order, conflict detection) + matcher as pure functions over path segments;
   param slot capture. Unit-tested against a linear-scan oracle (differential). Needs F1①.
-- **W2 — Ctx + serve + dispatch. DONE.** `web.Ctx`; the accept loop over std.http;
+- **W2 — Ctx + serve + dispatch. DONE.** `pkg.web.types.Ctx`; the accept loop over std.http;
   automatic 404/405/400/500; `group`. Integration tests via the in-process server pattern
   (`crates/align_driver/tests/m11_http.rs`).
 - **W3 — accessors + responders. DONE.** param/query/header/body/body_str;

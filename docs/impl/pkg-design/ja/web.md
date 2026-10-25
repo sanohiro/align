@@ -77,24 +77,25 @@ param を読んでから応答することは端的に拒否される（`c` を 
 
 ## 表面（Fiber 参考、Align 流儀）
 
+> **呼び出し規約（2026-07-20 決定）:** 呼び出しは `pkg.web.get(...)`、`pkg.web.param(c, "id")`、
+> `c: pkg.web.types.Ctx` のように完全修飾します（§17 D3、import aliasなし、出自を各使用箇所で明示）。
+> `Ctx` の型名には `import pkg.web.types` が必要です。本文とシグネチャ表は `pkg.web.` を `web.` と
+> 略記しますが、Alignのコード例は実装済みのパスを使います。
+
 ```align
 import pkg.web
+import pkg.web.types
 
-// ハンドラ: 唯一のシグネチャ — fn(c: web.Ctx) -> Result<response_builder, Error>
+// 全体レスポンスのハンドラ: fn(c: pkg.web.types.Ctx) -> Result<response_builder, Error>
 // ハンドラはレスポンスを**組み立てて返す**。書き込むのはフレームワーク。
-fn get_model(c: web.Ctx) -> Result<response_builder, Error> {
-  id := web.param(c, "id")               // リクエスト path への str view
-  m := lookup(id)?                        // `?` が使える: 失敗は 500 になる
-  web.json(json.encode(m))
+fn get_model(c: pkg.web.types.Ctx) -> Result<response_builder, Error> {
+  id := pkg.web.param(c, "id")              // リクエスト path への str view
+  return pkg.web.text(id)
 }
 
 fn main() -> Result<(), Error> {
-  routes := [
-    web.get("/v1/models", list_models),
-    web.get("/v1/models/:id", get_model),
-    web.post("/v1/chat/completions", chat),
-  ]
-  web.serve("127.0.0.1", 8080, routes, 4)
+  routes := [pkg.web.get("/v1/models/:id", get_model)]
+  return pkg.web.serve("127.0.0.1", 8080, routes[..], 1)
 }
 ```
 
@@ -162,7 +163,7 @@ web.status(code)             -> Result<response_builder, Error>  // ステータ
 
 ```text
 // 型
-web.Ctx    — view（method, path, query、マッチした pattern、body、切り離した header table）だけを
+pkg.web.types.Ctx    — view（method, path, query、マッチした pattern、body、切り離した header table）だけを
              持つ **Copy** struct。何も所有せず、`serve` が prepare と pump の間も request handle を保持する。
              trailing Copy field `upgrade_ready: bool` は HTTP/1.1 かつ parser residual なしの場合だけ
              true。view は handler/pump call 中有効である。
@@ -220,7 +221,7 @@ httprouter/matchit/Fiber のリファレンスに反して `/assets/*file` で�
 
 ## 土台（コンパイラ / std — 出荷済み）
 
-- **F1 — フィールド許可拡張。** `web.Ctx` と `Route` が必要とする形を出荷済み:
+- **F1 — フィールド許可拡張。** `pkg.web.types.Ctx` と `Route` が必要とする形を出荷済み:
   ① **fn 値**フィールド（Copy ポインタ — `Route.handler`; effect は `FnTy` を流れる）、
   ② Copy `Ctx` 内の detached **`http_headers` view** field、③ param スロット用の
   region 追跡される **`slice<str>`** フィールド。キャプチャする escaping クロージャはこの能力の
@@ -235,7 +236,7 @@ httprouter/matchit/Fiber のリファレンスに反して `/assets/*file` で�
 ```text
 Route / テーブル   Copy データ（リテラル str view + タグ + fn ポインタ）。Static。drop なし
 radix tree         serve 内で一度構築（arena か起動時ヒープ所有。serve 終了時解放）
-web.Ctx            request view の Copy struct。serve が request handle を保持し、
+pkg.web.types.Ctx            request view の Copy struct。serve が request handle を保持し、
                    middleware/handler/pump 完了まで全 view を有効にする
 web.serve          Impure。テーブル借用。セットアップ Err まで走る
 アクセサ           Pure。serve が保持する request owner に region 束縛された view
@@ -276,7 +277,7 @@ auth、request logging、redirect、preflight response などを扱う。状態�
 escaping closure environment の設計を待つ。
 
 
-## ストリーミング（SSE + 汎用）— 2026-07-21 設計、着地は W6
+## ストリーミング（SSE + 汎用）— 実装済み（W6）
 
 **問題。** ハンドラは `fn(Ctx) -> Result<response_builder, Error>` — 完結した 1 レスポンスを組み立てる。
 SSE や LLM トークンストリームは代わりに接続を保持して逐次書き込むので、ストリーミングには第二の
@@ -288,18 +289,20 @@ SSE や LLM トークンストリームは代わりに接続を保持して逐�
 ### 表面
 
 ```align
-// 第二（かつ最後）のハンドラシグネチャ。stream ルートに限定。`c` 経由でリクエストを借用し
+import pkg.web
+import pkg.web.types
+
+// stream ハンドラのシグネチャ。`c` 経由でリクエストを借用し
 // （serve がまだハンドルを保持しているので pump 呼び出しの間ずっと有効）、レスポンス stream を所有する。
 fn events(c: pkg.web.types.Ctx, s: http_stream) -> Result<(), Error> {
   s.send_event("tick")?
-  s.finish()
+  return s.finish()
 }
 
-routes := [
-  web.get("/v1/models", list_models),
-  web.sse("/v1/events", events),                                   // GET; text/event-stream
-  web.stream("POST", "/v1/chat/completions", "application/x-ndjson", chat),
-]
+fn main() -> Result<(), Error> {
+  routes := [pkg.web.sse("/v1/events", events)] // GET; text/event-stream
+  return pkg.web.serve("127.0.0.1", 8080, routes[..], 1)
+}
 ```
 
 ```text
@@ -312,15 +315,11 @@ s.send_event(data)       -> Result<(), Error>           // `data: {data}\n\n` 1 
 ```
 
 **`send_event` は `http_stream` の**メソッド**であり、`web.*` 自由関数ではない**（enabler 5 の出荷
-中に改めた — 表面は当初 `web.send_event(s, data)` として素描されていた）。理由は 2 つ、うち 1 つが
-決定的である: pkg レベルの自由関数は Move ハンドルを**値渡し**で取る — Align にユーザ関数の借用パラ
-メータは無い（借用は std の bound-receiver 機構であり、記録済みの `io.copy` 制限）— ので
-`web.send_event(s, …)?; s.finish()` はコンパイルできない: ラッパーが、pump がこれから finish すべき
-まさにその stream を消費してしまう。加えて SSE イベントフレーミングは既に std.http の床項目として
-確約済みで（「最初のストリーミング消費者が着地したときの SSE イベントフレーミング（WHATWG）」、上の
-前提条件）、フレーミングは他の stream 書き込みと同居する — `send` / `send_event` / `finish` /
-`reject`、1 つのハンドル上の 1 つのメソッド族。pkg.web はラッパーを**一切出荷しない**（`web.header`
-の非重複ルール）。
+中に改めた — 表面は当初 `web.send_event(s, data)` として素描されていた）。値渡しのラッパーは、
+pump が finish する前にstreamを消費してしまいます。現在はユーザ関数も明示的な借用引数を使えますが、
+イベントフレーミングのAPIを重複させる理由にはなりません。SSEフレーミングはstd.httpの他のstream書き込みと
+同居します — `send` / `send_event` / `finish` / `reject`、1つのハンドル上の1つのメソッド族です。
+pkg.webはラッパーを**一切出荷しません**（`web.header` の非重複ルール）。
 
 ### 型
 
@@ -712,7 +711,7 @@ registry はなく、hot path は closed Handler tag match 一つだけ増える
 - **W1 — router コア。完了。** パターン解析 + 検証。**radix tree**（static/param/wildcard ノード、
   優先順位、衝突検出）+ マッチャをセグメント上の純関数として。param スロットキャプチャ。線形
   走査オラクルとの差分テスト。出荷済みの F1① を利用する。
-- **W2 — Ctx + serve + ディスパッチ。完了。** `web.Ctx`。std.http 上の accept ループ。
+- **W2 — Ctx + serve + ディスパッチ。完了。** `pkg.web.types.Ctx`。std.http 上の accept ループ。
   自動 404/405/400/500。`group`。統合テストは in-process サーバパターン
   （`crates/align_driver/tests/m11_http.rs`）。
 - **W3 — アクセサ + レスポンダ。完了。** param/query/header/body/body_str、

@@ -67,7 +67,7 @@ File/Buffer を move・置換できません。予約はスカラー操作の完
 
 ## R65 の封印済みストレージ契約
 
-設計・レビュー指摘の反映を完了した [plan 50](../../50-r65-process-capability-handoff.md) が、明示的な
+実装済みの [plan 50](../../50-r65-process-capability-handoff.md) が、明示的な
 memory_kind、memory_writer、sealed_file、OS の seal、位置指定の writable-out 読み取り、
 所有権、ABI、検証条件を定めます。これらは非対応ホストのエラーを定めた Linux 固有の
 OS 機能であり、Mac の通常のファイル・プロセス操作の前提にはしません。データの作成は

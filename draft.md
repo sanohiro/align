@@ -3062,6 +3062,7 @@ Exports are explicit.
 
 ```align
 pub fn main(args: array<str>) -> Result<(), Error> {
+  return Ok(())
 }
 ```
 
@@ -3073,9 +3074,15 @@ A prefix-accessed library namespace must be `import`ed before use, so a file's h
 import core.json
 import std.fs
 
+User { id: i64, name: str }
+
 fn main() -> Result<(), Error> {
   data := fs.read_file("u.json")?     // needs `import std.fs`
-  users := json.decode(data)?         // needs `import core.json`
+  arena {
+    users: array<User> := json.decode(data)? // needs `import core.json`
+    print(users.len())
+  }
+  return Ok(())
 }
 ```
 
@@ -5520,8 +5527,8 @@ Align is a data-oriented AOT language designed to align human intent, AI generat
 Move owners. The implementation supports by-value/borrowed helper
 boundaries and ordinary recursive owning carriers together. Client network operations accept shared `borrow`; client configuration and
 request setters require `borrow mut` on borrowed receivers. Response inspection accepts shared borrows; request serialization remains an
-internal codec observed through sent bytes. The existing bound-owner
-value-carrying `if` gap remains deferred without an HTTP-specific exception. Response views and
+internal codec observed through sent bytes. A value-carrying `if` can select a
+bound owner under the general Move rule; use after a possible move is rejected. Response views and
 dependent streams retain their exact owner roots through imported helpers.
 This adds no transport, allocation, retry, or runtime ABI policy. The exact
 surface, exclusions, persistence tags and closure matrix are owned by
