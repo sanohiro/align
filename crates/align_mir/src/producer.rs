@@ -9073,6 +9073,76 @@ fn validate_resource_rvalues_inner(
     Ok(())
 }
 
+/// Boolean branch pruning is sound only for slots with a closed writer inventory.
+/// Native output slots and handed-out addresses cannot retain a local Store fact.
+fn builder_boolean_slots(function: &Function) -> Vec<bool> {
+    fn exclude(eligible: &mut [bool], slot: Slot) {
+        if let Some(value) = eligible.get_mut(slot as usize) { *value = false; }
+    }
+    fn address(eligible: &mut [bool], operand: &Operand) {
+        let mut pending = vec![operand];
+        while let Some(operand) = pending.pop() {
+            match operand {
+                Operand::BorrowedPlace(place) => {
+                    exclude(eligible, place.slot);
+                    if let Some(flag) = place.cleanup { exclude(eligible, flag); }
+                }
+                Operand::BorrowedFixedElementPlace(place) => {
+                    exclude(eligible, place.base);
+                    if let Some(flag) = place.cleanup { exclude(eligible, flag); }
+                }
+                Operand::BorrowedElementPlace(place) => {
+                    exclude(eligible, place.base.slot);
+                    if let Some(flag) = place.base.cleanup { exclude(eligible, flag); }
+                    pending.extend([&place.index, &place.guard.len]);
+                }
+                Operand::Const(_) | Operand::Value(_) | Operand::Arg(_)
+                | Operand::BorrowedCleanupArg(_) => {}
+            }
+        }
+    }
+    let mut eligible = function.slots.iter().map(|ty| *ty == Ty::Bool).collect::<Vec<_>>();
+    for slot in function.params.iter().chain(function.borrow_mut_cleanup_slots.iter().flatten()) {
+        exclude(&mut eligible, *slot);
+    }
+    for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+        match statement {
+            Stmt::Let(_, value) => {
+                for (slot, _) in xml_written_slots(value) { exclude(&mut eligible, slot); }
+                match crate::loop_facts::drop_state_call(value) {
+                    crate::loop_facts::DropStateCall::Direct(_, args)
+                    | crate::loop_facts::DropStateCall::Unknown(args) => {
+                        for argument in args { address(&mut eligible, argument); }
+                    }
+                    crate::loop_facts::DropStateCall::None => {}
+                }
+                if let Rvalue::Use(operand) = value { address(&mut eligible, operand); }
+                if let Rvalue::Closure { captures, .. } = value {
+                    for capture in captures { address(&mut eligible, capture); }
+                }
+            }
+            Stmt::Store(_, operand) => address(&mut eligible, operand),
+            Stmt::StoreField(slot, ..) | Stmt::StoreIndex(slot, ..)
+            | Stmt::StoreConstArray { slot, .. } | Stmt::StoreElemField(slot, ..)
+            | Stmt::DropFlagInit(slot) | Stmt::DropFlagMoveOut { slot, .. }
+            | Stmt::NullTupleField(slot, _) | Stmt::NullStructField(slot, _)
+            | Stmt::NullElemField(slot, ..) | Stmt::Drop(slot) | Stmt::DropField(slot, _)
+            | Stmt::DropElem(slot, ..) | Stmt::DropElemField(slot, ..)
+            | Stmt::ArrayTruncate { root: slot, .. } => exclude(&mut eligible, *slot),
+            // Pointer writes cannot reach an unexposed local Bool slot. The only local
+            // address carriers are the borrowed-place family, excluded independently.
+            Stmt::PtrStore(ptr, _, _) | Stmt::PtrStoreNoalias { ptr, .. }
+            | Stmt::RawStore { ptr, .. } => address(&mut eligible, ptr),
+            Stmt::VecStore { slice, .. } => address(&mut eligible, slice),
+            Stmt::StoreElemFieldPtr { base, .. } | Stmt::StoreColumn { base, .. } => address(&mut eligible, base),
+            Stmt::ArenaEnd(_) | Stmt::RawFree(_) | Stmt::ColumnBatchFinish { .. }
+            | Stmt::ColumnBatchDrop { .. } | Stmt::TgWait(_) | Stmt::TgEnd(_)
+            | Stmt::BorrowedElementReservation { .. } | Stmt::DropValue(_) => {}
+        }
+    }
+    eligible
+}
+
 /// A read snapshots a stable builder header before its index runs. Authenticate that snapshot
 /// against every CFG path, preserving ownership identity through moves, forwarded SSA and stores.
 fn validate_builder_read_reservations(
@@ -9084,6 +9154,7 @@ fn validate_builder_read_reservations(
         .any(|statement| matches!(statement, Stmt::Let(_, Rvalue::ArrayBuilderRead { .. } | Rvalue::BuilderBytes(_)))) {
         return Ok(());
     }
+    let boolean_slots = builder_boolean_slots(function);
     #[derive(Clone, PartialEq, Eq, Hash)]
     struct State {
         slots: Vec<usize>,
@@ -9176,7 +9247,6 @@ fn validate_builder_read_reservations(
         initial.normalize();
         let mut pending = VecDeque::from([(function.entry, initial)]);
         let mut seen = HashSet::new();
-        let mut reached = false;
         while let Some((block, mut state)) = pending.pop_front() {
             if !seen.insert((block, state.clone())) { continue; }
             let block = function.blocks.get(block as usize).ok_or_else(&fail)?;
@@ -9195,7 +9265,7 @@ fn validate_builder_read_reservations(
                     }
                     Stmt::Store(destination, source)
                         if function.slots.get(*destination as usize) == Some(&Ty::Bool) => {
-                        state.slot_bools[*destination as usize] = state.boolean(source);
+                        state.slot_bools[*destination as usize] = if boolean_slots[*destination as usize] { state.boolean(source) } else { None };
                     }
                     Stmt::DropFlagMoveOut { slot: source, .. } => {
                         if source == slot { state.reserved = false; }
@@ -9213,9 +9283,8 @@ fn validate_builder_read_reservations(
                         state.retire(identity);
                     }
                     Stmt::Let(id, value) => {
-                        if *id == read {
-                            reached = true;
-                            if !state.reserved || tracked == 0 || state.operand(owner) != tracked { return Err(fail()); }
+                        if *id == read && (!state.reserved || tracked == 0 || state.operand(owner) != tracked) {
+                            return Err(fail());
                         }
                         let (mut changed, mut retired, mut exclusive) = (Vec::new(), Vec::new(), Vec::new());
                         match value {
@@ -9293,7 +9362,8 @@ fn validate_builder_read_reservations(
                         if function.value_tys.get(*id as usize) == Some(&Ty::Bool) {
                             state.value_bools[*id as usize] = match value {
                                 Rvalue::Use(source) => state.boolean(source),
-                                Rvalue::Load(source) => state.slot_bools.get(*source as usize).copied().flatten(),
+                                Rvalue::Load(source) if boolean_slots.get(*source as usize) == Some(&true) =>
+                                    state.slot_bools.get(*source as usize).copied().flatten(),
                                 _ => None,
                             };
                         }
@@ -9326,7 +9396,6 @@ fn validate_builder_read_reservations(
             };
             for successor in successors { pending.push_back((successor, state.clone())); }
         }
-        if !reached { return Err(fail()); }
     }
     Ok(())
 }

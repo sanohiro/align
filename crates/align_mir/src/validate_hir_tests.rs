@@ -20385,7 +20385,7 @@ fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
             ("bytes[0] = 65", true),
             ("bytes.set_u8(0, 65)", true),
             ("bytes.fill(65)", true),
-            ("bytes.copy_from(\"xx\".bytes())", true),
+            ("copy_source := buffer.filled(2, 0); bytes.copy_from(copy_source.bytes())", true),
         ] {
             let source = format!("fn probe(borrow mut input: slice<u8>, {receiver}) {{ published := {publication}; mut bytes := input; {sink} }}\nfn main() -> i32 = 0\n");
             let mut program = checked_source_program(&source);
@@ -20406,7 +20406,13 @@ fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
                 assert_eq!(lower_program_checked(&program, per_unit, None).is_ok(), !write,
                     "{name}/{sink}/{per_unit}");
             }
-            if write { assert_body_entrypoints_empty(&format!("{name}/{sink}"), &program); }
+            if write {
+                let sources = SourceMap::new();
+                for lowered in [lower_program(&program), lower_program_located(&program, &sources),
+                    lower_program_per_unit(&program), lower_program_per_unit_located(&program, &sources)] {
+                    assert!(is_empty(&lowered), "{name}/{sink}: readonly write published MIR");
+                }
+            }
         }
     }
     Ok(())

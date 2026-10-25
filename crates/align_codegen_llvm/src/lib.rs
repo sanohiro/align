@@ -32931,6 +32931,65 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn builder_reads_in_unreachable_branches_are_well_typed() -> Result<(), &'static str> {
+        for (ty, new, initialize, read) in [
+            ("builder", "builder()", "b.write(\"x\")", "b.bytes().len()"),
+            ("array_builder<i64>", "array_builder()", "b.push(7)", "b[0]"),
+        ] {
+            for (setup, condition) in [("", "false"), ("flag := false", "flag")] {
+                let program = mir(&format!("fn main() {{ mut b: {ty} := {new}; {initialize}; {setup}; if {condition} {{ print({read}) }} }}"));
+                emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                    .map_err(|_| "valid dead builder read")?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn builder_reads_do_not_prune_mutated_boolean_branches() -> Result<(), &'static str> {
+        for (ty, new, initialize, read) in [
+            ("builder", "builder()", "b.write(\"x\")", "b.bytes().len()"),
+            ("array_builder<i64>", "array_builder()", "b.push(7)", "b[0]"),
+        ] {
+            for (call, imported) in [("flip(flag)", false), ("writer := flip; writer(flag)", false), ("flip(flag)", true)] {
+                let mut base = mir(&format!("fn flip(borrow mut flag: bool) {{ flag = true }}\nfn query() -> i64 {{ mut b: {ty} := {new}; {initialize}; mut flag := false; {call}; if flag {{ print(1) }}; {read} }}\nfn main() {{}}"));
+                if imported {
+                    let position = base.fns.iter().position(|f| f.name.as_str() == "flip").ok_or("flip")?;
+                    let function = base.fns.remove(position);
+                    let effects = base.drop_state_effects.remove(&function.name).ok_or("flip effects")?;
+                    base.imported_fns.push(align_mir::ImportedFn {
+                        name: function.name,
+                        params: function.params.iter().map(|slot| function.slots[*slot as usize]).collect(),
+                        param_modes: function.param_modes, ret: function.ret,
+                        return_borrow: function.return_borrow, return_region: function.return_region,
+                        return_cleanup: function.return_cleanup, drop_state_effects: effects,
+                        producer_certified: true,
+                    });
+                }
+                emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                    .map_err(|_| "valid boolean branch")?;
+                let mut bad = base.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name.as_str() == "query").ok_or("query")?;
+                let snapshot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt| match stmt {
+                    Stmt::Let(_, Rvalue::BuilderBytes(Operand::Value(owner)))
+                    | Stmt::Let(_, Rvalue::ArrayBuilderRead { builder: Operand::Value(owner), .. }) => Some(*owner),
+                    _ => None,
+                }).ok_or("read snapshot")?;
+                let slot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt| match stmt {
+                    Stmt::Let(value, Rvalue::Load(slot)) if *value == snapshot => Some(*slot), _ => None,
+                }).ok_or("builder slot")?;
+                let selected = function.blocks.iter().find_map(|block| match block.term {
+                    align_mir::Term::Branch(_, yes, _) => Some(yes), _ => None,
+                }).ok_or("boolean branch")?;
+                function.blocks.get_mut(selected as usize).ok_or("branch block")?.stmts.insert(0, Stmt::Drop(slot));
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(),
+                    "{ty}/{call}/{imported}: stale false flag hid native owner destruction");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn builder_reads_reject_alias_slot_after_exclusive_replacement() -> Result<(), &'static str> {
         for (ty, constructor, initialize, read) in [
             ("builder", "builder()", "b.write(\"a\")", "b.bytes().len()"),

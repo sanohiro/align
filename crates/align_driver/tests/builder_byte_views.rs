@@ -230,6 +230,19 @@ fn main() {
 }
 
 #[test]
+fn builder_bytes_dead_reads_emit_in_both_modes() {
+    owned_fixture::run("builder_bytes_dead_reads_emit_in_both_modes", |stage| {
+        let source = "fn main() { mut text := builder(); text.write(\"x\"); mut numbers: array_builder<i64> := array_builder(); numbers.push(7); flag := false; if false { print(text.bytes().len()); print(numbers[0]) }; if flag { print(text.bytes().len()); print(numbers[0]) }; loop { if false { print(text.bytes().len()) }; break }; print(0) }";
+        for per_unit in [false, true] {
+            if let Some(output) = execute(stage, &[("main.align", source)], per_unit) {
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                assert_eq!(output.stdout, b"0\n");
+            }
+        }
+    });
+}
+
+#[test]
 fn builder_bytes_selected_cleanup_keeps_live_original_owner() {
     verdict("builder-bytes-mixed-disjoint", "fn apply(borrow mut b: builder, borrow c: builder, flag: bool) { old := c.bytes().as_str() else { return }; (if flag { b } else { builder() }).write(\"x\"); print(old); print(b.bytes().len()) }\nfn main() {}", false);
     owned_fixture::run("builder_bytes_selected_cleanup_keeps_live_original_owner", |stage| {

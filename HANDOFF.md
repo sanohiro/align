@@ -104,10 +104,14 @@ reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
   producer, initialization/bounds/overlap/resource-lifetime proof and matching
   positional-read semantics. K1 and fallible raw allocation do not supply these
   permissions or establish a pinned-memory speedup.
-- LLM R37/R49/R80 remain investigations under Plan230. Their historical
-  source/log packet was found and authenticated on 2026-10-25 (below); recheck
-  current main before choosing a fix; do not infer closure from K1. R37 reports roughly 79.5 GiB peak memory at its
-  recorded revision, so reproduction needs explicit resource limits.
+- Plan210 also repairs R49's headerless-owner loop precision: mutations of an
+  independent builder preserve validated text. The authenticated original helper
+  and immutable control pass both check modes; actual-source mutation negatives
+  remain rejected. Consumer verification is pending.
+- LLM R37/R80 remain investigations under Plan230. Their historical source/log
+  packet was found and authenticated on 2026-10-25 (below). R37 reports roughly
+  79.5 GiB peak memory at its recorded revision, so reproduction needs explicit
+  resource limits; do not infer closure from K1.
 
 ### Recommended order and rough difficulty
 

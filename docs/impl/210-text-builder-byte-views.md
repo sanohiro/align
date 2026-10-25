@@ -82,8 +82,9 @@ existing conservative semantics. This restores the same identity already used
 when the empty entry is absent; it introduces no unknown-backing exemption.
 Cross text and scalar typed builders with source buffer/builder validation,
 loops, direct and helper writes, real-source mutation rejection and independent
-owner positives. Recheck R49's authenticated private helper in an owned copy;
-its consumer adoption remains external. This shared precision correction is
+owner positives. The authenticated original R49 helper and immutable control pass both whole
+and per-unit checks in an owned copy; the paired source-mutation negatives remain
+rejected. Consumer adoption remains external. This shared precision correction is
 required to close the text-view loop contract, rather than a separate producer.
 
 
@@ -105,10 +106,22 @@ continues to invalidate its prior observation. An exclusive call retires old
 SSA and slot aliases, then installs a fresh identity only in the actual caller
 place passed by reference, never every slot that happened to alias the old
 pointer. A finite optional-boolean fact follows Const Bool, Use, Load and Store
-for generated cleanup flags: a known Branch follows only its real successor,
-while an unknown condition retains both. This preserves selected identity versus
-conditional cleanup without a symbolic path solver. The getter still requires a fresh Load of its bound place and an
-unchanged reservation at the read. Do not use source-name exceptions or assume
+for local cleanup flags only when every possible writer is accounted for.
+Parameters, borrowed cleanup slots, every borrowed-place root/cleanup address in
+direct/runtime/indirect/raw calls, native output slots and non-Store statement
+destinations are ineligible for slot constants. Their Loads remain unknown;
+immutable SSA snapshots retain their observed value. The call-family classifier
+and statement inventory are exhaustive, and the native output inventory is shared
+with producer validation. A known Branch follows only its real successor; an
+unknown condition retains both. This preserves selected identity versus conditional
+cleanup without a symbolic path solver. A getter must still have an exact fresh
+Load shape and an unchanged live reservation whenever reached. Exhausting all
+actual paths without reaching a structurally valid dead getter is success.
+This boolean write/exposure and semantic-reachability axis was added after the
+independent review reproduced stale false facts hiding a Drop, and valid dead
+getters being rejected. Owner pairs cover mutable direct/indirect/imported Boolean calls,
+dead literal/local conditions, both builder families and mixed borrowed/fresh
+cleanup. Do not use source-name exceptions or assume
 that a native handle's declared type proves temporal liveness.
 
 Extend the existing parameterized indexed-builder forged-MIR retirement owner
