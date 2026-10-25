@@ -353,7 +353,6 @@ fn main()->i32 {{
         for expression in [
             "alias:=rows[0].ids",
             "unused:=fresh()[0].ids[0]",
-            "view:=rows[0].ids[..]",
             "unused:=rows[0].ids.map(fn x { x }).to_array()",
         ] {
             let errors = diagnostics(&format!("{PREFIX}fn main(){{rows:=fresh();{expression}}}"));

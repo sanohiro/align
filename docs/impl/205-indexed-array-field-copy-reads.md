@@ -1,5 +1,11 @@
 # Independent Copy reads through indexed owning array fields
 
+Current disposition: this plan owns independent Copy reads.
+[Plan242](242-indexed-field-views.md) separately supplies explicit retained
+read-only indexed-field ranges using Plan240 call authority. Its contract
+supersedes the historical view deferrals below; the original operation and
+its ownership/evaluation rules are unchanged.
+
 LLM Request137's scalar length observation is shipped under Plan196. Its next
 ordinary read, `rows[row].ids[index]`, still rejects at `06a4141f` because the
 immediate array field is Move. The complete-row shared helper remains a working

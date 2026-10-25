@@ -19,8 +19,8 @@ continue other selected work.
 [Plan241](docs/impl/241-bounded-http-responses.md) implements AM-R22's positive
 ordinary response budget with HEAD framing, bounded native writes and checked
 keep-alive restoration. Plan210 implements R28 text-builder bytes with read-only
-access and mutation/owner-generation invalidation. The remaining selected queue
-below is separate work.
+access and mutation/owner-generation invalidation. Plan242 implements retained read-only
+indexed-field ranges for AM-R16/R137. The remaining selected queue below is separate work.
 Missing evidence or a passing older provider PR is not a completed fix; the
 wider long-term backlog is unselected.
 
@@ -88,10 +88,12 @@ reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
   of initialized bytes. Every write, finish, move, replacement and Drop ends
   earlier views; shared readers may return caller-borrowed views. Plan240 supplies
   ordinary-call authority. Consumer adoption remains external.
-- AM-R16/R137 retained indexed owning-field views still need their producer and
-  lifetime/invalidation proof. Independent Copy builder reads, indexed Copy reads
-  and scalar lengths already ship. Consult Plans232 and 196/205 without reopening
-  those deliveries.
+- [Plan242](docs/impl/242-indexed-field-views.md) implements AM-R16/R137 explicit
+  read-only ranges into independent fixed/dynamic indexed array fields. It retains
+  parent and selected backing without a field snapshot; Plan240 owns call authority.
+  Independent Copy reads and lengths keep their existing semantics. Consumer
+  adoption remains external. Whole fixed record-array call producer limits and
+  unresolved returned byte-backing precision remain explicitly scoped in the plan.
 - R132 exclusive owned-subrecord borrowing remains unshipped and is reobserved
   by current MTP and structured-decoding consumers. Projection/replacement must
   preserve sibling cleanup and heap-versus-arena allocation authority. This is
@@ -124,7 +126,7 @@ remain separate capabilities.
 | --- | --- | --- | --- |
 | 1 | AM-R22 bounded HEAD-correct responses | Medium / medium | Plan241 implements `respond_timeout_ns` with one finite budget, partial-write cleanup and eligible keep-alive reuse. |
 | 2 | R28 text-builder byte views | Medium to large / high | Plan210 implements the read-only prefix and exact invalidation; consumer adoption and view-bearing typed-builder elements are separate. |
-| 3 | AM-R16/R137 retained indexed fields | Large / high | Preserve parent generation, selected field backing and bounds across readers and returns without an implicit Copy snapshot. Use Plans232/196/205. |
+| 3 | AM-R16/R137 retained indexed fields | Large / high | Plan242 implements explicit read-only ranges with parent/selected-storage lifetime and exact outer producer proof. |
 | 4 | AM-R23 connection observation | Medium / medium to high | Define exactly what a non-consuming bounded observation can establish, including half-close, buffered/pipelined data, errors and races; cancellation policy stays in the consumer. |
 | 5 | AM-R07 external writable positional reads | Large / high | Close exclusive native-view creation, initialization, bounds/overlap, external resource lifetime and synchronous short-read/error semantics together. No pinned-memory speed claim. |
 | Evidence lane | R37/R49/R80 | Unknown until reproduction / potentially high | Recheck the exact packets early under resource bounds. Separate checker precision from MIR/emission cost; do not assume that K1 fixed them. |

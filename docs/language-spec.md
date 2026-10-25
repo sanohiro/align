@@ -372,6 +372,24 @@ This adds no array-header value, slice, pipeline, write or exclusive-borrow
 permission. Shared calls and temporary/nested-index outer bases retain their
 existing restrictions. Plan205 owns the exact independent-data graph and proof.
 
+An explicit `rows[row].path.values[start..end]` forms a read-only `slice<T>`
+into an existing fixed or ordinary dynamic scalar/AoS-record array field. T must
+satisfy the same complete independent-Copy graph, including at length zero.
+The outer parent is a stable fixed/dynamic AoS record array or record slice;
+existing formation and call-place restrictions remain. The outer index and
+signed bounds precede both range operands; start and end then evaluate once in
+order before the signed range check. Omitted bounds use zero and field length.
+No element copy, allocation, ownership transfer or additional Drop occurs.
+The view retains the parent and selected backing through bounds and retained
+uses, including helpers, carriers and captures. Owning backing retirement ends
+it; replacing a fixed inline Copy parent preserves its address and updates the
+observed contents. Byte writes still invalidate previously validated text.
+An empty indexed field retains its parent lifetime and still checks the outer
+index. The resulting slice supports existing readers and pipelines but grants
+no write authority. Implicit field coercions, direct field pipelines without a
+range, temporary/nested-index outer parents and exclusive indexed-field access
+remain excluded. Plan242 owns the exact producer and validation boundaries.
+
 ```align
 area := match s {
   Circle(r)  => 3.14159 * r * r,

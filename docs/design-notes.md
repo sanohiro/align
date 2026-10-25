@@ -130,8 +130,7 @@ needs no interior substring. This adds no second string-slicing or error model;
 [Plan196](impl/196-indexed-array-field-length.md) admits the scalar observation
 `rows[index].values.len()` without exposing the owned array field as a value or
 view. It reuses the existing reserved, bounds-checked element place and reads
-only its length. General view-return and mutable-retention authority remain on
-the separate Plan61 track; a scalar observation needs neither a second borrow
+only its length. Ordinary call-boundary view authority is supplied by Plan240; a scalar observation needs neither a second borrow
 model nor a new lifetime summary.
 [Plan205](impl/205-indexed-array-field-copy-reads.md) extends the same reserved
 place to `rows[row].values[index]` when the selected element belongs to the
@@ -141,6 +140,14 @@ owner needs no retained-view permission. Chained record-field spelling normalize
 to that same complete Copy read followed by an ordinary local projection; it
 does not expose an intermediate array header. Ordinary array-header reads remain
 excluded. The source checker and producer share one type authority.
+[Plan242](impl/242-indexed-field-views.md) adds the explicit range consumer
+`rows[row].path.values[start..end]`. It retains an address into an independent
+fixed/dynamic field and carries the parent plus selected backing through bounds,
+returns and retained uses. Plan240 keeps that slice read-only at ordinary call
+boundaries. This preserves the distinction between an explicit view and Plan232's
+complete fixed-field Copy snapshot. Inline Copy replacement updates the existing
+address; owned backing retirement invalidates the view. UTF-8 validation is a
+separate observation that expires on byte writes even when the address survives.
 
 The [R77–R83 composition batch](impl/56-r77-r83-composition-plan.md) separates
 initialized reads, ownership, storage generations and contained-view lifetimes.

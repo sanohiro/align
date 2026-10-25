@@ -1,5 +1,11 @@
 # Indexed fixed-field independent values
 
+Current disposition: this plan owns fixed-field Copy snapshots.
+[Plan242](242-indexed-field-views.md) separately supplies explicit retained
+read-only indexed-field ranges using Plan240 call authority. Its contract
+supersedes the historical view deferrals below; the original operation and
+its ownership/evaluation rules are unchanged.
+
 ## Evidence and selection
 
 AM-R16 has two different consumers: `inputs[row].shape[index]` returns independent

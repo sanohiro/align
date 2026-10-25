@@ -248,6 +248,9 @@ runtime ABI. An arbitrary temporary is still not stable fixed-array storage;
 bind it before indexing or slicing. Plan232 separately composes an already-admitted
 indexed fixed-field independent Copy value with an ordinary index through its
 explicit-binding semantics; it adds no temporary slice or retained storage.
+Plan242 separately admits explicit indexed-field ranges into the existing
+independent Copy field graph, retaining parent and selected backing with read-only
+authority. The range does not take the Plan232 field snapshot.
 Plan233 separately admits positive numeric fixed fields in concrete C records,
 with raw storage and complete supported record-value ABIs. It adds neither a
 flexible/zero-length C member nor naked fixed-array extern parameters/results.

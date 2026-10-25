@@ -171,7 +171,6 @@ fn main()->i32 {{
         for expression in [
             "alias:=rows[0].ids",
             "view:slice<i64>:=rows[0].ids",
-            "view:=rows[0].ids[..]",
         ] {
             let errors = diagnostics(&format!("{prefix}fn main(){{rows:=fresh();{expression}}}"));
             assert!(errors.contains("Move-type field"), "{expression}: {errors}");
@@ -341,8 +340,10 @@ fn indexed_array_field_length_hir_matrix() {
                     }));
                 }
             }
-            assert!(
+            // Plan242 makes the explicit full-field view followed by Len valid HIR.
+            assert_eq!(
                 align_mir::lower_program_checked(&bad, per_unit, None).is_err(),
+                mutation != 7,
                 "mutation {mutation}/{per_unit}"
             );
         }

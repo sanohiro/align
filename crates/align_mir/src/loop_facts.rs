@@ -430,6 +430,7 @@ fn rvalue_facts(rv: &Rvalue) -> RvalueFacts<'_> {
         Rvalue::Select { cond, a, b } => Pure(vec![cond, a, b]),
         Rvalue::Field(_, _) => Pure(Vec::new()),
         Rvalue::SliceLen(a) => Pure(vec![a]),
+        Rvalue::IndexedFieldView(a) => Pure(vec![a]),
         Rvalue::SlicePtr(a) => Pure(vec![a]),
         Rvalue::SliceIndex(a, b) => Pure(vec![a, b]),
         Rvalue::SliceIndexNoalias { slice, index, scope: _ } => Pure(vec![slice, index]),
@@ -528,6 +529,7 @@ fn rvalue_operands_mut(rv: &mut Rvalue) -> Option<Vec<&mut Operand>> {
         Rvalue::Select { cond, a, b } => vec![cond, a, b],
         Rvalue::Field(_, _) => Vec::new(),
         Rvalue::SliceLen(a) => vec![a],
+        Rvalue::IndexedFieldView(a) => vec![a],
         Rvalue::SlicePtr(a) => vec![a],
         Rvalue::SliceIndex(a, b) => vec![a, b],
         Rvalue::SliceIndexNoalias { slice, index, scope: _ } => vec![slice, index],
@@ -2621,6 +2623,7 @@ fn direct_statement_slots(statement: &Stmt) -> Option<Vec<Slot>> {
             | Rvalue::Un(_, _)
             | Rvalue::Bin(_, _, _)
             | Rvalue::SliceLen(_)
+            | Rvalue::IndexedFieldView(_)
             | Rvalue::SlicePtr(_)
             | Rvalue::SliceIndex(_, _)
             | Rvalue::OptionSome(_)

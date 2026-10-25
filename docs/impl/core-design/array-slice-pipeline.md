@@ -32,7 +32,16 @@ binding; both signed bounds and source evaluation order remain. The result may
 outlive parent replacement or retirement, including chained record-field reads.
 The read allocates nothing and adds no borrowed view or indexed mutation. Views,
 owners, pointers and callables in the complete field still exclude this form.
-Direct slicing of an indexed fixed field remains a separate capability.
+[Plan242](../242-indexed-field-views.md) separately admits the explicit range
+`rows[row].path.field[start..end]` into an independent fixed or ordinary dynamic
+array field. It creates a read-only slice without copying elements or allocating.
+The parent and selected backing stay live through the outer index and both
+range bounds, then through retained reads. Owning retirement invalidates it;
+inline Copy replacement preserves the address and updates the observed contents.
+Byte writes still expire validated text. Even an empty indexed field keeps the
+parent lifetime and outer bounds check. Existing slice readers/pipelines apply;
+implicit indexed-field coercions, direct field pipelines without a range,
+temporary/nested-index outer parents and exclusive access remain excluded.
 
 `[T; N]` also names the fixed-array type in annotations. A record field contains its N slots
 inline; no array header, builder or allocation is introduced. Named locals, parameters and stable

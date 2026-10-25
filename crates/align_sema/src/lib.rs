@@ -4997,12 +4997,30 @@ pub fn indexed_array_field_has_length(ty: Ty) -> bool {
     matches!(ty, Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos))
 }
 
+/// Exact element domain for a retained read-only indexed field view.
+pub fn indexed_field_view_element(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> Option<Scalar> {
+    let element = match ty {
+        Ty::Array(element, _) | Ty::DynArray(element) => element,
+        Ty::StructArray(id, _) | Ty::DynStructArray(id, Layout::Aos) => Scalar::Struct(id),
+        _ => return None,
+    };
+    independent_copy_type(scalar_to_ty(element), structs, tuples, enums, tagged_types)
+        .then_some(element)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IndexedFieldUse {
     Value,
     SharedCall,
     Length,
     CopyRead,
+    View,
 }
 
 /// Whether an already-formed direct record field has a valid owning cleanup plan.
@@ -19854,10 +19872,9 @@ impl EscapeState {
                     (None, _) => true,
                     (Some(_), None) => false,
                 };
-                if compatible {
-                    matched = true;
-                    resolved = resolved.join(&self.resolve_storage_leaf(leaf, visiting));
-                }
+                if !compatible { resolved.identity_known = false; }
+                matched = true;
+                resolved = resolved.join(&self.resolve_storage_leaf(leaf, visiting));
             }
         }
         if !matched {
@@ -21160,11 +21177,13 @@ impl<'a> EscapeCheck<'a> {
         // The canonical empty slice has no backing storage: MIR lowers it to `{null, 0}`. Treating
         // its zero-length array literal as a frame borrow would make allocation-free constants
         // such as a route's empty configuration impossible to return.
-        let canonical_empty_slice = matches!(expression.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+        let canonical_empty_slice = (matches!(expression.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+            && !matches!(expression.kind, ExprKind::ElemField { .. }))
             || matches!(
                 &expression.kind,
                 ExprKind::ArrayToSlice(inner)
                     if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+                        && !matches!(inner.kind, ExprKind::ElemField { .. })
             );
         // A loop forwards this completed allocation fact for every Move carrier, including
         // records that own strings but contain no dynamic-array header. Borrowed text lifetime
@@ -22005,7 +22024,8 @@ impl<'a> EscapeCheck<'a> {
                 .cloned()
                 .unwrap_or_else(|| self.legacy_escape_value(expression)),
             ExprKind::ArrayToSlice(inner)
-                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) =>
+                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+                    && !matches!(inner.kind, ExprKind::ElemField { .. }) =>
             {
                 EscapeValueFact::default()
             }
@@ -22764,50 +22784,14 @@ impl<'a> EscapeCheck<'a> {
         &self,
         descriptor: StorageHeaderDescriptor,
         sources: &[EscapeValueFact],
-        mut fallback_roots: BorrowRoots,
+        fallback_roots: BorrowRoots,
     ) -> StorageHeaderLeaf {
-        let mut generations = std::collections::BTreeSet::new();
-        let mut matched = false;
-        let mut matched_exactly = true;
-        let mut matched_projected_candidate = false;
-        for source in sources {
-            for (path, leaf) in &source.headers.leaves {
-                let compatible = leaf.descriptor.is_some_and(|candidate| {
-                    storage_header_descriptors_compatible(
-                        descriptor,
-                        candidate,
-                        self.tagged_types,
-                    )
-                });
-                if compatible {
-                    matched = true;
-                    matched_projected_candidate |= !path.is_empty();
-                    matched_exactly &= leaf.known && !leaf.generations.is_empty();
-                    generations.extend(leaf.generations.iter().cloned());
-                    fallback_roots.extend(leaf.fallback_roots.iter().cloned());
-                }
-            }
-        }
-        // A flattened summary cannot prove that a direct root view preserves its one input header,
-        // so that ordinary identity-call shape remains non-writable. When it selects an aggregate,
-        // however, the complete compatible projected candidate set is closed: a write may update
-        // every same-typed candidate while excluding different-typed sibling headers.
-        let known = matched
-            && matched_exactly
-            && matched_projected_candidate
-            && !generations.is_empty();
-        if known {
-            fallback_roots = inline_owned_fallback_roots(
-                &fallback_roots, self.f, self.storage_type_context(),
-            );
-        }
-        StorageHeaderLeaf {
-            generations,
-            descriptor: Some(descriptor),
-            known: known && fallback_roots.is_empty(),
-            fallback_roots,
-            readonly_contents: false,
-        }
+        let retained = inline_owned_fallback_roots(&fallback_roots, self.f, self.storage_type_context());
+        retained_header_candidates(descriptor,
+            &sources.iter().map(|source| &source.headers).collect::<Vec<_>>(),
+            fallback_roots, retained,
+            sources.iter().any(|source| !source.content_ended.is_empty() || !source.content_unknown.is_empty()),
+            true, self.tagged_types)
     }
 
     /// `map_err` is a two-source sum result: the Ok subtree forwards the receiver, while the Err
@@ -23079,16 +23063,16 @@ impl<'a> EscapeCheck<'a> {
                             });
                             continue;
                         }
-                        // A call summary can prove the returned view's lifetime without proving
-                        // writable header identity. Resource owners/references are the canonical
-                        // cases: their header type differs from the returned row view, while the
-                        // legacy return-region summary still identifies the exact caller lifetime.
+                        // A native producer can prove the returned view's lifetime without
+                        // proving writable header identity. Resource owners/references are the
+                        // canonical cases. Ordinary call summaries must first close every
+                        // selected candidate before discarding broad lifetime dependencies.
                         // Keep the leaf unknown for aliasing, but do not replace that region with a
                         // synthetic local fallback.
-                        if sources.iter().all(|source| {
-                            source.content_ended.is_empty()
-                                && source.content_unknown.is_empty()
-                        }) {
+                        if result.initializer != StorageContentInitializer::CallSummary
+                            && sources.iter().all(|source| {
+                                source.content_ended.is_empty() && source.content_unknown.is_empty()
+                            }) {
                             fallback_roots = inline_owned_fallback_roots(
                                 &fallback_roots, self.f, self.storage_type_context(),
                             );
@@ -25557,7 +25541,8 @@ impl<'a> EscapeCheck<'a> {
             // Borrowing an array as a slice preserves the array's region — a `slice<str>` coerced
             // from an arena str-array must not outlive that arena.
             ExprKind::ArrayToSlice(inner)
-                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) =>
+                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+                    && !matches!(inner.kind, ExprKind::ElemField { .. }) =>
             {
                 values.push(Region::Static);
             }
@@ -26318,8 +26303,17 @@ impl<'a> EscapeCheck<'a> {
             // binds it to `resp`, but a `slice<u8>` of a numeric element is not `tracks_region`, so this
             // local-backed check is the one that catches its escape).
             ExprKind::ArrayToSlice(inner)
-                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0)) => {}
+                if matches!(inner.ty, Ty::Array(_, 0) | Ty::StructArray(_, 0))
+                    && !matches!(inner.kind, ExprKind::ElemField { .. }) => {}
             ExprKind::ArrayLit { elems, .. } if elems.is_empty() => {}
+            ExprKind::ArrayToSlice(inner) if matches!(inner.kind, ExprKind::ElemField { .. }) => {
+                let ExprKind::ElemField { recv, .. } = &inner.kind else { return true };
+                if matches!(recv.ty, Ty::Slice(_)) {
+                    work.push(recv);
+                } else if !self.borrowed_param_place(recv) {
+                    return true;
+                }
+            }
             ExprKind::ArrayToSlice(_)
             | ExprKind::ArrayLit { .. }
             | ExprKind::HttpCtxBody { .. } => return true,
@@ -27983,34 +27977,41 @@ impl<'a> EscapeCheck<'a> {
                 continue;
             };
 
-            let selected = Self::join_escape_value_facts(sources.iter().filter_map(|source| {
-                let value = frozen.get(source.index()).and_then(Option::as_ref)?.clone();
+            let selected_sources = sources.iter().map(|source| {
+                let value = frozen.get(source.index()).and_then(Option::as_ref).cloned().unwrap_or_default();
                 if matches!(source, BorrowMutRetentionSource::SelfContents(_)) {
                     // The content-region snapshot is already independent of the owned allocation
                     // lifetime. Keep its borrowed region/diagnostics without embedding displaced
                     // owned headers as dependencies of their replacement generations.
-                    let snapshot = self.state.argument_snapshots.get(&(call, source.index()))?;
-                    Some(EscapeValueFact {
+                    let Some(snapshot) = self.state.argument_snapshots.get(&(call, source.index())) else { return EscapeValueFact::default(); };
+                    EscapeValueFact {
                         non_storage: EscapeRegionFact::from_direct(snapshot.content_region),
                         content_ended: value.content_ended,
                         content_unknown: value.content_unknown,
                         ..EscapeValueFact::default()
-                    })
+                    }
                 } else {
-                    Some(value)
+                    value
                 }
-            }));
+            }).collect::<Vec<_>>();
+            let selected = Self::join_escape_value_facts(selected_sources.iter().cloned());
             if typed
                 .headers
                 .iter()
                 .all(|header| header.kind == StorageHeaderKind::View)
             {
-                let fallback_roots: BorrowRoots = selected
+                let mut fallback_roots: BorrowRoots = selected
                     .headers
                     .leaves
                     .values()
                     .flat_map(|leaf| leaf.fallback_roots.iter().cloned())
                     .collect();
+                for source in sources {
+                    if !matches!(source, BorrowMutRetentionSource::SelfContents(_))
+                        && let Some(argument) = args.get(source.index()) {
+                        fallback_roots.extend(self.escape_place_fallback_roots(argument));
+                    }
+                }
                 let headers = ProjectedHeaderFact {
                     leaves: typed
                         .headers
@@ -28024,7 +28025,7 @@ impl<'a> EscapeCheck<'a> {
                                 header.path.clone(),
                                 self.compatible_unknown_escape_leaf(
                                     descriptor,
-                                    std::slice::from_ref(&selected),
+                                    &selected_sources,
                                     fallback_roots.clone(),
                                 ),
                             )
@@ -32887,6 +32888,79 @@ fn storage_header_descriptors_compatible(
     expected == candidate
         || (expected.kind == StorageHeaderKind::View
             && indexed_backing_compatible(expected.ty, candidate.ty, tagged_types))
+}
+
+/// Ordinal-only call summaries select sources, not fields or element conversions. A matching
+/// sibling cannot prove that the complete backing set was represented. Candidate-owned parent
+/// and observation dependencies remain mandatory even when broad selection roots are redundant.
+fn retained_header_candidates(
+    descriptor: StorageHeaderDescriptor,
+    sources: &[&ProjectedHeaderFact],
+    broad_roots: BorrowRoots,
+    retained_roots: BorrowRoots,
+    source_unknown: bool,
+    require_projection: bool,
+    tagged_types: &[hir::TaggedType],
+) -> StorageHeaderLeaf {
+    let mut leaf = StorageHeaderLeaf::unknown_typed(BorrowRoots::new(), descriptor);
+    let mut complete = !source_unknown && !sources.is_empty() && retained_roots.is_empty();
+    let mut projected = false;
+    for source in sources {
+        complete &= !source.leaves.is_empty();
+        for (path, candidate) in &source.leaves {
+            let compatible = candidate.descriptor.is_some_and(|candidate| {
+                storage_header_descriptors_compatible(descriptor, candidate, tagged_types)
+            });
+            complete &= compatible && candidate.known && !candidate.generations.is_empty();
+            leaf.fallback_roots.extend(candidate.fallback_roots.iter().cloned());
+            leaf.readonly_contents |= candidate.readonly_contents;
+            if compatible {
+                projected |= !path.is_empty();
+                leaf.generations.extend(candidate.generations.iter().cloned());
+            }
+        }
+    }
+    leaf.known = complete && (!require_projection || projected) && !leaf.generations.is_empty();
+    leaf.fallback_roots.extend(if leaf.known { retained_roots } else { broad_roots });
+    leaf
+}
+
+#[cfg(test)]
+#[test]
+fn retained_header_candidate_completeness_matrix() {
+    let scalar = Scalar::Int(IntTy { bits: 64, signed: true });
+    let expected = StorageHeaderDescriptor { ty: Ty::Slice(scalar), kind: StorageHeaderKind::View };
+    let candidate = StorageHeaderDescriptor { ty: Ty::DynArray(scalar), kind: StorageHeaderKind::OwnedDynamic };
+    for projected in [false, true] {
+        for require_projection in [false, true] {
+            for mutation in 0..7 {
+                let generation = StorageGeneration::current(StorageOrigin::inline_place(0, &[]));
+                let mut leaf = StorageHeaderLeaf::known_typed(generation, candidate);
+                let mandatory = BorrowRoot::Local(7);
+                leaf.fallback_roots.insert(mandatory.clone());
+                let path = if projected { vec![BorrowProjection::StructField(0)] } else { Vec::new() };
+                let mut first = ProjectedHeaderFact::from_leaf(path.clone(), leaf.clone());
+                let mut second = first.clone();
+                match mutation {
+                    1 => second = ProjectedHeaderFact::default(),
+                    2 => second.leaves.get_mut(&path).unwrap().known = false,
+                    3 => second.leaves.get_mut(&path).unwrap().descriptor = Some(StorageHeaderDescriptor {
+                        ty: Ty::DynArray(Scalar::Bool), kind: StorageHeaderKind::OwnedDynamic }),
+                    4 => second.leaves.get_mut(&path).unwrap().descriptor = None,
+                    5 => first.leaves.get_mut(&path).unwrap().generations.clear(),
+                    _ => {}
+                }
+                let broad: BorrowRoots = [BorrowRoot::Local(10), BorrowRoot::Local(20)].into();
+                let result = retained_header_candidates(expected, &[&first, &second], broad.clone(),
+                    BorrowRoots::new(), mutation == 6, require_projection, &[]);
+                let closed = mutation == 0 && (!require_projection || projected);
+                assert_eq!(result.known, closed, "{projected}/{require_projection}/{mutation}");
+                assert!(result.fallback_roots.contains(&mandatory), "a candidate's parent is never optional");
+                assert_eq!(broad.is_subset(&result.fallback_roots), !closed,
+                    "partial candidate matches cannot erase source dependencies");
+            }
+        }
+    }
 }
 
 // These native producers allocate independent owners even inside a lexical arena.
@@ -37992,16 +38066,13 @@ impl<'a> MoveCheck<'a> {
                         ty: header.ty,
                         kind: header.kind,
                     };
-                    let mut candidates = ProjectedHeaderFact::default();
-                    for source in sources {
-                        let source_index = source.index();
-                        if let Some(headers) = header_argument_facts.get(source_index) {
-                            candidates = candidates.join(headers);
-                        }
-                    }
-                    if let Some(leaf) = self.compatible_header_union(&candidates, descriptor) {
-                        replacement.leaves.insert(header.path.clone(), leaf);
-                    }
+                    let candidates = sources.iter().filter_map(|source|
+                        header_argument_facts.get(source.index())).collect::<Vec<_>>();
+                    let roots = incoming.live_roots();
+                    let leaf = retained_header_candidates(descriptor, &candidates, roots.clone(),
+                        inline_owned_fallback_roots(&roots, self.f, self.storage_type_context()),
+                        candidates.len() != sources.len(), false, self.tagged_types);
+                    replacement.leaves.insert(header.path.clone(), leaf);
                 }
                 let mut destination = self.local_headers(place.root);
                 destination.replace_path(&place_path, replacement);
@@ -38393,12 +38464,12 @@ impl<'a> MoveCheck<'a> {
             }
         }
         if effect.may_rebind {
-            let mut sources = ProjectedHeaderFact::default();
+            let mut sources = Vec::new();
             let mut fallback_roots = BorrowRoots::new();
             for root in &effect.rebind_roots {
                 let index = root.index() as usize;
                 if let Some(headers) = header_argument_facts.get(index) {
-                    sources = sources.join(headers);
+                    sources.push(headers);
                 }
                 let fact = match root {
                     hir::MutableRetentionRoot::Contained(_) => whole_argument_facts.get(index),
@@ -38409,14 +38480,11 @@ impl<'a> MoveCheck<'a> {
                 }
             }
             let mut replacement = ProjectedHeaderFact::default();
-            if let Some(mut leaf) = self.compatible_header_union(&sources, descriptor) {
-                leaf.descriptor = Some(descriptor);
+            if !effect.rebind_roots.is_empty() {
+                let leaf = retained_header_candidates(descriptor, &sources, fallback_roots.clone(),
+                    inline_owned_fallback_roots(&fallback_roots, self.f, self.storage_type_context()),
+                    sources.len() != effect.rebind_roots.len(), false, self.tagged_types);
                 replacement.leaves.insert(Vec::new(), leaf);
-            } else if !effect.rebind_roots.is_empty() {
-                replacement.leaves.insert(
-                    Vec::new(),
-                    StorageHeaderLeaf::unknown_typed(fallback_roots, descriptor),
-                );
             }
             let mut destination = self.local_headers(destination_local);
             if !effect.must_rebind {
@@ -40043,6 +40111,19 @@ impl<'a> MoveCheck<'a> {
         }
         match &expression.kind {
             ExprKind::Local(local) => self.local_headers(*local),
+            ExprKind::ArrayToSlice(inner) if matches!(inner.kind, ExprKind::ElemField { .. }) => {
+                let mut headers = self.retarget_root_header(
+                    self.completed_headers(inner), expression.ty, &[],
+                );
+                // Dynamic fields keep their selected generation. The parent remains a
+                // dependency even when that field's own allocation has a separate header.
+                let mut roots = self.storage_roots(inner);
+                roots.insert(BorrowRoot::ReadOnly);
+                for leaf in headers.leaves.values_mut() {
+                    leaf.fallback_roots.extend(roots.iter().cloned());
+                }
+                headers
+            }
             ExprKind::ArrayToSlice(inner)
             | ExprKind::SliceRange { recv: inner, .. } => {
                 let mut headers = self.retarget_root_header(
@@ -40358,12 +40439,36 @@ impl<'a> MoveCheck<'a> {
             })
     }
 
+    fn close_call_dependencies(
+        &self,
+        mut normalized: ProjectedHeaderFact,
+        candidates: &ProjectedHeaderFact,
+        source_unknown: bool,
+        roots: &BorrowRoots,
+    ) -> ProjectedHeaderFact {
+        for leaf in normalized.leaves.values_mut() {
+            if let Some(descriptor) = leaf.descriptor {
+                *leaf = retained_header_candidates(descriptor, &[candidates], roots.clone(),
+                    inline_owned_fallback_roots(roots, self.f, self.storage_type_context()),
+                    source_unknown, false, self.tagged_types);
+            } else {
+                leaf.known = false;
+                leaf.fallback_roots.extend(roots.iter().cloned());
+            }
+        }
+        if normalized.leaves.is_empty() && (source_unknown || !roots.is_empty()) {
+            normalized.leaves.insert(Vec::new(), StorageHeaderLeaf::unknown(roots.clone()));
+        }
+        normalized
+    }
+
     fn call_generation_content_headers(
         &self,
         expression: &Expr,
         descriptor: StorageHeaderDescriptor,
+        roots: &BorrowRoots,
     ) -> ProjectedHeaderFact {
-        let (selected, _) = self.selected_move_call_headers(expression);
+        let (selected, source_unknown) = self.selected_move_call_headers(expression);
         let expanded = selected.join(&self.generation_content_headers(&selected));
         let expected = match expand_tagged_ty(descriptor.ty, self.tagged_types) {
             Ty::Array(..) | Ty::StructArray(..) => storage_type_paths(
@@ -40391,7 +40496,10 @@ impl<'a> MoveCheck<'a> {
             | Ty::Error => Vec::new(),
             _ => Vec::new(),
         };
-        self.normalize_expected_dependencies(&expected, &expanded)
+        let normalized = self.normalize_expected_dependencies(&expected, &expanded);
+        if expected.is_empty() { normalized } else {
+            self.close_call_dependencies(normalized, &expanded, source_unknown, roots)
+        }
     }
 
     /// Resolve an indexed observation through the stable generation content table. Scalar reads
@@ -40586,6 +40694,7 @@ impl<'a> MoveCheck<'a> {
             }
             return (headers, true);
         }
+        let mut missing = false;
         for source in &selection.sources {
             let selected = match source {
                 CallSelectedSource::Argument(index) => argument_headers
@@ -40602,9 +40711,10 @@ impl<'a> MoveCheck<'a> {
                     })
                     .unwrap_or_default(),
             };
+            missing |= selected.leaves.is_empty();
             headers = headers.join(&selected);
         }
-        (headers, false)
+        (headers, missing)
     }
 
     /// Return the exact dependency header source for one carrier result. Calls consume the shared
@@ -40696,6 +40806,8 @@ impl<'a> MoveCheck<'a> {
                 .map_or_else(ProjectedHeaderFact::default, |carrier_ty| {
                     self.normalize_carrier_dependencies(carrier_ty, &selected)
                 });
+            let normalized = self.close_call_dependencies(normalized, &selected,
+                source_unknown, &fact.live_roots());
             if normalized.leaves.is_empty() && source_unknown {
                 carried.leaves.insert(
                     path.clone(),
@@ -40716,35 +40828,10 @@ impl<'a> MoveCheck<'a> {
                     kind: header.kind,
                 };
                 if header.kind == StorageHeaderKind::View {
-                    let mut leaf = StorageHeaderLeaf::unknown_typed(
-                        fact.live_roots(),
-                        descriptor,
-                    );
-                    let mut matched = false;
-                    let mut matched_exactly = true;
-                    for candidate in selected.leaves.values() {
-                        if candidate.descriptor.is_some_and(|candidate_descriptor| {
-                            storage_header_descriptors_compatible(
-                                descriptor,
-                                candidate_descriptor,
-                                self.tagged_types,
-                            )
-                        }) {
-                            matched = true;
-                            matched_exactly &= candidate.known
-                                && !candidate.generations.is_empty();
-                            leaf.generations
-                                .extend(candidate.generations.iter().cloned());
-                            leaf.fallback_roots
-                                .extend(candidate.fallback_roots.iter().cloned());
-                        }
-                    }
-                    if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.fallback_roots = inline_owned_fallback_roots(
-                            &leaf.fallback_roots, self.f, self.storage_type_context(),
-                        );
-                        leaf.known = leaf.fallback_roots.is_empty();
-                    }
+                    let roots = fact.live_roots();
+                    let leaf = retained_header_candidates(descriptor, &[&selected], roots.clone(),
+                        inline_owned_fallback_roots(&roots, self.f, self.storage_type_context()),
+                        source_unknown, false, self.tagged_types);
                     unknown.leaves.insert(header.path, leaf);
                     return None;
                 }
@@ -40775,6 +40862,7 @@ impl<'a> MoveCheck<'a> {
                         headers: self.call_generation_content_headers(
                             expression,
                             descriptor,
+                            &fact.live_roots(),
                         ),
                     }),
                 }
@@ -40883,6 +40971,10 @@ impl<'a> MoveCheck<'a> {
                     .map_or_else(ProjectedHeaderFact::default, |carrier_ty| {
                         self.normalize_carrier_dependencies(carrier_ty, &dependencies)
                     });
+                let normalized = if matches!(expression.kind,
+                    ExprKind::Call { .. } | ExprKind::CallFnValue { .. } | ExprKind::RawCall { .. }) {
+                    self.close_call_dependencies(normalized, &dependencies, source_unknown, &fact.live_roots())
+                } else { normalized };
                 if normalized.leaves.is_empty() && source_unknown {
                     unknown.leaves.insert(
                         result.path,
@@ -40918,32 +41010,11 @@ impl<'a> MoveCheck<'a> {
                             | ExprKind::RawCall { .. }
                     )
                 {
-                    let (sources, _) = self.selected_move_call_headers(expression);
-                    let mut matched = false;
-                    let mut matched_exactly = true;
-                    for candidate in sources.leaves.values() {
-                        if candidate.descriptor.is_some_and(|candidate_descriptor| {
-                            storage_header_descriptors_compatible(
-                                descriptor,
-                                candidate_descriptor,
-                                self.tagged_types,
-                            )
-                        }) {
-                            matched = true;
-                            matched_exactly &=
-                                candidate.known && !candidate.generations.is_empty();
-                            leaf.generations
-                                .extend(candidate.generations.iter().cloned());
-                            leaf.fallback_roots
-                                .extend(candidate.fallback_roots.iter().cloned());
-                        }
-                    }
-                    if matched && matched_exactly && !leaf.generations.is_empty() {
-                        leaf.fallback_roots = inline_owned_fallback_roots(
-                            &leaf.fallback_roots, self.f, self.storage_type_context(),
-                        );
-                        leaf.known = leaf.fallback_roots.is_empty();
-                    }
+                    let (sources, source_unknown) = self.selected_move_call_headers(expression);
+                    let roots = fact.live_roots();
+                    leaf = retained_header_candidates(descriptor, &[&sources], roots.clone(),
+                        inline_owned_fallback_roots(&roots, self.f, self.storage_type_context()),
+                        source_unknown, false, self.tagged_types);
                 }
                 unknown.leaves.insert(
                     result.path,
@@ -41049,6 +41120,7 @@ impl<'a> MoveCheck<'a> {
                                 self.call_generation_content_headers(
                                     expression,
                                     StorageHeaderDescriptor { ty, kind },
+                                    &fact.live_roots(),
                                 )
                             })
                     } else {
@@ -43014,6 +43086,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResourceViewFromRaw { owner: parent, .. } => {
                 self.borrow_sources(parent)
             }
+            ExprKind::ArrayToSlice(inner) if matches!(inner.kind, ExprKind::ElemField { .. }) => {
+                let mut roots = self.storage_roots(inner);
+                roots.insert(BorrowRoot::ReadOnly);
+                roots
+            },
             ExprKind::StrBorrow(inner)
             | ExprKind::ArrayToSlice(inner)
             | ExprKind::SliceRange { recv: inner, .. }
@@ -43821,6 +43898,21 @@ impl<'a> MoveCheck<'a> {
             // Replacement and loop re-entry both write this physical frame slot, even when
             // lifetime analysis advances Current to Prior. All binding forms use this install.
             self.record_mutable_access_roots([BorrowRoot::Observation(generation.clone())].into());
+            if let Some(previous) = self.local_headers(local).leaves.get(&destination_path) {
+                // The address survives an inline copy, but byte validation of its previous
+                // contents does not. Rebinding a stored view never enters this InlineFixed
+                // arm, and a fresh destination cannot alias an existing observation.
+                let mut target = ByteValidationBacking {
+                    generations: previous.generations.iter()
+                        .map(|reference| reference.generation.clone()).collect(),
+                    unknown: !previous.known,
+                    ..ByteValidationBacking::default()
+                };
+                target.generations.extend([
+                    generation.clone(), StorageGeneration::Prior(origin.clone()),
+                ]);
+                self.borrows.invalidate_validated_bytes(&target);
+            }
             let preserves_live_destination = replacing
                 && self
                     .borrows
@@ -44477,6 +44569,21 @@ impl<'a> MoveCheck<'a> {
             );
             if header.known && !header.generations.is_empty() {
                 result.unknown = false;
+                // A selected inline field can carry a content header plus the physical
+                // parent as a fallback dependency. Include that possible byte backing;
+                // additional lifetime dependencies may only make overlap conservative.
+                for root in &header.fallback_roots {
+                    match root {
+                        BorrowRoot::StorageLocal(generation, ..) => {
+                            result.generations.insert(generation.clone());
+                        }
+                        BorrowRoot::Local(_) | BorrowRoot::Param(_) | BorrowRoot::ParamStorage(_) => {
+                            result.fallback_roots.insert(root.clone());
+                        }
+                        BorrowRoot::ReadOnly => {}
+                        _ => result.unknown = true,
+                    }
+                }
                 return result;
             }
         }
@@ -46830,8 +46937,8 @@ impl<'a> MoveCheck<'a> {
         // recursive path where the reservation encloses the child's complete evaluation.
         if matches!(expression.kind, ExprKind::BorrowedIndex { .. })
             || matches!(&expression.kind, ExprKind::Index { recv, .. } if recv.ty.is_array_builder())
-            || matches!(&expression.kind, ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. }
-                if indexed_array_field_has_length(inner.ty)
+            || matches!(&expression.kind, ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. } | ExprKind::ArrayToSlice(inner)
+                if (indexed_array_field_has_length(inner.ty) || matches!(expression.kind, ExprKind::ArrayToSlice(_)))
                     && matches!(inner.kind, ExprKind::ElemField { .. }))
         {
             return false;
@@ -48698,8 +48805,8 @@ impl<'a> MoveCheck<'a> {
                     ExprKind::BuilderNew {
                         capacity: Some(child),
                     } => (child.as_ref(), false, false, false, Post::None),
-                    ExprKind::Len(child)
-                        if indexed_array_field_has_length(child.ty)
+                    ExprKind::Len(child) | ExprKind::ArrayToSlice(child)
+                        if (indexed_array_field_has_length(child.ty) || matches!(current.kind, ExprKind::ArrayToSlice(_)))
                             && matches!(child.kind, ExprKind::ElemField { .. }) => break,
                     ExprKind::Unary { expr: child, .. }
                     | ExprKind::Cast(child)
@@ -50121,15 +50228,15 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, new_len, moved, false, false);
             }
             // The receiver is borrowed, not consumed.
-            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i) => {
+            ExprKind::BoxGet(i) | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::ArrayToSoa { source: i, .. } => {
                 move_expr!(self, i, moved, false, false)
             }
-            ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. } => {
+            ExprKind::Len(inner) | ExprKind::Index { recv: inner, .. } | ExprKind::ArrayToSlice(inner) => {
                 let selected_base = match &inner.kind {
                     ExprKind::Local(_) if inner.ty.is_array_builder()
                         && matches!(e.kind, ExprKind::Index { .. }) => Self::mutable_actual_place(inner),
                     ExprKind::ElemField { recv, .. }
-                        if indexed_array_field_has_length(inner.ty) =>
+                        if indexed_array_field_has_length(inner.ty) || matches!(e.kind, ExprKind::ArrayToSlice(_)) =>
                             Self::mutable_actual_place(recv),
                     _ => None,
                 };
@@ -66401,9 +66508,22 @@ impl<'a, 't> Checker<'a, 't> {
     /// to `0` / the receiver's length; bounds (`0 <= start <= end <= len`) are checked at runtime.
     fn check_slice_range(&mut self, recv: &ast::Expr, start: Option<&ast::Expr>, end: Option<&ast::Expr>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let r = self.check_expr(recv, None);
+        let mut r = if let Some((base, index, fields)) = peel_index_field_chain(recv)
+            && !fields.is_empty()
+        {
+            self.check_index_field(base, index, &fields, None, recv.span, IndexedFieldUse::View)
+        } else {
+            self.check_expr(recv, None)
+        };
         if r.ty == Ty::Error {
             return err;
+        }
+        if matches!(r.kind, ExprKind::ElemField { .. })
+            && let Some(element) = indexed_field_view_element(r.ty, self.structs,
+                self.tuples, self.enums, self.tagged_types)
+        {
+            r = Expr { kind: ExprKind::ArrayToSlice(Box::new(r)),
+                ty: Ty::Slice(element), span: recv.span };
         }
         // The result view type: a `str` slices to a `str`; an array / slice of `T` slices to a
         // `slice<T>`. Owned (`string`/`array<T>`) receivers auto-borrow to their view first.
@@ -71750,7 +71870,18 @@ impl<'a, 't> Checker<'a, 't> {
             && indexed_array_field_copy_element(leaf_ty, self.structs, self.tuples,
                 self.enums, self.tagged_types).is_some()
             && self.borrowed_element_base(&r).is_some();
-        let admitted_move_field = indexed_move_borrow || length_observation || copy_read
+        let view = use_kind == IndexedFieldUse::View
+            && indexed_field_view_element(leaf_ty, self.structs, self.tuples,
+                self.enums, self.tagged_types).is_some()
+            && self.borrowed_element_base(&r).is_some();
+        if use_kind == IndexedFieldUse::View
+            && matches!(leaf_ty, Ty::Array(..) | Ty::StructArray(..))
+            && !view
+        {
+            self.diags.error("an indexed field view requires a stable parent and independent Copy elements".to_string(), span);
+            return err;
+        }
+        let admitted_move_field = indexed_move_borrow || length_observation || copy_read || view
             || matches!((r.ty, leaf_ty), (Ty::StructArray(..), Ty::Resource(_)));
         if !admitted_move_field
             && drop_plan(leaf_ty, self.structs, self.tuples, self.enums, self.tagged_types).needs_drop()

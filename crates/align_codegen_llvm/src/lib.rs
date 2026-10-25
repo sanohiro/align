@@ -10090,6 +10090,7 @@ fn rvalue_keeps_view_facts(f: &Function, rv: &Rvalue) -> bool {
         | Rvalue::SoaColumn { .. }
         | Rvalue::SoaGather { .. }
         | Rvalue::SliceLen(_)
+        | Rvalue::IndexedFieldView(_)
         | Rvalue::SlicePtr(_)
         | Rvalue::SliceIndex(..)
         | Rvalue::SliceIndexNoalias { .. }
@@ -19411,6 +19412,32 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 result.add_incoming(&[(&with_code, code_end), (&category, category_end)]);
                 result.as_basic_value()
             }
+            Rvalue::IndexedFieldView(input) => {
+                let Operand::BorrowedElementPlace(place) = input else {
+                    return Err(self.err("indexed field view requires an exact borrowed element place"));
+                };
+                let element = align_sema::indexed_field_view_element(place.element_ty,
+                    &self.program.structs, &self.program.tuples,
+                    &self.program.enums, &self.program.tagged_types)
+                    .ok_or_else(|| self.err("indexed field view requires independent array elements"))?;
+                if result_ty != Ty::Slice(element) || place.field_path.is_empty() {
+                    return Err(self.err("indexed field view physical field/result mismatch"));
+                }
+                let field = self.borrowed_element_ptr(place)?;
+                match place.element_ty {
+                    Ty::Array(_, count) | Ty::StructArray(_, count) => {
+                        let data = self.element_storage_base(self.llvm_type(scalar_to_ty(element)), field)?;
+                        let head = self.builder.build_insert_value(slice_struct_type(self.ctx).get_poison(),
+                            data, 0, "indexed.view.data").map_err(|error| self.err(error))?.into_struct_value();
+                        self.builder.build_insert_value(head, self.ctx.i64_type().const_int(u64::from(count), false),
+                            1, "indexed.view.len").map_err(|error| self.err(error))?.into_struct_value().into()
+                    }
+                    Ty::DynArray(_) | Ty::DynStructArray(_, align_sema::Layout::Aos) =>
+                        self.builder.build_load(slice_struct_type(self.ctx), field, "indexed.view")
+                            .map_err(|error| self.err(error))?,
+                    _ => return Err(self.err("indexed field view has an unsupported layout")),
+                }
+            }
             Rvalue::SliceLen(op) => {
                 if let Operand::BorrowedElementPlace(place) = op {
                     if place.field_path.is_empty()
@@ -27993,6 +28020,138 @@ fn main() -> i32 {
                 assert_eq!(function.print_to_string().to_string().contains("byval("), preceding >= budget);
                 if preceding >= budget {
                     assert!(function.print_to_string().to_string().contains("align 16"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_field_view_mir_matrix() -> Result<(), String> {
+        for field in ["[i64; 0]", "[i64; 2]", "array<i64>"] {
+            for parent in ["array<R>", "[R; 1]", "slice<R>"] {
+                for discard in [false, true] {
+                    let tail = if discard { "-> () { unused := rows[i].data[..] }" }
+                        else { "-> slice<i64> = rows[i].data[..]" };
+                    let source = format!("R {{ data: {field} }}\nfn view(borrow rows: {parent}, i: i64) {tail}\nfn main() {{}}");
+                    let original = mir(&source);
+                    emit_llvm_ir(&original, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                        .map_err(|error| format!("valid {field}/{parent}/{discard}: {error}"))?;
+                    for mutation in 0..13 {
+                        let mut bad = original.clone();
+                        let function = bad.fns.iter_mut().find(|f| f.name.as_str().ends_with("view")).ok_or("view function")?;
+                        let (block, statement, result, place) = function.blocks.iter().enumerate().find_map(|(b, block)| {
+                            block.stmts.iter().enumerate().find_map(|(s, statement)| match statement {
+                                Stmt::Let(result, Rvalue::IndexedFieldView(Operand::BorrowedElementPlace(place))) => Some((b, s, *result, place.as_ref().clone())),
+                                _ => None,
+                            })
+                        }).ok_or("view producer")?;
+                        if mutation == 10 {
+                            function.blocks[block].stmts.insert(statement,
+                                Stmt::BorrowedElementReservation { token: place.guard.reservation, root: place.base.slot });
+                        } else if mutation == 11 {
+                            let value = u32::try_from(function.value_tys.len()).map_err(|_| "fixture value")?;
+                            function.value_tys.push(place.base.ty);
+                            function.blocks[block].stmts.splice(statement..statement, [
+                                Stmt::Let(value, Rvalue::Load(place.base.slot)),
+                                Stmt::Store(place.base.slot, Operand::Value(value)),
+                            ]);
+                        } else if mutation == 12 {
+                            let branch = function.blocks.iter_mut().find(|b| matches!(b.term, Term::Branch(..))).ok_or("outer guard")?;
+                            let Term::Branch(_, _, success) = branch.term else { return Err("fixture shape".into()); };
+                            branch.term = Term::Goto(success);
+                        } else {
+                            let Stmt::Let(_, producer) = &mut function.blocks[block].stmts[statement] else { return Err("fixture shape".into()); };
+                            match mutation {
+                                0 => function.value_tys[result as usize] = Ty::Slice(align_sema::Scalar::Bool),
+                                1 => *producer = Rvalue::Use(Operand::BorrowedElementPlace(Box::new(place.clone()))),
+                                _ => {
+                                    let Rvalue::IndexedFieldView(input) = producer else { return Err("fixture shape".into()); };
+                                    if mutation == 2 { *input = Operand::Const(Const::Unit); }
+                                    else {
+                                        let Operand::BorrowedElementPlace(place) = input else { return Err("fixture shape".into()); };
+                                        match mutation {
+                                            3 => place.field_path.clear(),
+                                            4 => place.field_path.push(u32::MAX),
+                                            5 => place.element_ty = Ty::DynArray(align_sema::Scalar::Bool),
+                                            6 => place.base.path.push(align_sema::hir::BorrowedPathSegment::StructField(u32::MAX)),
+                                            7 => place.index = Operand::Const(Const::Int(-1, Ty::Int(align_sema::IntTy { bits: 64, signed: true }))),
+                                            8 => place.guard.reservation = u32::MAX,
+                                            _ => place.guard.len = Operand::Const(Const::Int(0, Ty::Int(align_sema::IntTy { bits: 64, signed: true }))),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let error = emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                            .expect_err(&format!("accepted {field}/{parent}/{discard}/{mutation}"));
+                        if mutation == 11 {
+                            assert!(error.to_string().contains("root changes"), "parent interval: {error}");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn indexed_view_copy_publication_matrix() -> Result<(), String> {
+        for discard in [false, true] {
+            for forwarded in [false, true] {
+                let tail = if discard { "0" } else { "(view[0] + view[1]) as i32" };
+                let source = format!("Row {{ data: [i64; 2], marker: i64 }}\nfn main() -> i32 {{ mut rows := [Row {{ data: [1, 2], marker: 3 }}, Row {{ data: [4, 5], marker: 6 }}]; view := rows[0].data[..]; rows = [Row {{ data: [7, 8], marker: 9 }}, Row {{ data: [10, 11], marker: 12 }}]; {tail} }}");
+                let mut original = mir(&source);
+                let function = original.fns.iter_mut().find(|f| f.name.as_str() == "main").ok_or("fixture member")?;
+                let (block, load, source_slot, loaded) = function.blocks.iter().enumerate().find_map(|(b, block)| {
+                    block.stmts.iter().enumerate().find_map(|(s, statement)| match statement {
+                        Stmt::Let(value, Rvalue::Load(slot)) if matches!(function.slots[*slot as usize], Ty::StructArray(..)) => Some((b, s, *slot, *value)),
+                        _ => None,
+                    })
+                }).ok_or("whole replacement load")?;
+                if forwarded {
+                    let wrapper = u32::try_from(function.value_tys.len()).map_err(|_| "fixture value")?;
+                    function.value_tys.push(function.slots[source_slot as usize]);
+                    function.blocks[block].stmts.insert(load + 1, Stmt::Let(wrapper, Rvalue::Use(Operand::Value(loaded))));
+                    let store = function.blocks[block].stmts.iter_mut().find(|statement|
+                        matches!(statement, Stmt::Store(_, Operand::Value(value)) if *value == loaded)).ok_or("fixture member")?;
+                    let Stmt::Store(_, input) = store else { return Err("fixture shape".into()); };
+                    *input = Operand::Value(wrapper);
+                }
+                emit_llvm_ir(&original, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                    .map_err(|error| format!("valid {discard}/{forwarded}: {error}"))?;
+                for mutation in 0..8 {
+                    let mut bad = original.clone();
+                    let function = bad.fns.iter_mut().find(|f| f.name.as_str() == "main").ok_or("fixture member")?;
+                    let position = function.blocks[block].stmts.iter().position(|statement|
+                        matches!(statement, Stmt::StoreElemField(slot, _, path, _) if *slot == source_slot && path == &[0])).ok_or("fixture member")?;
+                    let input = function.blocks[block].stmts[position].clone();
+                    match mutation {
+                        0 => { function.blocks[block].stmts.remove(position); }
+                        1 => function.blocks[block].stmts.insert(position, input),
+                        2 | 3 | 4 | 5 => {
+                            let Stmt::StoreElemField(_, index, path, value) = &mut function.blocks[block].stmts[position] else { return Err("fixture shape".into()); };
+                            match mutation {
+                                2 => *index = Operand::Const(Const::Int(2, Ty::Int(align_sema::IntTy { bits: 64, signed: true }))),
+                                3 => path.push(u32::MAX),
+                                4 => *value = Operand::Const(Const::Bool(true)),
+                                _ => *index = Operand::Const(Const::Int(-1, Ty::Int(align_sema::IntTy { bits: 64, signed: true }))),
+                            }
+                        }
+                        6 => {
+                            function.blocks[block].stmts.remove(position);
+                            let load = function.blocks[block].stmts.iter().position(|statement|
+                                matches!(statement, Stmt::Let(value, _) if *value == loaded)).ok_or("fixture member")?;
+                            function.blocks[block].stmts.insert(load + 1, input);
+                        }
+                        _ => {
+                            function.blocks[block].stmts.remove(position);
+                            let trap = function.blocks.iter_mut().find(|block| matches!(block.term, Term::Unreachable)).ok_or("fixture member")?;
+                            trap.stmts.insert(0, input);
+                        }
+                    }
+                    emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                        .expect_err(&format!("publication accepted {discard}/{forwarded}/{mutation}"));
                 }
             }
         }
