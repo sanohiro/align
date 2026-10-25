@@ -20379,6 +20379,8 @@ fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
         ("stdout", "borrow source: run_bytes", "source.stdout()"),
         ("stderr", "borrow source: run_bytes", "source.stderr()"),
         ("builder", "borrow source: builder", "source.bytes()"),
+        ("indexed-fixed", "borrow source: array<IndexedFixed>", "source[0].bytes[..]"),
+        ("indexed-owned", "borrow source: array<IndexedOwned>", "source[0].bytes[..]"),
     ] {
         for (sink, write) in [
             ("print(bytes[0])", false),
@@ -20387,7 +20389,7 @@ fn readonly_view_publication_checked_hir_replay() -> Result<(), &'static str> {
             ("bytes.fill(65)", true),
             ("copy_source := buffer.filled(2, 0); bytes.copy_from(copy_source.bytes())", true),
         ] {
-            let source = format!("fn probe(borrow mut input: slice<u8>, {receiver}) {{ published := {publication}; mut bytes := input; {sink} }}\nfn main() -> i32 = 0\n");
+            let source = format!("IndexedFixed {{ bytes: [u8; 2] }}\nIndexedOwned {{ bytes: array<u8> }}\nfn probe(borrow mut input: slice<u8>, {receiver}) {{ published := {publication}; mut bytes := input; {sink} }}\nfn main() -> i32 = 0\n");
             let mut program = checked_source_program(&source);
             assert!(align_sema::checked_hir_body_facts_are_valid(&program));
             let function = program.fns.iter_mut().find(|f| f.name == "probe").ok_or("publication probe")?;
@@ -21513,6 +21515,101 @@ fn indexed_array_field_length_permission_stops_at_calls() -> Result<(), String> 
     Ok(())
 }
 
+
+#[test]
+fn indexed_field_view_hir_matrix() -> Result<(), String> {
+    for field in ["[i64; 2]", "array<i64>"] {
+        let source = format!("R {{ data: {field} }}\nfn view(borrow rows: array<R>, i: i64) -> slice<i64> = rows[i].data[..]\nfn main() {{}}");
+        let original = checked_source_program(&source);
+        assert!(body_core_metadata_is_valid(&original));
+        for mutation in 0..10 {
+            let mut bad = original.clone();
+            let function = bad.fns.iter_mut().find(|f| f.name == "view").ok_or("view")?;
+            let expression = function.body.value.as_deref_mut().ok_or("range")?;
+            let hir::ExprKind::SliceRange { recv, .. } = &mut expression.kind else { return Err("range shape".into()) };
+            let hir::ExprKind::ArrayToSlice(source) = &mut recv.kind else { return Err("view shape".into()) };
+            match mutation {
+                0 => expression.ty = Ty::Slice(Scalar::Bool),
+                1 => recv.ty = Ty::Slice(Scalar::Bool),
+                2 => source.ty = Ty::DynArray(Scalar::Bool),
+                3 => { let replacement = source.as_ref().clone(); **recv = replacement; }
+                _ => {
+                    let hir::ExprKind::ElemField { recv: parent, index, path, struct_id } = &mut source.kind else { return Err("field shape".into()) };
+                    match mutation {
+                        4 => path.clear(),
+                        5 => path.push(u32::MAX),
+                        6 => *struct_id = u32::MAX,
+                        7 => index.ty = Ty::Bool,
+                        8 => parent.ty = Ty::Slice(Scalar::Bool),
+                        _ => index.kind = hir::ExprKind::Local(u32::MAX),
+                    }
+                }
+            }
+            assert!(!body_core_metadata_is_valid(&bad), "{field}/{mutation}");
+            assert_body_entrypoints_empty("indexed field view", &bad);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn indexed_field_view_rejects_temporary_hir_parents() -> Result<(), String> {
+    for (field, data) in [("[i64; 2]", "[1, 2]"), ("array<i64>", "[1, 2].to_array()")] {
+        for (parent, temporary) in [
+            ("[R; 1]", format!("[R {{ data: {data} }}]")),
+            ("array<R>", "make()".to_string()),
+            ("slice<R>", "identity(rows)".to_string()),
+        ] {
+            for used in [false, true] {
+                let tail = if used { "print(selected.len())" } else { "" };
+                let source = format!("R {{ data: {field} }}\nfn make() -> array<R> {{ mut b: array_builder<R> := array_builder(); b.push(R {{ data: {data} }}); b.build() }}\nfn identity(borrow rows: slice<R>) -> slice<R> = rows\nfn view(borrow rows: {parent}, i: i64) {{ temporary := {temporary}; selected := rows[i].data[..]; {tail} }}\nfn main() {{}}");
+                let original = checked_source_program(&source);
+                assert!(body_core_metadata_is_valid(&original));
+                let mut bad = original.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name == "view").ok_or("view")?;
+                let parent_ty = function.locals.first().ok_or("parent local")?.ty;
+                let temporary = function.body.stmts.iter().find_map(|statement| match statement {
+                    hir::Stmt::Let { init, .. } if init.ty == parent_ty => Some(init.clone()),
+                    _ => None,
+                }).ok_or("temporary parent")?;
+                let selected = function.body.stmts.iter_mut().find_map(|statement| match statement {
+                    hir::Stmt::Let { init, .. } if matches!(init.kind, hir::ExprKind::SliceRange { .. }) => Some(init),
+                    _ => None,
+                }).ok_or("selected view")?;
+                let hir::ExprKind::SliceRange { recv, .. } = &mut selected.kind else { return Err("range".into()); };
+                let hir::ExprKind::ArrayToSlice(field) = &mut recv.kind else { return Err("view".into()); };
+                let hir::ExprKind::ElemField { recv: receiver, .. } = &mut field.kind else { return Err("field".into()); };
+                **receiver = temporary;
+                assert!(!body_core_metadata_is_valid(&bad), "accepted temporary {parent}/{used}");
+                assert_body_entrypoints_empty("temporary indexed view parent", &bad);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn indexed_view_retention_replays_field_retirement() -> Result<(), &'static str> {
+    let prefix = "Row { data: array<i64> }\nOuter { rows: array<Row>, other: array<i64> }\nfn rows() -> array<Row> { mut b: array_builder<Row> := array_builder(); b.push(Row { data: [7].to_array() }); b.build() }\nfn make() -> Outer = Outer { rows: rows(), other: [9].to_array() }\nfn view(borrow outer: Outer) -> slice<i64> = outer.rows[0].data[..]\nfn publish(borrow mut target: slice<i64>, borrow outer: Outer) { target = outer.rows[0].data[..] }\n";
+    for setup in ["value := view(outer)", "initial := [0]; mut value: slice<i64> := initial; publish(value, outer)"] {
+        let source = format!("{prefix}fn main() {{ mut outer := make(); mut other := make(); {setup}; other.rows = rows(); print(value.len()) }}");
+        let original = checked_source_program(&source);
+        assert!(body_core_metadata_is_valid(&original));
+        let mut bad = original.clone();
+        let main = bad.fns.iter_mut().find(|function| function.name == "main").ok_or("main")?;
+        let outer = u32::try_from(main.locals.iter().position(|local| local.name == "outer").ok_or("outer")?).map_err(|_| "local id")?;
+        let assignment = main.body.stmts.iter_mut().find(|statement| matches!(statement, hir::Stmt::AssignField { .. })).ok_or("field assignment")?;
+        let hir::Stmt::AssignField { root, .. } = assignment else { return Err("assignment"); };
+        *root = outer;
+        assert_replay_rejects_without_mutating(bad.clone(), "indexed retained backing retirement");
+        let source_map = SourceMap::new();
+        for lowered in [lower_program(&bad), lower_program_located(&bad, &source_map),
+            lower_program_per_unit(&bad), lower_program_per_unit_located(&bad, &source_map)] {
+            assert!(is_empty(&lowered), "expired indexed view published MIR");
+        }
+    }
+    Ok(())
+}
 
 #[test]
 fn indexed_array_field_copy_reads_hir_matrix() -> Result<(), String> {

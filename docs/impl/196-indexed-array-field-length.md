@@ -1,5 +1,11 @@
 # Indexed owned-array field length
 
+Current disposition: this plan owns scalar length.
+[Plan242](242-indexed-field-views.md) separately supplies explicit retained
+read-only indexed-field ranges using Plan240 call authority. Its contract
+supersedes the historical view deferrals below; the original operation and
+its ownership/evaluation rules are unchanged.
+
 LLM R137's real Case.ids use needs `rows[index].ids.len()`. The reduced source
 rejects at 9227651f while a complete-Case shared helper works. This is a valid
 scalar observation of existing storage, not an owning element extraction.

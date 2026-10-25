@@ -605,6 +605,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             }
         }
         Rvalue::SliceLen(op) => format!("slice_len({})", operand_str(op)),
+        Rvalue::IndexedFieldView(op) => format!("indexed_field_view({})", operand_str(op)),
         Rvalue::SlicePtr(op) => format!("slice_ptr({})", operand_str(op)),
         Rvalue::SliceIndex(s, idx) => format!("{}[{}]", operand_str(s), operand_str(idx)),
         Rvalue::SliceIndexNoalias { slice, index, scope } => format!("{}[{}] !alias.scope(in#{scope})", operand_str(slice), operand_str(index)),

@@ -1533,6 +1533,9 @@ pub enum Rvalue {
     },
     /// The `len` of a slice operand.
     SliceLen(Operand),
+    /// Read-only view of a checked indexed fixed/dynamic independent array field.
+    /// The operand must be BorrowedElementPlace; no owning header is published.
+    IndexedFieldView(Operand),
     /// The buffer `ptr` (field 0) of a slice / owned-array `{ptr,len}` operand — the raw element
     /// pointer, used to store back into the buffer (e.g. an in-place `sort`).
     SlicePtr(Operand),
@@ -11422,6 +11425,12 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 None,
             ),
             hir::ExprKind::ArrayToSlice(inner) => {
+                if matches!(inner.kind, hir::ExprKind::ElemField { .. }) {
+                    let place = lower_required!(b, lower_borrowed_element_field(b, inner), Operand::Const(Const::Unit));
+                    let value = b.fresh_value(e.ty);
+                    b.push(Stmt::Let(value, Rvalue::IndexedFieldView(place)));
+                    return Operand::Value(value);
+                }
                 if matches!(
                     inner.ty,
                     Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)

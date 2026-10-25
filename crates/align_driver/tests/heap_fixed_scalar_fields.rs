@@ -204,7 +204,7 @@ fn rejections() {
             "fn main() { mut b: array_builder<Item> := array_builder(); value := make(); b.push(value); b.push(value) }",
             "fn main() { arena out { mut b: array_builder<Item> := array_builder(out) } }",
             "fn main() { mut b: array_builder<[i64; 3]> := array_builder() }",
-            "fn main() { mut b: array_builder<Item> := array_builder(); b.push(make()); values := b.build(); print(values[0].shape[..].len()) }",
+            "fn main() { mut b: array_builder<Item> := array_builder(); b.push(make()); values := b.build(); mut view := values[0].shape[..]; view[0] = 9 }",
             "fn inspect(borrow value: Item) {}\nfn main() { mut b: array_builder<Item> := array_builder(); b.push(make()); values := b.build(); inspect(values[0]) }",
             "fn read(borrow value: Option<Item>) -> i64 { match value { Some(row) => row.shape[0], None => 0 } }\nfn main() {}",
             "fn escape() -> slice<i64> { value := make(); return value.shape[..] }\nfn main() {}",

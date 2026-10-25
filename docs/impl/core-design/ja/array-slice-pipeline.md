@@ -26,7 +26,16 @@ slice<T>         borrowed view {ptr,len}, Copy, region = the data it points into
 評価する前に field 全体をコピーし、両方の符号付き境界検査と評価順序を維持する。
 record field を続けて読む場合も同じで、結果は親の置換・破棄後も使える。
 読み出しは allocation、借用 view、添字代入を追加しない。field 全体に view、owner、
-pointer、callable が含まれる場合は対象外。添字付き固定長 field の直接スライスは別の能力となる。
+pointer、callable が含まれる場合は対象外。
+[Plan242](../../242-indexed-field-views.md) は、独立した固定長または通常の dynamic array field に
+対する明示的な range `rows[row].path.field[start..end]` を別途提供する。
+要素のコピーや allocation なしに読み取り専用 slice を作る。親と選択した backing は
+外側の添字と両方の range 境界の評価中、および保持した view の読み出し中に生存する。
+所有する backing の破棄は view を無効化する。inline Copy の置換ではアドレスが維持され、
+view が観測する内容が更新される。byte の書き込みは既存の文字列検証結果を失効させる。
+空の field でも親の寿命と外側の境界検査を維持する。既存の slice reader／pipeline を使えるが、
+添字付き field の暗黙 coercion、range のない直接 pipeline、一時値や入れ子の添字を外側の親に
+使う形、exclusive access は引き続き対象外。
 
 `[T; N]` は型注釈でも固定長配列型を表す。record field は N 個の slot を inline に保持し、
 array header、builder、allocation を追加しない。named local、parameter、stable field place は

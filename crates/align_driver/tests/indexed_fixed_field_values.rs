@@ -235,7 +235,7 @@ fn main() -> i32 {{
 fn excluded_neighbors() {
     owned_fixture::run("excluded_neighbors", |stage| {
         let mut cases = vec![
-            "Row { values: [i64; 2] }\nfn read(rows: slice<Row>) -> slice<i64> = rows[0].values[..]\nfn main() {}".to_owned(),
+            "Row { values: [i64; 2] }\nfn read(rows: slice<Row>) { mut view := rows[0].values[..]; view[0] = 9 }\nfn main() {}".to_owned(),
             "Row { values: [i64; 2] }\nfn read(rows: slice<Row>) -> i64 = rows[0].values.sum()\nfn main() {}".to_owned(),
             "fn make() -> [i64; 2] = [7, 12]\nfn main() { print(make()[0]) }".to_owned(),
             "Row { values: [i64; 2] }\nfn main() { mut rows := [Row { values: [7, 12] }]; rows[0].values[0] = 9 }".to_owned(),
