@@ -2546,3 +2546,7 @@ copies and independent builders remain valid. Plan240 supplies ordinary-call
 read-only authority; no permission bit, implicit clone or alternative accumulator
 is introduced. Builder formation restrictions and typed-builder reads remain
 separate contracts.
+
+## External writable windows
+
+An unsafe producer may retain an initialized external range under an existing mutable resource borrow. This avoids an extra owned Buffer copy without introducing permission types or writable ordinary returns. Scalar writes preserve the lifetime but retire overlapping UTF-8 validation. The synchronous File writer consumes that same authority; transfer completion and GPU ownership remain wrapper obligations. Plan244 owns the exact source and native contract.

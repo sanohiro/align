@@ -82,6 +82,28 @@ fs.remove_empty_dir(path: str) -> Result<(), Error>
 
 ## Public contract
 
+### Initialized writable-view reads
+
+`f.read_at(offset: i64, destination: slice<u8>) -> Result<i64, Error>` reads
+synchronously into an initialized writable byte view. The File receiver is a
+bound local shared borrow; the destination is a bound exclusive view, including
+existing fixed-array coercion and `borrow mut`/`out` helper parameters. Bind a
+subrange to select a window. Operands evaluate once left to right; later operands
+cannot invalidate completed native owners. Negative offset/length, unrepresentable
+length, nonempty null, address overflow and File-shell overlap are Invalid before
+I/O. File/destination pointer admission precedes descriptor access; a negative fd
+is Invalid even for zero length. Valid zero length performs no syscall. One pread
+retries only EINTR, preserves the cursor and uses the existing errno mapping.
+Success returns the actual prefix count, including short reads and EOF zero;
+bytes beyond that prefix remain unchanged. Admission failures/zero/EOF preserve
+bytes; native Err may alter bytes inside the selected window and yields no valid
+count. Bytes outside the window and full initialization always survive. No Align
+allocation, resize, initialization, copy, address retention or descriptor rebind
+occurs. File, view and owner generation survive Ok/Err; every call expires earlier
+overlapping byte-validation observations. The unsafe producer must already have
+initialized the whole range. `pread_into` remains the owning Buffer operation
+that may extend initialized length. Plan244 fixes the complete contract.
+
 ### Direct bounded buffer-window reads
 
 `f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`

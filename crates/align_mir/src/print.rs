@@ -945,6 +945,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::FileCreateRwExclusive { path, out } => format!("fs_create_rw_exclusive({}, -> _{out})", operand_str(path)),
         Rvalue::FilePread { file, buffer, offset } => format!("file_pread({}, {}, {})", operand_str(file), operand_str(buffer), operand_str(offset)),
         Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset } => format!("file_pread_into({}, {}, {}, {}, {})", operand_str(file), operand_str(buffer), operand_str(destination_offset), operand_str(length), operand_str(offset)),
+        Rvalue::FileReadAt { file, offset, destination } => format!("file_read_at({}, {}, {})", operand_str(file), operand_str(offset), operand_str(destination)),
         Rvalue::FilePwrite { file, data, offset } => format!("file_pwrite({}, {}, {})", operand_str(file), operand_str(data), operand_str(offset)),
         Rvalue::FileSync(file) => format!("file_sync({})", operand_str(file)),
         Rvalue::FileLen { file } => format!("file_len({})", operand_str(file)),

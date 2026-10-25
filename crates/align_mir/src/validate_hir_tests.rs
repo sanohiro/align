@@ -13066,8 +13066,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // RawTryAlloc adds the atomic non-owning Result allocation producer.
         // HttpRespondTimeoutNs adds one checked three-operand native action.
         // HttpCtxPeerEof adds a checked shared receiver and Copy bool/Error result.
+        // FileReadAt adds one explicit initialized byte-view native writer.
         variants,
-        363,
+        364,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

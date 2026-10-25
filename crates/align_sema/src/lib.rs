@@ -12248,7 +12248,7 @@ fn compact_abstract_nominal_instances(
             }
             ExprKind::ResourceViewFromRaw { resource, view, .. } => {
                 remap_id(resource, &remap.resources, valid);
-                if let hir::ResourceViewKind::Slice(scalar) = view {
+                if let hir::ResourceViewKind::Slice(scalar) | hir::ResourceViewKind::SliceMut(scalar) = view {
                     remap_scalar(scalar, remap, valid);
                 }
             }
@@ -17618,7 +17618,7 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
             }
             // File pread/pwrite/len/sync are syscalls (I/O / fstat / synchronization) — Impure, like `reader.read`.
-            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
+            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
                 self.impure_direct = true;
             }
             // `.bytes()` re-views string/buffer memory and `.len()` reads it — pure (no I/O), like
@@ -25998,10 +25998,10 @@ impl<'a> EscapeCheck<'a> {
                 parent: Some(parent),
                 ..
             }
-            | ExprKind::ResourceViewFromRaw { owner: parent, .. } => push_fold(
-                &mut work,
-                Region::Static,
-                vec![(parent, depth, None)],
+            => push_fold(&mut work, Region::Static, vec![(parent, depth, None)]),
+            ExprKind::ResourceViewFromRaw { owner, view, .. } => push_fold(
+                &mut work, Region::Static,
+                vec![(owner, depth, view.is_mutable().then(|| self.borrowed_storage_cap(owner)))],
             ),
             ExprKind::ResourceBorrow { owner: parent, .. } => push_fold(
                 &mut work,
@@ -26102,7 +26102,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
-            | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
+            | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. }
@@ -26589,7 +26589,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
-            | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
+            | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
             | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. }
@@ -29803,6 +29803,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(buffer, depth);
                 self.walk(offset, depth);
             }
+            ExprKind::FileReadAt { file, offset, destination } => { self.walk(file, depth); self.walk(offset, depth); self.walk(destination, depth); }
             ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
                 self.walk(file, depth);
                 self.walk(buffer, depth);
@@ -30650,7 +30651,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(reader, depth);
                 self.walk(writer, depth);
             }
-            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => self.walk_file_op(&e.kind, depth),
+            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => self.walk_file_op(&e.kind, depth),
             ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => self.walk(buffer, depth),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.walk(bytes, depth);
@@ -31914,6 +31915,10 @@ struct StorageHeaderLeaf {
     descriptor: Option<StorageHeaderDescriptor>,
     known: bool,
     fallback_roots: BorrowRoots,
+    /// Complete native allocation alternatives authenticated by ResourceViewFromRaw's owner.
+    /// Separate from `known`: no managed collection generation or mutable contents are invented.
+    /// Ordinary unresolved call results have no such proof.
+    external_backing: Option<BorrowRoots>,
     /// Borrowed views already present in these elements crossed an ordinary function boundary.
     /// This restricts their descriptors, never this independently owned allocation itself.
     readonly_contents: bool,
@@ -31928,6 +31933,7 @@ impl StorageHeaderLeaf {
             descriptor: None,
             known: true,
             fallback_roots: BorrowRoots::new(),
+            external_backing: None,
             readonly_contents: false,
         }
     }
@@ -31951,6 +31957,7 @@ impl StorageHeaderLeaf {
             descriptor: None,
             known: true,
             fallback_roots: BorrowRoots::new(),
+            external_backing: None,
             readonly_contents: false,
         }
     }
@@ -31973,6 +31980,7 @@ impl StorageHeaderLeaf {
             descriptor: None,
             known: false,
             fallback_roots,
+            external_backing: None,
             readonly_contents: false,
         }
     }
@@ -31999,6 +32007,8 @@ impl StorageHeaderLeaf {
                 .flatten(),
             known: self.known && other.known,
             fallback_roots,
+            external_backing: self.external_backing.as_ref().zip(other.external_backing.as_ref())
+                .map(|(left, right)| left.union(right).cloned().collect()),
             readonly_contents: self.readonly_contents || other.readonly_contents,
         }
     }
@@ -32011,6 +32021,7 @@ impl StorageHeaderLeaf {
                 .collect();
         }
         rename_borrow_roots(&mut self.fallback_roots, renames);
+        if let Some(roots) = &mut self.external_backing { rename_borrow_roots(roots, renames); }
     }
 }
 
@@ -33204,7 +33215,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::FileCreateRw { .. }
         | ExprKind::FileOpenRw { .. }
         | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
-        | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
+        | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. }
         | ExprKind::FilePwrite { .. }
         | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }
         | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. }
@@ -39516,7 +39527,8 @@ impl<'a> MoveCheck<'a> {
     fn type_has_validation_bytes(&self, ty: Ty) -> bool {
         ty_contains_leaf(ty, self.structs, self.tuples, self.enums, self.tagged_types,
             |ty| match ty {
-                Ty::Buffer | Ty::Soa(_) | Ty::SoaParam(_) => true,
+                Ty::Buffer | Ty::Soa(_) | Ty::SoaParam(_)
+                | Ty::Resource(_) | Ty::ResourceRef(_) => true,
                 Ty::Slice(element) | Ty::Array(element, _) | Ty::DynArray(element) =>
                     matches!(element, Scalar::Int(_) | Scalar::Float(_)),
                 Ty::DynSliceArray(element) =>
@@ -41010,6 +41022,9 @@ impl<'a> MoveCheck<'a> {
                         StorageHeaderLeaf::unknown_typed(fact.live_roots(), descriptor)
                     },
                 );
+                if matches!(expression.kind, ExprKind::ResourceViewFromRaw { .. }) {
+                    leaf.external_backing = Some(fact.live_roots());
+                }
                 if let Some(descriptor) = descriptor
                     && matches!(
                         expression.kind,
@@ -41217,6 +41232,13 @@ impl<'a> MoveCheck<'a> {
         }
         fact = fact.join(&boundary);
         let validation = match &expression.kind {
+            ExprKind::ResourceViewFromRaw { owner, view: hir::ResourceViewKind::StrUtf8, .. } => {
+                let roots = self.completed_storage_fact(owner).live_roots();
+                Some((ByteValidationKind::Utf8,
+                    self.byte_backing(&ProjectedHeaderFact::default(),
+                        &BorrowFact::from_direct(roots.clone()), &MutableBackingFact::known(roots)),
+                    vec![vec![BorrowProjection::OptionSome]]))
+            }
             ExprKind::BytesAsStr { bytes } => Some((
                 ByteValidationKind::Utf8,
                 self.completed_byte_backing(bytes),
@@ -41537,7 +41559,8 @@ impl<'a> MoveCheck<'a> {
     /// using the existing owning-handle machinery until the complete operation starts.
     fn file_action_inputs(kind: &ExprKind) -> Option<(&Expr, Option<&Expr>)> {
         match kind {
-            ExprKind::FilePread { file, buffer, .. } | ExprKind::FilePreadInto { file, buffer, .. } => Some((file, Some(buffer))),
+            ExprKind::FilePread { file, buffer, .. } | ExprKind::FilePreadInto { file, buffer, .. }
+            | ExprKind::FileReadAt { file, destination: buffer, .. } => Some((file, Some(buffer))),
             ExprKind::FilePwrite { file, .. } | ExprKind::FileLen { file } | ExprKind::FileSync { file } => Some((file, None)),
             _ => None,
         }
@@ -41567,6 +41590,7 @@ impl<'a> MoveCheck<'a> {
 
     fn reader_action_receiver(expression: &Expr) -> Option<&Expr> {
         match &expression.kind {
+            ExprKind::ResourceViewFromRaw { owner: reader, view, .. } if view.is_mutable() => Some(reader),
             ExprKind::XmlNext { reader } | ExprKind::XmlName { reader }
             | ExprKind::XmlAttributeCount { reader } | ExprKind::XmlText { reader }
             | ExprKind::XmlAttributeName { reader, .. }
@@ -42562,9 +42586,15 @@ impl<'a> MoveCheck<'a> {
             ExprKind::ResourceFromRaw { parent: None, .. }
             | ExprKind::ResourceRaw { .. }
             | ExprKind::ResourceIntoRaw { .. } => BorrowFact::default(),
-            ExprKind::ResourceViewFromRaw { owner, .. } => self
-                .borrow_fact(owner)
-                .prefixed(BorrowProjection::OptionSome),
+            ExprKind::ResourceViewFromRaw { owner, view, .. } => {
+                let mut fact = if view.is_mutable() {
+                    BorrowFact::from_direct(self.storage_roots(owner))
+                } else { self.borrow_fact(owner) };
+                if matches!(view, hir::ResourceViewKind::Slice(_)) {
+                    fact.direct.insert(BorrowRoot::ReadOnly);
+                }
+                fact.prefixed(BorrowProjection::OptionSome)
+            },
             ExprKind::Field { root, path } => {
                 let path = path
                     .iter()
@@ -43091,8 +43121,12 @@ impl<'a> MoveCheck<'a> {
                 parent: Some(parent),
                 ..
             }
-            | ExprKind::ResourceViewFromRaw { owner: parent, .. } => {
-                self.borrow_sources(parent)
+            => self.borrow_sources(parent),
+            ExprKind::ResourceViewFromRaw { owner, view, .. } => {
+                let mut roots = if view.is_mutable() { self.storage_roots(owner) }
+                    else { self.borrow_sources(owner) };
+                if matches!(view, hir::ResourceViewKind::Slice(_)) { roots.insert(BorrowRoot::ReadOnly); }
+                roots
             }
             ExprKind::ArrayToSlice(inner) if matches!(inner.kind, ExprKind::ElemField { .. }) => {
                 let mut roots = self.storage_roots(inner);
@@ -43510,7 +43544,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CodecEncoderPut { .. } | ExprKind::CodecEncoderFinish { .. }
             | ExprKind::FrameInnerJoin { .. }
             | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
-            | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. }
+            | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. } | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. } | ExprKind::BuilderLen { .. } | ExprKind::ArrayBuilderLen { .. }
             | ExprKind::BytesRead { .. }
             | ExprKind::BytesSet { .. }
@@ -44570,6 +44604,10 @@ impl<'a> MoveCheck<'a> {
             ..ByteValidationBacking::default()
         };
         if let Some(header) = headers.leaves.get(&Vec::new()) {
+            if let Some(roots) = &header.external_backing {
+                return self.byte_backing(&ProjectedHeaderFact::default(), storage,
+                    &MutableBackingFact::known(roots.clone()));
+            }
             result.generations.extend(
                 header
                     .generations
@@ -44620,7 +44658,8 @@ impl<'a> MoveCheck<'a> {
         let headers = self.completed_headers(expression);
         let storage = self.completed_storage_fact(expression);
         let backing = if headers.leaves.is_empty()
-            && self.is_move_ty(expression.ty)
+            && (matches!(expression.ty, Ty::Resource(_) | Ty::ResourceRef(_))
+            || (self.is_move_ty(expression.ty)
             && !ty_may_borrow(
                 expression.ty,
                 self.structs,
@@ -44628,7 +44667,7 @@ impl<'a> MoveCheck<'a> {
                 self.enums,
                 self.tagged_types,
             )
-            && matches!(expression.kind, ExprKind::Local(_) | ExprKind::Field { .. })
+            && matches!(expression.kind, ExprKind::Local(_) | ExprKind::Field { .. })))
         {
             // Native owning handles have no collection header. A completed owner place is
             // authenticated identity; an arbitrary view-returning call is not.
@@ -45844,6 +45883,7 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, buffer, moved, false, false);
                 move_expr!(self, offset, moved, false, false);
             }
+            ExprKind::FileReadAt { file, offset, destination } => { move_expr!(self, file, moved, false, false); move_expr!(self, offset, moved, false, false); move_expr!(self, destination, moved, false, false); }
             ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
                 move_expr!(self, file, moved, false, false);
                 move_expr!(self, buffer, moved, false, false);
@@ -47757,6 +47797,7 @@ impl<'a> MoveCheck<'a> {
         kind: &ExprKind,
     ) -> Option<SourceVisibleMutationAction<'_>> {
         match kind {
+            ExprKind::FileReadAt { destination, .. } => Some(SourceVisibleMutationAction::Collection(destination)),
             ExprKind::HttpSseStreamNext { stream, buffer } => {
                 Some(SourceVisibleMutationAction::StorageAndSource {
                     storage: buffer,
@@ -50144,7 +50185,7 @@ impl<'a> MoveCheck<'a> {
             // `f.pread(b, off)` / `f.pwrite(data, off)` / `f.len()` all **borrow** the file (never
             // consumed — no move-out); the buffer is filled in place and the data/offset are read.
             // Split out `#[inline(never)]` so its arm locals stay out of this recursive frame (#296).
-            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. }
+            ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. }
             | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => {
                 if !self.move_file_op(&e.kind, moved) {
@@ -57395,7 +57436,7 @@ impl<'a, 't> Checker<'a, 't> {
                         | "borrow"
                         | "raw"
                         | "into_raw"
-                        | "view_from_raw"
+                        | "view_from_raw" | "view_mut_from_raw"
                 )
             {
                 return self.check_resource_op(method, args, expected, span);
@@ -58409,6 +58450,7 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let recv_expr = self.check_expr(recv, recv_expected);
         let recv_ty = recv_expr.ty;
+        if recv_ty == Ty::File && method == "read_at" { return self.check_file_method(recv_expr, method, args, span); }
         if let Some(kind) = process_live::ProcessLiveKind::from_method(recv_ty, method) {
             return self.check_process_live(kind, Some(recv_expr), args, span);
         }
@@ -64899,7 +64941,7 @@ impl<'a, 't> Checker<'a, 't> {
         let required = match method {
             "from_raw" | "borrow" | "raw" | "into_raw" => 1,
             "from_raw_borrowed" => 2,
-            "view_from_raw" => 3,
+            "view_from_raw" | "view_mut_from_raw" => 3,
             _ => unreachable!("resource dispatcher admits only the settled intrinsic set"),
         };
         if args.len() != required {
@@ -65086,18 +65128,23 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
-            "view_from_raw" => {
+            "view_from_raw" | "view_mut_from_raw" => {
+                let mutable = method == "view_mut_from_raw";
                 let owner = self.check_expr(&args[0], None);
-                let Ty::ResourceRef(resource) = self.resolve(owner.ty) else {
-                    self.diags.error(
-                        format!(
-                            "'resource.view_from_raw' expects `resource_ref<R>` first, got {}",
-                            self.ty_display(owner.ty)
-                        ),
-                        args[0].span,
-                    );
-                    return err();
+                let resource = match (mutable, self.resolve(owner.ty)) {
+                    (false, Ty::ResourceRef(resource)) | (true, Ty::Resource(resource)) => resource,
+                    _ => {
+                        self.diags.error(format!("'resource.{method}' expects {} first", if mutable { "an owning resource" } else { "resource_ref<R>" }), args[0].span);
+                        return err();
+                    }
                 };
+                if mutable {
+                    if !matches!(owner.kind, ExprKind::Local(_)) {
+                        self.diags.error("'resource.view_mut_from_raw' requires a bound whole resource local".to_string(), args[0].span);
+                        return err();
+                    }
+                    self.validate_borrow_argument(&owner, ast::ParamMode::BorrowMut, "resource.view_mut_from_raw");
+                }
                 if !self.resource_privileged(resource) {
                     self.diags.error(
                         format!(
@@ -65115,20 +65162,19 @@ impl<'a, 't> Checker<'a, 't> {
                 let len = self.check_expr(&args[2], Some(i64_ty));
                 let expected = expected.map(|ty| expand_tagged_ty(self.resolve(ty), self.tagged_types));
                 let (ty, view) = match expected {
-                    Some(Ty::Option(Scalar::Str)) => {
+                    Some(Ty::Option(Scalar::Str)) if !mutable => {
                         (Ty::Option(Scalar::Str), hir::ResourceViewKind::StrUtf8)
                     }
                     Some(Ty::Option(Scalar::Slice(element @ (PrimScalar::Int(_) | PrimScalar::Float(_))))) => {
                         let scalar = prim_to_scalar(element);
                         (
                             Ty::Option(Scalar::Slice(element)),
-                            hir::ResourceViewKind::Slice(scalar),
+                            if mutable { hir::ResourceViewKind::SliceMut(scalar) } else { hir::ResourceViewKind::Slice(scalar) },
                         )
                     }
                     _ => {
                         self.diags.error(
-                            "'resource.view_from_raw' needs an expected `Option<str>` or `Option<slice<FFIScalar>>` type"
-                                .to_string(),
+                            format!("'resource.{method}' needs an expected {}", if mutable { "Option<slice<FFIScalar>>" } else { "Option<str> or Option<slice<FFIScalar>>" }),
                             span,
                         );
                         return err();
@@ -71260,6 +71306,19 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "read_at" => {
+                let [offset, destination] = args else {
+                    self.diags.error("'.read_at()' takes a file offset and writable byte view".to_string(), span);
+                    return err;
+                };
+                let offset = self.check_expr(offset, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if !self.require_i64_arg(offset.ty, offset.span, "'.read_at()' file offset") { return err; }
+                let bytes = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+                let destination = self.check_call_argument_for_mode(destination, Some(bytes), ast::ParamMode::BorrowMut, None);
+                if destination.ty != bytes { self.diags.error("'.read_at()' requires a writable slice<u8>".to_string(), destination.span); return err; }
+                self.validate_borrow_argument(&destination, ast::ParamMode::BorrowMut, "file.read_at");
+                Expr { kind: ExprKind::FileReadAt { file: Box::new(recv_expr), offset: Box::new(offset), destination: Box::new(destination) }, ty: i64_result, span }
+            }
             "pread_into" => {
                 let [buf_arg, destination_arg, length_arg, off_arg] = args else {
                     self.diags.error(format!("'.pread_into()' takes 4 arguments (a mut buffer, destination offset, length, and file offset), got {}", args.len()), span);
@@ -72149,7 +72208,7 @@ impl<'a, 't> Checker<'a, 't> {
             ) if matches!(
                 &callee.kind,
                 ast::ExprKind::FieldAccess { recv, field }
-                    if field.name == "view_from_raw"
+                    if matches!(field.name.as_str(), "view_from_raw" | "view_mut_from_raw")
                         && matches!(
                             &recv.kind,
                             ast::ExprKind::Path(path)
@@ -73240,6 +73299,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(buffer);
                 self.finalize_expr(offset);
             }
+            ExprKind::FileReadAt { file, offset, destination } => { self.finalize_expr(file); self.finalize_expr(offset); self.finalize_expr(destination); }
             ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
                 self.finalize_expr(file);
                 self.finalize_expr(buffer);
@@ -74249,7 +74309,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(reader);
                 self.finalize_expr(writer);
             }
-            k @ (ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }) => self.finalize_file_op(k),
+            k @ (ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }) => self.finalize_file_op(k),
             ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => self.finalize_expr(buffer),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.finalize_expr(bytes);
@@ -82678,9 +82738,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // RawTryAlloc constructs a Copy Result without retained input storage.
         // HttpRespondTimeoutNs consumes two native owners and returns unit/Error.
         // HttpCtxPeerEof shared-borrows a context and returns Copy bool/Error.
+        // FileReadAt borrows File and writes an initialized byte view, returning count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 363,
+            variants, 364,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

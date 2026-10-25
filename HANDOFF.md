@@ -102,10 +102,12 @@ reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
   conflicting replacement, aliases and exactly-once cleanup need a separate
   complete design; nested owning fields may also encounter R132. The retired
   Qwen2 dispatcher is not current adoption evidence.
-- AM-R07 external writable read destinations need an explicit native-view
-  producer, initialization/bounds/overlap/resource-lifetime proof and matching
-  positional-read semantics. K1 and fallible raw allocation do not supply these
-  permissions or establish a pinned-memory speedup.
+- [Plan244](docs/impl/244-external-writable-file-windows.md) implements AM-R07
+  with unsafe privileged `resource.view_mut_from_raw` and synchronous File
+  `read_at` into an initialized writable view. Owner/parent lifetimes survive
+  byte writes; overlapping UTF-8 observations expire. Ordinary returned views
+  remain read-only. Consumer pinned-memory initialization, transfer completion,
+  adoption and GPU performance qualification remain external.
 - Plan210 also repairs R49's headerless-owner loop precision: mutations of an
   independent builder preserve validated text. The authenticated original helper
   and immutable control pass both check modes; actual-source mutation negatives

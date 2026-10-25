@@ -740,3 +740,5 @@ independent native ABI audit and all three platform checks passed.
 | #1413 | `4442e7b6` | P2 | `analysis-control-path-completeness` | Dynamic reachability was incorrectly required for every typed builder getter. Literal/local/loop dead-read owners cross both builder families and whole/per-unit execution; every getter keeps exact shape/type validation and every reached read keeps live identity. |
 
 | #1414 | `34af02c0` | P2 | `validation-phase-completeness` | Fixed Copy indexed-field views bypassed the stable-parent check nested under the Move-only gate. The immediate retained-view predicate now applies to every field class; a twelve-cell same-typed temporary-parent matrix crosses fixed/dynamic fields, fixed/dynamic/slice parents and used/discarded results through structural HIR validation and all four public lowering entrypoints. |
+
+| #1415 | `fae0f224` | P2 | `analysis-fact-consumer-sweep` | The new HTTP observation had complete explicit walkers but both ExprKind inventory counts remained stale. Both existing tripwires were advanced together and executed in the final owner bundle; no wildcard or weakened assertion was introduced. |

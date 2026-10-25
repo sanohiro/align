@@ -7131,3 +7131,7 @@ batch, route skew, cache/tier residency, and bytes moved before selecting any po
 "make cost visible" instinct but is a **weaker** north star: ASIC/electricity economics dominate, mature
 GPU miners are hard to beat, and the hot loop is tiny/specialized. Acceptable as a side experiment;
 **not** a core language driver. Do not optimize the language around speculative profitability.
+
+## Settled: external writable windows (Plan244)
+
+Use resource.view_mut_from_raw on a bound mutable owning resource and File.read_at on a bound initialized writable byte view. Shared references and ordinary function results cannot mint write authority. No uninitialized-slice or retained-address API is added. Error results promise no rollback within the window. Plan244 is the authoritative ledger.
