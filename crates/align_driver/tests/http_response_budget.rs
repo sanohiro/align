@@ -62,6 +62,73 @@ fn response_budget_reserves_consuming_operands_until_action() {
 }
 
 #[test]
+fn response_budget_reserves_each_selected_builder_source() {
+    for builder in [
+        "rb",
+        "{ rb }",
+        "if flag { rb } else { http.response(201) }",
+        "match choice { 0 => rb, _ => http.response(201) }",
+        "unsafe { if flag { rb } else { http.response(201) } }",
+        "task_group { if flag { rb } else { http.response(201) } }",
+        "arena { if flag { rb } else { http.response(201) } }",
+        "optional else rb",
+        "optional else if flag { rb } else { http.response(201) }",
+        "loop { break rb }",
+    ] {
+        for (timeout, rejected) in [
+            ("1", false),
+            ("{ return Ok(()) }", false),
+            ("{ taken := rb; 1 }", true),
+            ("{ rb = http.response(202); 1 }", true),
+            ("{ other.respond(rb) else {}; 1 }", true),
+        ] {
+            // A loop break completes its own transfer before the outer call; replacing the old
+            // source then is safe. Selected branch/fallback sources remain deferred instead.
+            let rejected =
+                rejected && !(builder.starts_with("loop") && timeout.starts_with("{ rb ="));
+            let source = format!(
+                "import std.http\nfn send(ctx: http_request_ctx, other: http_request_ctx, b: response_builder, optional: Option<response_builder>, flag: bool, choice: i64) -> Result<(), Error> {{\nmut rb := b\nctx.respond_timeout_ns({builder}, {timeout})\n}}\nfn main() {{}}\n"
+            );
+            let files = [("main.align", source.as_str())];
+            let checked = assert_same_verdict("response-budget-selected", &files, "main.align");
+            assert_eq!(
+                checked.diags.has_errors(),
+                rejected,
+                "{builder}/{timeout}: {}",
+                check_multi_diagnostics("response-budget-selected", &files, "main.align")
+            );
+        }
+    }
+}
+
+#[test]
+fn response_budget_reserves_selected_field_sources() {
+    for builder in [
+        "row.value",
+        "if flag { row.value } else { http.response(201) }",
+    ] {
+        for (timeout, rejected) in [
+            ("1", false),
+            ("{ return Ok(()) }", false),
+            ("{ taken := row.value; 1 }", true),
+            ("{ row = Holder { value: http.response(202) }; 1 }", true),
+        ] {
+            let source = format!(
+                "import std.http\nHolder {{ value: response_builder }}\nfn send(ctx: http_request_ctx, b: response_builder, flag: bool) -> Result<(), Error> {{\nmut row := Holder {{ value: b }}\nctx.respond_timeout_ns({builder}, {timeout})\n}}\nfn main() {{}}\n"
+            );
+            let files = [("main.align", source.as_str())];
+            let checked = assert_same_verdict("response-budget-field", &files, "main.align");
+            assert_eq!(
+                checked.diags.has_errors(),
+                rejected,
+                "{builder}/{timeout}: {}",
+                check_multi_diagnostics("response-budget-field", &files, "main.align")
+            );
+        }
+    }
+}
+
+#[test]
 fn response_budget_eager_exit_preserves_fresh_and_bound_cleanup() {
     for builder in [
         "rb",

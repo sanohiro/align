@@ -36044,8 +36044,10 @@ impl<'a> MoveCheck<'a> {
             }
             if let ExprKind::HttpRespondTimeoutNs { ctx, rb, .. } = &expression.kind {
                 for input in [ctx.as_ref(), rb.as_ref()] {
-                    arguments.insert(Self::expr_key(input));
-                    places.insert(Self::expr_key(input));
+                    for source in self.completed_action_values(input, true) {
+                        arguments.insert(Self::expr_key(source));
+                        places.insert(Self::expr_key(source));
+                    }
                 }
             }
             if let Some(receiver) = Self::http_timeout_action_receiver(&expression.kind)
@@ -47029,19 +47031,19 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    /// Null only the already-evaluated value selected at an action boundary. This deliberately
-    /// never re-walks statements or nested calls: those ran while forming the completion. Nested
-    /// aggregates are structural and are fused into this action, so descend through their payload
-    /// expressions until stable local/field sources are reached.
-    fn consume_completed_action_value(&mut self, value: &Expr, moved: &mut MovedSet) {
-        if !self.is_move_ty(value.ty) {
-            return;
-        }
+    /// Sources whose transfer is deferred to the enclosing action. Share the selected-value
+    /// inventory between reservations, duplicate-source checks and consumption. Statements and
+    /// nested calls have already completed their own actions; only their result is selected here.
+    /// Reservations also retain the forwarding nodes so their completion frontiers keep the
+    /// selected leaf observations alive through nested control and scope wrappers.
+    fn completed_action_values<'b>(&self, value: &'b Expr, include_wrappers: bool) -> Vec<&'b Expr> {
+        let mut sources = Vec::new();
         let mut work = vec![value];
         while let Some(value) = work.pop() {
             if !self.is_move_ty(value.ty) {
                 continue;
             }
+            if include_wrappers { sources.push(value); }
             match &value.kind {
                 ExprKind::StructLit { fields, .. } => work.extend(fields.iter().rev()),
                 ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => {
@@ -47075,8 +47077,15 @@ impl<'a> MoveCheck<'a> {
                 // The container was consumed while selecting the edge. A bound fallback was
                 // only observed then, and transfers with this enclosing successful action.
                 ExprKind::ElseUnwrap { fallback, .. } => work.push(fallback),
-                _ => self.consume_match_result(value, moved, true),
+                _ => if !include_wrappers { sources.push(value); },
             }
+        }
+        sources
+    }
+
+    fn consume_completed_action_value(&mut self, value: &Expr, moved: &mut MovedSet) {
+        for source in self.completed_action_values(value, false) {
+            self.consume_match_result(source, moved, true);
         }
     }
 
@@ -47520,11 +47529,7 @@ impl<'a> MoveCheck<'a> {
         let mut previous = MovedSet::new();
         for input in inputs {
             let mut selected = MovedSet::new();
-            let mut pending = vec![input];
-            while let Some(value) = pending.pop() {
-                if !self.is_move_ty(value.ty) {
-                    continue;
-                }
+            for value in self.completed_action_values(input, false) {
                 match &value.kind {
                     ExprKind::Local(local) => { selected.insert(MovedKey::Whole(*local)); }
                     ExprKind::Field { root, path } if path.len() == 1 => {
@@ -47543,22 +47548,6 @@ impl<'a> MoveCheck<'a> {
                             selected.insert(MovedKey::ElemField(local, index, path.clone().into_boxed_slice()));
                         }
                     }
-                    ExprKind::StructLit { fields, .. } => pending.extend(fields),
-                    ExprKind::Tuple { elems, .. } | ExprKind::ArrayLit { elems, .. } => pending.extend(elems),
-                    ExprKind::EnumValue { payload, .. } => pending.extend(payload),
-                    ExprKind::OptionSome(value) | ExprKind::ResultOk(value) | ExprKind::ResultErr(value) => pending.push(value),
-                    ExprKind::Block(block) | ExprKind::FloatScope { block, .. }
-                    | ExprKind::Arena(block) | ExprKind::NamedArena { block, .. }
-                    | ExprKind::TaskGroup(block) | ExprKind::Unsafe(block) => {
-                        pending.extend(block.value.as_deref());
-                    }
-                    ExprKind::If { then, els, .. } => {
-                        pending.extend(then.value.as_deref());
-                        pending.extend(els.value.as_deref());
-                    }
-                    ExprKind::Match { arms, .. } => pending.extend(arms.iter().map(|arm| &arm.body)),
-                    ExprKind::ElseUnwrap { fallback, .. } => pending.push(fallback),
-                    // A call, unwrap or loop result has already established its own transfer.
                     _ => {}
                 }
             }
@@ -82466,9 +82455,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // UnicodeNfc constructs a fresh owned string without retaining input storage.
         // ArraySortCmp shares the fresh pipeline-element policy with the other sort terminals.
         // RawTryAlloc constructs a Copy Result without retained input storage.
+        // HttpRespondTimeoutNs consumes two native owners and returns unit/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 360,
+            variants, 361,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

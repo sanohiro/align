@@ -13064,8 +13064,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // UnicodeNfc adds the canonical owned-string normalization producer.
         // ArraySortCmp adds the explicit two-input comparison terminal.
         // RawTryAlloc adds the atomic non-owning Result allocation producer.
+        // HttpRespondTimeoutNs adds one checked three-operand native action.
         variants,
-        360,
+        361,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -20815,12 +20816,12 @@ fn sync_methods_hir_reject_forged_native_types() -> Result<(), &'static str> {
 
 #[test]
 fn http_response_budget_hir_rejects_forged_operands_and_borrowed_consumption() -> Result<(), &'static str> {
-    let base = checked_source_program("import std.http\nfn send(ctx: http_request_ctx, rb: response_builder) -> Result<(), Error> = ctx.respond_timeout_ns(rb, 1)\nfn main() {}\n");
+    let base = checked_source_program("import std.http\nfn send(ctx: http_request_ctx, rb: response_builder) -> Result<(), Error> = ctx.respond_timeout_ns(rb, 1)\nfn main() { value := send }\n");
     assert!(validate_hir::body_only_metadata_is_valid(&base));
     assert!(lower_program_checked(&base, false, None).is_ok());
     let bad_effect = base.clone();
     bad_effect.fn_types.first().ok_or("send function type")?.effect.set(FnEffect::Pure);
-    assert_body_entrypoints_empty("response-budget-pure-effect", &bad_effect);
+    assert_replay_rejects_without_mutating(bad_effect, "response-budget-pure-effect");
     for mutation in 0..9 {
         let mut bad = base.clone();
         let function = bad.fns.iter_mut().find(|f| f.name == "send").ok_or("send function")?;
