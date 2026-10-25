@@ -12,7 +12,8 @@ The owner resumed the selected batch on 2026-10-25 and authorized merging
 completed capability PRs. The five selected provider capabilities and the
 private-evidence investigations are complete at the boundaries below. AM-R24
 was delivered by #1410 before this batch. Consumer adoption remains pending;
-R132/R142 stay excluded. R37 and both R80 defects are reproduced, not repaired.
+R132/R142 stay excluded. The selected R37 and both R80 repairs are implemented
+under Plans245–248 without a language restriction.
 When external evidence or a machine dependency is unavailable, request the
 specific missing input and continue other selected work.
 
@@ -62,7 +63,7 @@ The original Plan239 relational model and its checkpoints remain preserved on
 port. The older Plan61 implementation and general aggregate-provenance experiment
 also remain parked. Broader writable returns are not a queued requirement.
 
-## Completed batch and next repair boundaries
+## Completed batch and repair boundaries
 
 The selected provider capabilities are implemented:
 
@@ -74,15 +75,22 @@ The selected provider capabilities are implemented:
 | AM-R23 | [Plan243](docs/impl/243-peer-eof-observation.md), #1415: one nonblocking, nonconsuming receive-EOF peek. | Cancellation policy and GPU cleanup; false is not liveness and true includes half-close. |
 | AM-R07 | [Plan244](docs/impl/244-external-writable-file-windows.md), #1416: unsafe initialized external views and synchronous File.read_at windows. | Native initialization/unique ownership, transfer completion, adoption and GPU performance qualification. |
 
-[Plan230](docs/impl/230-request-follow-up-plan.md) records the authenticated
-private packet, exact compiler/source bindings, bounded measurements, synthetic
-reductions and recommended repair boundaries. R37 still grows in frontend replay
-and separately in whole-program native-producer analysis; preserve the 3 GiB
-supervisor and phase isolation. The original R80 Option-array branch witness and
-the separately authenticated MTP three-loop array witness both remain rejected.
-The latter uses reproduction base `2be36e7669df822c6ddd8516c1b926fe6687197a`;
-its comparison passes both frontends. No external evidence request remains open
-for those reproductions. These completed investigations are not compiler fixes.
+The subsequent selected repair batch is complete at the provider boundary:
+
+| Request | Repair | Acceptance boundary |
+| --- | --- | --- |
+| R80 nested loops | [Plan245](docs/impl/245-loop-generation-advance-scope.md), #1418: advance only the exited loop's storage generation. | Authenticated MTP failing source and run_case control pass both check modes; actual expired views still reject. |
+| R80 Result-to-Option owner | [Plan246](docs/impl/246-inactive-owned-payload-releases.md), #1419: refine only the inactive producer's exact initial temporary release. | Authentic FILE_SET failure and immutable control pass both modes; imported/native allocation and real-expiration owners pass. |
+| R37 builder memory | [Plan247](docs/impl/247-builder-validation-live-state.md), #1420: live SSA/Boolean facts and sparse exact reservation states. | The original module passes per-unit check and MIR emission near 1.25 GiB instead of exceeding the 3 GiB supervisor. |
+| R37 producer CPU | [Plan248](docs/impl/248-producer-query-reuse.md): reuse completed exact graph-node results, including slot/buffer queries. | Whole-project helper MIR emission completes in 44 s instead of a 240 s stop; original inline project completes in 67 s near 1.45 GiB. |
+
+[Plan230](docs/impl/230-request-follow-up-plan.md) records source authentication
+and the historical reproductions. Fresh phase tracing corrected the original
+R37 attribution: the module peak was MIR builder-reservation validation, not
+MoveCheck loop replay. The plans retain exact local measurement limits and
+owner inventories; these are macOS arm64 observations, not global complexity
+or cross-machine promises. Consumer repinning and runtime qualification remain
+external. No missing evidence request remains open for these repairs.
 
 R132 exclusive owned-subrecord access and R142 exclusive matched owned payloads
 remain excluded. Projection, replacement, active-tag authority and exactly-once

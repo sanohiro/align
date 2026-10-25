@@ -167,6 +167,7 @@ fn arena_decoder_buffer_and_payload_are_distinct() -> TestResult {
         }
     }
     let graph = ValidatedProducerGraph {
+        access_cache: std::cell::RefCell::new(XmlAccessCache::default()),
         function,
         program: &program,
         local_contracts: &HashSet::new(),
@@ -191,16 +192,14 @@ fn arena_decoder_buffer_and_payload_are_distinct() -> TestResult {
                 XmlAccessProvenance::Shared
             })
         );
-        let mut analyzer = XmlAccessAnalyzer::new(&graph);
-        let source = analyzer.buffer_node(XmlAccessNode::Slot(output, path));
-        assert_eq!(
-            analyzer.build(source, None),
-            if field < 2 {
-                XmlProducerState::Present(XmlAccessProvenance::Owned)
-            } else {
-                XmlProducerState::Invalid
-            }
-        );
+        let expected = if field < 2 {
+            XmlProducerState::Present(XmlAccessProvenance::Owned)
+        } else { XmlProducerState::Invalid };
+        for cached in [false, true, true] {
+            let mut analyzer = XmlAccessAnalyzer::new(&graph);
+            let source = analyzer.buffer_node(XmlAccessNode::Slot(output, path.clone()));
+            assert_eq!(analyzer.build(source, cached.then_some(&graph.access_cache)), expected);
+        }
     }
     assert_eq!(
         xml_slot_path_access(
@@ -214,6 +213,57 @@ fn arena_decoder_buffer_and_payload_are_distinct() -> TestResult {
         ),
         XmlProducerState::Present(XmlAccessProvenance::Shared)
     );
+    Ok(())
+}
+
+#[test]
+fn producer_query_cache_preserves_call_position() -> TestResult {
+    let program = lower("fn read(borrow data: [i64; 2]) -> i64 = data[0]\nfn main() { values := [1,2]; result := read(values) }")?;
+    let mut function = program.fns.iter().find(|function| function.name.as_str() == "main").ok_or("main")?.clone();
+    let (late, call, place) = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| match statement {
+        Stmt::Let(id, value @ Rvalue::Call(DirectCall::Program(target), args)) if target.as_str() == "read" =>
+            match args.first() { Some(Operand::BorrowedPlace(place)) => Some((*id, value.clone(), place.clone())), _ => None },
+        _ => None,
+    }).ok_or("read call")?;
+    let early = u32::try_from(function.value_tys.len())?;
+    function.value_tys.push(function.value_tys[late as usize]);
+    function.blocks[function.entry as usize].stmts.insert(0, Stmt::Let(early, call));
+    let mut definitions = vec![None; function.value_tys.len()];
+    let mut counts = vec![0; function.value_tys.len()];
+    let mut stores = XmlSlotStores {
+        roots: vec![Vec::new(); function.slots.len()], fields: vec![Vec::new(); function.slots.len()],
+        elements: vec![Vec::new(); function.slots.len()], element_fields: vec![Vec::new(); function.slots.len()],
+        constant_elements: vec![Vec::new(); function.slots.len()], producers: vec![Vec::new(); function.slots.len()],
+    };
+    for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+        match statement {
+            Stmt::Let(id, value) => { definitions[*id as usize] = Some(value); counts[*id as usize] += 1; }
+            Stmt::Store(slot, value) => stores.roots[*slot as usize].push(value),
+            Stmt::StoreIndex(slot, index, value) => stores.elements[*slot as usize].push((index, value)),
+            Stmt::StoreConstArray { slot, elems, elem } => stores.constant_elements[*slot as usize].push((elems, *elem)),
+            _ => {}
+        }
+    }
+    let contracts = program.fns.iter().map(|function| function.name.clone()).collect();
+    let graph = ValidatedProducerGraph {
+        access_cache: std::cell::RefCell::new(XmlAccessCache::default()),
+        function: &function, program: &program, local_contracts: &contracts,
+        value_definitions: &definitions, auxiliary_value_definitions: &vec![None; counts.len()],
+        duplicate_values: &vec![false; counts.len()], slot_stores: &stores,
+        primary_definitions: &counts, auxiliary_definitions: &vec![0; counts.len()],
+    };
+    let leaves = xml_owned_leaf_paths(&program, place.ty).ok_or("leaf paths")?;
+    for order in [[late, early], [early, late]] {
+        graph.access_cache.replace(XmlAccessCache::default());
+        for call in order {
+            assert_eq!(xml_place_call_access_valid(&graph, &place, place.ty,
+                align_ast::ParamMode::Borrow, call, &leaves), call == late);
+        }
+        assert!(!graph.access_cache.borrow().states.is_empty(), "late call did not warm its slot graph");
+        // An already populated slot graph never supplies a position-specific initialization proof.
+        assert!(!xml_place_call_access_valid(&graph, &place, place.ty,
+            align_ast::ParamMode::Borrow, early, &leaves));
+    }
     Ok(())
 }
 

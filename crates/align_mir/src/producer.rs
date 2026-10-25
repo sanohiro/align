@@ -298,6 +298,7 @@ struct XmlSlotStores<'a> {
 }
 
 struct ValidatedProducerGraph<'a> {
+    access_cache: std::cell::RefCell<XmlAccessCache>,
     function: &'a crate::Function,
     program: &'a Program,
     local_contracts: &'a HashSet<ProgramCall>,
@@ -2289,6 +2290,15 @@ fn xml_owning_buffer_ty(ty: Ty) -> bool {
         | Ty::DynFixedArray(..) | Ty::DynFixedStructArray(..)
         | Ty::ArrayBuilder(_) | Ty::VecArrayBuilder(..) | Ty::MaskArrayBuilder(..)
         | Ty::FixedArrayBuilder(..) | Ty::FixedStructArrayBuilder(..))
+}
+
+/// Final results belong to one immutable function graph and local-contract component.
+/// Conditional/invalid results answer exact roots only; they are never internal seeds.
+#[derive(Default)]
+struct XmlAccessCache {
+    states: HashMap<XmlAccessNode, XmlProducerState>,
+    #[cfg(test)]
+    solved_nodes: usize,
 }
 
 struct XmlAccessAnalyzer<'a> {
@@ -8009,7 +8019,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
     fn build(
         mut self,
         root: XmlAccessSource,
-        cache: Option<&std::cell::RefCell<HashMap<XmlAccessNode, XmlAccessProvenance>>>,
+        cache: Option<&std::cell::RefCell<XmlAccessCache>>,
     ) -> XmlProducerState {
         let root_node = match root {
             XmlAccessSource::Seed(access) => return XmlProducerState::Present(access),
@@ -8017,12 +8027,18 @@ impl<'a> XmlAccessAnalyzer<'a> {
             XmlAccessSource::Node(node) => node,
             XmlAccessSource::ReadNode(node) => node,
         };
+        // source()/the selected-node constructor has already authenticated this root.
+        if let Some(state) = cache.and_then(|cache| cache.borrow().states.get(&root_node).copied()) {
+            return state;
+        }
         while let Some(node) = self.pending.pop_front() {
             if self.equations.contains_key(&node) {
                 continue;
             }
-            if let Some(access) = cache
-                .and_then(|cache| cache.borrow().get(&node).copied())
+            if let Some(XmlProducerState::Present(access @ (
+                XmlAccessProvenance::Owned | XmlAccessProvenance::Shared
+                | XmlAccessProvenance::Exclusive | XmlAccessProvenance::Unreadable
+            ))) = cache.and_then(|cache| cache.borrow().states.get(&node).copied())
             {
                 self.equations.insert(
                     node,
@@ -8062,28 +8078,21 @@ impl<'a> XmlAccessAnalyzer<'a> {
         }
 
         let (values, invalid) = solve_xml_access_equations(&self.equations);
+        let result = |node: &XmlAccessNode| {
+            if invalid.contains(node) { XmlProducerState::Invalid }
+            else { values.get(node).copied().unwrap_or(XmlProducerState::Invalid) }
+        };
         if let Some(cache) = cache {
             let mut cache = cache.borrow_mut();
-            for (node, state) in &values {
-                if !invalid.contains(node)
-                    && let XmlProducerState::Present(
-                        access @ (XmlAccessProvenance::Owned
-                        | XmlAccessProvenance::Shared
-                        | XmlAccessProvenance::Exclusive
-                        | XmlAccessProvenance::Unreadable),
-                    ) = state
-                {
-                    cache.insert(node.clone(), *access);
-                }
+            #[cfg(test)]
+            { cache.solved_nodes += self.equations.len(); }
+            // Publish only a complete dependency closure with final invalidity applied.
+            // Equations depend on graph+node, so every solved node is also an exact root result.
+            for node in self.equations.keys() {
+                cache.states.insert(node.clone(), result(node));
             }
         }
-        if invalid.contains(&root_node) {
-            return XmlProducerState::Invalid;
-        }
-        values
-            .get(&root_node)
-            .copied()
-            .unwrap_or(XmlProducerState::Invalid)
+        result(&root_node)
     }
 }
 
@@ -8094,7 +8103,7 @@ fn xml_operand_access(
 ) -> XmlProducerState {
     let mut analysis = XmlAccessAnalyzer::new(graph);
     let root = analysis.source(operand, expected, Vec::new());
-    analysis.build(root, None)
+    analysis.build(root, Some(&graph.access_cache))
 }
 
 fn xml_operand_path_access(
@@ -8102,11 +8111,10 @@ fn xml_operand_path_access(
     operand: &Operand,
     selected: Ty,
     path: Vec<XmlAccessPathSegment>,
-    cache: &std::cell::RefCell<HashMap<XmlAccessNode, XmlAccessProvenance>>,
 ) -> XmlProducerState {
     let mut analysis = XmlAccessAnalyzer::new(graph);
     let root = analysis.source(operand, selected, path);
-    analysis.build(root, Some(cache))
+    analysis.build(root, Some(&graph.access_cache))
 }
 
 fn xml_slot_path_access(
@@ -8127,7 +8135,7 @@ fn xml_slot_path_access(
     }
     let mut analysis = XmlAccessAnalyzer::new(graph);
     let root = analysis.queue(XmlAccessNode::Slot(slot, path));
-    analysis.build(root, None)
+    analysis.build(root, Some(&graph.access_cache))
 }
 
 fn xml_borrowed_path(
@@ -8494,7 +8502,7 @@ fn xml_place_call_access_valid(
         if buffer {
             let mut analysis = XmlAccessAnalyzer::new(graph);
             let source = analysis.buffer_node(XmlAccessNode::Slot(place.slot, path));
-            analysis.build(source, None)
+            analysis.build(source, Some(&graph.access_cache))
         } else { xml_slot_path_access(graph, place.slot, actual, path) }
     };
     if leaves.is_empty() {
@@ -9769,6 +9777,7 @@ fn validate_resource_rvalues_component(
             }
         }
         let access_graph = ValidatedProducerGraph {
+            access_cache: std::cell::RefCell::new(XmlAccessCache::default()),
             function,
             program,
             local_contracts,
@@ -9779,11 +9788,8 @@ fn validate_resource_rvalues_component(
             primary_definitions: &primary_definitions,
             auxiliary_definitions: &auxiliary_definitions,
         };
-        // Every query below uses this immutable function graph. Reuse only nodes that a complete
-        // fixed point proved Present; absent, conditional, unresolved, and invalid states must be
-        // recomputed so a different selected root cannot erase their discriminator requirements.
-        let access_node_cache =
-            std::cell::RefCell::new(HashMap::<XmlAccessNode, XmlAccessProvenance>::new());
+        // Every query below uses this immutable function graph. Complete results may answer
+        // exact source-validated roots; only valid Present states may seed a different graph.
         let cached_path_access =
             |operand: &Operand, selected: Ty, path: Vec<XmlAccessPathSegment>| {
                 xml_operand_path_access(
@@ -9791,7 +9797,6 @@ fn validate_resource_rvalues_component(
                     operand,
                     selected,
                     path,
-                    &access_node_cache,
                 )
             };
         let xml_access = |operand: &Operand, expected: Ty| {
@@ -9993,7 +9998,7 @@ fn validate_resource_rvalues_component(
                                 let source = analysis.buffer_source(operand, Vec::new());
                                 return OperandRequirement {
                                     write: true, exclusive: true, ..OperandRequirement::default()
-                                }.is_satisfied_by(analysis.build(source, None));
+                                }.is_satisfied_by(analysis.build(source, Some(&access_graph.access_cache)));
                             }
                             let canonical_borrow = matches!(
                                 operand,
@@ -13011,6 +13016,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn producer_query_cache_preserves_complete_results() -> Result<(), Box<dyn std::error::Error>> {
+        let source = "fn conditional(flag: bool) -> Option<string> { mut value: Option<string> := None; if flag { value = Some(\"x\".clone()) }; return value }\nfn guarded(flag: bool) -> i64 { match conditional(flag) { Some(item) => item.len(), None => 0 } }\nfn main() -> i32 = 0\n";
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let ast = align_parser::parse_file(align_lexer::tokenize(0, source, &mut diagnostics), &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+        let program = crate::lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?;
+        let contracts = program.fns.iter().map(|function| function.name.clone()).collect();
+        let mut observed = Vec::new();
+        for name in ["conditional", "guarded"] {
+          for corruption in 0..3 {
+            let mut function = program.fns.iter().find(|function| function.name.as_str() == name).ok_or("query fixture")?.clone();
+            let target = function.value_tys.iter().position(|ty| *ty == Ty::String).ok_or("owned string")?;
+            for statement in function.blocks.iter_mut().flat_map(|block| &mut block.stmts) {
+                if let Stmt::Let(id, value) = statement
+                    && usize::try_from(*id)? == target && corruption == 1 {
+                    *value = Rvalue::Use(Operand::Value(*id)); // An uninitialized self-cycle.
+                }
+            }
+            if corruption == 2 {
+                for block in &mut function.blocks {
+                    block.stmts.retain(|statement| !matches!(statement, Stmt::Let(id, _) if *id as usize == target));
+                }
+            }
+            let mut definitions = vec![None; function.value_tys.len()];
+            let mut counts = vec![0; function.value_tys.len()];
+            let mut stores = XmlSlotStores {
+                roots: vec![Vec::new(); function.slots.len()], fields: vec![Vec::new(); function.slots.len()],
+                elements: vec![Vec::new(); function.slots.len()], element_fields: vec![Vec::new(); function.slots.len()],
+                constant_elements: vec![Vec::new(); function.slots.len()], producers: vec![Vec::new(); function.slots.len()],
+            };
+            for statement in function.blocks.iter().flat_map(|block| &block.stmts) {
+                match statement {
+                    Stmt::Let(id, value) => { definitions[*id as usize] = Some(value); counts[*id as usize] += 1; }
+                    Stmt::Store(slot, value) => stores.roots[*slot as usize].push(value),
+                    _ => {}
+                }
+            }
+            let graph = ValidatedProducerGraph {
+                access_cache: std::cell::RefCell::new(XmlAccessCache::default()),
+                function: &function, program: &program, local_contracts: &contracts, value_definitions: &definitions,
+                auxiliary_value_definitions: &vec![None; counts.len()], duplicate_values: &vec![false; counts.len()],
+                slot_stores: &stores, primary_definitions: &counts, auxiliary_definitions: &vec![0; counts.len()],
+            };
+            let mut queries = Vec::new();
+            for (id, ty) in function.value_tys.iter().enumerate() {
+                let operand = Operand::Value(u32::try_from(id)?);
+                queries.push((operand.clone(), *ty, Vec::new()));
+                for (selected, path) in xml_owned_leaf_paths(&program, *ty).ok_or("leaf paths")? {
+                    queries.push((operand.clone(), selected, path));
+                }
+            }
+            for reverse in [false, true] {
+                if reverse { queries.reverse(); }
+                graph.access_cache.replace(XmlAccessCache::default());
+                for (operand, selected, path) in &queries {
+                    let mut cold = XmlAccessAnalyzer::new(&graph);
+                    let root = cold.source(operand, *selected, path.clone());
+                    let expected = cold.build(root, None);
+                    observed.push(expected);
+                    assert_eq!(xml_operand_path_access(&graph, operand, *selected, path.clone()), expected,
+                        "{name}/{corruption}/{reverse}: {operand:?} {path:?}");
+                }
+                let completed = graph.access_cache.borrow().solved_nodes;
+                assert!(completed > 0);
+                for _ in 0..4 {
+                    for (operand, selected, path) in queries.iter().rev() {
+                        let state = xml_operand_path_access(&graph, operand, *selected, path.clone());
+                        let mut cold = XmlAccessAnalyzer::new(&graph);
+                        let root = cold.source(operand, *selected, path.clone());
+                        assert_eq!(state, cold.build(root, None));
+                        // A warm exact node must not bypass the query's selected type or path.
+                        let wrong = if *selected == Ty::Raw { Ty::Bool } else { Ty::Raw };
+                        assert_eq!(xml_operand_path_access(&graph, operand, wrong, path.clone()), XmlProducerState::Invalid);
+                        assert_eq!(xml_operand_path_access(&graph, operand, *selected,
+                            vec![XmlAccessPathSegment::StructField(u32::MAX)]), XmlProducerState::Invalid);
+                    }
+                }
+                assert_eq!(graph.access_cache.borrow().solved_nodes, completed, "warm queries rebuilt an equation graph");
+                // Node kind is semantic identity. A cached Value/Slot never answers a Capture/Buffer query.
+                for node in [XmlAccessNode::Value(u32::try_from(target)?, vec![]),
+                    XmlAccessNode::CaptureValue(u32::try_from(target)?, vec![]),
+                    XmlAccessNode::BufferValue(u32::try_from(target)?, vec![])] {
+                    let mut cold = XmlAccessAnalyzer::new(&graph);
+                    let root = cold.queue(node.clone());
+                    let expected = cold.build(root, None);
+                    let mut warm = XmlAccessAnalyzer::new(&graph);
+                    let root = warm.queue(node);
+                    assert_eq!(warm.build(root, Some(&graph.access_cache)), expected);
+                }
+            }
+          }
+        }
+        assert!(observed.contains(&XmlProducerState::Absent));
+        assert!(observed.iter().any(|state| matches!(state, XmlProducerState::MaybeAbsent(_))));
+        assert!(observed.contains(&XmlProducerState::Invalid));
+        Ok(())
+    }
+
+    #[test]
     fn builder_reservation_live_boolean_edges() -> Result<(), Box<dyn std::error::Error>> {
         fn lower(source: &str) -> Result<Program, Box<dyn std::error::Error>> {
             let mut diagnostics = align_diag::Diagnostics::new();
@@ -13181,6 +13286,7 @@ mod tests {
                     }
                 }
                 let graph = ValidatedProducerGraph {
+                access_cache: std::cell::RefCell::new(XmlAccessCache::default()),
                     function, program: &base, local_contracts: &HashSet::new(), value_definitions: &definitions,
                     auxiliary_value_definitions: &vec![None; counts.len()], duplicate_values: &vec![false; counts.len()],
                     slot_stores: &stores, primary_definitions: &counts, auxiliary_definitions: &vec![0; counts.len()],
