@@ -81065,6 +81065,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
                                 }),
                                 known: populated,
                                 fallback_roots: input.clone(),
+                                external_backing: Some(input.clone()),
                                 readonly_contents: false,
                             };
                             let expected_leaf = StorageHeaderLeaf {
@@ -81073,6 +81074,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
                                     .map(|reference| reference.rename_generation(&renames))
                                     .collect(),
                                 fallback_roots: expected.clone(),
+                                external_backing: Some(expected.clone()),
                                 ..actual.clone()
                             };
                             actual.rename_generations(&renames);
@@ -82652,6 +82654,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
                 descriptor: None,
                 known: true,
                 fallback_roots: BorrowRoots::new(),
+                external_backing: None,
                 readonly_contents: false,
             },
         );
