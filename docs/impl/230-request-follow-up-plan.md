@@ -26,7 +26,8 @@ closure-matrix and independent-review gates. Consumer adoption remains external.
 
 Plan240/#1409 delivers K1's selected call-boundary repair, with all three
 consumer adoption receipts. The owner selected the remaining assessed requests
-except R132/R142, then ended this machine's implementation after AM-R24/#1410.
+except R132/R142 and resumed the batch after AM-R24/#1410. Plan241 implements
+AM-R22; the remaining capabilities and evidence investigations stay selected.
 The live [HANDOFF](../../HANDOFF.md) owns the receiving-machine queue, rough
 scope and difficulty, specification preference and evidence-transfer instructions.
 The historical assessments below do not reopen K1 or override that selection.
@@ -36,7 +37,8 @@ hash-authenticated on 2026-10-25. All 362 source entries agree with private
 align-llm commit `33e4d3ff40f45f48a4edf2a2f155a9e7966aeaed`; the failing variant
 hashes agree with their retained receipts. A compact private transfer archive
 retains that snapshot, variants, passing controls and replay instructions.
-The archive is outside public Git and must be transferred separately. No
+The archive is outside public Git. Its private transfer to this checkout and
+all 379 internal checksums were verified on 2026-10-25. No
 current-compiler reproduction or repair is claimed. R37 still requires explicit
 memory limits and phase isolation; the later R80 nested-loop MTP witness needs
 its separate import revision authenticated before replay.

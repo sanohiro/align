@@ -13,6 +13,16 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Bounded ordinary HTTP responses (SETTLED 2026-10-25)
+
+`ctx.respond_timeout_ns(rb: response_builder, timeout_ns: i64) -> Result<(), Error>`
+consumes both owners with one strictly positive total response budget. HEAD
+suppression, Content-Length and existing reuse eligibility remain. Partial
+output, expiration or native-mode failure closes; only fully written/restored
+connections can park. No implicit budget or cancellation policy is introduced.
+[Plan241](impl/241-bounded-http-responses.md) fixes argument staging, validation
+precedence, lock acquisition, platform behavior and acceptance.
+
 ### Copy RNG record composition (SETTLED 2026-10-13)
 
 Ordinary records admit the existing `rng` state, including nested/generic fields.

@@ -19146,6 +19146,12 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 return Ok(None);
             }
+            Rvalue::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => {
+                let c = self.operand(ctx)?.into_pointer_value();
+                let r = self.operand(rb)?.into_pointer_value();
+                let ns = self.operand(timeout_ns)?.into_int_value();
+                self.builder.build_call(self.runtime(RuntimeKey::HttpRespondTimeoutNs), &[c.into(), r.into(), ns.into()], "httprespondtimed").map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("httprespondtimed returned void"))?
+            }
             Rvalue::HttpRespond { ctx, rb } => {
                 let c = self.operand(ctx)?.into_pointer_value();
                 let r = self.operand(rb)?.into_pointer_value();

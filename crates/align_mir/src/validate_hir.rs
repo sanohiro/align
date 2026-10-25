@@ -4942,7 +4942,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
-            | hir::ExprKind::HttpRespond { .. }
+            | hir::ExprKind::HttpRespondTimeoutNs { .. } | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
             | hir::ExprKind::HttpRespondUpgrade { .. }
             | hir::ExprKind::HttpUpgradeReadExact { .. }
@@ -5323,7 +5323,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
-            | hir::ExprKind::HttpRespond { .. }
+            | hir::ExprKind::HttpRespondTimeoutNs { .. } | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
             | hir::ExprKind::HttpRespondUpgrade { .. }
             | hir::ExprKind::HttpUpgradeReadExact { .. }
@@ -10275,6 +10275,12 @@ impl<'a> BodyValidator<'a> {
                     && rb.ty == Ty::ResponseBuilder
                     && byte_view(data.ty))
                     .then(|| strict(Ty::Unit, &[rb, data]))?
+            }
+            hir::ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => {
+                (self.http_request_ctx_place(ctx, context)
+                    && ctx.ty == Ty::HttpRequestCtx
+                    && rb.ty == Ty::ResponseBuilder && timeout_ns.ty == i64)
+                    .then(|| result(Ty::Unit, &[ctx, rb, timeout_ns]))?
             }
             hir::ExprKind::HttpRespond { ctx, rb } => {
                 (self.http_request_ctx_place(ctx, context)

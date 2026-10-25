@@ -254,6 +254,7 @@ key|HttpRespHeader|http_resp_header|HostState|declare i32 @align_rt_http_resp_he
 key|HttpRespStatus|http_resp_status|HostState|declare i64 @align_rt_http_resp_status(ptr) #2
 key|HttpRespond|http_respond|HostState|declare i32 @align_rt_http_respond(ptr, ptr) #2
 key|HttpRespondStream|http_respond_stream|HostState|declare i32 @align_rt_http_respond_stream(ptr, ptr, ptr) #2
+key|HttpRespondTimeoutNs|http_respond_timeout_ns|HostState|declare i32 @align_rt_http_respond_timeout_ns(ptr, ptr, i64) #2
 key|HttpRespondUpgrade|http_respond_upgrade|HostState|declare i32 @align_rt_http_respond_upgrade(ptr, ptr, ptr) #2
 key|HttpResponseFree|http_response_free|HostState|declare void @align_rt_http_response_free(ptr) #2
 key|HttpResponseNew|http_response_new|AllocNew|declare noalias ptr @align_rt_http_response_new(i64) #0

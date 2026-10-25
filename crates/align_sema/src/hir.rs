@@ -2514,6 +2514,8 @@ pub enum ExprKind {
     /// runtime frees both (like [`HttpClientRequest`]'s `req`). A caller-supplied Content-Length / a bad
     /// status is `Error.Invalid`. **Impure** (network I/O).
     HttpRespond { ctx: Box<Expr>, rb: Box<Expr> },
+    /// Consume both owners with one strictly positive whole-response write budget.
+    HttpRespondTimeoutNs { ctx: Box<Expr>, rb: Box<Expr>, timeout_ns: Box<Expr> },
     /// `ctx.respond_stream(rb)` — begin a chunked/streaming response: validate + serialize `rb`'s head
     /// (header-only) plus the transfer framing into the returned stream (**lazy** — the first
     /// `send`/`finish` writes it), and yield `Result<http_stream, Error>` (the `ty`). **Consumes `rb`

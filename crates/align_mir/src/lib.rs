@@ -2977,6 +2977,8 @@ pub enum Rvalue {
         ctx: Operand,
         rb: Operand,
     },
+    /// Consume context and response builder with one positive total output budget.
+    HttpRespondTimeoutNs { ctx: Operand, rb: Operand, timeout_ns: Operand },
     /// `ctx.respond_stream(rb)` — validate + serialize `rb`'s head + the transfer framing (stored in
     /// the stream, written lazily by the first send), lift the fd out of `ctx`, and write an owned
     /// `http_stream` handle (opaque pointer) to `out`. `rb` is an opaque pointer **moved in** (the
@@ -8420,7 +8422,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
-            | hir::ExprKind::HttpRespond { .. }
+            | hir::ExprKind::HttpRespondTimeoutNs { .. } | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
             | hir::ExprKind::HttpRespondUpgrade { .. }
             | hir::ExprKind::HttpUpgradeReadExact { .. }
@@ -8625,7 +8627,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpResponseBuilder { .. }
         | hir::ExprKind::HttpRbHeader { .. }
         | hir::ExprKind::HttpRbBody { .. }
-        | hir::ExprKind::HttpRespond { .. }
+        | hir::ExprKind::HttpRespondTimeoutNs { .. } | hir::ExprKind::HttpRespond { .. }
         | hir::ExprKind::HttpRespondStream { .. }
         | hir::ExprKind::HttpRespondUpgrade { .. }
         | hir::ExprKind::HttpUpgradeReadExact { .. }
@@ -10083,7 +10085,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
             | hir::ExprKind::HttpRbBody { .. }
-            | hir::ExprKind::HttpRespond { .. }
+            | hir::ExprKind::HttpRespondTimeoutNs { .. } | hir::ExprKind::HttpRespond { .. }
             | hir::ExprKind::HttpRespondStream { .. }
             | hir::ExprKind::HttpRespondUpgrade { .. }
             | hir::ExprKind::HttpUpgradeReadExact { .. }
@@ -22611,6 +22613,19 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             let v = b.fresh_value(Ty::Unit);
             b.push(Stmt::Let(v, Rvalue::HttpRbBody { rb: r, data: d }));
             Operand::Value(v)
+        }
+        // Stage both owners until the timeout operand completes, including fresh builder cleanup.
+        hir::ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => {
+            let (cx, ctx_owner) = lower_consumed_call_arg(b, ctx);
+            if !lowering_continues(b) { return terminated_operand(); }
+            let (r, rb_owner) = lower_consumed_call_arg(b, rb);
+            if !lowering_continues(b) { return terminated_operand(); }
+            let timeout_ns = lower_required!(b, lower_expr(b, timeout_ns), terminated_operand());
+            ctx_owner.finish(b);
+            rb_owner.finish(b);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpRespondTimeoutNs { ctx: cx, rb: r, timeout_ns }));
+            lower_status_result(b, code, e.ty)
         }
         // `ctx.respond(rb)` → `Result<(), Error>`. BOTH `ctx` and `rb` are **consumed** by the call (the
         // runtime frees both): null both source slots so the exit `Drop` doesn't double-free.

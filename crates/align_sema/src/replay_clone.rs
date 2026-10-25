@@ -1627,6 +1627,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             rb: boxed!(rb),
             data: boxed!(data),
         },
+        ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => ExprKind::HttpRespondTimeoutNs {
+            ctx: boxed!(ctx), rb: boxed!(rb), timeout_ns: boxed!(timeout_ns),
+        },
         ExprKind::HttpRespond { ctx, rb } => ExprKind::HttpRespond {
             ctx: boxed!(ctx),
             rb: boxed!(rb),
@@ -2717,6 +2720,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             token: value,
             ..
         }
+        | ExprKind::HttpRespondTimeoutNs { ctx: ptr, rb: offset, timeout_ns: value }
         | ExprKind::HttpUpgradeReadExact {
             upgrade: ptr,
             out: offset,

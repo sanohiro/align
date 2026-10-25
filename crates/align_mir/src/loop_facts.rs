@@ -350,7 +350,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::HttpCtxPath { .. } | Rvalue::HttpCtxHeader { .. } | Rvalue::HttpHeadersCount { .. } |
         Rvalue::HttpHeadersTokensValid { .. } | Rvalue::HttpHeadersContainsToken { .. } | Rvalue::HttpCtxUpgradeReady { .. } |
         Rvalue::HttpCtxBody { .. } | Rvalue::HttpResponseBuilder { .. } | Rvalue::HttpRbHeader { .. } |
-        Rvalue::HttpRbBody { .. } | Rvalue::HttpRespond { .. } | Rvalue::HttpRespondStream { .. } |
+        Rvalue::HttpRbBody { .. } | Rvalue::HttpRespondTimeoutNs { .. } | Rvalue::HttpRespond { .. } | Rvalue::HttpRespondStream { .. } |
         Rvalue::HttpRespondUpgrade { .. } | Rvalue::HttpUpgradeReadExact { .. } | Rvalue::HttpUpgradeWrite { .. } |
         Rvalue::HttpUpgradeDeadline { .. } | Rvalue::HttpStreamWriteTimeoutNs { .. } | Rvalue::HttpServerAcceptTimeoutNs { .. } | Rvalue::HttpUpgradeShutdown { .. } | Rvalue::HttpStreamSend { .. } |
         Rvalue::HttpStreamFinish { .. } | Rvalue::HttpStreamReject { .. }

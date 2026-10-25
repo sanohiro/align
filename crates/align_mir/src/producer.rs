@@ -6941,7 +6941,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::HttpResponseBuilder { .. }
             | Rvalue::HttpRbHeader { .. }
             | Rvalue::HttpRbBody { .. }
-            | Rvalue::HttpRespond { .. }
+            | Rvalue::HttpRespondTimeoutNs { .. } | Rvalue::HttpRespond { .. }
             | Rvalue::HttpRespondStream { .. }
             | Rvalue::HttpRespondUpgrade { .. }
             | Rvalue::HttpUpgradeReadExact { .. }
