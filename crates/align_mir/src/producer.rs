@@ -13122,7 +13122,7 @@ mod tests {
                 for block in &mut stale.blocks {
                     if let Some(index) = block.stmts.iter().position(|statement| matches!(statement,
                         Stmt::Let(_, Rvalue::ArrayBuilderRead { .. } | Rvalue::BuilderBytes(_)))) {
-                        let Stmt::Let(_, value) = &block.stmts[index] else { unreachable!() };
+                        let Stmt::Let(_, value) = &block.stmts[index] else { return Err("getter statement".into()); };
                         let (_, owner) = builder_read_action(value).ok_or("getter action")?;
                         block.stmts.insert(index, Stmt::DropValue(owner.clone()));
                         changed = true;
