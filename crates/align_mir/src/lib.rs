@@ -2058,6 +2058,7 @@ pub enum Rvalue {
     BufferTryNew { capacity: Operand, fill: Option<Operand>, alignment: Operand, pages: Operand, out: Slot },
     /// `b.bytes()` — a `slice<u8>` view `{ptr,len}` of the buffer's current contents (borrow).
     BufferBytes(Operand),
+    BuilderBytes(Operand),
     /// `b.len()` — the buffer's current byte count (`i64`).
     BufferLen(Operand),
     /// The fixed caller-selected read window, independent of the buffer's current published len.
@@ -9252,14 +9253,15 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(code, Rvalue::BufferTryNew { capacity, fill, alignment, pages, out }));
                 emit_status_buffer_result(b, code, out, e.ty)
             }
-            hir::ExprKind::BufferBytes { buffer } => {
+            hir::ExprKind::BufferBytes { buffer } | hir::ExprKind::BuilderBytes { builder: buffer } => {
                 lower_required_binding!(
                     b,
                     bop = lower_expr(b, buffer),
                     Operand::Const(Const::Unit)
                 );
                 let v = b.fresh_value(e.ty);
-                b.push(Stmt::Let(v, Rvalue::BufferBytes(bop)));
+                let value = if matches!(e.kind, hir::ExprKind::BuilderBytes { .. }) { Rvalue::BuilderBytes(bop) } else { Rvalue::BufferBytes(bop) };
+                b.push(Stmt::Let(v, value));
                 Operand::Value(v)
             }
             hir::ExprKind::BufferLen { buffer } => {

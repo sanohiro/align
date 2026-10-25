@@ -10361,7 +10361,7 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         | Rvalue::BuilderWriteBool(b, _)
                         | Rvalue::BuilderWriteChar(b, _)
                         | Rvalue::BuilderWriteFloat(b, _)
-                        | Rvalue::BuilderToString(b) | Rvalue::BuilderLen(b) => {
+                        | Rvalue::BuilderToString(b) | Rvalue::BuilderLen(b) | Rvalue::BuilderBytes(b) => {
                             allow_loaded(b, &load_defs, &owner, &mut allowed_loads, &mut bad)
                         }
                         Rvalue::BuilderWriteStrIntStr(b, _, _, _) => {
@@ -17089,12 +17089,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 self.apply_native_call_attributes(key, call);
                 call.try_as_basic_value().basic().ok_or_else(|| self.err("buffer constructor returned no status"))?
             }
-            Rvalue::BufferBytes(buf) => {
+            Rvalue::BufferBytes(buf) | Rvalue::BuilderBytes(buf) => {
                 // The runtime writes the `{ptr,len}` view into a stack slot; load it back.
                 let bp = self.operand(buf)?.into();
                 let slot = self.alloca_at_entry(slice_struct_type(self.ctx).into(), "bytesslot")?;
+                let key = if matches!(rv, Rvalue::BuilderBytes(_)) { RuntimeKey::BuilderBytes } else { RuntimeKey::BufferBytes };
                 self.builder
-                    .build_call(self.runtime(RuntimeKey::BufferBytes), &[bp, slot.into()], "")
+                    .build_call(self.runtime(key), &[bp, slot.into()], "")
                     .map_err(|e| self.err(e))?;
                 self.builder.build_load(slice_struct_type(self.ctx), slot, "bytes").map_err(|e| self.err(e))?
             }
@@ -32862,6 +32863,119 @@ fn main() -> i32 = 0
                 }
                 assert!(changed);
                 assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "alignment/{mutation}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn builder_bytes_mir_types_and_retirement() -> Result<(), &'static str> {
+        let base = mir("fn prefix(borrow b: builder) -> slice<u8> = b.bytes()\nfn main() {}\n");
+        emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+            .map_err(|_| "valid builder byte getter")?;
+        for mutation in 0..5 {
+            let mut bad = base.clone();
+            let mut changed = false;
+            for function in &mut bad.fns {
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(result, Rvalue::BuilderBytes(builder)) = statement else { continue };
+                        changed = true;
+                        match mutation {
+                            0 => *builder = Operand::Const(Const::Unit),
+                            1 => *builder = Operand::Value(u32::MAX),
+                            2 => function.value_tys[*result as usize] = Ty::Str,
+                            3 => {
+                                let Operand::Value(owner) = builder else { return Err("getter owner SSA") };
+                                function.value_tys[*owner as usize] = Ty::Buffer;
+                            }
+                            _ => *builder = Operand::Arg(0),
+                        }
+                    }
+                }
+            }
+            assert!(changed);
+            assert_xml_producer_rejected(&bad, &format!("builder bytes types/{mutation}"));
+        }
+        let owned = mir("fn query() -> i64 { mut b := builder(); b.write(\"hello\"); bytes := b.bytes(); bytes.len() }\nfn main() {}\n");
+        for forwarded in [false, true] {
+            for retirement in 0..4 {
+                let mut bad = owned.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name.as_str() == "query").ok_or("query")?;
+                let (block_index, index, snapshot) = function.blocks.iter().enumerate().find_map(|(bi, block)|
+                    block.stmts.iter().enumerate().find_map(|(si, statement)| match statement {
+                        Stmt::Let(_, Rvalue::BuilderBytes(Operand::Value(owner))) => Some((bi, si, *owner)), _ => None,
+                    })).ok_or("getter")?;
+                let slot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| match statement {
+                    Stmt::Let(value, Rvalue::Load(slot)) if *value == snapshot => Some(*slot), _ => None,
+                }).ok_or("getter slot")?;
+                let alias = u32::try_from(function.value_tys.len()).map_err(|_| "alias id")?;
+                function.value_tys.push(Ty::Builder);
+                let done = u32::try_from(function.value_tys.len()).map_err(|_| "finish id")?;
+                function.value_tys.push(Ty::String);
+                let retired = match retirement {
+                    0 => Stmt::Drop(slot),
+                    1 => Stmt::DropValue(Operand::Value(snapshot)),
+                    2 => Stmt::Let(done, Rvalue::BuilderToString(Operand::Value(snapshot))),
+                    _ => Stmt::Store(slot, Operand::Value(snapshot)),
+                };
+                let mut injected = vec![Stmt::Let(alias, Rvalue::Use(Operand::Value(snapshot))), retired];
+                if retirement != 3 {
+                    injected.push(Stmt::Store(slot, Operand::Value(if forwarded { alias } else { snapshot })));
+                }
+                function.blocks[block_index].stmts.splice(index..index, injected);
+                assert_xml_producer_rejected(&bad, &format!("builder bytes retirement/{forwarded}/{retirement}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn builder_reads_reject_alias_slot_after_exclusive_replacement() -> Result<(), &'static str> {
+        for (ty, constructor, initialize, read) in [
+            ("builder", "builder()", "b.write(\"a\")", "b.bytes().len()"),
+            ("array_builder<i64>", "array_builder()", "b.push(7)", "b[0]"),
+        ] {
+            for joined in [false, true] {
+                let replace = if joined { "if flag { replace(b) }" } else { "replace(b)" };
+                let base = mir(&format!("fn replace(borrow mut b: {ty}) {{ b = {constructor}; {initialize} }}\nfn query(flag: bool) -> i64 {{ mut b: {ty} := {constructor}; {initialize}; {replace}; {read} }}\nfn main() {{}}"));
+                emit_llvm_ir(&base, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                    .map_err(|_| "valid replacement read")?;
+                let mut bad = base.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name.as_str() == "query").ok_or("query")?;
+                let snapshot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| match statement {
+                    Stmt::Let(_, Rvalue::BuilderBytes(Operand::Value(owner)))
+                    | Stmt::Let(_, Rvalue::ArrayBuilderRead { builder: Operand::Value(owner), .. }) => Some(*owner), _ => None,
+                }).ok_or("getter")?;
+                let owner_slot = function.blocks.iter().flat_map(|block| &block.stmts).find_map(|statement| match statement {
+                    Stmt::Let(value, Rvalue::Load(slot)) if *value == snapshot => Some(*slot), _ => None,
+                }).ok_or("owner slot")?;
+                let alias_slot = u32::try_from(function.slots.len()).map_err(|_| "slot id")?;
+                function.slots.push(function.slots[owner_slot as usize]);
+                function.slot_align.push(None);
+                let alias_value = u32::try_from(function.value_tys.len()).map_err(|_| "value id")?;
+                function.value_tys.push(function.slots[owner_slot as usize]);
+                // Capture before the branch so every incoming path initializes the alias slot.
+                function.blocks[function.entry as usize].stmts.extend([
+                    Stmt::Let(alias_value, Rvalue::Load(owner_slot)),
+                    Stmt::Store(alias_slot, Operand::Value(alias_value)),
+                ]);
+                if !joined {
+                    let block = &mut function.blocks[function.entry as usize];
+                    let captured = block.stmts.split_off(block.stmts.len() - 2);
+                    let call = block.stmts.iter().position(|statement| matches!(statement,
+                        Stmt::Let(_, Rvalue::Call(DirectCall::Program(target), _)) if target.as_str() == "replace"))
+                        .ok_or("replace call")?;
+                    block.stmts.splice(call..call, captured);
+                }
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        if let Stmt::Let(value, Rvalue::Load(slot)) = statement
+                            && *value == snapshot { *slot = alias_slot; }
+                    }
+                }
+                assert_xml_producer_rejected(&bad, &format!("stale alias slot {ty}/{joined}"));
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err());
             }
         }
         Ok(())

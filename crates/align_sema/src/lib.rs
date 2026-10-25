@@ -17608,7 +17608,7 @@ impl EffectScan<'_> {
             ExprKind::StrBytes { inner } => walk!(inner),
             ExprKind::BytesView { bytes, .. } => walk!(bytes),
             ExprKind::SliceAsBytes { slice, .. } => walk!(slice),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => walk!(buffer),
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => walk!(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
             // mutates local heap like a `mut` array store, never a syscall). Walk the sub-exprs.
             ExprKind::BytesRead { bytes, offset, .. } => {
@@ -22667,7 +22667,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ResourceViewFromRaw { owner, .. } => {
                 vec![self.completed_escape_value(owner)]
             }
-            ExprKind::BufferBytes { buffer } => vec![self.completed_escape_value(buffer)],
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } => vec![self.completed_escape_value(buffer)],
             ExprKind::StrBytes { inner } => vec![self.completed_escape_value(inner)],
             ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 vec![self.completed_escape_value(out)]
@@ -22740,7 +22740,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::ResourceViewFromRaw { owner, .. } => {
                 roots.extend(self.escape_place_fallback_roots(owner));
             }
-            ExprKind::BufferBytes { buffer } => {
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } => {
                 roots.extend(self.escape_place_fallback_roots(buffer));
             }
             ExprKind::StrBytes { inner } => {
@@ -25628,7 +25628,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::PathComponent { path, .. } => work.push(Work::Eval(path, depth)),
             // `buf.bytes()` is a `slice<u8>` view of the `buffer` local's heap storage (freed at
             // frame exit), so — like `StrBorrow` — it is `Frame`-regioned and cannot escape the frame.
-            ExprKind::BufferBytes { buffer } => push_fold(
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } => push_fold(
                 &mut work,
                 self.borrowed_storage_cap(buffer),
                 vec![(buffer, depth, None)],
@@ -26327,7 +26327,7 @@ impl<'a> EscapeCheck<'a> {
             // A `borrow`/`borrow mut` parameter still belongs to the caller, however, so its view
             // may be returned with that caller-side provenance (the same distinction made by
             // `borrowed_storage_cap` in `region_of`).
-            ExprKind::BufferBytes { buffer: out }
+            ExprKind::BufferBytes { buffer: out } | ExprKind::BuilderBytes { builder: out }
             | ExprKind::HttpRespBody { resp: out }
             | ExprKind::RunBytesStdout { out } | ExprKind::RunBytesStderr { out } => {
                 if !self.borrowed_param_place(out) {
@@ -30643,7 +30643,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(writer, depth);
             }
             ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } => self.walk_file_op(&e.kind, depth),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => self.walk(buffer, depth),
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => self.walk(buffer, depth),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.walk(bytes, depth);
                 self.walk(offset, depth);
@@ -32940,6 +32940,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
 
         ExprKind::ResourceViewFromRaw { .. }
         | ExprKind::BufferBytes { .. }
+        | ExprKind::BuilderBytes { .. }
         | ExprKind::CodecOpen { .. }
         | ExprKind::CodecBatchName { .. }
         | ExprKind::CodecBatchI64s { .. }
@@ -36034,9 +36035,11 @@ impl<'a> MoveCheck<'a> {
                 places.insert(Self::expr_key(digest));
             }
             if let Some(receiver) = Self::array_builder_action_receiver(&expression.kind)
-                .or_else(|| Self::buffer_growth_receiver(&expression.kind)) {
-                arguments.insert(Self::expr_key(receiver));
-                places.insert(Self::expr_key(receiver));
+                .or_else(|| Self::native_growth_receiver(&expression.kind)) {
+                for source in self.completed_action_values(receiver, true) {
+                    arguments.insert(Self::expr_key(source));
+                    places.insert(Self::expr_key(source));
+                }
             }
             if let ExprKind::ArrayTruncate { receiver, .. } = &expression.kind {
                 arguments.insert(Self::expr_key(receiver));
@@ -37110,7 +37113,7 @@ impl<'a> MoveCheck<'a> {
         }
         match &expression.kind {
             ExprKind::Local(local) => self.local_mutable_backing(*local),
-            ExprKind::BufferBytes { buffer } => {
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } => {
                 MutableBackingFact::known(self.storage_roots(buffer))
             }
             ExprKind::ArrayToSlice(inner)
@@ -38947,7 +38950,7 @@ impl<'a> MoveCheck<'a> {
                 path.push(BorrowProjection::TupleElement(*index));
                 Some((root, path))
             }
-            ExprKind::BufferBytes { buffer }
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer }
             | ExprKind::StrBytes { inner: buffer }
             | ExprKind::StrBorrow(buffer)
             | ExprKind::ArrayToSlice(buffer)
@@ -39189,6 +39192,12 @@ impl<'a> MoveCheck<'a> {
             let mut roots = self.borrows.resolve_headers(headers).non_storage.live_roots();
             if self.f.locals.get(id as usize).is_some_and(|local| {
                 has_inline_owned_storage(local.ty, self.storage_type_context())
+                    // Mutable-call completion can record an empty projection map for an opaque
+                    // native owner. Empty bookkeeping does not erase its stable storage identity.
+                    // Types requiring real headers must not take this fallback when a selected
+                    // payload is empty or the backing graph is incomplete.
+                    || (headers.leaves.is_empty() && self.local_owns_view_storage(id)
+                        && storage_type_paths(local.ty, self.storage_type_context()).headers.is_empty())
             }) {
                 roots.insert(self.stable_owner_root(id));
             }
@@ -39693,6 +39702,22 @@ impl<'a> MoveCheck<'a> {
     fn storage_roots(&self, e: &Expr) -> BorrowRoots {
         if independent_builder_read(e, self.structs, self.tuples, self.enums, self.tagged_types) {
             return BorrowRoots::default();
+        }
+        if e.ty == Ty::Builder {
+            let selected = match &e.kind {
+                ExprKind::Block(block) | ExprKind::FloatScope { block, .. }
+                | ExprKind::Arena(block) | ExprKind::NamedArena { block, .. }
+                | ExprKind::TaskGroup(block) | ExprKind::Unsafe(block) =>
+                    Some(block.value.iter().map(|value| value.as_ref()).collect::<Vec<_>>()),
+                ExprKind::If { then, els, .. } => Some(then.value.iter().chain(&els.value)
+                    .map(|value| value.as_ref()).collect()),
+                ExprKind::Match { arms, .. } => Some(arms.iter().map(|arm| &arm.body).collect()),
+                _ => None,
+            };
+            if let Some(selected) = selected {
+                return selected.into_iter().filter(|value| !hir_expr_diverges(value))
+                    .flat_map(|value| self.completed_storage_fact(value).flatten()).collect();
+            }
         }
         // Borrowing through a wrapper borrows what is inside it — the SAME set
         // [`may_need_synthetic_owner`] sees through, single-sourced in `borrow_transparent_value` so
@@ -41218,7 +41243,7 @@ impl<'a> MoveCheck<'a> {
                 ExprKind::Field { root, .. } => break Some(*root),
                 ExprKind::Local(local) => break Some(*local),
                 ExprKind::TupleIndex { recv: inner, .. }
-                | ExprKind::BufferBytes { buffer: inner }
+                | ExprKind::BufferBytes { buffer: inner } | ExprKind::BuilderBytes { builder: inner }
                 | ExprKind::StrBytes { inner }
                 | ExprKind::StrBorrow(inner)
                 | ExprKind::ArrayToSlice(inner)
@@ -41470,10 +41495,11 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
-    fn buffer_growth_receiver(kind: &ExprKind) -> Option<&Expr> {
+    fn native_growth_receiver(kind: &ExprKind) -> Option<&Expr> {
         match kind {
             ExprKind::BufferPut { buffer, .. } | ExprKind::BufferAppend { buffer, .. }
-            | ExprKind::BufferAppendFilled { buffer, .. } => Some(buffer),
+            | ExprKind::BufferAppendFilled { buffer, .. }
+            | ExprKind::BuilderWrite { builder: buffer, .. } => Some(buffer),
             _ => None,
         }
     }
@@ -41496,10 +41522,18 @@ impl<'a> MoveCheck<'a> {
             }
             return;
         }
+        if let Some(receiver) = Self::native_growth_receiver(&expression.kind) {
+            for source in self.completed_action_values(receiver, true) {
+                let key = Self::expr_key(source);
+                self.clear_value_snapshot(key);
+                children.retain(|snapshot| *snapshot != key);
+            }
+            return;
+        }
         let receiver = match &expression.kind {
             ExprKind::ArrayTruncate { receiver, .. } => Some(receiver.as_ref()),
             _ => Self::array_builder_action_receiver(&expression.kind)
-                .or_else(|| Self::buffer_growth_receiver(&expression.kind))
+                .or_else(|| Self::native_growth_receiver(&expression.kind))
                 .or_else(|| Self::http_timeout_action_receiver(&expression.kind))
                 .or_else(|| Self::cli_action_receiver(&expression.kind))
                 .or_else(|| Self::reader_action_receiver(expression)),
@@ -41516,6 +41550,10 @@ impl<'a> MoveCheck<'a> {
     /// transition. Only the exact destination snapshot is exempt: a callee, source value, or
     /// another eager operand may retain the same pre-action roots and must still be rejected.
     fn intentional_action_snapshot(&self, expression: &Expr, snapshot: usize) -> bool {
+        if let Some(receiver) = Self::native_growth_receiver(&expression.kind) {
+            return self.completed_action_values(receiver, true).iter()
+                .any(|source| Self::expr_key(source) == snapshot);
+        }
         let is_exact_snapshot = |argument: &Expr| Self::expr_key(argument) == snapshot;
         match &expression.kind {
             ExprKind::Call { func, args, .. } => {
@@ -42990,7 +43028,8 @@ impl<'a> MoveCheck<'a> {
                 roots.insert(BorrowRoot::ReadOnly);
                 roots
             },
-            ExprKind::HttpRespBody { resp: owner }
+            ExprKind::BuilderBytes { builder: owner }
+            | ExprKind::HttpRespBody { resp: owner }
             | ExprKind::HttpCtxBody { ctx: owner }
             | ExprKind::RunBytesStdout { out: owner }
             | ExprKind::RunBytesStderr { out: owner } => {
@@ -44683,7 +44722,11 @@ impl<'a> MoveCheck<'a> {
     fn invalidate_storage(&mut self, storage: &Expr) {
         self.record_storage_access(storage);
         self.invalidate_source_mutation_target(storage);
-        let storage_roots = self.completed_storage_fact(storage).live_roots();
+        self.invalidate_storage_fact(self.completed_storage_fact(storage), self.completed_headers(storage));
+    }
+
+    fn invalidate_storage_fact(&mut self, storage: BorrowFact, headers: ProjectedHeaderFact) {
+        let storage_roots = storage.live_roots();
         // A caller-owned `borrow mut` buffer has no local release generation, but its
         // `ParamStorage` root is still the exact generation advanced by an in-place fill. End that
         // root so a view returned by one fill cannot survive the next fill in the same callee.
@@ -44695,8 +44738,7 @@ impl<'a> MoveCheck<'a> {
             .collect::<BorrowRoots>();
         self.borrows
             .invalidate_roots(&caller_storage_roots, BorrowEnd::Consumed);
-        let generations = self
-            .completed_headers(storage)
+        let generations = headers
             .leaves
             .values()
             .flat_map(|leaf| leaf.generations.iter())
@@ -47614,7 +47656,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CryptoRandom { out: buffer }
             | ExprKind::BufferPut { buffer, .. }
             | ExprKind::BufferAppend { buffer, .. }
-            | ExprKind::BufferAppendFilled { buffer, .. } => {
+            | ExprKind::BufferAppendFilled { buffer, .. }
+            | ExprKind::BuilderWrite { builder: buffer, .. } => {
                 Some(SourceVisibleMutationAction::Storage(buffer))
             }
             ExprKind::ArrayBuilderPush { builder, value, .. } => {
@@ -47780,12 +47823,28 @@ impl<'a> MoveCheck<'a> {
         };
         match action {
             SourceVisibleMutationAction::Storage(destination) => {
-                if Self::buffer_growth_receiver(&expression.kind).is_some() {
-                    let key = Self::expr_key(destination);
-                    self.validate_value_snapshot(Self::expr_key(expression), key, expression.span);
-                    self.borrows.finish_mutable_place_source(key);
+                if Self::native_growth_receiver(&expression.kind).is_some() {
+                    for source in self.completed_action_values(destination, true) {
+                        let key = Self::expr_key(source);
+                        self.validate_value_snapshot(Self::expr_key(expression), key, expression.span);
+                        self.borrows.finish_mutable_place_source(key);
+                    }
+                }
+                if matches!(expression.kind, ExprKind::BuilderWrite { .. }) {
+                    // A validated str may retain an observation instead of the raw owner root.
+                    // This completed opaque receiver has authenticated selected storage identity;
+                    // end those observations without invalidating independent native owners.
+                    let storage = self.completed_storage_fact(destination);
+                    let backing = self.byte_backing(&self.completed_headers(destination), &storage,
+                        &MutableBackingFact::known(storage.live_roots()));
+                    self.borrows.invalidate_validated_bytes(&backing);
                 }
                 self.invalidate_storage(destination);
+                if let ExprKind::BuilderWrite { arg, .. } = &expression.kind {
+                    // Reallocation may invalidate the still-needed text input. Numeric copied
+                    // inputs have no storage dependency and remain valid across this action.
+                    self.validate_value_snapshot(Self::expr_key(expression), Self::expr_key(arg), expression.span);
+                }
             }
             SourceVisibleMutationAction::StorageAndSource { storage, source } => {
                 self.invalidate_storage(storage);
@@ -48657,7 +48716,7 @@ impl<'a> MoveCheck<'a> {
                     }
                     ExprKind::StrBytes { inner: child }
                     | ExprKind::StrTrim { recv: child, .. }
-                    | ExprKind::BufferBytes { buffer: child }
+                    | ExprKind::BufferBytes { buffer: child } | ExprKind::BuilderBytes { builder: child }
                     | ExprKind::BufferLen { buffer: child } | ExprKind::BufferCapacity { buffer: child } | ExprKind::BuilderLen { builder: child } | ExprKind::ArrayBuilderLen { builder: child }
                     | ExprKind::BytesAsStr { bytes: child } => {
                         (child.as_ref(), false, false, false, Post::None)
@@ -49979,7 +50038,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::StrBytes { inner } => move_expr!(self, inner, moved, false, false),
             ExprKind::BytesView { bytes, .. } => move_expr!(self, bytes, moved, false, false),
             ExprKind::SliceAsBytes { slice, .. } => move_expr!(self, slice, moved, false, false),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => move_expr!(self, buffer, moved, false, false),
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => move_expr!(self, buffer, moved, false, false),
             // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
             // place), never consumed.
             ExprKind::BytesRead { bytes, offset, .. } => {
@@ -54327,7 +54386,7 @@ impl<'a, 't> Checker<'a, 't> {
             // cannot see that `s` and `xs` share a buffer.
             ExprKind::SliceRange { recv, .. } => self.expr_root_local(recv),
             ExprKind::StrBytes { inner } => self.expr_root_local(inner),
-            ExprKind::BufferBytes { buffer } => self.expr_root_local(buffer),
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } => self.expr_root_local(buffer),
             ExprKind::BytesView { bytes, .. } => self.expr_root_local(bytes),
             ExprKind::SliceAsBytes { slice, .. } => self.expr_root_local(slice),
             ExprKind::Field { root, .. } => Some(self.root_local(*root)),
@@ -57836,6 +57895,9 @@ impl<'a, 't> Checker<'a, 't> {
                 return self.check_http_upgrade_method(recv_expr, method, args, span);
             }
             if method == "bytes" {
+                if recv_expr.ty == Ty::Builder {
+                    return self.check_builder_bytes(recv_expr, args, span);
+                }
                 if recv_expr.ty == Ty::Buffer {
                     return self.check_buffer_bytes(recv_expr, args, span);
                 }
@@ -71187,8 +71249,17 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `b.bytes()` on a `buffer` ([`Ty::Buffer`]), the receiver already evaluated. A `slice<u8>`
-    /// view of the buffer's current contents, borrowing it (region-tracked: must not outlive `b`).
+    /// Read-only initialized bytes of a bound text builder, borrowing its current generation.
+    fn check_builder_bytes(&mut self, receiver: Expr, args: &[ast::Expr], span: Span) -> Expr {
+        if !args.is_empty() || !matches!(receiver.kind, ExprKind::Local(_)) {
+            self.diags.error("builder.bytes() takes no arguments and requires a bound builder local or parameter".to_string(), span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
+        }
+        Expr { kind: ExprKind::BuilderBytes { builder: Box::new(receiver) },
+            ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })), span }
+    }
+
+    /// `b.bytes()` on a buffer: a region-tracked view of its current contents.
     fn check_buffer_bytes(&mut self, recv_expr: Expr, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // The receiver must be a stable local/field place. On an unbound
@@ -74029,7 +74100,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(writer);
             }
             k @ (ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FilePwrite { .. } | ExprKind::FileLen { .. } | ExprKind::FileSync { .. }) => self.finalize_file_op(k),
-            ExprKind::BufferBytes { buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => self.finalize_expr(buffer),
+            ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => self.finalize_expr(buffer),
             ExprKind::BytesRead { bytes, offset, .. } => {
                 self.finalize_expr(bytes);
                 self.finalize_expr(offset);
@@ -82458,7 +82529,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // HttpRespondTimeoutNs consumes two native owners and returns unit/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 361,
+            variants, 362,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

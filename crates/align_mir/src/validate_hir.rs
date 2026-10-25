@@ -4807,6 +4807,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. } | hir::ExprKind::BufferTryNew { .. }
             | hir::ExprKind::BufferBytes { .. }
+            | hir::ExprKind::BuilderBytes { .. }
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BytesView { .. }
             | hir::ExprKind::SliceAsBytes { .. }
@@ -5212,6 +5213,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. } | hir::ExprKind::BufferTryNew { .. }
             | hir::ExprKind::BufferBytes { .. }
+            | hir::ExprKind::BuilderBytes { .. }
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. } | hir::ExprKind::BuilderLen { .. } | hir::ExprKind::ArrayBuilderLen { .. }
             | hir::ExprKind::BufferAppend { .. }
@@ -9443,6 +9445,11 @@ impl<'a> BodyValidator<'a> {
                 } else {
                     result(Ty::Buffer, &[capacity, alignment, pages])
                 }
+            }
+            hir::ExprKind::BuilderBytes { builder } => {
+                (matches!(builder.kind, hir::ExprKind::Local(_))
+                    && self.handle_receiver_place(builder, context, Ty::Builder))
+                    .then(|| strict(Ty::Slice(u8_scalar), &[builder]))?
             }
             hir::ExprKind::BufferBytes { buffer } => {
                 (self.handle_receiver_place(buffer, context, Ty::Buffer) && buffer.ty == Ty::Buffer)

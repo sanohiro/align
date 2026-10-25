@@ -1665,6 +1665,11 @@ pub fn native_owner_mir_contract<'a>(
             contract.operands.push((alignment, i64_ty, read));
             contract.operands.push((pages, i32_ty, read));
         }
+        Rvalue::BuilderBytes(builder) => {
+            contract.result = Ty::Slice(align_sema::Scalar::Int(IntTy { bits: 8, signed: false }));
+            contract.operands = vec![(builder, Ty::Builder, read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
         Rvalue::BuilderLen(builder) | Rvalue::ArrayBuilderLen(builder) => {
             let owner = if matches!(value, Rvalue::BuilderLen(_)) {
                 Ty::Builder
@@ -6812,7 +6817,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. }
             | Rvalue::FilePwrite { .. }
             | Rvalue::FileLen { .. } | Rvalue::FileSync(..)
-            | Rvalue::BufferBytes(..)
+            | Rvalue::BufferBytes(..) | Rvalue::BuilderBytes(..)
             | Rvalue::BufferLen(..)
             | Rvalue::BufferCapacity(..)
             | Rvalue::BuilderLen(..) | Rvalue::ArrayBuilderLen(..) | Rvalue::ArrayBuilderRead { .. }
@@ -9076,7 +9081,7 @@ fn validate_builder_read_reservations(
     local_contracts: &HashSet<ProgramCall>,
 ) -> Result<(), ProducerError> {
     if !function.blocks.iter().flat_map(|block| &block.stmts)
-        .any(|statement| matches!(statement, Stmt::Let(_, Rvalue::ArrayBuilderRead { .. }))) {
+        .any(|statement| matches!(statement, Stmt::Let(_, Rvalue::ArrayBuilderRead { .. } | Rvalue::BuilderBytes(_)))) {
         return Ok(());
     }
     #[derive(Clone, PartialEq, Eq, Hash)]
@@ -9084,6 +9089,8 @@ fn validate_builder_read_reservations(
         slots: Vec<usize>,
         values: Vec<usize>,
         args: Vec<usize>,
+        slot_bools: Vec<Option<bool>>,
+        value_bools: Vec<Option<bool>>,
         reserved: bool,
     }
     impl State {
@@ -9093,6 +9100,13 @@ fn validate_builder_read_reservations(
                 Operand::Arg(argument) => self.args.get(*argument as usize).copied().unwrap_or(0),
                 Operand::BorrowedPlace(place) => self.slots.get(place.slot as usize).copied().unwrap_or(0),
                 _ => 0,
+            }
+        }
+        fn boolean(&self, operand: &Operand) -> Option<bool> {
+            match operand {
+                Operand::Const(Const::Bool(value)) => Some(*value),
+                Operand::Value(value) => self.value_bools.get(*value as usize).copied().flatten(),
+                _ => None,
             }
         }
         fn fresh(&self) -> usize {
@@ -9120,10 +9134,10 @@ fn validate_builder_read_reservations(
         .filter_map(|statement| match statement { Stmt::Let(id, value) => Some((*id, value)), _ => None })
         .collect();
     let is_builder_operand = |operand: &Operand| match operand {
-        Operand::Value(value) => function.value_tys.get(*value as usize).is_some_and(|ty| ty.is_array_builder()),
+        Operand::Value(value) => function.value_tys.get(*value as usize).is_some_and(|ty| ty.is_array_builder() || *ty == Ty::Builder),
         Operand::Arg(argument) => function.params.get(*argument as usize)
-            .and_then(|slot| function.slots.get(*slot as usize)).is_some_and(|ty| ty.is_array_builder()),
-        Operand::BorrowedPlace(place) => place.ty.is_array_builder(),
+            .and_then(|slot| function.slots.get(*slot as usize)).is_some_and(|ty| ty.is_array_builder() || *ty == Ty::Builder),
+        Operand::BorrowedPlace(place) => place.ty.is_array_builder() || place.ty == Ty::Builder,
         _ => false,
     };
     let is_null = |operand: &Operand| {
@@ -9141,20 +9155,21 @@ fn validate_builder_read_reservations(
         }
     };
     let reads = definitions.iter().filter_map(|(&id, value)| match value {
-        Rvalue::ArrayBuilderRead { builder, .. } => Some((id, builder)), _ => None,
+        Rvalue::ArrayBuilderRead { builder, .. } | Rvalue::BuilderBytes(builder) => Some((id, builder)), _ => None,
     }).collect::<Vec<_>>();
     for (read, owner) in reads {
         let fail = || ProducerError::Lowering(format!(
-            "array builder read in '{}' has no live unchanged owner snapshot", function.name));
+            "builder read in '{}' has no live unchanged owner snapshot", function.name));
         let Operand::Value(snapshot) = owner else { return Err(fail()) };
         let Some(Rvalue::Load(slot)) = definitions.get(snapshot).copied() else { return Err(fail()) };
-        if !function.slots.get(*slot as usize).is_some_and(|ty| ty.is_array_builder()) {
+        if !function.slots.get(*slot as usize).is_some_and(|ty| ty.is_array_builder() || *ty == Ty::Builder) {
             return Err(fail());
         }
         let mut initial = State { slots: vec![0; function.slots.len()],
-            values: vec![0; function.value_tys.len()], args: vec![0; function.params.len()], reserved: false };
+            values: vec![0; function.value_tys.len()], args: vec![0; function.params.len()],
+            slot_bools: vec![None; function.slots.len()], value_bools: vec![None; function.value_tys.len()], reserved: false };
         for (index, parameter) in function.params.iter().enumerate() {
-            if function.slots.get(*parameter as usize).is_some_and(|ty| ty.is_array_builder()) {
+            if function.slots.get(*parameter as usize).is_some_and(|ty| ty.is_array_builder() || *ty == Ty::Builder) {
                 initial.args[index] = index + 1;
             }
         }
@@ -9169,18 +9184,18 @@ fn validate_builder_read_reservations(
                 let tracked = state.slots[*slot as usize];
                 match statement {
                     Stmt::Store(destination, source)
-                        if function.slots.get(*destination as usize).is_some_and(|ty| ty.is_array_builder()) => {
+                        if function.slots.get(*destination as usize).is_some_and(|ty| ty.is_array_builder() || *ty == Ty::Builder) => {
                         let identity = state.operand(source);
                         if identity == 0 && !is_null(source) { return Err(fail()); }
-                        let old = state.slots[*destination as usize];
-                        if destination == slot || (identity != 0 && identity == tracked) { state.reserved = false; }
-                        // Publishing an owner consumes all earlier SSA/slot aliases. Only a fresh
-                        // Load from its new place may authorize another transfer or observation.
-                        // A null store moves the owner into an SSA operand before build/call;
-                        // it clears the place but does not free that pending transferred owner.
-                        if identity != 0 { state.retire(old); }
-                        state.retire(identity);
+                        if destination == slot { state.reserved = false; }
+                        // Store copies a native pointer, including borrowed control and cleanup
+                        // staging. Only explicit Drop/finish retires its physical allocation.
+                        // Source nulling clears that place without reviving an ended identity.
                         state.slots[*destination as usize] = identity;
+                    }
+                    Stmt::Store(destination, source)
+                        if function.slots.get(*destination as usize) == Some(&Ty::Bool) => {
+                        state.slot_bools[*destination as usize] = state.boolean(source);
                     }
                     Stmt::DropFlagMoveOut { slot: source, .. } => {
                         if source == slot { state.reserved = false; }
@@ -9204,7 +9219,12 @@ fn validate_builder_read_reservations(
                         }
                         let (mut changed, mut retired, mut exclusive) = (Vec::new(), Vec::new(), Vec::new());
                         match value {
-                            Rvalue::ArrayBuilderLen(builder)
+                            Rvalue::BuilderBytes(builder) | Rvalue::BuilderLen(builder)
+                            | Rvalue::BuilderToString(builder)
+                            | Rvalue::BuilderWriteStr(builder, _) | Rvalue::BuilderWriteInt(builder, _)
+                            | Rvalue::BuilderWriteBool(builder, _) | Rvalue::BuilderWriteChar(builder, _)
+                            | Rvalue::BuilderWriteFloat(builder, _) | Rvalue::BuilderWriteStrIntStr(builder, ..)
+                            | Rvalue::ArrayBuilderLen(builder)
                             | Rvalue::ArrayBuilderRead { builder, .. }
                             | Rvalue::ArrayBuilderBuild { builder }
                             | Rvalue::ArrayBuilderPush { builder, .. }
@@ -9212,8 +9232,11 @@ fn validate_builder_read_reservations(
                             | Rvalue::ArrayBuilderAppend { builder, .. } => {
                                 let identity = state.operand(builder);
                                 if identity == 0 { return Err(fail()); }
-                                if matches!(value, Rvalue::ArrayBuilderBuild { .. }) { retired.push(identity); }
-                                else if matches!(value, Rvalue::ArrayBuilderPush { .. }
+                                if matches!(value, Rvalue::ArrayBuilderBuild { .. } | Rvalue::BuilderToString(_)) { retired.push(identity); }
+                                else if matches!(value, Rvalue::BuilderWriteStr(..) | Rvalue::BuilderWriteInt(..)
+                                    | Rvalue::BuilderWriteBool(..) | Rvalue::BuilderWriteChar(..)
+                                    | Rvalue::BuilderWriteFloat(..) | Rvalue::BuilderWriteStrIntStr(..)
+                                    | Rvalue::ArrayBuilderPush { .. }
                                     | Rvalue::ArrayBuilderPushStr { .. } | Rvalue::ArrayBuilderAppend { .. }) {
                                     changed.push(identity);
                                 }
@@ -9240,32 +9263,48 @@ fn validate_builder_read_reservations(
                                 }
                                 match modes.as_ref().and_then(|modes| modes.get(index)) {
                                     Some(align_ast::ParamMode::Borrow) => {}
-                                    Some(align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out) => exclusive.push(identity),
+                                    Some(align_ast::ParamMode::BorrowMut | align_ast::ParamMode::Out) => {
+                                        let actual = match argument {
+                                            Operand::BorrowedPlace(place) if place.path.is_empty() => Some(place.slot),
+                                            Operand::Value(value) => match definitions.get(value).copied() {
+                                                Some(Rvalue::Load(place)) => Some(*place), _ => None,
+                                            },
+                                            Operand::Arg(parameter) => function.params.get(*parameter as usize).copied(),
+                                            _ => None,
+                                        }.ok_or_else(&fail)?;
+                                        if state.slots.get(actual as usize).copied() != Some(identity) { return Err(fail()); }
+                                        exclusive.push((identity, actual));
+                                    },
                                     _ => retired.push(identity),
                                 }
                             }
                         }
-                        if tracked != 0 && changed.iter().chain(&retired).chain(&exclusive).any(|identity| *identity == tracked) {
+                        if tracked != 0 && changed.iter().chain(&retired).chain(exclusive.iter().map(|(identity, _)| identity)).any(|identity| *identity == tracked) {
                             state.reserved = false;
                         }
                         for identity in retired { state.retire(identity); }
-                        for identity in exclusive {
-                            // A callee can replace/free its exclusive argument. The updated caller
-                            // place remains owned, but no pre-call SSA may name its new generation.
-                            let places = state.slots.iter().enumerate().filter_map(|(slot, token)|
-                                (*token == identity).then_some(slot)).collect::<Vec<_>>();
+                        for (identity, actual) in exclusive {
+                            // Replacement updates only the caller place passed by reference.
+                            // Any copied slot or pre-call SSA still names the retired allocation.
                             let replacement = state.fresh();
                             state.retire(identity);
-                            for place in places { state.slots[place] = replacement; }
+                            state.slots[actual as usize] = replacement;
                         }
-                        if function.value_tys.get(*id as usize).is_some_and(|ty| ty.is_array_builder()) {
+                        if function.value_tys.get(*id as usize) == Some(&Ty::Bool) {
+                            state.value_bools[*id as usize] = match value {
+                                Rvalue::Use(source) => state.boolean(source),
+                                Rvalue::Load(source) => state.slot_bools.get(*source as usize).copied().flatten(),
+                                _ => None,
+                            };
+                        }
+                        if function.value_tys.get(*id as usize).is_some_and(|ty| ty.is_array_builder() || *ty == Ty::Builder) {
                             let identity = match value {
                                 Rvalue::Load(source) => state.slots.get(*source as usize).copied().unwrap_or(0),
                                 Rvalue::Use(source) => state.operand(source),
                                 Rvalue::RawNull => 0,
                                 // The mandatory producer graph separately authenticates creation
                                 // and returned-owner contracts; it cannot establish temporal life.
-                                Rvalue::ArrayBuilderNew { .. } | Rvalue::Call(..) | Rvalue::CallWithCleanup(_)
+                                Rvalue::BuilderNew { .. } | Rvalue::ArrayBuilderNew { .. } | Rvalue::Call(..) | Rvalue::CallWithCleanup(_)
                                 | Rvalue::CallIndirect { .. } | Rvalue::CallIndirectWithCleanup(_) | Rvalue::RawCall { .. } => state.fresh(),
                                 _ => 0,
                             };
@@ -9279,9 +9318,13 @@ fn validate_builder_read_reservations(
                 }
             }
             state.normalize();
-            for successor in crate::byte_ranges::successors(&block.term) {
-                pending.push_back((successor, state.clone()));
-            }
+            let successors = match &block.term {
+                crate::Term::Branch(condition, then, els) => state.boolean(condition)
+                    .map(|value| vec![if value { *then } else { *els }])
+                    .unwrap_or_else(|| vec![*then, *els]),
+                _ => crate::byte_ranges::successors(&block.term),
+            };
+            for successor in successors { pending.push_back((successor, state.clone())); }
         }
         if !reached { return Err(fail()); }
     }

@@ -2539,3 +2539,17 @@ walks recurse through the other members. RawTryAlloc replays exact i64 input,
 lexical unsafe and builtin Error result, including eager divergence. RawLoad
 continues to reject Scalar::Raw: pointer storage uses the exact RawPointerLoad
 record, and whole-struct raw storage remains C-layout-only.
+
+## Text-builder byte observation (Plan210)
+
+`BuilderBytes { builder }` admits only a bound local/parameter of exact Builder
+type and returns exactly `slice<u8>`. Replayed lifetime/storage analysis binds the
+read-only descriptor to completed owner storage. Text writes freeze selected
+storage identity through scopes and returning branches, reserve each selected
+source through eager argument completion, and retire the old byte observations
+at the reached action. Borrowed storage ordinals are not contained-value roots.
+Actual MIR independently checks the getter's result/handle types, shared access
+and live unchanged native identity; forwarded retired handles cannot revive.
+`builder_byte_views` and forged checked-HIR/MIR owners cover authority,
+self-aliasing, caller effects and stale versus independent/fresh views. Existing
+interface records and the executable compiler fingerprint remain sufficient.

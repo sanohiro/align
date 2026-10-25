@@ -941,6 +941,7 @@ fn walk_body_records<'a>(
                 | ExprKind::FileOpenRo { path: recv, .. } | ExprKind::FileCreateRwExclusive { path: recv }
                 | ExprKind::FileLen { file: recv } | ExprKind::FileSync { file: recv }
                 | ExprKind::BufferBytes { buffer: recv }
+                | ExprKind::BuilderBytes { builder: recv }
                 | ExprKind::StrBytes { inner: recv }
                 | ExprKind::BytesView { bytes: recv, .. }
                 | ExprKind::SliceAsBytes { slice: recv, .. }

@@ -2520,3 +2520,15 @@ ordinary-field transport therefore share one non-owning representation. Explicit
 resource construction remains the way to acquire automatic cleanup. Collection
 and foreign-carrier admission are independent capabilities, not consequences of
 adding an internal Scalar leaf. K1 view authority is not supplied or consumed.
+
+### Unfinished text-prefix observation
+
+Plan210 gives `builder.bytes()` the existing read-only slice contract and the
+builder's exact initialized prefix. Every write invalidates old views even when
+it appends no bytes, so safety does not depend on spare capacity or allocator
+behavior. Selected receiver storage identity remains distinct from contained
+value roots; helper calls preserve that distinction. Explicit scalar/owned
+copies and independent builders remain valid. Plan240 supplies ordinary-call
+read-only authority; no permission bit, implicit clone or alternative accumulator
+is introduced. Builder formation restrictions and typed-builder reads remain
+separate contracts.

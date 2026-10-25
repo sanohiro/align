@@ -1171,6 +1171,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::BufferCapacity { buffer } => ExprKind::BufferCapacity {
             buffer: boxed!(buffer),
         },
+        ExprKind::BuilderBytes { builder } => ExprKind::BuilderBytes {
+            builder: boxed!(builder),
+        },
         ExprKind::BuilderLen { builder } => ExprKind::BuilderLen {
             builder: boxed!(builder),
         },
@@ -2859,6 +2862,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::FileOpenRo { path: recv, .. } | ExprKind::FileCreateRwExclusive { path: recv }
         | ExprKind::FileLen { file: recv } | ExprKind::FileSync { file: recv }
         | ExprKind::BufferBytes { buffer: recv }
+        | ExprKind::BuilderBytes { builder: recv }
         | ExprKind::StrBytes { inner: recv }
         | ExprKind::BytesView { bytes: recv, .. }
         | ExprKind::SliceAsBytes { slice: recv, .. }

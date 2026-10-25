@@ -303,6 +303,7 @@ fn operation_types_match(f: &Function, id: ValueId, rv: &Rvalue) -> bool {
             operand_ty(f, buffer) == Some(Ty::Buffer)
                 && operand_ty(f, data).is_some_and(|ty| ty == bytes || ty == Ty::Str),
         ),
+        Rvalue::BuilderBytes(builder) => (bytes, operand_ty(f, builder) == Some(Ty::Builder)),
         Rvalue::BufferBytes(buffer) => (bytes, operand_ty(f, buffer) == Some(Ty::Buffer)),
         Rvalue::BufferLen(buffer) => (integer, operand_ty(f, buffer) == Some(Ty::Buffer)),
         _ => return false,
