@@ -82677,9 +82677,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // ArraySortCmp shares the fresh pipeline-element policy with the other sort terminals.
         // RawTryAlloc constructs a Copy Result without retained input storage.
         // HttpRespondTimeoutNs consumes two native owners and returns unit/Error.
+        // HttpCtxPeerEof shared-borrows a context and returns Copy bool/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 362,
+            variants, 363,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

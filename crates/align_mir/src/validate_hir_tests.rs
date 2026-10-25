@@ -13065,8 +13065,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // ArraySortCmp adds the explicit two-input comparison terminal.
         // RawTryAlloc adds the atomic non-owning Result allocation producer.
         // HttpRespondTimeoutNs adds one checked three-operand native action.
+        // HttpCtxPeerEof adds a checked shared receiver and Copy bool/Error result.
         variants,
-        362,
+        363,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
