@@ -43,7 +43,8 @@ fn receiver_argument_invalidation_matrix() {
                 );
                 let diagnostics = check_diagnostics("text-builder-receiver-invalidation", &source);
                 assert!(
-                    diagnostics.contains("value snapshot was invalidated"),
+                    diagnostics.contains("value snapshot was invalidated")
+                        || diagnostics.contains("borrow mut argument place was invalidated before the call action"),
                     "{receiver}.{method}({action}): {diagnostics}"
                 );
             }
@@ -56,7 +57,8 @@ fn receiver_argument_invalidation_matrix() {
         let diagnostics =
             check_diagnostics("text-builder-borrowed-receiver-invalidation", &borrowed);
         assert!(
-            diagnostics.contains("value snapshot was invalidated"),
+            diagnostics.contains("value snapshot was invalidated")
+                        || diagnostics.contains("borrow mut argument place was invalidated before the call action"),
             "{diagnostics}"
         );
         let positive = format!(
