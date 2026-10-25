@@ -29,8 +29,10 @@ consumer adoption receipts. The resumed batch delivers AM-R22 in Plan241/#1412,
 R28 and the authentic R49 precision repair in Plan210/#1413, AM-R16/R137 in
 Plan242/#1414, AM-R23 in Plan243/#1415, and AM-R07 in Plan244/#1416. AM-R24/#1410
 preceded this batch. Consumer adoption remains separate; R132/R142 were excluded.
-The source-packet investigations below are complete at the evidence/reproduction
-boundary. R37 resource growth and both R80 precision witnesses remain unfixed.
+The source-packet investigations led to the selected repairs in Plans245–248:
+#1418 closes R80 nested-loop expiry, #1419 closes inactive owned-payload expiry,
+#1420 closes the R37 module memory witness, and Plan248 closes its separate
+whole-project producer CPU witness. No language restriction was required.
 
 ## Authenticated request investigation (2026-10-25)
 
@@ -44,18 +46,18 @@ source and raw logs remain under `.git/handoff`, outside Git/PR publication.
 | Request | Reproduced boundary and completed investigation result | Remaining work |
 | --- | --- | --- |
 | R49 mutable-builder helper precision | The authentic helper previously rejected an unchanged text owner after an independent builder mutation. Plan210/#1413 repairs lost identity for statically headerless owners without weakening unknown collection proofs. Original helper and immutable control pass both check modes on the final Plan210 compiler; mutation negatives still reject. | Consumer verification remains external. |
-| R37 compiler resource growth | On macOS arm64 with opt-level-1 compiler and a supervised 3 GiB RSS cap, the complete inline-builder program passes whole-program check in 19.783 s (sampled peak 292,656 KiB), but MIR emission reaches the cap in 18.621 s. A reduced imported module reaches the same cap in 7.372 s for emission and 8.719 s for per-unit check; the shared-helper control emits in 2.970 s / 114,688 KiB. Samples place the reduced frontend cost in checked-HIR body analysis/MoveCheck loop replay. Whole-program control emission has a separate 240 s bounded stop with active CPU at 605,232 KiB in native producer analysis. | This closes the missing-evidence/reproduction task, not the compiler complexity defect. Separate frontend replay growth from whole-program native-producer cost before changing a solver; preserve the cap and owner comparison. No speed or asymptotic repair is claimed. |
-| R80 optional owned-array assignment | The authentic old FILE_SET branch witness rejects in both frontends while its immutable control passes. A synthetic loop-free reduction also rejects: assign a Result-match payload array into a mutable Option local and return it. Scalar/string controls, immutable conditional binding and else-unwrap assignment pass; a record containing an array fails. The reduced matrix still reproduces on the final Plan242 compiler. | Investigate branch-local active payload/release ownership before any precision fix. Merely ignoring a staging release when a joined Local release also exists is not a sound repair. The separately authenticated nested-MTP witness is reproduced below; its loop-depth defect must not be conflated with this branch-local Option assignment. |
+| R37 compiler resource growth | Historical module per-unit check and MIR emission exceeded a supervised 3 GiB RSS cap; helper whole-project emission separately exceeded 240 s. Fresh tracing corrects the initial startup-sample attribution: the module peak was MIR builder-reservation state inventory, not MoveCheck replay. [Plan247](247-builder-validation-live-state.md)/#1420 closes the module witness near 1.25 GiB. [Plan248](248-producer-query-reuse.md) reuses completed exact producer results: helper project emission completes in 44.080 s / 603,968 KiB and the original inline project in 67.150 s / 1,519,088 KiB. | Consumer repinning and application qualification. These are scoped macOS arm64 opt-level-1 observations under the same 3 GiB/240 s supervisor, not global complexity or portable speed claims. |
+| R80 optional owned-array assignment | The authentic old FILE_SET branch witness and loop-free Result-payload-to-mutable-Option reduction exposed an inactive alternative carrying the active producer's temporary release. [Plan246](246-inactive-owned-payload-releases.md)/#1419 refines only its exact initial Current Producer association, preserving active/unknown alternatives, prior generations and ended evidence. Authentic failure and immutable control now pass both frontends; imported/native allocation and real-expiration owners pass. | Consumer verification. Nested-loop advancement is separately repaired by Plan245/#1418 below; broader exclusive payload access remains excluded. |
 
 The R37 figures are bounded observations, not benchmark claims: RSS was sampled
 at 100 ms, cap overshoot is possible, and the compiler/source bindings
-and per-run hashes are preserved in the private result manifests. R49 final
-replay and R80 final reduction have their own compiler hashes; an earlier R37
-measurement is not silently relabeled as a final-batch measurement. Historical
+and per-run hashes are preserved in the private result manifests. Each repair's
+replay has its own compiler/source binding; earlier investigations are not
+silently relabeled as final repair measurements. Historical
 high-RSS R37 logs justify the bounded supervisor, not reproducing that allocation
 on the current 16 GiB machine. No receiving application was changed or adopted.
 
-### Additional R80: authenticated nested-loop MTP witness
+### Additional R80: authenticated nested-loop MTP witness and repair
 
 The owner confirmed reproduction base `2be36e7669df822c6ddd8516c1b926fe6687197a`
 from the dated manifest and evidence index. The original log predates that commit:
@@ -64,7 +66,12 @@ execution is inferred from Git history/timestamps as
 `b39d9ee88d42ddd47966ce8c6b0c070ea4efd56c`. That inference is recorded separately
 from the authenticated reproduction base; it is not an exact historical checkout.
 
-On candidate `32b99f385716ae427895ce109fe32e3a325eaa6a`, an Align-owned copy of
+[Plan245](245-loop-generation-advance-scope.md)/#1418 repairs this witness by
+advancing only the innermost loop's storage generation on its break path.
+The authenticated failing source and run_case comparison now pass both check
+modes. The source binding and historical reduction below explain that boundary.
+
+On historical candidate `32b99f385716ae427895ce109fe32e3a325eaa6a`, an Align-owned copy of
 the confirmed commit passes both check modes with its `run_case` comparison.
 Replacing only `src/native_cuda_mtp_probe.align` with the retained failing source
 reproduces the expired `expected` diagnostics in both modes. Whole check takes
@@ -106,15 +113,11 @@ fn main() {
 }
 ```
 
-Recommended implementation boundary: loop-scope generation advancement and release
-ownership in sema, independently replayed checked HIR, without weakening actual
-iteration-owned temporary or escaped-view rejection. A closure matrix must cross
-one/two/three/deeper loops, owner declaration depth, normal/back/break/return/`?`
-edges, owning array versus string/scalar controls, helper extraction, imported
-whole/per-unit paths, and real local/temporary expiration negatives. First prove
-which scope owns each release before adjusting `invalidate_iteration_drops`,
-iteration release handling or loop-head joins. R37 and both R80 reductions remain
-unfixed; their selected evidence/reproduction investigations are complete.
+Plan245's closure matrix and owners cover loop depth, declaration depth,
+normal/back/break/return/`?` edges, type siblings, helper extraction,
+whole/per-unit replay and genuine expiration negatives. Plan246 separately
+owns branch-local inactive payload releases. Both exact consumer witnesses now
+pass; Plan247/248 own the two distinct R37 performance repairs.
 
 ## Historical non-deferred reconciliation (2026-10-21)
 
