@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 478] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 479] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -256,6 +256,7 @@ runtime_keys! {
     HttpCtxHeader => "http_ctx_header",
     HttpCtxMethod => "http_ctx_method",
     HttpCtxPath => "http_ctx_path",
+    HttpCtxPeerEof => "http_ctx_peer_eof",
     HttpCtxUpgradeReady => "http_ctx_upgrade_ready",
     HttpGetMany => "http_get_many",
     HttpHeader => "http_header",
@@ -503,7 +504,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 478] = [(); RuntimeKey::ALL.len()];
+const _: [(); 479] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -512,7 +513,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 478);
+        assert_eq!(RuntimeKey::ALL.len(), 479);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

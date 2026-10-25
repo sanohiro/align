@@ -2491,6 +2491,8 @@ pub enum ExprKind {
     },
     /// Pure HTTP/1.1 plus parser-residual readiness query.
     HttpCtxUpgradeReady { ctx: Box<Expr> },
+    /// Non-consuming, nonblocking peer EOF observation. Impure, Result<bool, Error>.
+    HttpCtxPeerEof { ctx: Box<Expr> },
     /// `ctx.body()` — the request body as a `slice<u8>` **view** into `ctx`'s buffer (the `ty` is
     /// [`crate::Ty::Slice`] of `u8`), region-bound to `ctx`. `ctx` is a bound local. Pure. The read-dual
     /// of [`HttpRespBody`].

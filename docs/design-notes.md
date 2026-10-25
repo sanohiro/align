@@ -1,5 +1,12 @@
 # Align Design Notes
 
+A nonblocking HTTP peer EOF probe reports the narrow TCP receive observation.
+Orderly close and send-half-close share EOF; queued bytes can hide it, and no
+probe guarantees future response success. One per-call nonblocking peek avoids
+connection-global mode changes, waits and EINTR loops while preserving request
+bytes and ownership. The caller chooses cancellation boundaries and cleanup.
+[Plan243](impl/243-peer-eof-observation.md) owns this bounded observation.
+
 Bounded ordinary HTTP responses retain the shared HEAD/framing serializer and
 consume both owners only after all arguments complete. A single explicit positive
 budget covers the complete response and safe connection reuse; progress never

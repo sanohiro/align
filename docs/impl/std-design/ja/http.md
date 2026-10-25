@@ -87,6 +87,7 @@ hs.get(name: str) -> Option<str>             // RFC 9110 §5.1 case-insensitive 
                                              // str views the request buffer and INHERITS `hs`'s
                                              // region (so a wrapper taking the view through a
                                              // parameter compiles — item 10 ④)
+ctx.peer_eof() -> Result<bool, Error>         // 非消費・nonblocking の受信 EOF 観測（Plan243）
 ctx.body() -> bytes                          // view into ctx (region-bound)
 rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
                                              // the build-dual of `request`; named apart from the
@@ -1671,3 +1672,34 @@ Linux は MSG_DONTWAIT と SIGPIPE 抑制を使う。Darwin は F_GETFL/F_SETFL 
 設定・復元失敗や期限切れでは追加 I/O・復元をせず閉じる。fd alias を公開しない。
 既存 builder、連続した直列化領域、有界の park 集合を維持し、新しい保持 view や本文
 コピーを追加しない。生成・キャンセルは呼出側の方針。Plan241 が契約と検証行列を管理する。
+
+## 非消費の peer EOF 観測（Plan243）
+
+```text
+ctx.peer_eof() -> Result<bool, Error>
+```
+
+束縛済み local または local を根とする field の context を共有借用する Impure 操作。
+借用 helper 内でも使え、引数・環境設定はない。native 検証後に
+`recv(MSG_PEEK | MSG_DONTWAIT)` を1回呼び、stack 上の最大1 byte を観測する。
+heap allocation、待機、poll loop、EINTR 再試行、socket mode/timeout 変更、所有権移転はない。
+検証失敗時の recv は0回。この上限は操作回数であり、scheduler の実時間保証ではない。
+
+`Ok(true)` は kernel 内の先行 byte の後の受信 EOF を観測する。送信側だけを閉じた
+peer は応答を受信できる場合がある。`Ok(false)` は読み残しや EAGAIN/EWOULDBLOCK を
+含み、生存や次の書き込み成功を証明しない。他の失敗は既存の native Error に変換し、
+EINTR も再試行せず `Error.Code(EINTR)` を返す。recv は保留中の socket error を
+消費する場合がある。各呼び出しは新しい観測であり、前回と結果が異なり得る。
+
+kernel の byte は消費しない。既に先読みした要求の残余 byte にも触れないため、
+application buffer に残余があっても true になり得る。kernel の読み残しは後続 EOF を
+隠し得る。残余がある場合の close と keep-alive 適格性は維持する。Ok/Err とも要求内容、
+view、context 所有権を維持し、respond、stream/Upgrade、Drop は既存契約に従う。
+キャンセル、GPU cleanup、出力公開は呼出側の方針。
+
+A19 ABI は `i32 align_rt_http_ctx_peer_eof(const HttpRequestCtx*, u8*)`。
+null・不正 alignment、context shell と出力の範囲重複、address overflow は参照・出力書き込み・
+recv の前に Invalid。u8 出力の alignment は1。pointer 検証後に出力を zero にして、
+負の fd を recv 前に Invalid とする。成功は厳密に0または1、他の検証後エラーは zero を保持する。
+unsafe 呼出側が生存する context と重複しない書き込み可能な1 byte を保証する。
+生成コードは専用 scratch を使い、status-zero 成功時だけ読む。Plan243 が検証行列を管理する。

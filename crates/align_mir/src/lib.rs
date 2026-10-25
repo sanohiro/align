@@ -2948,6 +2948,8 @@ pub enum Rvalue {
         token: Operand,
         exact: bool,
     },
+    /// One nonblocking peek; status i32 and bool output initialized after native admission.
+    HttpCtxPeerEof { ctx: Operand, out: Slot },
     HttpCtxUpgradeReady {
         ctx: Operand,
     },
@@ -8422,6 +8424,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpHeadersTokensValid { .. }
             | hir::ExprKind::HttpHeadersContainsToken { .. }
             | hir::ExprKind::HttpCtxUpgradeReady { .. }
+        | hir::ExprKind::HttpCtxPeerEof { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
@@ -8627,6 +8630,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpHeadersTokensValid { .. }
         | hir::ExprKind::HttpHeadersContainsToken { .. }
         | hir::ExprKind::HttpCtxUpgradeReady { .. }
+            | hir::ExprKind::HttpCtxPeerEof { .. }
         | hir::ExprKind::HttpCtxBody { .. }
         | hir::ExprKind::HttpResponseBuilder { .. }
         | hir::ExprKind::HttpRbHeader { .. }
@@ -10086,6 +10090,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpHeadersTokensValid { .. }
             | hir::ExprKind::HttpHeadersContainsToken { .. }
             | hir::ExprKind::HttpCtxUpgradeReady { .. }
+            | hir::ExprKind::HttpCtxPeerEof { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
@@ -21678,7 +21683,7 @@ fn emit_open_handle_result(
     let rslot = b.new_slot(result_ty);
     b.terminate(Term::Branch(Operand::Value(isok), ok_bb, err_bb));
 
-    // Ok: load the handle pointer and wrap it (the unwrapped local owns it — `Drop` closes it).
+    // Ok: only success publishes an initialized payload. Wrap it using its existing ownership.
     b.cur = ok_bb;
     let h = b.fresh_value(handle_ty);
     b.push(Stmt::Let(h, Rvalue::Load(out)));
@@ -21687,7 +21692,7 @@ fn emit_open_handle_result(
     b.push(Stmt::Store(rslot, Operand::Value(okv)));
     b.terminate(Term::Goto(join));
 
-    // Err: the out slot was zeroed (null handle) → nothing to close; map the status.
+    // Err: reconstruct from status without loading the output; admission may leave it untouched.
     b.cur = err_bb;
     let errv = b.fresh_value(result_ty);
     let ec = make_error_from_status(b, code, result_ty);
@@ -22570,6 +22575,13 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
                 ),
             ));
             Operand::Value(value)
+        }
+        hir::ExprKind::HttpCtxPeerEof { ctx } => {
+            let ctx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
+            let out = b.new_slot(Ty::Bool);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpCtxPeerEof { ctx, out }));
+            emit_open_handle_result(b, code, out, Ty::Bool, e.ty)
         }
         hir::ExprKind::HttpCtxUpgradeReady { ctx } => {
             let ctx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));

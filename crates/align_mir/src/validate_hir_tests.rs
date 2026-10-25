@@ -13065,8 +13065,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // ArraySortCmp adds the explicit two-input comparison terminal.
         // RawTryAlloc adds the atomic non-owning Result allocation producer.
         // HttpRespondTimeoutNs adds one checked three-operand native action.
+        // HttpCtxPeerEof adds a checked shared receiver and Copy bool/Error result.
         variants,
-        362,
+        363,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -21515,6 +21516,34 @@ fn indexed_array_field_length_permission_stops_at_calls() -> Result<(), String> 
     Ok(())
 }
 
+
+#[test]
+fn http_peer_eof_hir_shape_and_effect() -> Result<(), String> {
+    let source = "import std.http\nfn observe(borrow ctx: http_request_ctx) -> Result<bool, Error> = ctx.peer_eof()\nfn readiness(borrow ctx: http_request_ctx) -> bool = ctx.upgrade_ready()\nfn main() {}";
+    let original = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&original));
+    let effects = align_sema::fn_effects(&original, &Default::default());
+    assert_eq!(effects.get("observe"), Some(&FnEffect::Impure));
+    assert_eq!(effects.get("readiness"), Some(&FnEffect::Pure));
+    for mutation in 0..5 {
+        let mut bad = original.clone();
+        let function = bad.fns.iter_mut().find(|function| function.name == "observe").ok_or("observe")?;
+        let expression = function.body.value.as_deref_mut().ok_or("observation")?;
+        let hir::ExprKind::HttpCtxPeerEof { ctx } = &mut expression.kind else { return Err("observation shape".into()); };
+        match mutation {
+            0 => expression.ty = Ty::Bool,
+            1 => ctx.ty = Ty::HttpServer,
+            2 => ctx.kind = hir::ExprKind::Local(u32::MAX),
+            3 => ctx.kind = hir::ExprKind::Bool(false),
+            _ => {
+                let value = ctx.as_ref().clone();
+                ctx.kind = hir::ExprKind::Block(hir::Block { stmts: Vec::new(), value: Some(Box::new(value)) });
+            }
+        }
+        assert_body_entrypoints_empty("peer EOF malformed HIR", &bad);
+    }
+    Ok(())
+}
 
 #[test]
 fn indexed_field_view_hir_matrix() -> Result<(), String> {

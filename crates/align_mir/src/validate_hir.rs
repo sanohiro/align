@@ -4942,6 +4942,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpHeadersTokensValid { .. }
             | hir::ExprKind::HttpHeadersContainsToken { .. }
             | hir::ExprKind::HttpCtxUpgradeReady { .. }
+            | hir::ExprKind::HttpCtxPeerEof { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
@@ -5324,6 +5325,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpHeadersTokensValid { .. }
             | hir::ExprKind::HttpHeadersContainsToken { .. }
             | hir::ExprKind::HttpCtxUpgradeReady { .. }
+            | hir::ExprKind::HttpCtxPeerEof { .. }
             | hir::ExprKind::HttpCtxBody { .. }
             | hir::ExprKind::HttpResponseBuilder { .. }
             | hir::ExprKind::HttpRbHeader { .. }
@@ -10254,6 +10256,10 @@ impl<'a> BodyValidator<'a> {
                 (self.exclusive_handle_place(context, server, Ty::HttpServer)
                     && server.ty == Ty::HttpServer && limit.ty == i64)
                     .then(|| strict(Ty::Unit, &[server, limit]))?
+            }
+            hir::ExprKind::HttpCtxPeerEof { ctx } => {
+                (self.http_request_ctx_place(ctx, context) && ctx.ty == Ty::HttpRequestCtx)
+                    .then(|| result(Ty::Bool, &[ctx]))?
             }
             hir::ExprKind::HttpCtxMethod { ctx }
             | hir::ExprKind::HttpCtxPath { ctx }

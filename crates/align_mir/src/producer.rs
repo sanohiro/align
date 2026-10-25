@@ -1756,6 +1756,11 @@ pub fn native_owner_mir_contract<'a>(
             contract.result = i32_ty;
             contract.operands = vec![(writer, Ty::Writer, read)];
         }
+        Rvalue::HttpCtxPeerEof { ctx, out } => {
+            contract.result = i32_ty;
+            contract.outputs = vec![(*out, Ty::Bool)];
+            contract.operands = vec![(ctx, Ty::HttpRequestCtx, read)];
+        }
         Rvalue::StrParseI64 { input, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, i64_ty)];
@@ -1951,7 +1956,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
     let owned = |slot| vec![(slot, Owned)];
     match rvalue {
         Rvalue::ProcessLive { out, .. } => out.iter().map(|slot|(*slot,Owned)).collect(),
-        Rvalue::ChildWait { out, .. } => vec![(*out, Owned)],
+        Rvalue::ChildWait { out, .. } | Rvalue::HttpCtxPeerEof { out, .. } => vec![(*out, Owned)],
         Rvalue::FsTree { output, .. } => fs_tree_output_slots(*output).into_iter().map(|slot| (slot, Owned)).collect(),
         Rvalue::JsonDecode { out, .. }
         | Rvalue::JsonDecodeStructArray { out, .. }
@@ -7015,6 +7020,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::HttpHeadersTokensValid { .. }
             | Rvalue::HttpHeadersContainsToken { .. }
             | Rvalue::HttpCtxUpgradeReady { .. }
+            | Rvalue::HttpCtxPeerEof { .. }
             | Rvalue::HttpCtxBody { .. }
             | Rvalue::HttpResponseBuilder { .. }
             | Rvalue::HttpRbHeader { .. }
