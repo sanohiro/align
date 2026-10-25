@@ -22,7 +22,26 @@ invariants and prerequisites, acceptance owners and an implementation recommenda
 A public-contract or safety-strategy change then follows the ordinary ledger,
 closure-matrix and independent-review gates. Consumer adoption remains external.
 
-## Non-deferred request reconciliation (2026-10-21)
+## Current continuation (2026-10-25)
+
+Plan240/#1409 delivers K1's selected call-boundary repair, with all three
+consumer adoption receipts. The owner selected the remaining assessed requests
+except R132/R142, then ended this machine's implementation after AM-R24/#1410.
+The live [HANDOFF](../../HANDOFF.md) owns the receiving-machine queue, rough
+scope and difficulty, specification preference and evidence-transfer instructions.
+The historical assessments below do not reopen K1 or override that selection.
+
+The exact R37/R49/R80 historical source/log packet was found locally and
+hash-authenticated on 2026-10-25. All 362 source entries agree with private
+align-llm commit `33e4d3ff40f45f48a4edf2a2f155a9e7966aeaed`; the failing variant
+hashes agree with their retained receipts. A compact private transfer archive
+retains that snapshot, variants, passing controls and replay instructions.
+The archive is outside public Git and must be transferred separately. No
+current-compiler reproduction or repair is claimed. R37 still requires explicit
+memory limits and phase isolation; the later R80 nested-loop MTP witness needs
+its separate import revision authenticated before replay.
+
+## Historical non-deferred reconciliation (2026-10-21)
 
 The owner's follow-up selects every remaining request except deferred work.
 All three registers were reread. Plans231–236 below are already merged;
@@ -61,7 +80,7 @@ entries retain their existing receipts and limits.
 | Media AM-R07 | External writable read destinations remain separate. K1 plus an explicit exclusive-view formation, initialization, bounds/overlap, native lifetime and synchronous I/O contract are prerequisites. Fallible allocation does not create these permissions or establish a pinned-memory performance claim. |
 | LLM R28/R132/R137/R142 and related media view composition | Reconcile the current remaining portions against shipped builder Copy reads, owning-field extraction and indexed independent Copy observations. Use [Plan61](61-interprocedural-view-access-plan.md), [Plan196](196-indexed-array-field-length.md) and [Plan210](210-text-builder-byte-views.md) to identify the exact missing interprocedural read-only/writable authority and retained-view proof. Do not reopen already delivered portions or widen a readable header into writable/owned backing. |
 
-## K1 scope and difficulty assessment (2026-10-20)
+## Historical K1 scope and difficulty assessment (2026-10-20)
 
 The owner selected independent AM-R16 element reads first and an assessment of
 K1 before implementation. PR1398 delivers those reads. Retained fixed-field
@@ -127,12 +146,12 @@ receives the ordinary independent strategy review before compiler changes.
 
 ## Evidence-dependent compiler triage
 
-The 2026-10-19 LLM reconciliation names the following residuals. Their exact
-`request-adoption-20261019` source/log packet was not present in the available
-local consumer/cache or its GitHub main tree during the 2026-10-20 audit. The
-register supplies descriptions, not a reduced reproducer for these cells.
-Acquire shared source and compact receipts first; do not attribute them to the
-historical request's original cause or claim a repair from an older provider PR.
+The 2026-10-19 LLM reconciliation names the following residuals. Its exact
+`request-adoption-20261019` source/log packet was unavailable during the
+2026-10-20 audit and is now retained in the private transfer packet above.
+Reproduce those authenticated sources on current main; do not attribute them
+to the historical request's original cause or claim a repair from an older
+provider PR. The investigation/acceptance boundaries below remain applicable.
 
 | Residual | First bounded investigation and acceptance |
 | --- | --- |
