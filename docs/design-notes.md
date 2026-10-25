@@ -1,5 +1,13 @@
 # Align Design Notes
 
+Bounded ordinary HTTP responses retain the shared HEAD/framing serializer and
+consume both owners only after all arguments complete. A single explicit positive
+budget covers the complete response and safe connection reuse; progress never
+restarts it. Checked Darwin mode restoration is part of success, so a partially
+written or uncertain-mode socket cannot enter the keep-alive pool. The existing
+staged consuming-argument machinery covers early exits without a second ownership
+model. [Plan241](impl/241-bounded-http-responses.md) owns the contract.
+
 Function boundaries make view mutation explicit. A value slice parameter or
 captured view is read-only; a helper that writes uses `borrow mut` or `out`.
 Ordinary returned views are read-only too. This rule removes the need to prove

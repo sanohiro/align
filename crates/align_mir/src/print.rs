@@ -1306,6 +1306,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::HttpResponseBuilder { status } => format!("http_response({})", operand_str(status)),
         Rvalue::HttpRbHeader { rb, name, value } => format!("http_rb_header({}, {}, {})", operand_str(rb), operand_str(name), operand_str(value)),
         Rvalue::HttpRbBody { rb, data } => format!("http_rb_body({}, {})", operand_str(rb), operand_str(data)),
+        Rvalue::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => format!("http_respond_timeout_ns({}, {}, {})", operand_str(ctx), operand_str(rb), operand_str(timeout_ns)),
         Rvalue::HttpRespond { ctx, rb } => format!("http_respond({}, {})", operand_str(ctx), operand_str(rb)),
         Rvalue::HttpRespondStream { ctx, rb, out } => format!("http_respond_stream({}, {}, -> _{out})", operand_str(ctx), operand_str(rb)),
         Rvalue::HttpRespondUpgrade { ctx, rb, out } => format!("http_respond_upgrade({}, {}, -> _{out})", operand_str(ctx), operand_str(rb)),

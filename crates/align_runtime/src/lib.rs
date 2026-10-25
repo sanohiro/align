@@ -29,6 +29,8 @@ mod sse_storage_tests;
 #[cfg(test)]
 mod http_stream_tests;
 #[cfg(test)]
+mod http_response_budget_tests;
+#[cfg(test)]
 mod http_accept_budget_tests;
 #[cfg(test)]
 mod net_service_tests;
@@ -27877,10 +27879,24 @@ fn http_serialize_response_inner(rb: &ResponseBuilder, suppress_body: bool, pers
 /// [`align_rt_http_response_new`] (moved in — freed here), or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mut ResponseBuilder) -> i32 {
+    unsafe { http_respond_impl(ctx, rb, None, &mut NativeHttpStreamWriteOps) }
+}
+
+/// Consume both response owners with one positive total write budget (Plan241).
+///
+/// # Safety
+/// Same live/aligned owner requirements as `align_rt_http_respond`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_respond_timeout_ns(ctx: *mut HttpRequestCtx, rb: *mut ResponseBuilder, timeout_ns: i64) -> i32 {
+    unsafe { http_respond_impl(ctx, rb, Some(timeout_ns), &mut NativeHttpStreamWriteOps) }
+}
+
+unsafe fn http_respond_impl<O: HttpStreamWriteOps>(ctx: *mut HttpRequestCtx, rb: *mut ResponseBuilder, timeout_ns: Option<i64>, ops: &mut O) -> i32 {
     // Take ownership of BOTH moved-in handles FIRST, so every early return frees them (mirror
     // `http_client_request`): the ctx's `Drop` closes its fd; the builder's `Drop` frees its buffers.
     let ctx_owned = if ctx.is_null() { None } else { Some(unsafe { Box::from_raw(ctx) }) };
     let rb_owned = if rb.is_null() { None } else { Some(unsafe { Box::from_raw(rb) }) };
+    if timeout_ns.is_some_and(|ns| ns <= 0) { return AL_INVALID; }
     let (Some(mut c), Some(r)) = (ctx_owned, rb_owned) else {
         return AL_INVALID; // a null handle — both `Drop` here (fd closed, buffers freed)
     };
@@ -27889,6 +27905,10 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
     if c.fd < 0 {
         return AL_INVALID;
     }
+    let budget = timeout_ns.and_then(|ns| ops.start_budget(ns));
+    // Positive inputs always produce a finite budget. Keep injected/native failures fail closed.
+    if timeout_ns.is_some() && budget.is_none() { return AL_INVALID; }
+    if http_response_expired(budget.as_ref(), ops) { return AL_TIMEOUT; }
     // RFC 9110 §9.3.2: a HEAD response carries the same headers the GET would have — including
     // the body's `Content-Length` — but MUST NOT send the body bytes. Enforced here, at the
     // protocol boundary, so every caller (incl. a framework routing HEAD to a GET handler) is
@@ -27903,14 +27923,27 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
         true => c.park.take(),
         false => None,
     };
-    let mut slot = park.as_ref().map(|p| p.lock().unwrap_or_else(|e| e.into_inner()));
-    let persistent = matches!(slot.as_deref(), Some(ParkSlot::Live(_)));
-    let bytes = match http_serialize_response_inner(&r, head_only, persistent) {
-        Ok(b) => b,
-        Err(s) => return s, // `c` drops → the accepted fd is closed
+    let mut slot = match park.as_ref() {
+        Some(park) => match http_response_lock(park, budget.as_ref(), ops) {
+            Ok(slot) => Some(slot), Err(status) => return status,
+        },
+        None => None,
     };
-    // One SIGPIPE-safe write of the whole response.
-    let status = unsafe { http_send_all(c.fd, &bytes) };
+    if http_response_expired(budget.as_ref(), ops) { return AL_TIMEOUT; }
+    let persistent = matches!(slot.as_deref(), Some(ParkSlot::Live(_)));
+    let serialized = http_serialize_response_inner(&r, head_only, persistent);
+    if http_response_expired(budget.as_ref(), ops) { return AL_TIMEOUT; }
+    let bytes = match serialized {
+        Ok(bytes) => bytes,
+        Err(status) => return status,
+    };
+    let status = if let Some(budget) = budget {
+        http_response_write(c.fd, &bytes, budget, persistent, ops)
+    } else {
+        // Preserve ordinary respond's clock-free blocking path.
+        unsafe { http_send_all(c.fd, &bytes) }
+    };
+    if http_response_expired(budget.as_ref(), ops) { return AL_TIMEOUT; }
     if status == 0
         && persistent
         && let Some(guard) = slot.as_mut()
@@ -27922,6 +27955,7 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
         if fds.len() >= HTTP_MAX_PARKED_CONNS {
             unsafe { close(fds.remove(0)) };
         }
+        if http_response_expired(budget.as_ref(), ops) { return AL_TIMEOUT; }
         fds.push(c.fd);
         c.fd = -1;
     }
@@ -27929,6 +27963,60 @@ pub unsafe extern "C" fn align_rt_http_respond(ctx: *mut HttpRequestCtx, rb: *mu
     // `c` (and its fd, unless parked above) drops at scope end → the connection is closed. `r`'s
     // buffers likewise drop here.
     status
+}
+
+fn http_response_expired<O: HttpStreamWriteOps>(budget: Option<&MonotonicTimeoutBudget>, ops: &mut O) -> bool {
+    budget.is_some_and(|budget| ops.remaining(budget).is_none())
+}
+
+fn http_response_lock<'a, O: HttpStreamWriteOps>(park: &'a std::sync::Mutex<ParkSlot>, budget: Option<&MonotonicTimeoutBudget>, ops: &mut O) -> Result<std::sync::MutexGuard<'a, ParkSlot>, i32> {
+    let Some(budget) = budget else {
+        return Ok(park.lock().unwrap_or_else(|error| error.into_inner()));
+    };
+    loop {
+        if ops.remaining(budget).is_none() { return Err(AL_TIMEOUT); }
+        let attempt = park.try_lock();
+        let Some(remaining) = ops.remaining(budget) else { return Err(AL_TIMEOUT); };
+        match attempt {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                ops.pause(remaining.min(std::time::Duration::from_millis(1)));
+                if ops.remaining(budget).is_none() { return Err(AL_TIMEOUT); }
+            }
+        }
+    }
+}
+
+fn http_response_write<O: HttpStreamWriteOps>(fd: i32, bytes: &[u8], budget: MonotonicTimeoutBudget, persistent: bool, ops: &mut O) -> i32 {
+    let original_flags = if ops.requires_nonblocking_mode() {
+        if ops.remaining(&budget).is_none() { return AL_TIMEOUT; }
+        let got = ops.get_flags(fd);
+        if ops.remaining(&budget).is_none() { return AL_TIMEOUT; }
+        let Some(flags) = i32::try_from(got.result).ok().filter(|flags| *flags >= 0) else {
+            return io_read_write_status(&std::io::Error::from_raw_os_error(got.errno));
+        };
+        if ops.remaining(&budget).is_none() { return AL_TIMEOUT; }
+        // Reassert socket-effective mode even if a previous flag read already shows the bit.
+        let set = ops.set_flags(fd, flags | libc::O_NONBLOCK);
+        if ops.remaining(&budget).is_none() { return AL_TIMEOUT; }
+        if set.result != 0 {
+            return io_read_write_status(&std::io::Error::from_raw_os_error(set.errno));
+        }
+        Some(flags)
+    } else { None };
+    let mut parts = [libc::iovec { iov_base: bytes.as_ptr().cast_mut().cast(), iov_len: bytes.len() }];
+    let status = http_stream_write_parts(fd, &mut parts, bytes.len(), Some(budget), original_flags.is_some(), ops);
+    if status != 0 { return status; }
+    if persistent && let Some(flags) = original_flags {
+        if ops.remaining(&budget).is_none() { return AL_TIMEOUT; }
+        let restored = ops.set_flags(fd, flags);
+        if ops.remaining(&budget).is_none() { return AL_TIMEOUT; }
+        if restored.result != 0 {
+            return io_read_write_status(&std::io::Error::from_raw_os_error(restored.errno));
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -28648,6 +28736,10 @@ unsafe fn http_stream_bytes<'a>(ptr: *const u8, len: i64) -> Result<&'a [u8], i3
 
 /// One statically dispatched native operation, also used by partial-write and pointer owners.
 trait HttpStreamWriteOps {
+    fn pause(&mut self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
+
     fn requires_nonblocking_mode(&self) -> bool {
         cfg!(any(target_os = "macos", target_os = "ios"))
     }

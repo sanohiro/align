@@ -1636,7 +1636,38 @@ per-call nonblocking recv。shared server は別々の SO_REUSEPORT listener を
 検証済み SIGPIPE 方針を維持し、Drop はモードを復元せず所有者を閉じる。
 
 完全な要求の所有権と response/Upgrade は維持する。通常の ctx.respond の出力を
-制限しないため、supervisor は期限を設定した stream で返信する。reactor、streaming
+制限しないため、supervisor は respond_timeout_ns または期限を設定した stream で返信する。reactor、streaming
 upload API、pkg.web の自動 timeout は追加しない。ABI は A04
 `i32 align_rt_http_server_accept_timeout_ns(ptr, i64)`、interface format 17 を維持する。
 公開契約・source/native/platform 検証行列は plan 90 が管理する。
+
+## 通常応答の有限時間制限（Plan241）
+
+```text
+ctx.respond_timeout_ns(rb: response_builder, timeout_ns: i64) -> Result<(), Error>
+```
+
+Impure な操作で、Invalid・Timeout・native エラーを含む全結果で ctx と builder を
+消費する。レシーバー、builder、期限を順に1回評価し、全引数の完了後に所有権を移す。
+途中の早期終了では生成済み一時所有者を解放する。後の引数による先の所有者の無効化は
+拒否する。respond と同じ束縛済み place を受け付け、既定引数はない。
+
+所有権取得後、正の期限、両ハンドル、未消費の context の順に検証する。zero・負数は
+出力前に Invalid。park lock 取得と通常の応答検証・直列化の前に1つの単調時計期限を
+開始する。lock 試行、直列化、native 設定、書き込み、readiness 待機、復元の前後と
+成功・park 前に確認し、同時の native 成功・エラーより期限切れを優先する。
+期限前の本文禁止 status・status・呼出側 framing の検証順序は維持する。
+lock 競合時は残り時間以内・最大1msの休止で再試行する。ハードリアルタイムや
+allocator の所要時間を保証しない。
+
+通常の framing を共有し、完全一致の HEAD は Content-Length を維持して本文を
+送らない。他の method、本文禁止 status、HTTP/1.0、要求側 close、残存 pipeline、
+終了済み server の規則は維持する。部分書き込み、EINTR、EAGAIN/readiness 再試行は
+同じ期限を共有し、期限後に zero-time probe をしない。失敗は1回閉じ、部分応答を
+park しない。既存 lock の下で完全成功した適格接続だけを再利用する。
+
+Linux は MSG_DONTWAIT と SIGPIPE 抑制を使う。Darwin は F_GETFL/F_SETFL を検証して
+他のフラグを保持しつつ O_NONBLOCK を再設定し、park 前に元のフラグの復元成功を確認する。
+設定・復元失敗や期限切れでは追加 I/O・復元をせず閉じる。fd alias を公開しない。
+既存 builder、連続した直列化領域、有界の park 集合を維持し、新しい保持 view や本文
+コピーを追加しない。生成・キャンセルは呼出側の方針。Plan241 が契約と検証行列を管理する。

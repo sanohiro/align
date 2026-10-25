@@ -18030,6 +18030,12 @@ impl EffectScan<'_> {
                 walk!(server);
                 walk!(limit);
             }
+            ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => {
+                walk!(ctx);
+                walk!(rb);
+                walk!(timeout_ns);
+                self.impure_direct = true;
+            }
             ExprKind::HttpRespond { ctx, rb } => {
                 walk!(ctx);
                 walk!(rb);
@@ -26217,7 +26223,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpResponseBuilder { .. }
             | ExprKind::HttpRbHeader { .. }
             | ExprKind::HttpRbBody { .. }
-            | ExprKind::HttpRespond { .. }
+            | ExprKind::HttpRespondTimeoutNs { .. } | ExprKind::HttpRespond { .. }
             | ExprKind::HttpRespondStream { .. }
             | ExprKind::HttpHeadersCount { .. }
             | ExprKind::HttpHeadersTokensValid { .. }
@@ -26721,7 +26727,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpResponseBuilder { .. }
             | ExprKind::HttpRbHeader { .. }
             | ExprKind::HttpRbBody { .. }
-            | ExprKind::HttpRespond { .. }
+            | ExprKind::HttpRespondTimeoutNs { .. } | ExprKind::HttpRespond { .. }
             | ExprKind::HttpRespondStream { .. }
             | ExprKind::HttpRespondUpgrade { .. }
             | ExprKind::HttpUpgradeReadExact { .. }
@@ -30420,6 +30426,11 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(limit, depth);
             }
             ExprKind::HttpAccept { server } => self.walk(server, depth),
+            ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => {
+                self.walk(ctx, depth);
+                self.walk(rb, depth);
+                self.walk(timeout_ns, depth);
+            }
             ExprKind::HttpRespond { ctx, rb } => {
                 self.walk(ctx, depth);
                 self.walk(rb, depth);
@@ -33237,7 +33248,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpResponseBuilder { .. }
         | ExprKind::HttpRbHeader { .. }
         | ExprKind::HttpRbBody { .. }
-        | ExprKind::HttpRespond { .. }
+        | ExprKind::HttpRespondTimeoutNs { .. } | ExprKind::HttpRespond { .. }
         | ExprKind::HttpRespondStream { .. }
         | ExprKind::HttpRespondUpgrade { .. }
         | ExprKind::HttpUpgradeReadExact { .. }
@@ -36030,6 +36041,12 @@ impl<'a> MoveCheck<'a> {
             if let ExprKind::ArrayTruncate { receiver, .. } = &expression.kind {
                 arguments.insert(Self::expr_key(receiver));
                 places.insert(Self::expr_key(receiver));
+            }
+            if let ExprKind::HttpRespondTimeoutNs { ctx, rb, .. } = &expression.kind {
+                for input in [ctx.as_ref(), rb.as_ref()] {
+                    arguments.insert(Self::expr_key(input));
+                    places.insert(Self::expr_key(input));
+                }
             }
             if let Some(receiver) = Self::http_timeout_action_receiver(&expression.kind)
                 .or_else(|| Self::cli_action_receiver(&expression.kind)) {
@@ -43413,7 +43430,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpGetMany { .. } | ExprKind::HttpServe { .. } | ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | ExprKind::HttpAccept { .. }
             | ExprKind::HttpResponseBuilder { .. } | ExprKind::HttpRbHeader { .. } | ExprKind::HttpRbBody { .. }
-            | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
+            | ExprKind::HttpRespondTimeoutNs { .. } | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpHeadersCount { .. } | ExprKind::HttpHeadersTokensValid { .. }
             | ExprKind::HttpHeadersContainsToken { .. } | ExprKind::HttpCtxUpgradeReady { .. }
             | ExprKind::HttpRespondUpgrade { .. } | ExprKind::HttpUpgradeReadExact { .. }
@@ -46994,6 +47011,7 @@ impl<'a> MoveCheck<'a> {
 
     fn action_values(expression: &Expr) -> Vec<&Expr> {
         match &expression.kind {
+            ExprKind::HttpRespondTimeoutNs { ctx, rb, .. } => vec![ctx, rb],
             ExprKind::LogNew { output, .. } => vec![output],
             ExprKind::XmlParse { input } => vec![input],
             ExprKind::StructLit { fields, .. } => fields.iter().collect(),
@@ -47313,6 +47331,14 @@ impl<'a> MoveCheck<'a> {
             self.record_mutable_access_roots([Self::closure_environment_root(expression)].into());
         }
         match &expression.kind {
+            ExprKind::HttpRespondTimeoutNs { ctx, rb, .. } => {
+                for argument in [ctx.as_ref(), rb.as_ref()] {
+                    if self.ended_value_snapshot(Self::expr_key(argument)).is_none() {
+                        self.consume_completed_action_value(argument, moved);
+                        self.end_completed_owned_headers(argument, BorrowEnd::Consumed);
+                    }
+                }
+            }
             ExprKind::Call { func, args, .. } => {
                 self.check_callback_requirements(func, args, expression.span);
                 self.add_direct_parallel_transfer(func, args);
@@ -47655,7 +47681,8 @@ impl<'a> MoveCheck<'a> {
     fn kind_has_ownership_action(kind: &ExprKind) -> bool {
         matches!(
             kind,
-            ExprKind::Call { .. }
+            ExprKind::HttpRespondTimeoutNs { .. }
+                | ExprKind::Call { .. }
                 | ExprKind::CallFnValue { .. }
                 | ExprKind::RawCall { .. }
                 | ExprKind::StructLit { .. }
@@ -50981,6 +51008,11 @@ impl<'a> MoveCheck<'a> {
                 move_expr!(self, limit, moved, false, false);
             }
             ExprKind::HttpAccept { server } => move_expr!(self, server, moved, false, false),
+            ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => {
+                move_expr_deferred!(self, ctx, moved);
+                move_expr_deferred!(self, rb, moved);
+                move_expr!(self, timeout_ns, moved, false, false);
+            }
             ExprKind::HttpRespond { ctx, rb } => {
                 move_expr!(self, ctx, moved, true, true);
                 move_expr!(self, rb, moved, true, true);
@@ -58410,7 +58442,7 @@ impl<'a, 't> Checker<'a, 't> {
             // intercept above, alongside `tcp_listener`'s accept — the name is shared.)
             // Request-context getters + `respond` on an `http_request_ctx`: `ctx.method()` / `ctx.path()`
             // / `ctx.headers()` / `ctx.body()` (views) and `ctx.respond(rb)` (consumes ctx + rb).
-            "method" | "path" | "headers" | "body" | "upgrade_ready" | "respond" | "respond_stream" | "respond_upgrade" if recv_ty == Ty::HttpRequestCtx => {
+            "method" | "path" | "headers" | "body" | "upgrade_ready" | "respond" | "respond_timeout_ns" | "respond_stream" | "respond_upgrade" if recv_ty == Ty::HttpRequestCtx => {
                 self.check_http_ctx_method(recv_expr, method, args, span)
             }
             // The old spelling. `ctx.header(name)` was replaced by `ctx.headers().get(name)` (item 10
@@ -69674,6 +69706,25 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "respond_timeout_ns" => {
+                if args.len() != 2 {
+                    self.diags.error(format!("'.respond_timeout_ns()' takes 2 arguments (response_builder, i64), got {}", args.len()), span);
+                    return err;
+                }
+                let rb = self.check_expr(&args[0], None);
+                let timeout_ns = self.check_expr(&args[1], Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                if rb.ty == Ty::Error || timeout_ns.ty == Ty::Error { return err; }
+                if self.resolve(rb.ty) != Ty::ResponseBuilder {
+                    self.diags.error("'.respond_timeout_ns()' expects a response_builder as its first argument".to_string(), args[0].span);
+                    return err;
+                }
+                if !self.require_i64_arg(timeout_ns.ty, args[1].span, "'.respond_timeout_ns()' timeout_ns") { return err; }
+                Expr {
+                    kind: ExprKind::HttpRespondTimeoutNs { ctx: Box::new(recv_expr), rb: Box::new(rb), timeout_ns: Box::new(timeout_ns) },
+                    ty: Ty::Result(Scalar::Unit, Scalar::Enum(self.error_enum_id)),
+                    span,
+                }
+            }
             "respond" => {
                 if args.len() != 1 {
                     self.diags.error(format!("'.respond()' takes 1 argument (a response_builder), got {}", args.len()), span);
@@ -69741,7 +69792,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / headers / body / upgrade_ready / respond / respond_stream / respond_upgrade)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / headers / body / upgrade_ready / respond / respond_timeout_ns / respond_stream / respond_upgrade)"), span);
                 err
             }
         }
@@ -73785,6 +73836,11 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(limit);
             }
             ExprKind::HttpAccept { server } => self.finalize_expr(server),
+            ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } => {
+                self.finalize_expr(ctx);
+                self.finalize_expr(rb);
+                self.finalize_expr(timeout_ns);
+            }
             ExprKind::HttpRespond { ctx, rb } => {
                 self.finalize_expr(ctx);
                 self.finalize_expr(rb);

@@ -1696,8 +1696,45 @@ them, even when the flag bit already appears clear. Failure closes that fd once.
 Retain checked SIGPIPE behavior; Drop closes owners without mode restoration.
 
 Complete request ownership and response/Upgrade behavior remain. This budget does
-not bound ordinary ctx.respond output; a supervisor configures a stream for its
-replies. No reactor, streaming-upload API or automatic pkg.web timeout is added.
+not bound ordinary ctx.respond output; a supervisor selects respond_timeout_ns
+or configures a stream for its replies. No reactor, streaming-upload API or automatic pkg.web timeout is added.
 The ABI is A04 `i32 align_rt_http_server_accept_timeout_ns(ptr, i64)`; interface
 format 17 remains. [Plan 90](../90-multimodal-library-foundation-plan.md) owns the
 public ledger and source/native/platform acceptance matrix.
+
+## Bounded ordinary response (Plan241)
+
+```text
+ctx.respond_timeout_ns(rb: response_builder, timeout_ns: i64) -> Result<(), Error>
+```
+
+The Impure operation consumes both context and builder, including on Invalid,
+Timeout or native error. Receiver, builder and timeout evaluate once in order;
+all transfers wait for the completed action, and eager exits clean up completed
+fresh temporaries. A later operand cannot invalidate an earlier owner. The
+receiver admits the same bound places as respond. No default argument exists.
+
+After taking ownership, validate a positive budget, both handles and unspent
+context. Zero/negative values are Invalid without output. Start one monotonic
+budget before acquiring the parking lock and serializing with the ordinary
+response validator. Check before/after lock attempts, serialization, setup,
+write, readiness and restoration, and before success/parking. Expiration wins
+over a simultaneous native success/error; existing bodyless-status, status and
+caller-framing error precedence remains before expiration. Retry lock contention
+with at most one millisecond pauses bounded by remaining time. This is no hard
+real-time scheduling or allocator guarantee.
+
+Reuse ordinary framing: exact uppercase HEAD suppresses the body while keeping
+its Content-Length. Other methods, bodyless statuses, HTTP/1.0, request close,
+residual pipelining and dead-server rules remain. Every partial write, EINTR and
+EAGAIN/readiness retry shares the original deadline. No final zero-time probe
+runs after expiration. Any failure closes once and never parks a partial response.
+Only complete success can reuse an eligible connection under the existing lock.
+
+Linux writes use per-call MSG_DONTWAIT and SIGPIPE suppression. Darwin checks
+F_GETFL/F_SETFL and reasserts O_NONBLOCK before output, preserving other flags;
+checked restoration of original flags precedes parking. Setup/restoration failure
+or timeout closes without further I/O/restoration. No descriptor alias escapes.
+Existing builder storage, contiguous serialization allocation and bounded parked
+set remain; no new retained view or payload copy is introduced. Content generation
+and cancellation stay caller policy. Plan241 owns the ledger and closure matrix.

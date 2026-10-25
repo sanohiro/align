@@ -1043,6 +1043,7 @@ fn walk_body_records<'a>(
                     token: value,
                     ..
                 }
+                | ExprKind::HttpRespondTimeoutNs { ctx: ptr, rb: offset, timeout_ns: value }
                 | ExprKind::HttpUpgradeReadExact {
                     upgrade: ptr,
                     out: offset,

@@ -8,23 +8,19 @@ record adoption of that compiler on 2026-10-25, within their named native
 acceptance boundaries. Do not restart the relational-solver investigation or
 interpret its older handoff as unfinished production work.
 
-The owner ended this machine's implementation session after AM-R24 on
-2026-10-25. The remaining work moves to another machine; do not start another
-capability here. AM-R24 is delivered by #1410:
-raw-loaded Copy C records with inline numeric fixed arrays can return directly
-or through a bound local. Genuine slices borrowing local inline storage still
-reject. No language, ownership or ABI contract changed. Semantic, native C,
-whole/per-unit/cache owners, independent review, the bounded gate, Clippy and
-local PostgreSQL verification passed. The final
-`cargo build --release --workspace` also passed; no versioned release was
-requested. Consumer adoption remains pending.
+The owner resumed the selected batch on 2026-10-25 and authorized merging
+completed capability PRs. AM-R24 is delivered by #1410; consumer adoption remains
+pending. R132 and R142 stay excluded. Finish each independently useful capability
+through its normal review, local verification and merge boundary, then run the
+batch release build without creating a versioned release. When external evidence
+or a machine dependency is unavailable, request the specific missing input and
+continue other selected work.
 
-The earlier authorization selects the remaining assessed work except R132 and
-R142. The queue below is continuation scope, not work completed in this session.
-Missing evidence or a passing older provider PR is not a completed fix. The wider
-long-term backlog is unselected. Reconcile current main and all three consumer
-registers on the receiving machine before implementing; finish each independently
-useful capability through its normal review, verification and merge boundary.
+[Plan241](docs/impl/241-bounded-http-responses.md) implements AM-R22's positive
+ordinary response budget with HEAD framing, bounded native writes and checked
+keep-alive restoration. The remaining selected queue below is separate work.
+Missing evidence or a passing older provider PR is not a completed fix; the
+wider long-term backlog is unselected.
 
 Preserve the existing language specification where practical. The owner permits
 a small specification revision when it substantially reduces compiler complexity
@@ -75,16 +71,16 @@ also remain parked. Broader writable returns are not a queued requirement.
 ## Selected work and remaining prerequisites
 
 The remaining batch follows the scope above; R132/R142 below are explicitly
-excluded. AM-R24 is complete at the provider boundary.
+excluded. AM-R24 is complete at the provider boundary; Plan241 owns AM-R22.
 [Plan230](docs/impl/230-request-follow-up-plan.md) retains the historical request
 reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
 
 - Media AM-R22 requests bounded, HEAD-correct HTTP response writes. AM-R23
-  requests non-consuming connection observation before response. Both are
-  non-blocking drafts with current workarounds. The register's older missing-URL
-  note is supplemented by the private committed-source location below; no timed
-  HEAD or connection-observation acceptance is claimed. Exact deadline, half-close,
-  connection reuse and cleanup contracts precede implementation. Connection observation does not itself
+  requests non-consuming connection observation before response. Plan241 implements AM-R22; AM-R23 remains a
+  non-blocking draft with its current workaround. The register's older missing-URL
+  note is supplemented by the private committed-source location below; consumer acceptance of timed
+  HEAD or connection observation remains external. AM-R23 still needs its exact
+  half-close, connection reuse and cleanup contract. Connection observation does not itself
   deliver model cancellation or GPU cleanup.
 - R28 text-builder byte views and AM-R16/R137 retained indexed owning-field views
   still need dedicated producers and lifetime/invalidation proofs. Plan240
@@ -115,11 +111,12 @@ reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
 
 These are pre-design scope estimates, not delivery-time commitments. K1's
 completed call-boundary authority is a prerequisite to reuse, not a solver port
-to repeat. No implementation or new public-contract design below was started.
+to repeat. AM-R22 now has its implementation and public contract in Plan241; later rows
+remain separate capabilities.
 
 | Order | Capability | Rough scale / difficulty | First closure decision |
 | --- | --- | --- | --- |
-| 1 | AM-R22 bounded HEAD-correct responses | Medium / medium | Specify one finite logical write budget, partial-write cleanup and eligible keep-alive reuse; reuse existing timed native write machinery. API spelling is not selected. |
+| 1 | AM-R22 bounded HEAD-correct responses | Medium / medium | Plan241 implements `respond_timeout_ns` with one finite budget, partial-write cleanup and eligible keep-alive reuse. |
 | 2 | R28 text-builder byte views | Medium to large / high | New read-only producer plus invalidation on write/growth/build/move/replacement/Drop. Ordinary-call authority comes from Plan240; view-bearing builder elements are separate. |
 | 3 | AM-R16/R137 retained indexed fields | Large / high | Preserve parent generation, selected field backing and bounds across readers and returns without an implicit Copy snapshot. Use Plans232/196/205. |
 | 4 | AM-R23 connection observation | Medium / medium to high | Define exactly what a non-consuming bounded observation can establish, including half-close, buffered/pipelined data, errors and races; cancellation policy stays in the consumer. |
@@ -138,10 +135,10 @@ The private LLM packet is now available on this machine under the common Git
 directory as `handoff/2026-10-25-private-request-evidence.tar.gz` (832,473 bytes;
 SHA-256 `38125adc4a41127f2e348d2688f3b850d84d7459da2511a16e69d26a073e3402`).
 It is deliberately outside the public repository and is **not transferred by a
-Git fetch**. Copy it privately to the receiving machine and verify `SHA256SUMS`
-after extraction. It contains the authenticated 362-file consumer source snapshot,
+Git fetch**. It was copied privately to this checkout and its archive hash plus all 379
+internal checksums were verified on 2026-10-25. It contains the authenticated 362-file consumer source snapshot,
 three exact failing variants, passing borrow controls, compact original logs and
-replay instructions. No current-compiler reproduction was run in this session.
+replay instructions. Current-compiler reproduction remains pending.
 
 The source binding names private `align-llm` commit
 `33e4d3ff40f45f48a4edf2a2f155a9e7966aeaed`; all 362 committed source hashes match.

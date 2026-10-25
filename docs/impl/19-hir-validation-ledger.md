@@ -1319,7 +1319,7 @@ predicate, not type equality alone:
   the `Index` row, and whose result is `HttpResponse`. `HttpRespStatus`,
   `HttpRespHeader`, and `HttpRespBody` use it.
 - `HttpRequestCtxPlace(e)` is `LocalHandle(HttpRequestCtx,e)` or a valid
-  `Field` place of that exact type. Every `HttpCtx*`, `HttpRespond`, and
+  `Field` place of that exact type. Every `HttpCtx*`, `HttpRespondTimeoutNs`, `HttpRespond`, and
   `HttpRespondStream` receiver uses it. `HttpHeaders` is a Copy view and has no
   stable-handle restriction, preserving `ctx.headers().get(name)`.
 - `SourceMutLocal(T,e)` is exactly a bare source local whose checked child is
@@ -1344,7 +1344,7 @@ predicate, not type equality alone:
 - A row marked `consume-any` transfers the complete temporary and is exempt;
   ordinary `consume` does not erase a row's stated receiver-place gate. The
   complete consume-any set is `ReaderBuffered.reader`,
-  `ArrayBuilderBuild.builder`, `HttpClientRequest.req`, `HttpRespond.rb`,
+  `ArrayBuilderBuild.builder`, `HttpClientRequest.req`, `HttpRespond.rb`, `HttpRespondTimeoutNs.rb`,
   `HttpRespondStream.rb`, and `HttpStreamReject.rb`. Every other handle
   operand uses the applicable place above.
 
@@ -1498,6 +1498,7 @@ merely because its `Ty` matches.
 | `HttpResponseBuilder` | `env[]; child[status]`; `i64; result ResponseBuilder; new owned builder; Pure`. |
 | `HttpRbHeader` | `env[]; child[rb,name,value]`; `LocalHandle(ResponseBuilder,rb),Str,Str; result Unit; rb native state mutated without source mut; Pure`. |
 | `HttpRbBody` | `env[]; child[rb,data]`; `LocalHandle(ResponseBuilder,rb),byte-view; result Unit; rb native state mutated without source mut, bytes copied; Pure`. |
+| `HttpRespondTimeoutNs` | `env[]; child[ctx,rb,timeout_ns]`; `HttpRequestCtx,ResponseBuilder,i64; result ERR(Unit); both owners consumed exactly once after all operands complete; staged temporary cleanup on eager exits; Impure` (Plan241). |
 | `HttpRespond` | `env[]; child[ctx,rb]`; `HttpRequestCtx,ResponseBuilder; result ERR(Unit); both consumed exactly once on the runtime call; Impure`. |
 | `HttpRespondStream` | `env[]; child[ctx,rb]`; `HttpRequestCtx,ResponseBuilder; result ERR(HttpStream); ctx borrowed then marked spent on success, rb consumed; stream owns lifted fd; Impure`. |
 | `HttpStreamSend` | `env[event]`; `child[stream,chunk]`; `LocalHandle(HttpStream,stream),byte-view; result ERR(Unit); stream native state mutated without source mut, chunk borrowed; Impure`. |

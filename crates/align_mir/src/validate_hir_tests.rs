@@ -20814,6 +20814,38 @@ fn sync_methods_hir_reject_forged_native_types() -> Result<(), &'static str> {
 }
 
 #[test]
+fn http_response_budget_hir_rejects_forged_operands_and_borrowed_consumption() -> Result<(), &'static str> {
+    let base = checked_source_program("import std.http\nfn send(ctx: http_request_ctx, rb: response_builder) -> Result<(), Error> = ctx.respond_timeout_ns(rb, 1)\nfn main() {}\n");
+    assert!(validate_hir::body_only_metadata_is_valid(&base));
+    assert!(lower_program_checked(&base, false, None).is_ok());
+    let bad_effect = base.clone();
+    bad_effect.fn_types.first().ok_or("send function type")?.effect.set(FnEffect::Pure);
+    assert_body_entrypoints_empty("response-budget-pure-effect", &bad_effect);
+    for mutation in 0..9 {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name == "send").ok_or("send function")?;
+        let value = function.body.value.as_mut().ok_or("send value")?;
+        let hir::ExprKind::HttpRespondTimeoutNs { ctx, rb, timeout_ns } = &mut value.kind else { return Err("timed response"); };
+        match mutation {
+            0 => ctx.ty = Ty::Bool,
+            1 => ctx.kind = hir::ExprKind::Local(u32::MAX),
+            2 => rb.ty = Ty::Bool,
+            3 => timeout_ns.ty = Ty::Bool,
+            4 => value.ty = Ty::Bool,
+            5..=8 => {
+                let position = usize::from(mutation >= 7);
+                let exclusive = mutation % 2 == 0;
+                function.param_modes[position] = if exclusive { align_ast::ParamMode::BorrowMut } else { align_ast::ParamMode::Borrow };
+                function.locals[function.params[position] as usize].is_mut = exclusive;
+            }
+            _ => return Err("unknown response-budget mutation"),
+        }
+        assert_body_entrypoints_empty(&format!("response-budget-{mutation}"), &bad);
+    }
+    Ok(())
+}
+
+#[test]
 fn builder_length_hir_rejects_forged_receiver_place_and_result() -> Result<(), &'static str> {
     for ty in ["builder", "array_builder<i64>", "array_builder<vec4<i32>>",
         "array_builder<mask4<i32>>", "array_builder<[i64; 2]>", "array_builder<[Row; 1]>"] {

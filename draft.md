@@ -4868,9 +4868,21 @@ fd-pressure backoff. Expiry returns Timeout, drops selected incomplete input,
 and preserves the listener and unselected parked peers. No partial context is
 published. Native mode changes are checked and owner-local; a latched listener
 later reset to zero uses clock-free indefinite readiness waits. Ordinary response
-writes are separate and require an explicit stream write budget when bounded
-output is needed. The exact platform and error contract is in
+writes use the explicit bounded ordinary-response operation below or a configured
+stream write budget. The exact platform and error contract is in
 `docs/impl/std-design/http.md`.
+
+`ctx.respond_timeout_ns(rb: response_builder, timeout_ns: i64) -> Result<(), Error>`
+is Impure and consumes both context and builder on every runtime result.
+The budget must be positive; zero/negative values return Invalid before output.
+One monotonic deadline covers parking-lock acquisition, serialization, complete
+output, partial writes/retries and native-mode restoration. Timeout takes
+precedence over a simultaneous native result. Exact uppercase HEAD suppresses
+body bytes while preserving Content-Length. Only complete success with restored
+socket mode can reuse an otherwise eligible connection; all failures close it.
+Arguments evaluate once in order, with ownership transfer after all complete;
+eager exits keep ordinary cleanup. Existing response allocation/framing rules
+remain. The full contract is in `docs/impl/std-design/http.md` and Plan241.
 
 An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)`
 with `Result<(), Error>` and Impure effect. The default is zero (unbounded).
