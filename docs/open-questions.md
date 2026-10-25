@@ -13,6 +13,18 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Non-consuming HTTP peer EOF observation (SETTLED 2026-10-25)
+
+`ctx.peer_eof() -> Result<bool, Error>` is an Impure, non-consuming observation
+on a bound HTTP request context. After admission it performs one nonblocking
+one-byte peek, with no allocation, wait or retry. True observes incoming EOF,
+including a peer send-half-close; false includes queued bytes or no event and
+proves no liveness. Other native errors, including EINTR, use the ordinary Error
+mapping. Request bytes/views, owner lifetime and keep-alive eligibility remain;
+a probe may consume a pending socket error. Cancellation is caller policy.
+The exact admission, buffered-data and race contract is in Plan243 and
+`docs/impl/std-design/http.md`.
+
 ### Unfinished text-builder byte views (SETTLED 2026-10-25)
 
 A bound `builder.bytes()` returns a read-only borrowed `slice<u8>` over the

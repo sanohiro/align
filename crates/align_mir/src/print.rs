@@ -1303,6 +1303,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(name),
             operand_str(token),
         ),
+        Rvalue::HttpCtxPeerEof { ctx, out } => format!("http_ctx_peer_eof({}, @{})", operand_str(ctx), out),
         Rvalue::HttpCtxUpgradeReady { ctx } => format!("http_ctx_upgrade_ready({})", operand_str(ctx)),
         Rvalue::HttpCtxBody { ctx } => format!("http_ctx_body({})", operand_str(ctx)),
         Rvalue::HttpResponseBuilder { status } => format!("http_response({})", operand_str(status)),

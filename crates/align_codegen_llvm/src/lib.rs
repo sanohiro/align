@@ -19104,6 +19104,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .ok_or_else(|| self.err("http_headers_contains_token returned no value"))?
             }
+            Rvalue::HttpCtxPeerEof { ctx, out } => {
+                let ctx = self.operand(ctx)?.into_pointer_value();
+                let out = *self.slots.get(out).ok_or_else(|| self.err("missing HTTP EOF output"))?;
+                let key = RuntimeKey::HttpCtxPeerEof;
+                let call = self.builder.build_call(self.runtime(key), &[ctx.into(), out.into()], "httpctxpeereof")
+                    .map_err(|error| self.err(error))?;
+                self.apply_native_call_attributes(key, call);
+                call.try_as_basic_value().basic().ok_or_else(|| self.err("HTTP EOF returned no status"))?
+            }
             Rvalue::HttpCtxUpgradeReady { ctx } => {
                 let ctx = self.operand(ctx)?.into_pointer_value();
                 self.builder
@@ -28021,6 +28030,42 @@ fn main() -> i32 {
                 if preceding >= budget {
                     assert!(function.print_to_string().to_string().contains("align 16"));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn http_peer_eof_mir_shape() -> Result<(), String> {
+        for used in [false, true] {
+            let tail = if used { "-> Result<bool, Error> = ctx.peer_eof()" }
+                else { "{ unused := ctx.peer_eof() }" };
+            let source = format!("import std.http\nfn observe(borrow ctx: http_request_ctx) {tail}\nfn main() {{}}");
+            let original = mir(&source);
+            emit_llvm_ir(&original, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                .map_err(|error| error.to_string())?;
+            for mutation in 0..6 {
+                let mut bad = original.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name.as_str().ends_with("observe")).ok_or("observe")?;
+                let (block, position, result, output) = function.blocks.iter().enumerate().find_map(|(b, block)| {
+                    block.stmts.iter().enumerate().find_map(|(s, statement)| match statement {
+                        Stmt::Let(result, Rvalue::HttpCtxPeerEof { out, .. }) => Some((b, s, *result, *out)),
+                        _ => None,
+                    })
+                }).ok_or("native observation")?;
+                if mutation == 5 {
+                    function.blocks[block].stmts.insert(position, Stmt::Store(output, Operand::Const(Const::Bool(false))));
+                } else {
+                    let Stmt::Let(_, Rvalue::HttpCtxPeerEof { ctx, out }) = &mut function.blocks[block].stmts[position] else { return Err("native shape".into()); };
+                    match mutation {
+                        0 => function.value_tys[result as usize] = Ty::Bool,
+                        1 => function.slots[output as usize] = Ty::Int(align_sema::IntTy { bits: 64, signed: true }),
+                        2 => *ctx = Operand::Const(Const::Bool(false)),
+                        3 => *out = u32::MAX,
+                        _ => *out = *function.params.first().ok_or("receiver parameter")?,
+                    }
+                }
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "accepted {used}/{mutation}");
             }
         }
         Ok(())

@@ -89,6 +89,7 @@ hs.get(name: str) -> Option<str>             // RFC 9110 §5.1 case-insensitive 
                                              // str views the request buffer and INHERITS `hs`'s
                                              // region (so a wrapper taking the view through a
                                              // parameter compiles — item 10 ④)
+ctx.peer_eof() -> Result<bool, Error>         // one nonblocking incoming EOF observation (Plan243)
 ctx.body() -> bytes                          // view into ctx (region-bound)
 rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
                                              // the build-dual of `request`; named apart from the
@@ -1738,3 +1739,39 @@ or timeout closes without further I/O/restoration. No descriptor alias escapes.
 Existing builder storage, contiguous serialization allocation and bounded parked
 set remain; no new retained view or payload copy is introduced. Content generation
 and cancellation stay caller policy. Plan241 owns the ledger and closure matrix.
+
+## Non-consuming peer EOF observation (Plan243)
+
+```text
+ctx.peer_eof() -> Result<bool, Error>
+```
+
+This Impure operation shared-borrows a bound local or local-rooted field context,
+including through borrowed helpers. It takes no arguments or ambient options.
+After native admission, one `recv(MSG_PEEK | MSG_DONTWAIT)` observes at most one
+stack byte. There is no heap allocation, wait, polling loop, EINTR retry, socket
+mode/timeout change or ownership transfer. Admission failure performs no recv.
+The bound is an operation count, not a scheduler wall-clock guarantee.
+
+`Ok(true)` observes incoming EOF after kernel-queued bytes. A peer that closed
+only its sending direction may still receive the response. `Ok(false)` includes
+queued bytes and EAGAIN/EWOULDBLOCK; neither proves liveness or future write
+success. Other failures use the ordinary native Error mapping, including
+`Error.Code(EINTR)` without retry. A receive probe can consume a pending socket
+error. Every call is a fresh observation and may differ from an earlier one.
+
+Kernel bytes stay queued. Already co-read residual request bytes are untouched,
+so true may coexist with residual application bytes; pending kernel bytes can
+hide later EOF. Existing close-after-residual and keep-alive eligibility remain.
+Request content/views and context ownership survive both Ok and Err. Respond,
+stream/Upgrade and Drop keep their existing contracts. Cancellation, GPU cleanup
+and output publication remain caller policy.
+
+The A19 ABI is `i32 align_rt_http_ctx_peer_eof(const HttpRequestCtx*, u8*)`.
+Null/misaligned pointers, overlapping shell/output ranges or address overflow
+return Invalid before dereference, output writes or recv. The u8 output has
+alignment one. After pointer admission, zero the output and reject a negative fd
+with Invalid before recv. Success writes exactly 0 or 1; other admitted errors
+leave zero. The unsafe caller supplies a live context and disjoint writable byte.
+Generated code uses dedicated scratch and reads it only on status-zero success.
+Plan243 owns the complete validation and acceptance matrix.

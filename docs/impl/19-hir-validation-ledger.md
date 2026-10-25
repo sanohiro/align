@@ -1498,6 +1498,7 @@ merely because its `Ty` matches.
 | `HttpResponseBuilder` | `env[]; child[status]`; `i64; result ResponseBuilder; new owned builder; Pure`. |
 | `HttpRbHeader` | `env[]; child[rb,name,value]`; `LocalHandle(ResponseBuilder,rb),Str,Str; result Unit; rb native state mutated without source mut; Pure`. |
 | `HttpRbBody` | `env[]; child[rb,data]`; `LocalHandle(ResponseBuilder,rb),byte-view; result Unit; rb native state mutated without source mut, bytes copied; Pure`. |
+| `HttpCtxPeerEof` | `env[]; child[ctx]`; `bound Local/Field HttpRequestCtx; result ERR(Bool); shared non-consuming receiver; Impure; independent receiver/result/effect replay` (Plan243). |
 | `HttpRespondTimeoutNs` | `env[]; child[ctx,rb,timeout_ns]`; `HttpRequestCtx,ResponseBuilder,i64; result ERR(Unit); both owners consumed exactly once after all operands complete; staged temporary cleanup on eager exits; Impure` (Plan241). |
 | `HttpRespond` | `env[]; child[ctx,rb]`; `HttpRequestCtx,ResponseBuilder; result ERR(Unit); both consumed exactly once on the runtime call; Impure`. |
 | `HttpRespondStream` | `env[]; child[ctx,rb]`; `HttpRequestCtx,ResponseBuilder; result ERR(HttpStream); ctx borrowed then marked spent on success, rb consumed; stream owns lifted fd; Impure`. |

@@ -18033,7 +18033,7 @@ impl EffectScan<'_> {
             }
             // `std.http` (Slice 4) — the server primitive. `serve`/`accept`/`respond` hit the network
             // (bind/accept/write syscalls) → **Impure** (excluded from `par_map`, like the client). The
-            // response builder ops and the ctx getters are **Pure** (build/read owned memory): recurse
+            // response builder ops and the ctx metadata/body getters are **Pure** (build/read owned memory): recurse
             // so an effect *inside* the operands is still counted.
             ExprKind::HttpServe { host, port, .. } => {
                 walk!(host);
@@ -18129,6 +18129,10 @@ impl EffectScan<'_> {
             | ExprKind::HttpCtxBody { ctx }
             | ExprKind::HttpCtxHeaders { ctx }
             | ExprKind::HttpCtxUpgradeReady { ctx } => walk!(ctx),
+            ExprKind::HttpCtxPeerEof { ctx } => {
+                walk!(ctx);
+                self.impure_direct = true;
+            }
             ExprKind::HttpCtxHeader { headers, name }
             | ExprKind::HttpHeadersCount { headers, name }
             | ExprKind::HttpHeadersTokensValid { headers, name } => {
@@ -26214,6 +26218,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpHeadersTokensValid { .. }
             | ExprKind::HttpHeadersContainsToken { .. }
             | ExprKind::HttpCtxUpgradeReady { .. }
+            | ExprKind::HttpCtxPeerEof { .. }
             | ExprKind::HttpRespondUpgrade { .. }
             | ExprKind::HttpUpgradeReadExact { .. }
             | ExprKind::HttpUpgradeWrite { .. }
@@ -26718,6 +26723,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpHeadersTokensValid { .. }
             | ExprKind::HttpHeadersContainsToken { .. }
             | ExprKind::HttpCtxUpgradeReady { .. }
+            | ExprKind::HttpCtxPeerEof { .. }
             | ExprKind::HttpResponseBuilder { .. }
             | ExprKind::HttpRbHeader { .. }
             | ExprKind::HttpRbBody { .. }
@@ -30489,7 +30495,8 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
             | ExprKind::HttpCtxHeaders { ctx }
-            | ExprKind::HttpCtxUpgradeReady { ctx } => self.walk(ctx, depth),
+            | ExprKind::HttpCtxUpgradeReady { ctx }
+            | ExprKind::HttpCtxPeerEof { ctx } => self.walk(ctx, depth),
             ExprKind::HttpCtxHeader { headers, name }
             | ExprKind::HttpHeadersCount { headers, name }
             | ExprKind::HttpHeadersTokensValid { headers, name } => {
@@ -33320,6 +33327,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::HttpHeadersTokensValid { .. }
         | ExprKind::HttpHeadersContainsToken { .. }
         | ExprKind::HttpCtxUpgradeReady { .. }
+        | ExprKind::HttpCtxPeerEof { .. }
         | ExprKind::HttpResponseBuilder { .. }
         | ExprKind::HttpRbHeader { .. }
         | ExprKind::HttpRbBody { .. }
@@ -43551,6 +43559,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpRespondTimeoutNs { .. } | ExprKind::HttpRespond { .. } | ExprKind::HttpRespondStream { .. } | ExprKind::HttpStreamSend { .. }
             | ExprKind::HttpHeadersCount { .. } | ExprKind::HttpHeadersTokensValid { .. }
             | ExprKind::HttpHeadersContainsToken { .. } | ExprKind::HttpCtxUpgradeReady { .. }
+            | ExprKind::HttpCtxPeerEof { .. }
             | ExprKind::HttpRespondUpgrade { .. } | ExprKind::HttpUpgradeReadExact { .. }
             | ExprKind::HttpUpgradeWrite { .. } | ExprKind::HttpUpgradeDeadline { .. }
             | ExprKind::HttpStreamWriteTimeoutNs { .. }
@@ -51235,7 +51244,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
             | ExprKind::HttpCtxHeaders { ctx }
-            | ExprKind::HttpCtxUpgradeReady { ctx } => move_expr!(self, ctx, moved, false, false),
+            | ExprKind::HttpCtxUpgradeReady { ctx }
+            | ExprKind::HttpCtxPeerEof { ctx } => move_expr!(self, ctx, moved, false, false),
             ExprKind::HttpCtxHeader { headers, name }
             | ExprKind::HttpHeadersCount { headers, name }
             | ExprKind::HttpHeadersTokensValid { headers, name } => {
@@ -58600,7 +58610,7 @@ impl<'a, 't> Checker<'a, 't> {
             // intercept above, alongside `tcp_listener`'s accept — the name is shared.)
             // Request-context getters + `respond` on an `http_request_ctx`: `ctx.method()` / `ctx.path()`
             // / `ctx.headers()` / `ctx.body()` (views) and `ctx.respond(rb)` (consumes ctx + rb).
-            "method" | "path" | "headers" | "body" | "upgrade_ready" | "respond" | "respond_timeout_ns" | "respond_stream" | "respond_upgrade" if recv_ty == Ty::HttpRequestCtx => {
+            "method" | "path" | "headers" | "body" | "upgrade_ready" | "peer_eof" | "respond" | "respond_timeout_ns" | "respond_stream" | "respond_upgrade" if recv_ty == Ty::HttpRequestCtx => {
                 self.check_http_ctx_method(recv_expr, method, args, span)
             }
             // The old spelling. `ctx.header(name)` was replaced by `ctx.headers().get(name)` (item 10
@@ -69864,6 +69874,14 @@ impl<'a, 't> Checker<'a, 't> {
                     span,
                 }
             }
+            "peer_eof" => {
+                if !args.is_empty() {
+                    self.diags.error(format!("'.peer_eof()' takes no arguments, got {}", args.len()), span);
+                    return err;
+                }
+                Expr { kind: ExprKind::HttpCtxPeerEof { ctx: Box::new(recv_expr) },
+                    ty: Ty::Result(Scalar::Bool, Scalar::Enum(self.error_enum_id)), span }
+            }
             "upgrade_ready" => {
                 if !args.is_empty() {
                     self.diags.error(format!("'.upgrade_ready()' takes no arguments, got {}", args.len()), span);
@@ -69963,7 +69981,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             }
             _ => {
-                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / headers / body / upgrade_ready / respond / respond_timeout_ns / respond_stream / respond_upgrade)"), span);
+                self.diags.error(format!("'.{method}()' is not a method on an http request context (try method / path / headers / body / upgrade_ready / peer_eof / respond / respond_timeout_ns / respond_stream / respond_upgrade)"), span);
                 err
             }
         }
@@ -74089,7 +74107,8 @@ impl<'a, 't> Checker<'a, 't> {
             | ExprKind::HttpCtxPath { ctx }
             | ExprKind::HttpCtxBody { ctx }
             | ExprKind::HttpCtxHeaders { ctx }
-            | ExprKind::HttpCtxUpgradeReady { ctx } => self.finalize_expr(ctx),
+            | ExprKind::HttpCtxUpgradeReady { ctx }
+            | ExprKind::HttpCtxPeerEof { ctx } => self.finalize_expr(ctx),
             ExprKind::HttpCtxHeader { headers, name }
             | ExprKind::HttpHeadersCount { headers, name }
             | ExprKind::HttpHeadersTokensValid { headers, name } => {

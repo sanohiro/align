@@ -4922,6 +4922,16 @@ Arguments evaluate once in order, with ownership transfer after all complete;
 eager exits keep ordinary cleanup. Existing response allocation/framing rules
 remain. The full contract is in `docs/impl/std-design/http.md` and Plan241.
 
+`ctx.peer_eof() -> Result<bool, Error>` is an Impure, non-consuming observation
+on a bound HTTP request context. After admission it performs one nonblocking
+one-byte peek, with no allocation, wait or retry. True observes incoming EOF,
+including a peer send-half-close; false includes queued bytes or no event and
+proves no liveness. Other native errors, including EINTR, use the ordinary Error
+mapping. Request bytes/views, owner lifetime and keep-alive eligibility remain;
+a probe may consume a pending socket error. Cancellation is caller policy.
+The exact admission, buffered-data and race contract is in Plan243 and
+`docs/impl/std-design/http.md`.
+
 An exclusively borrowed bound stream accepts `s.write_timeout_ns(timeout_ns: i64)`
 with `Result<(), Error>` and Impure effect. The default is zero (unbounded).
 Negative input returns Invalid before state inspection/mutation; failure preserves

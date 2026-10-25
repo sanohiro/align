@@ -8,8 +8,8 @@ ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
 returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Plan 65's
 SIMD-surface consistency capability adds `BufferAppendFilled`. Unsigned integer display adds `PrintU64`, a non-retaining `u64` input with
 `void(i64)` native ABI and the same stdout/flush behavior as signed display.
-Current inventory: 478 keyed,
-496 base, 503 alloc-count, 500 par-map-probe and 507 maximum exports.
+Current inventory: 479 keyed,
+497 base, 504 alloc-count, 501 par-map-probe and 508 maximum exports.
 
 **R65 implemented contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md) own the
@@ -79,7 +79,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 478 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 479 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -126,7 +126,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 478 keyed records, 496 base records, and 507 records in the maximum optional-probe export table.
+are 479 keyed records, 497 base records, and 508 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -378,6 +378,7 @@ declaration golden owns the emitted declaration and the class token together.
 | `HttpCtxHeader` | `align_rt_http_ctx_header` | `HostState` |
 | `HttpCtxMethod` | `align_rt_http_ctx_method` | `HostState` |
 | `HttpCtxPath` | `align_rt_http_ctx_path` | `HostState` |
+| `HttpCtxPeerEof` | `align_rt_http_ctx_peer_eof` | `HostState` |
 | `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | `HostState` |
 | `HttpGetMany` | `align_rt_http_get_many` | `HostState` |
 | `HttpHeader` | `align_rt_http_header` | `HostState` |
@@ -1128,6 +1129,7 @@ The implemented `pkg.ws` capability activates eleven keyed identities, all on ex
 | `HttpHeadersTokensValid` | `align_rt_http_headers_tokens_valid` | A20: `i32 @SYM(ptr, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64) -> i32` |
 | `HttpHeadersContainsToken` | `align_rt_http_headers_contains_token` | A120: `i32 @SYM(ptr, ptr, i64, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64, *const u8, i64) -> i32` |
 | `HttpHeadersContainsTokenExact` | `align_rt_http_headers_contains_token_exact` | A120: `i32 @SYM(ptr, ptr, i64, ptr, i64)` | `unsafe extern "C" fn(*mut HttpRequestCtx, *const u8, i64, *const u8, i64) -> i32` |
+| `HttpCtxPeerEof` | `align_rt_http_ctx_peer_eof` | A19: `i32 @SYM(ptr, ptr)` | `unsafe extern "C" fn(*const HttpRequestCtx, *mut u8) -> i32` |
 | `HttpCtxUpgradeReady` | `align_rt_http_ctx_upgrade_ready` | A03: `i32 @SYM(ptr)` | `unsafe extern "C" fn(*mut HttpRequestCtx) -> i32` |
 
 These rows activate together in `RuntimeKey`, declarations, definitions, exports, collision
@@ -1773,10 +1775,10 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 478 keys, mapped symbols, LLVM declaration types, and derived effects
+- all 479 keys, mapped symbols, LLVM declaration types, and derived effects
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 496 base native symbols against default-feature `align_runtime` exports,
+- the 497 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
@@ -1789,8 +1791,8 @@ Tests compare:
 - rt-LTO off/on attributes for every guarded symbol, with missing,
   declaration-only, wrong-type, internal, private, available-externally, and
   non-C-calling-convention artifact negatives;
-- all 478 identities through the one `RuntimeAbiId`-keyed row iterator and all
-  478 exact registry function types through the production compatibility
+- all 479 identities through the one `RuntimeAbiId`-keyed row iterator and all
+  479 exact registry function types through the production compatibility
   predicate, one return mutation per row, and one mutation of every parameter
   ordinal; source-valid compatible reuse for a keyed builtin and the thirteen
   source-reachable unkeyed rows; explicit `ArgsBuild` exact status/out-pointer source
@@ -2474,3 +2476,18 @@ releases None, returns_fresh false and diverges false. The implementation reads
 the builder and writes only the disjoint output descriptor; it captures neither
 pointer. Both pointers must meet the native live/aligned/writable obligations.
 Heap, arena-associated and compiler stack headers use the same representation.
+
+## HTTP peer EOF observation (Plan243)
+
+`HttpCtxPeerEof` maps to A19 `i32 @align_rt_http_ctx_peer_eof(ptr ctx, ptr out)`.
+The shared context is retained, and the output is one canonical boolean byte.
+HostState effects conservatively use the ordinary HTTP pointer attributes; no
+owner is released. Pointer admission rejects null/alignment, shell/output overlap
+and address overflow before any pointed-to access. Admitted output is zeroed
+before fd validation; exactly one one-byte nonblocking peek follows a nonnegative
+fd. Native errors retain the status mapping and initialized zero; success writes
+0/1. Dedicated MIR scratch has no ordinary root stores, one exact native producer,
+and a bool payload load only on success. The context READ, i32 status and bool
+output are authenticated even for discarded results. Plan243 fixes half-close,
+queued-data, pending-error and ownership semantics. The keyed/base/maximum
+inventories increase by one without adding an ABI shape or probe family.

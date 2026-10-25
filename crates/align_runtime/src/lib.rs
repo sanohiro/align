@@ -33,6 +33,8 @@ mod http_stream_tests;
 #[cfg(test)]
 mod http_response_budget_tests;
 #[cfg(test)]
+mod http_peer_eof_tests;
+#[cfg(test)]
 mod http_accept_budget_tests;
 #[cfg(test)]
 mod net_service_tests;
@@ -27533,6 +27535,48 @@ fn http_headers_contains_token_inner(
 pub unsafe extern "C" fn align_rt_http_ctx_upgrade_ready(ctx: *mut HttpRequestCtx) -> i32 {
     let c = unsafe { http_query_ctx(ctx, "http_request_ctx.upgrade_ready: invalid request context") };
     i32::from(c.upgrade_ready)
+}
+
+/// Pointer admission and one-attempt observation share an owner with injected native outcomes.
+/// Invalid output/context ranges are rejected before either pointed-to object is accessed.
+unsafe fn http_peer_eof_with(
+    ctx: *const HttpRequestCtx,
+    out: *mut u8,
+    peek: impl FnOnce(i32, *mut u8, usize, i32) -> std::io::Result<usize>,
+) -> i32 {
+    if !abi_ptr_is_aligned(ctx) || !abi_ptr_is_aligned(out) {
+        return AL_INVALID;
+    }
+    let Some(ctx_end) = ctx.addr().checked_add(core::mem::size_of::<HttpRequestCtx>()) else { return AL_INVALID; };
+    let Some(out_end) = out.addr().checked_add(1) else { return AL_INVALID; };
+    if ctx.addr() < out_end && out.addr() < ctx_end {
+        return AL_INVALID;
+    }
+    unsafe { out.write(0); }
+    let fd = unsafe { (*ctx).fd };
+    if fd < 0 { return AL_INVALID; }
+    let mut byte = 0u8;
+    match peek(fd, &mut byte, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) {
+        Ok(count) => { unsafe { out.write(u8::from(count == 0)); } 0 }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+        Err(error) => io_error_to_status(&error),
+    }
+}
+
+/// Observe incoming peer EOF with one nonblocking peek, preserving queued bytes and ownership.
+/// EOF includes a peer send-half-close; false is not a proof of liveness. A pending socket error
+/// may be consumed by recv. EINTR returns its status without retry or hidden waiting.
+///
+/// # Safety
+/// `ctx` must point to a live aligned request context and `out` to a disjoint writable byte.
+/// Detectable pointer/range failures return Invalid without output writes or socket access.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_http_ctx_peer_eof(ctx: *const HttpRequestCtx, out: *mut u8) -> i32 {
+    unsafe { http_peer_eof_with(ctx, out, |fd, byte, length, flags| {
+        let count = libc::recv(fd, byte.cast(), length, flags);
+        if count >= 0 { Ok(usize::from(count > 0)) }
+        else { Err(std::io::Error::last_os_error()) }
+    }) }
 }
 
 /// `ctx.body()` — a `slice<u8>` **view** over the request body (zero copy; region-bound in sema).

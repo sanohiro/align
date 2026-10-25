@@ -348,7 +348,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::HttpSseStreamRetryMs { .. } | Rvalue::HttpSseStreamNext { .. } | Rvalue::HttpGetMany { .. } |
         Rvalue::HttpServe { .. } | Rvalue::HttpAccept { .. } | Rvalue::HttpServerMaxRequestBodyBytes { .. } | Rvalue::HttpCtxMethod { .. } |
         Rvalue::HttpCtxPath { .. } | Rvalue::HttpCtxHeader { .. } | Rvalue::HttpHeadersCount { .. } |
-        Rvalue::HttpHeadersTokensValid { .. } | Rvalue::HttpHeadersContainsToken { .. } | Rvalue::HttpCtxUpgradeReady { .. } |
+        Rvalue::HttpHeadersTokensValid { .. } | Rvalue::HttpHeadersContainsToken { .. } | Rvalue::HttpCtxUpgradeReady { .. } | Rvalue::HttpCtxPeerEof { .. } |
         Rvalue::HttpCtxBody { .. } | Rvalue::HttpResponseBuilder { .. } | Rvalue::HttpRbHeader { .. } |
         Rvalue::HttpRbBody { .. } | Rvalue::HttpRespondTimeoutNs { .. } | Rvalue::HttpRespond { .. } | Rvalue::HttpRespondStream { .. } |
         Rvalue::HttpRespondUpgrade { .. } | Rvalue::HttpUpgradeReadExact { .. } | Rvalue::HttpUpgradeWrite { .. } |

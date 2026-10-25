@@ -77,13 +77,13 @@ excluded. AM-R24 is complete at the provider boundary; Plan241 owns AM-R22.
 [Plan230](docs/impl/230-request-follow-up-plan.md) retains the historical request
 reconciliation; Plan240 supersedes its pre-K1 call-authority blocker.
 
-- Media AM-R22 requests bounded, HEAD-correct HTTP response writes. AM-R23
-  requests non-consuming connection observation before response. Plan241 implements AM-R22; AM-R23 remains a
-  non-blocking draft with its current workaround. The register's older missing-URL
-  note is supplemented by the private committed-source location below; consumer acceptance of timed
-  HEAD or connection observation remains external. AM-R23 still needs its exact
-  half-close, connection reuse and cleanup contract. Connection observation does not itself
-  deliver model cancellation or GPU cleanup.
+- Plan241 implements AM-R22 bounded, HEAD-correct HTTP response writes.
+  [Plan243](docs/impl/243-peer-eof-observation.md) implements AM-R23 as
+  `ctx.peer_eof() -> Result<bool, Error>`: one nonblocking receive peek, shared
+  context borrow, no allocation or retry. True includes send-half-close; false
+  is not liveness. Queued kernel bytes can hide EOF, while co-read application
+  bytes and request views survive. Consumer adoption, cancellation and GPU
+  cleanup remain external.
 - Plan210 implements R28 `builder.bytes()` as an allocation-free read-only view
   of initialized bytes. Every write, finish, move, replacement and Drop ends
   earlier views; shared readers may return caller-borrowed views. Plan240 supplies
@@ -127,7 +127,7 @@ remain separate capabilities.
 | 1 | AM-R22 bounded HEAD-correct responses | Medium / medium | Plan241 implements `respond_timeout_ns` with one finite budget, partial-write cleanup and eligible keep-alive reuse. |
 | 2 | R28 text-builder byte views | Medium to large / high | Plan210 implements the read-only prefix and exact invalidation; consumer adoption and view-bearing typed-builder elements are separate. |
 | 3 | AM-R16/R137 retained indexed fields | Large / high | Plan242 implements explicit read-only ranges with parent/selected-storage lifetime and exact outer producer proof. |
-| 4 | AM-R23 connection observation | Medium / medium to high | Define exactly what a non-consuming bounded observation can establish, including half-close, buffered/pipelined data, errors and races; cancellation policy stays in the consumer. |
+| 4 | AM-R23 connection observation | Medium / medium to high | Plan243 implements one nonblocking incoming EOF observation, including half-close, buffered/pipelined data, native errors and races; cancellation policy stays in the consumer. |
 | 5 | AM-R07 external writable positional reads | Large / high | Close exclusive native-view creation, initialization, bounds/overlap, external resource lifetime and synchronous short-read/error semantics together. No pinned-memory speed claim. |
 | Evidence lane | R37/R49/R80 | Unknown until reproduction / potentially high | Recheck the exact packets early under resource bounds. Separate checker precision from MIR/emission cost; do not assume that K1 fixed them. |
 

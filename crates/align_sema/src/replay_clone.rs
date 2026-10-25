@@ -1616,6 +1616,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             token: boxed!(token),
             exact: *exact,
         },
+        ExprKind::HttpCtxPeerEof { ctx } => ExprKind::HttpCtxPeerEof { ctx: boxed!(ctx) },
         ExprKind::HttpCtxUpgradeReady { ctx } => ExprKind::HttpCtxUpgradeReady { ctx: boxed!(ctx) },
         ExprKind::HttpCtxBody { ctx } => ExprKind::HttpCtxBody { ctx: boxed!(ctx) },
         ExprKind::HttpResponseBuilder { status } => ExprKind::HttpResponseBuilder {
@@ -2341,6 +2342,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::Len(expr)
         | ExprKind::ArrayBuilderBuild(expr)
         | ExprKind::HttpCtxUpgradeReady { ctx: expr }
+        | ExprKind::HttpCtxPeerEof { ctx: expr }
         | ExprKind::HttpUpgradeShutdown { upgrade: expr } => one!(expr),
         ExprKind::CloneIn { value, region } => {
             one!(value);

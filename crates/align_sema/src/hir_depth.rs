@@ -398,6 +398,7 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(expr), child_depth));
                 }
                 ExprKind::HttpCtxUpgradeReady { ctx: expr }
+                | ExprKind::HttpCtxPeerEof { ctx: expr }
                 | ExprKind::HttpUpgradeShutdown { upgrade: expr } => {
                     work.push((BodyRecord::Expr(expr), child_depth));
                 }

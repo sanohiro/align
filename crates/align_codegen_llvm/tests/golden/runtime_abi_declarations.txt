@@ -231,6 +231,7 @@ key|HttpCtxFree|http_ctx_free|HostState|declare void @align_rt_http_ctx_free(ptr
 key|HttpCtxHeader|http_ctx_header|HostState|declare i32 @align_rt_http_ctx_header(ptr, ptr, i64, ptr) #2
 key|HttpCtxMethod|http_ctx_method|HostState|declare { ptr, i64 } @align_rt_http_ctx_method(ptr) #2
 key|HttpCtxPath|http_ctx_path|HostState|declare { ptr, i64 } @align_rt_http_ctx_path(ptr) #2
+key|HttpCtxPeerEof|http_ctx_peer_eof|HostState|declare i32 @align_rt_http_ctx_peer_eof(ptr, ptr) #2
 key|HttpCtxUpgradeReady|http_ctx_upgrade_ready|HostState|declare i32 @align_rt_http_ctx_upgrade_ready(ptr) #2
 key|HttpGetMany|http_get_many|HostState|declare i32 @align_rt_http_get_many(ptr, ptr, i64, i64, ptr) #2
 key|HttpHeader|http_header|HostState|declare void @align_rt_http_header(ptr, ptr, i64, ptr, i64) #2
