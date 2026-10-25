@@ -195,6 +195,9 @@ pub fn sources_for_revision(revision: u8) -> (String, String, usize) {
             }
         }
         source.push_str("}\n");
+        source.push_str(&format!(
+            "fn raw_direct_{ordinal}(p:raw)->{name} {{ unsafe {{ return raw.load(p,1) }} }}\nfn raw_bound_{ordinal}(p:raw)->{name} {{ unsafe {{ value:{name}:=raw.load(p,1); return keep(value) }} }}\n"
+        ));
         c.push_str(&format!("}} {name};\n"));
         // Pin C's independent layout, including tail padding, rather than only reading values.
         let mut offset = 0usize;
@@ -244,6 +247,7 @@ pub fn sources_for_revision(revision: u8) -> (String, String, usize) {
         };
         body.push_str(&format!("{original} := {}\ncopy{ordinal} := keep({original})\np{ordinal} := cfa_storage()\nraw.store(p{ordinal},1,{original})\ncfa_raw_{ordinal}(p{ordinal},0)\nmut loaded{ordinal}: {name} := raw.load(p{ordinal},1)\n", initial));
         body.push_str(&align_checks(record, &format!("loaded{ordinal}"), false));
+        body.push_str(&format!("direct{ordinal}:=raw_direct_{ordinal}(p{ordinal})\nbound{ordinal}:=raw_bound_{ordinal}(p{ordinal})\n"));
         for (i, field) in record.fields.iter().enumerate() {
             if field.ty == "raw" {
                 continue;
@@ -263,6 +267,9 @@ pub fn sources_for_revision(revision: u8) -> (String, String, usize) {
         body.push_str(&format!(
             "raw.store(p{ordinal},1,loaded{ordinal})\ncfa_raw_{ordinal}(p{ordinal},1)\n"
         ));
+        // Returned copies retain every inline field after both the local copy and raw source change.
+        body.push_str(&align_checks(record, &format!("direct{ordinal}"), false));
+        body.push_str(&align_checks(record, &format!("bound{ordinal}"), false));
         // Width/stride and padding are checked through independent C reads and boundary sentinels.
         body.push_str(&format!("if cfa_size_{ordinal}() < 1 {{ return 13 }}\n"));
         for (gp, fp) in [

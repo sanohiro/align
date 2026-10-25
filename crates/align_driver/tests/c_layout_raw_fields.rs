@@ -141,6 +141,53 @@ fn fixed_numeric_field_cache_tracks_width_count_and_revert() {
     run_owned_role("fixed-array-cache");
 }
 
+#[test]
+fn raw_loaded_fixed_records_return_across_units() {
+    run_owned_role("raw-fixed-return");
+}
+
+fn raw_fixed_return(stage: &Path) {
+    compile_c(stage, "void align_raw_return_fixture(void) {}\n");
+    fs::write(stage.join("factory.align"), r#"module factory
+pub layout(C) Record { pointer:raw, values:[i64;8] }
+pub fn keep<T>(value:T)->T = value
+pub fn direct(p:raw)->Record { unsafe { return raw.load(p,0) } }
+pub fn local()->Record {
+  unsafe {
+    p:=raw.alloc(72)
+    raw.store(p,0,Record {pointer:raw.null(),values:[1,2,3,4,5,6,7,8]})
+    value:Record:=raw.load(p,0)
+    raw.free(p)
+    return keep(value)
+  }
+}
+"#).unwrap();
+    let source = r#"import factory
+fn main()->i32 {
+  unsafe {
+    original:=factory.local()
+    p:=raw.alloc(72)
+    raw.store(p,0,original)
+    loaded:=factory.direct(p)
+    raw.free(p)
+    mut independent:=factory.keep(loaded)
+    independent.values[0]=99
+    mut at:=0
+    loop {
+      if at>=8 { break }
+      if original.values[at]!=at+1 || loaded.values[at]!=at+1 { return 1 }
+      at=at+1
+    }
+    if !loaded.pointer.is_null() || independent.values[0]!=99 { return 2 }
+    return 0
+  }
+}
+"#;
+    for per_unit in [false, true] {
+        build_and_run(stage, source, per_unit, "raw-fixed-return");
+    }
+}
+
 fn fixed_arrays(stage: &Path) {
     let (c, source, calls) = ffi_fixed_array_cases::sources();
     assert_eq!(calls, 392, "fixed C-field native inventory changed");
@@ -227,6 +274,7 @@ fn c_layout_raw_helper() {
         "imported-externs" => imported_externs(stage),
         "alignment-cache" => cache_alignment(stage),
         "fixed-arrays" => fixed_arrays(stage),
+        "raw-fixed-return" => raw_fixed_return(stage),
         "fixed-array-cache" => fixed_array_cache(stage),
         "leader" => {
             // Deliberately leave a live descendant after the group leader exits. Its ownership

@@ -32998,9 +32998,10 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         ExprKind::ArrayBuilderBuild(_) => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::BuilderElement)
         }
-        // These native outputs retain no borrowed content. Copy scalar targets have no
-        // storage headers; successful owners start fresh, and Result::Err carries no header.
-        ExprKind::JsonDecodeScalar { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
+        // These native outputs retain no borrowed content. Raw-loaded C records copy their
+        // inline numeric fields; keep their fresh storage identity without a source borrow.
+        // Copy scalar targets have no headers; Result::Err carries no header either.
+        ExprKind::RawLoad { .. } | ExprKind::JsonDecodeScalar { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -33024,7 +33025,6 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::RawAlloc(_) | ExprKind::RawTryAlloc(_)
         | ExprKind::RawNull
         | ExprKind::RawFree(_)
-        | ExprKind::RawLoad { .. }
         | ExprKind::RawPointerLoad { .. }
         | ExprKind::StaticDescriptorView { .. }
         | ExprKind::RawStore { .. }
@@ -79121,6 +79121,34 @@ mod tests {
             assert_eq!(c_record_field_scalar(ty), None);
         }
     }
+
+    #[test]
+    fn raw_loaded_fixed_c_records_are_independent() {
+        for ty in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"] {
+            let declaration = format!("layout(C) Record {{ pointer:raw, values:[{ty};3] }}\n");
+            for body in [
+                "fn read(p:raw)->Record { unsafe { return raw.load(p,0) } }",
+                "fn read(p:raw)->Record { unsafe { value:Record:=raw.load(p,0); return value } }",
+                "fn read(p:raw)->Record { arena { unsafe { value:Record:=raw.load(p,0); return value } } }",
+                "fn read(p:raw)->Option<Record> { unsafe { value:Record:=raw.load(p,0); return Some(value) } }",
+                "fn read(p:raw)->Result<Record,Error> { unsafe { value:Record:=raw.load(p,0); return Ok(value) } }",
+            ] {
+                let (_, diagnostics) = check(&format!("{declaration}{body}"));
+                assert!(!diagnostics.has_errors(), "{ty}/{body}: {:?}", diagnostics.iter().collect::<Vec<_>>());
+            }
+            for direct in [false, true] {
+                let body = if direct {
+                    format!("fn read(p:raw)->slice<{ty}> {{ unsafe {{ value:Record:=raw.load(p,0); return value.values[..] }} }}")
+                } else {
+                    format!("fn read(p:raw)->slice<{ty}> {{ unsafe {{ value:Record:=raw.load(p,0); view:=value.values[..]; return view }} }}")
+                };
+                let (_, diagnostics) = check(&format!("{declaration}{body}"));
+                assert!(diagnostics.iter().any(|d| d.message.contains("local storage") || d.message.contains("local array")),
+                    "loaded-field view escaped {ty}: {:?}", diagnostics.iter().collect::<Vec<_>>());
+            }
+        }
+    }
+
     fn with_dynamic_array_field_checkers(
         source: &str,
         operation: impl FnOnce(&mut EscapeCheck<'_>, &mut MoveCheck<'_>),

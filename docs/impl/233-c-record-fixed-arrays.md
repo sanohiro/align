@@ -102,6 +102,29 @@ pressure, malformed metadata, native collisions and imported/cache identity.
 
 ## Author closure pass
 
+### Raw-loaded return correction (AM-R24)
+
+The 2026-10-25 consumer reproducer rejects both direct and local-bound raw-load
+returns of the admitted C record, while reconstruction from its Copy fields
+passes. The storage classifier still assigns `RawLoad` the missing-producer
+policy; numeric fixed fields therefore become unknown local storage. Classify
+the existing raw-load result as fresh content without borrowed dependencies.
+Its inline storage remains tracked for views, replacement and expiry. This
+implements the existing source/Copy contract; no representation, API, ABI,
+interface format, lifetime rule or allocation behavior changes.
+
+| Closure cell | Implementation and owner |
+| --- | --- |
+| Valid formation and complete copied contents | `storage_variant_policy` supplies fresh empty content to both EscapeCheck and MoveCheck; `raw_loaded_fixed_c_records_are_independent` covers ten numeric types, raw siblings, direct/bound/arena returns and tagged carriers. Existing `c_record_field_domain` and checked-HIR C-field owners retain malformed-domain rejection. |
+| Construction, copying, replacement and return | The existing 28-record native fixture adds direct/bound raw-load helpers and checks every returned element after mutation of the source and another Copy. The same fixture runs whole/per-unit and through width/count/cache-hit/revert rounds. |
+| Imported result and source release | `raw_loaded_fixed_records_return_across_units` returns copied numeric fields after freeing the source allocation, then checks direct/bound/imported/generic results and independent-copy mutation in both compilation modes. |
+| Borrowed negatives and control paths | The sema owner retains local fixed-field slice escape rejection, including direct loaded fields; existing fixed-field exclusion and Copy/FFI control-join owners remain. Inline views retain lifetime/generation tracking. |
+| Drop and other boundaries | C records contain no owning children or Drop action; raw pointer fields convey no pointee authority. Existing raw unsafe checks, native ABI owners and independent checked-HIR replay remain authoritative. Partial owning fields, external writable views and R132/R142 are outside this correction. |
+
+This is the already-reviewed Plan233 strategy with a missing producer repaired.
+The author matrix pass and one preflight diff review cover the correction; no
+new safety strategy or separate broad design review is required.
+
 The extracted ledger obligations map to the following changed sites and owners.
 No IR variant, ownership transfer, cleanup strategy or serialized format changes.
 
