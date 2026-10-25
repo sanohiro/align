@@ -49748,6 +49748,7 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    #[inline(never)]
     fn move_match(
         &mut self,
         expression: &'a Expr,
