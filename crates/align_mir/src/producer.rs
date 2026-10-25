@@ -1743,6 +1743,10 @@ pub fn native_owner_mir_contract<'a>(
             contract.outputs = vec![(*out, Ty::File)];
             contract.operands = vec![(path, Ty::Str, read)];
         }
+        Rvalue::FileReadAt { file, offset, destination } => {
+            contract.result = i64_ty;
+            contract.operands = vec![(file, Ty::File, read), (offset, i64_ty, read), (destination, bytes, write)];
+        }
         Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset } => {
             contract.result = i64_ty;
             contract.operands = vec![(file, Ty::File, read), (buffer, Ty::Buffer, write),
@@ -3911,7 +3915,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         1,
                         true,
                     )),
-                    hir::ResourceViewKind::Slice(scalar) => {
+                    hir::ResourceViewKind::Slice(scalar) | hir::ResourceViewKind::SliceMut(scalar) => {
                         let bits = match scalar {
                             Scalar::Int(integer) => integer.bits,
                             Scalar::Float(float) => float.bits,
@@ -3954,7 +3958,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         .get(resource as usize)
                         .is_none()
                     || xml_operand_base_ty(self.graph.function, &owner)
-                        != Some(Ty::ResourceRef(resource))
+                        != Some(view.owner_ty(resource))
                     || xml_operand_base_ty(self.graph.function, &ptr) != Some(Ty::Raw)
                     || xml_operand_base_ty(self.graph.function, &len) != Some(i64_ty)
                     || !allow_null_if_empty
@@ -3964,14 +3968,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                 } else {
-                    self.check_operand(
-                        &mut equation,
-                        &owner,
-                        Ty::ResourceRef(resource),
-                    );
+                    let source = self.read_source(&mut equation, &owner, view.owner_ty(resource), Vec::new());
+                    Self::add_required_source(&mut equation, source, OperandRequirement {
+                        write: view.is_mutable(), exclusive: view.is_mutable(), ..OperandRequirement::READ
+                    });
                     self.check_operand(&mut equation, &ptr, Ty::Raw);
                     self.check_operand(&mut equation, &len, i64_ty);
-                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    equation.seed = Some(if view.is_mutable() { XmlAccessProvenance::Exclusive } else { XmlAccessProvenance::Shared });
                 }
             }
             Rvalue::Load(slot) => {
@@ -4130,7 +4133,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     // Exact zero-length inline storage has no element producer to follow.
                     // Bounds validation keeps every element read unreachable; this is a
                     // readable empty view, not an uninitialized nonempty payload.
-                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    // Its backing authority comes from the inline slot, never from the view
+                    // descriptor. Shared incoming arrays remain shared even when empty.
+                    equation.seed = Some(self.graph.function.params.iter().position(|parameter| *parameter == slot)
+                        .map_or(XmlAccessProvenance::Owned, |position| xml_argument_access(self.graph.function, position as u32)));
                 } else if path.is_empty() {
                     let source = self.queue(XmlAccessNode::Slot(
                         slot,
@@ -4141,7 +4147,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         source,
                         OperandRequirement::READ,
                     );
-                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    equation.seed = Some(self.graph.function.params.iter().position(|parameter| *parameter == slot)
+                        .map_or(XmlAccessProvenance::Owned, |position| xml_argument_access(self.graph.function, position as u32)));
                 } else if let Some(remaining) =
                     path.strip_prefix(&[XmlAccessPathSegment::Element])
                 {
@@ -4201,7 +4208,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if fields.is_empty() || !view_matches {
                     equation.invalid = true;
                 } else if length == 0 {
-                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    equation.seed = Some(self.graph.function.params.iter().position(|parameter| *parameter == slot)
+                        .map_or(XmlAccessProvenance::Owned, |position| xml_argument_access(self.graph.function, position as u32)));
                 } else if path.is_empty() {
                     let mut source_path = field_path;
                     source_path.push(XmlAccessPathSegment::Element);
@@ -4211,7 +4219,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         source,
                         OperandRequirement::READ,
                     );
-                    equation.seed = Some(XmlAccessProvenance::Shared);
+                    equation.seed = Some(self.graph.function.params.iter().position(|parameter| *parameter == slot)
+                        .map_or(XmlAccessProvenance::Owned, |position| xml_argument_access(self.graph.function, position as u32)));
                 } else if let Some(remaining) = path.strip_prefix(&[XmlAccessPathSegment::Element]) {
                     let mut source_path = field_path;
                     source_path.push(XmlAccessPathSegment::Element);
@@ -6892,7 +6901,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::FileCreateRw { .. }
             | Rvalue::FileOpenRw { .. }
             | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
-            | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. }
+            | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. } | Rvalue::FileReadAt { .. }
             | Rvalue::FilePwrite { .. }
             | Rvalue::FileLen { .. } | Rvalue::FileSync(..)
             | Rvalue::BufferBytes(..) | Rvalue::BuilderBytes(..)
@@ -10052,7 +10061,7 @@ fn validate_resource_rvalues_component(
                 {
                     return Err(fail(function, &format!("native owner producer contract mismatch: {rvalue:?}")));
                 }
-                if matches!(rvalue, Rvalue::IndexedFieldView(_)
+                if matches!(rvalue, Rvalue::ResourceViewFromRaw { .. } | Rvalue::IndexedFieldView(_)
                     | Rvalue::SliceLen(Operand::BorrowedElementPlace(_))
                     | Rvalue::SliceIndex(Operand::BorrowedElementPlace(_), _)
                     | Rvalue::SliceIndexNoalias { slice: Operand::BorrowedElementPlace(_), .. })
@@ -10409,7 +10418,7 @@ fn validate_resource_rvalues_component(
                     } => {
                         let expected = match view {
                             hir::ResourceViewKind::StrUtf8 => Some((Ty::Option(Scalar::Str), 1, true)),
-                            hir::ResourceViewKind::Slice(Scalar::Int(integer)) => {
+                            hir::ResourceViewKind::Slice(Scalar::Int(integer)) | hir::ResourceViewKind::SliceMut(Scalar::Int(integer)) => {
                                 align_sema::scalar_to_prim(Scalar::Int(*integer)).map(|primitive| {
                                     (
                                         Ty::Option(Scalar::Slice(primitive)),
@@ -10418,7 +10427,7 @@ fn validate_resource_rvalues_component(
                                     )
                                 })
                             }
-                            hir::ResourceViewKind::Slice(Scalar::Float(float)) => {
+                            hir::ResourceViewKind::Slice(Scalar::Float(float)) | hir::ResourceViewKind::SliceMut(Scalar::Float(float)) => {
                                 align_sema::scalar_to_prim(Scalar::Float(*float)).map(|primitive| {
                                     (
                                         Ty::Option(Scalar::Slice(primitive)),
@@ -10427,12 +10436,12 @@ fn validate_resource_rvalues_component(
                                     )
                                 })
                             }
-                            hir::ResourceViewKind::Slice(_) => None,
+                            hir::ResourceViewKind::Slice(_) | hir::ResourceViewKind::SliceMut(_) => None,
                         };
                         expected.is_some_and(|(expected, alignment, utf8)| {
                             program.resources.get(*resource as usize).is_some()
                                 && operand_ty(function, owner)
-                                    == Some(Ty::ResourceRef(*resource))
+                                    == Some(view.owner_ty(*resource))
                                 && operand_ty(function, ptr) == Some(Ty::Raw)
                                 && operand_ty(function, len)
                                     == Some(Ty::Int(IntTy {

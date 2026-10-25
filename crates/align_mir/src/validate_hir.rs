@@ -4555,14 +4555,15 @@ impl<'a> BodyValidator<'a> {
                     hir::ResourceViewKind::StrUtf8 => Ty::Option(Scalar::Str),
                     hir::ResourceViewKind::Slice(
                         scalar @ (Scalar::Int(_) | Scalar::Float(_)),
-                    ) => Ty::Option(Scalar::Slice(
+                    ) | hir::ResourceViewKind::SliceMut(scalar @ (Scalar::Int(_) | Scalar::Float(_))) => Ty::Option(Scalar::Slice(
                         align_sema::scalar_to_prim(*scalar)
                             .expect("validated primitive resource view scalar"),
                     )),
-                    hir::ResourceViewKind::Slice(_) => Ty::Error,
+                    hir::ResourceViewKind::Slice(_) | hir::ResourceViewKind::SliceMut(_) => Ty::Error,
                 };
                 self.program.resources.get(*resource as usize).is_some()
-                    && owner.ty == Ty::ResourceRef(*resource)
+                    && owner.ty == view.owner_ty(*resource)
+                    && (!view.is_mutable() || self.mutable_resource_view_owner(owner, context))
                     && expression.ty == expected
             }
             hir::ExprKind::ArrayLit {
@@ -4805,7 +4806,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. } | hir::ExprKind::FileReadAt { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. } | hir::ExprKind::BufferTryNew { .. }
@@ -5212,7 +5213,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
-            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. }
+            | hir::ExprKind::FilePread { .. } | hir::ExprKind::FilePreadInto { .. } | hir::ExprKind::FileReadAt { .. }
             | hir::ExprKind::FilePwrite { .. }
             | hir::ExprKind::FileLen { .. } | hir::ExprKind::FileSync { .. }
             | hir::ExprKind::BufferNew { .. } | hir::ExprKind::BufferTryNew { .. }
@@ -5884,6 +5885,28 @@ impl<'a> BodyValidator<'a> {
         expression.ty == Ty::HttpResponse
             && self.local_handle_place(context, recv, Ty::DynResponseArray)
             && self.expr_flow(index).is_some_and(|flow| flow.ty == i64_ty())
+    }
+
+    fn mutable_byte_view_place(&self, context: &BodyContext, value: &hir::Expr) -> bool {
+        let place = align_sema::borrow_argument_source(value);
+        match &place.kind {
+            hir::ExprKind::Local(_) => self.source_mut_local(context, place, place.ty),
+            hir::ExprKind::Field { root, .. } => {
+                let Some(ty) = self.local_type(context, *root) else { return false; };
+                let local = hir::Expr { kind: hir::ExprKind::Local(*root), ty, span: place.span };
+                self.source_mut_local(context, &local, ty)
+            }
+            _ => false,
+        }
+    }
+
+    fn mutable_resource_view_owner(&self, owner: &hir::Expr, context: &BodyContext) -> bool {
+        let hir::ExprKind::Local(local) = owner.kind else { return false; };
+        let Some(function) = self.program.fns.get(context.function) else { return false; };
+        function.locals.get(local as usize).is_some_and(|record| record.is_mut)
+            && function.params.iter().position(|param| *param == local).is_none_or(|position| {
+                matches!(function.param_modes.get(position), Some(align_ast::ParamMode::ByValue | align_ast::ParamMode::BorrowMut))
+            })
     }
 
     fn http_request_ctx_place(&self, expression: &hir::Expr, context: &BodyContext) -> bool {
@@ -8832,6 +8855,7 @@ impl<'a> BodyValidator<'a> {
                 resource,
                 view,
             } => {
+                if view.is_mutable() && !self.mutable_resource_view_owner(owner, context) { return None; }
                 let owner = self.expr_flow(owner)?;
                 let ptr = self.expr_flow(ptr)?;
                 let len = self.expr_flow(len)?;
@@ -8839,11 +8863,11 @@ impl<'a> BodyValidator<'a> {
                     hir::ResourceViewKind::StrUtf8 => Ty::Option(Scalar::Str),
                     hir::ResourceViewKind::Slice(
                         scalar @ (Scalar::Int(_) | Scalar::Float(_)),
-                    ) => Ty::Option(Scalar::Slice(align_sema::scalar_to_prim(*scalar)?)),
-                    hir::ResourceViewKind::Slice(_) => return None,
+                    ) | hir::ResourceViewKind::SliceMut(scalar @ (Scalar::Int(_) | Scalar::Float(_))) => Ty::Option(Scalar::Slice(align_sema::scalar_to_prim(*scalar)?)),
+                    hir::ResourceViewKind::Slice(_) | hir::ResourceViewKind::SliceMut(_) => return None,
                 };
                 if context.unsafe_depth == 0
-                    || owner.ty != Ty::ResourceRef(*resource)
+                    || owner.ty != view.owner_ty(*resource)
                     || ptr.ty != Ty::Raw
                     || len.ty != i64_ty()
                     || self.program.resources.get(*resource as usize).is_none()
@@ -9428,6 +9452,12 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[file, buffer, offset])
+            }
+            hir::ExprKind::FileReadAt { file, offset, destination } => {
+                let bytes = Ty::Slice(Scalar::Int(align_sema::IntTy { bits: 8, signed: false }));
+                if !local(file, Ty::File) || offset.ty != i64 || destination.ty != bytes
+                    || !self.mutable_byte_view_place(context, destination) { return None; }
+                result(i64, &[file, offset, destination])
             }
             hir::ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
                 if !local(file, Ty::File) || !mutable_local(buffer, Ty::Buffer)

@@ -35,6 +35,8 @@ mod http_response_budget_tests;
 #[cfg(test)]
 mod http_peer_eof_tests;
 #[cfg(test)]
+mod file_read_at_tests;
+#[cfg(test)]
 mod http_accept_budget_tests;
 #[cfg(test)]
 mod net_service_tests;
@@ -11799,6 +11801,47 @@ unsafe fn file_pread_into_with(
         Ok((count, initialized)) => { buffer.len = initialized; count }
         Err(status) => -i64::from(status),
     }
+}
+
+/// One initialized external window; all detectable admission checks precede file access.
+unsafe fn file_read_at_with(
+    file: *const RwFile, offset: i64, destination: *mut u8, length: i64,
+    mut read: impl FnMut(i32, *mut u8, usize, i64) -> std::io::Result<usize>,
+) -> i64 {
+    let invalid = -i64::from(AL_INVALID);
+    if !abi_ptr_is_aligned(file) { return invalid; }
+    let Some(file_end) = file.addr().checked_add(core::mem::size_of::<RwFile>()) else { return invalid; };
+    if offset < 0 { return invalid; }
+    let Ok(requested) = safe_len(length) else { return invalid; };
+    if isize::try_from(requested).is_err() || (requested != 0 && destination.is_null()) { return invalid; }
+    let Some(end) = destination.addr().checked_add(requested) else { return invalid; };
+    if requested != 0 && destination.addr() < file_end && file.addr() < end { return invalid; }
+    let fd = unsafe { (*file).fd };
+    if fd < 0 { return invalid; }
+    if requested == 0 { return 0; }
+    loop {
+        match read(fd, destination, requested, offset) {
+            Ok(count) if count <= requested => return i64::try_from(count).unwrap_or(invalid),
+            Ok(_) => return invalid,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(error) => return -i64::from(io_error_to_status(&error)),
+        }
+    }
+}
+
+/// `f.read_at(offset, destination)` borrows an initialized byte view for synchronous positional I/O.
+/// Success publishes only the returned prefix. Native Err has no count/rollback promise.
+/// The descriptor, allocation, cursor and bytes outside the window are unchanged.
+///
+/// # Safety
+/// File must be live/aligned, and destination must name initialized writable bytes, disjoint
+/// from the File shell and any concurrent access, for the call. No address is retained.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_io_file_read_at(file: *const RwFile, offset: i64, destination: *mut u8, length: i64) -> i64 {
+    unsafe { file_read_at_with(file, offset, destination, length, |fd, bytes, requested, offset| {
+        let count = pread(fd, bytes.cast(), requested, offset);
+        usize::try_from(count).map_err(|_| std::io::Error::last_os_error())
+    }) }
 }
 
 /// `f.pread_into(b, destination_offset, length, file_offset)` — bounded direct buffer-window I/O.

@@ -8,8 +8,8 @@ ownership. Six native-observation rows and the lossy/SHA-1 rows are implemented.
 returning independently owned pointer/length results from borrowed bytes. Canonical leaf tags are unchanged. R88 adds the ordinary-path regular-reader row (plan 58). Plan 65's
 SIMD-surface consistency capability adds `BufferAppendFilled`. Unsigned integer display adds `PrintU64`, a non-retaining `u64` input with
 `void(i64)` native ABI and the same stdout/flush behavior as signed display.
-Current inventory: 479 keyed,
-497 base, 504 alloc-count, 501 par-map-probe and 508 maximum exports.
+Current inventory: 480 keyed,
+498 base, 505 alloc-count, 502 par-map-probe and 509 maximum exports.
 
 **R65 implemented contract:** [plan 50](50-r65-process-capability-handoff.md) and
 [plan 49](49-native-process-contract.md) own the
@@ -79,7 +79,7 @@ owned JSON, exclusive filesystem publication, retained-root regular-file access,
 lifecycle, HTTP client
 raw/SSE receive streaming, asymmetric signatures, `std.log`, `core.codec`, `pkg.frame`, `pkg.kv`,
 `pkg.csv`, `pkg.ws`, `pkg.template`, named time/path wire formats, incremental SHA-256 host observation and ordinary directory operations, there
-are 479 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
+are 480 `RuntimeKey` variants and a one-to-one native-symbol record. Relative to Am-c1, F-B added
 `ArrayBuilderNewIn` and `ArrayBuilderPushBytes`; the four
 AEAD symbols that were previously selected from `AeadCipher × AeadDir` become
 ordinary typed keys; they may no longer bypass the registry. Eighteen always-built
@@ -126,7 +126,7 @@ added six keyed rows, `core.codec` then added eight, `pkg.frame` added two, `pkg
 source-reachable unkeyed row, `pkg.csv` added one keyed row, `pkg.ws` added eleven keyed rows, and
 `pkg.template` added five keyed rows. Their runtime
 definitions and registry entries activated atomically at their respective capability boundaries: the current exact counts
-are 479 keyed records, 497 base records, and 508 records in the maximum optional-probe export table.
+are 480 keyed records, 498 base records, and 509 records in the maximum optional-probe export table.
 No new probe category was introduced. The implemented `pkg.kv` row reuses an existing ABI shape. Its two
 independently useful prerequisites first hardened the shared TCP timeout substrate and existing
 TCP-derived writers without changing a symbol, key, shape, attribute, or count.
@@ -436,6 +436,7 @@ declaration golden owns the emitted declaration and the class token together.
 | `IoFileOpenRo` | `align_rt_io_file_open_ro` | `HostState` |
 | `IoFileOpenRoRegular` | `align_rt_io_file_open_ro_regular` | `HostState` |
 | `IoFilePread` | `align_rt_io_file_pread` | `HostState` |
+| `IoFileReadAt` | `align_rt_io_file_read_at` | `HostState` |
 | `IoFilePreadInto` | `align_rt_io_file_pread_into` | `HostState` |
 | `IoFilePwrite` | `align_rt_io_file_pwrite` | `HostState` |
 | `IoFileSync` | `align_rt_io_file_sync` | `HostState` |
@@ -1574,6 +1575,7 @@ from the bodies. A merged body also carries no producer string attribute.
 | A133 | `i64 @SYM(i32)` | `align_rt_process_signal_number` |
 | A134 | `i32 @SYM(i32, ptr)` | `align_rt_process_signals` |
 | A135 | `i32 @SYM(i32, i64, ptr)` | `align_rt_fs_memory_file` |
+| A139 | `i64 @SYM(ptr, i64, ptr, i64)` | `align_rt_io_file_read_at` |
 | A138 | `i64 @SYM(ptr, ptr, i64, i64, i64)` | `align_rt_io_file_pread_into` |
 | A20 | `i32 @SYM(ptr, ptr, i64)` | `align_rt_io_writer_write`, `align_rt_cli_get_bool`, `align_rt_regex_is_match`, `align_rt_http_stream_send`, `align_rt_http_stream_send_event`, `align_rt_unicode_nfc` |
 | A21 | `i32 @SYM(ptr, ptr, i64, i64, ptr)` | `align_rt_http_get_many`, `align_rt_regex_find` |
@@ -1775,10 +1777,10 @@ LLVM construction and receives no runtime-feature input.
 
 Tests compare:
 
-- all 479 keys, mapped symbols, LLVM declaration types, and derived effects
+- all 480 keys, mapped symbols, LLVM declaration types, and derived effects
   against this table through the checked-in
   `crates/align_codegen_llvm/tests/golden/runtime_abi_declarations.txt`;
-- the 497 base native symbols against default-feature `align_runtime` exports,
+- the 498 base native symbols against default-feature `align_runtime` exports,
   plus every actual Rust definition's normalized native return and ordered
   parameter types against the declaration golden, failing on either direction's
   difference through `scripts/test-runtime-abi-exports.sh`;
@@ -2491,3 +2493,7 @@ and a bool payload load only on success. The context READ, i32 status and bool
 output are authenticated even for discarded results. Plan243 fixes half-close,
 queued-data, pending-error and ownership semantics. The keyed/base/maximum
 inventories increase by one without adding an ABI shape or probe family.
+
+## Plan244: initialized File destination windows
+
+A139 takes const File*, i64 offset, mutable byte pointer and i64 length, returning a nonnegative count or existing negative status. HostState conservatively exposes operands 0 and 2, with no release. File and destination are borrowed only during synchronous pread. Admission is file pointer/alignment/shell-end, nonnegative offset and representable length, destination null/end/shell-overlap, negative fd, then zero or EINTR-only native read. No output counter or allocation is added. Plan244 fixes byte preservation and native-error limits.

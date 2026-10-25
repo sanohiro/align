@@ -228,23 +228,24 @@ fn binary_byte_write_rejects_invalid_authority_and_old_observations() {
                     "fn bad()->Result<(),Error>{mut owner:=buffer.filled(1,65);mut bytes:=owner.bytes();text:=bytes.as_str()?;bytes.set_u8(0,255);print(text);return Ok(())}",
                     "invalidated borrow",
                 ),
-                // A conditional write is not a mandatory write, including an error before it.
+                // Plan240 preserves Copy-element slice backing without a mandatory write.
+                // These calls leave the original descriptor live, even on a conditional/no-op path.
                 (
                     "fn write(borrow mut bytes:slice<u8>,flag:bool){if flag {bytes.set_u8(0,1)}}\nfn bad(borrow mut bytes:slice<u8>,flag:bool){mut active:=bytes[0..1];write(active,flag);print(bytes.len())}",
-                    "invalidated borrow",
+                    "",
                 ),
                 (
                     "fn write(borrow mut bytes:slice<u8>,flag:bool)->Result<(),Error>{if flag {return Err(Error.Invalid)};bytes.set_u8(0,1);return Ok(())}\nfn bad(borrow mut bytes:slice<u8>,flag:bool)->Result<(),Error>{mut active:=bytes[0..1];write(active,flag)?;print(bytes.len());return Ok(())}",
-                    "invalidated borrow",
+                    "",
                 ),
                 // Empty fill/copy may return without writing an element.
                 (
                     "fn write(borrow mut bytes:slice<u8>){bytes.fill(1)}\nfn bad(borrow mut bytes:slice<u8>){mut active:=bytes[0..0];write(active);print(bytes.len())}",
-                    "invalidated borrow",
+                    "",
                 ),
                 (
                     "fn write(borrow mut bytes:slice<u8>,source:slice<u8>){bytes.copy_from(source)}\nfn bad(borrow mut bytes:slice<u8>,source:slice<u8>){mut active:=bytes[0..0];write(active,source);print(bytes.len())}",
-                    "invalidated borrow",
+                    "",
                 ),
             ];
             for (index, (body, expected)) in cases.iter().enumerate() {
@@ -261,7 +262,7 @@ fn binary_byte_write_rejects_invalid_authority_and_old_observations() {
                     };
                     let rendered = align_driver::format_diagnostics(&sources, &diagnostics);
                     assert!(
-                        diagnostics.has_errors() && rendered.contains(expected),
+                        diagnostics.has_errors() == !expected.is_empty() && rendered.contains(expected),
                         "{index}/{per_unit}: {rendered}"
                     );
                 }

@@ -1217,6 +1217,9 @@ fn walk_body_records<'a>(
                         work.push((BodyRecord::Expr(argument), child_depth));
                     }
                 }
+                ExprKind::FileReadAt { file, offset, destination } => {
+                    for child in [file, offset, destination] { work.push((BodyRecord::Expr(child), child_depth)); }
+                }
                 ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
                     for child in [file, buffer, destination_offset, length, offset] {
                         work.push((BodyRecord::Expr(child), child_depth));

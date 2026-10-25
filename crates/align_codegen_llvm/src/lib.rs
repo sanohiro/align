@@ -15256,6 +15256,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_and(valid, aligned, "resource.valid.alignment")
                     .map_err(|e| self.err(e))?;
 
+                // The initialized foreign range is the unsafe wrapper's obligation, but reject
+                // arithmetic wrap before even UTF-8 validation can access pointed-to bytes.
+                let byte_length = self.builder.build_int_mul(length,
+                    self.ctx.i64_type().const_int(u64::from(*check_alignment), false),
+                    "resource.byte.length").map_err(|e| self.err(e))?;
+                let end = self.builder.build_int_add(address, byte_length, "resource.end")
+                    .map_err(|e| self.err(e))?;
+                let range_valid = self.builder.build_int_compare(IntPredicate::UGE, end, address,
+                    "resource.range.valid").map_err(|e| self.err(e))?;
+                let valid = self.builder.build_and(valid, range_valid, "resource.valid.range")
+                    .map_err(|e| self.err(e))?;
+
                 let valid = if *check_utf8 {
                     let check = self.ctx.append_basic_block(self.func, "resource.utf8.check");
                     let invalid = self.ctx.append_basic_block(self.func, "resource.utf8.skip");
@@ -15313,7 +15325,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 };
                 let expected_payload = match view {
                     hir::ResourceViewKind::StrUtf8 => Scalar::Str,
-                    hir::ResourceViewKind::Slice(scalar) => Scalar::Slice(
+                    hir::ResourceViewKind::Slice(scalar) | hir::ResourceViewKind::SliceMut(scalar) => Scalar::Slice(
                         align_sema::scalar_to_prim(*scalar)
                             .ok_or_else(|| self.err("resource slice view element is not primitive"))?,
                     ),
@@ -16967,7 +16979,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // bodies — `gen_rvalue` is depth-recursive (via operand materialization), so keeping its
             // frame flat preserves the expr-depth budget (the #296 lesson, mirroring MIR's dispatcher).
             Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }
-            | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) => self.gen_file_rvalue(rv)?,
+            | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. } | Rvalue::FileReadAt { .. } | Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) => self.gen_file_rvalue(rv)?,
             Rvalue::ReaderStdin => self
                 .builder
                 .build_call(self.runtime(RuntimeKey::IoReaderStdin), &[], "stdin")
@@ -24394,6 +24406,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_call(self.runtime(RuntimeKey::IoFilePread), &[fp, bp, off], "pread")
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("io_file_pread returns i64")
+            }
+            Rvalue::FileReadAt { file, offset, destination } => {
+                let fp = self.operand(file)?.into();
+                let off = self.operand(offset)?.into();
+                let bytes = self.operand(destination)?.into_struct_value();
+                let ptr = self.builder.build_extract_value(bytes, 0, "readat.ptr").map_err(|error| self.err(error))?;
+                let len = self.builder.build_extract_value(bytes, 1, "readat.len").map_err(|error| self.err(error))?;
+                let key = RuntimeKey::IoFileReadAt;
+                let call = self.builder.build_call(self.runtime(key), &[fp, off, ptr.into(), len.into()], "readat")
+                    .map_err(|error| self.err(error))?;
+                self.apply_native_call_attributes(key, call);
+                call.try_as_basic_value().basic().ok_or_else(|| self.err("file_read_at returned no count"))?
             }
             Rvalue::FilePreadInto { file, buffer, destination_offset, length, offset } => {
                 let arguments = [self.operand(file)?.into(), self.operand(buffer)?.into(),

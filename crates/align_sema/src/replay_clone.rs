@@ -1128,6 +1128,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             buffer: boxed!(buffer),
             offset: boxed!(offset),
         },
+        ExprKind::FileReadAt { file, offset, destination } => ExprKind::FileReadAt {
+            file: boxed!(file), offset: boxed!(offset), destination: boxed!(destination),
+        },
         ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => ExprKind::FilePreadInto {
             file: boxed!(file), buffer: boxed!(buffer), destination_offset: boxed!(destination_offset),
             length: boxed!(length), offset: boxed!(offset),
@@ -3044,6 +3047,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(doc);
             one!(key);
         }
+        ExprKind::FileReadAt { file, offset, destination } => { one!(file); one!(offset); one!(destination); }
         ExprKind::FilePreadInto { file, buffer, destination_offset, length, offset } => {
             one!(file); one!(buffer); one!(destination_offset); one!(length); one!(offset);
         }

@@ -29,6 +29,25 @@ receiver は共有借用、入力の借用は呼び出し中だけ。実 UID/GID
 > single-link open も実装済みであり、align-llm 側の adoption は外部作業として残る。Request 56 の
 > private temporary-directory lifecycle は実装済みである。利用側の導入状況は外部の request register で管理する。
 
+## 初期化済み可変ビューへの位置指定読み込み
+
+`f.read_at(offset: i64, destination: slice<u8>) -> Result<i64, Error>` は同期的に
+初期化済み可変バイトビューへ読み込みます。File は束縛済みローカルの共有借用、宛先は
+束縛済みの排他的ビューです。固定配列の既存の変換と `borrow mut`/`out` 引数も使えます。
+部分範囲は先にスライスとして束縛します。引数は左から一度ずつ評価し、後続引数による
+評価済み所有者の無効化を拒否します。負の offset/長さ、表現不能長、非空 null、
+アドレス末尾の overflow、File 本体との重複は I/O 前に Invalid です。ポインタの検証後に
+fd を読み、負の fd は長さゼロでも Invalid です。有効なゼロ長では syscall を行いません。
+pread は EINTR のみ再試行し、カーソルを変えず、既存の errno 表を使います。
+成功は実際の読み込み数を返し、短い読み込みと EOF のゼロも含みます。その接頭範囲以外は
+保持します。入力拒否・ゼロ長・EOF ではバイトを変えません。native Err は範囲内を変更する
+場合があり、有効な読み込み数を公開しません。範囲外と全体の初期化状態は常に保持します。
+Align 側の確保・resize・初期化・コピー・アドレス保持・記述子再束縛はありません。
+File、ビュー、所有者世代は Ok/Err とも保持しますが、重なる既存の UTF-8 検証は失効します。
+unsafe producer は全範囲を事前に初期化し、外部転送の完了を含む有効性・書き込み権限を
+保証します。初期化済み長を延長できる所有 Buffer の操作は `pread_into` です。
+厳密な契約は [Plan244](../../244-external-writable-file-windows.md) にあります。
+
 ## 既存バッファへの範囲指定読み込み
 
 `f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`

@@ -1628,6 +1628,23 @@ generation, so the parent cannot move/drop before the child. The private unsafe
 `Option<slice<FFIScalar>>` tied to that generation after shape/alignment/UTF-8 checks; foreign range
 validity remains the wrapper's unsafe obligation. No owner-free safe raw-to-view conversion exists.
 
+
+`resource.view_mut_from_raw(owner, ptr, len)` is the unsafe privileged writable
+counterpart. Its owner must be a bound mutable owning resource local, including
+`borrow mut R`, never a shared reference, temporary or partial Move field. The
+expected result is `Option<slice<FFIScalar>>`; `str` is excluded. Length is i64
+in elements. Both constructors reject pointer-end overflow before pointed access.
+The wrapper proves the entire range initialized, live, writable, uniquely owned
+and free of foreign concurrent access, including external transfer completion.
+Formation allocates/copies nothing and retains the existing resource/parent
+generation, including empty views. Later operands cannot retire the selected
+owner. Actual byte writes retain the descriptor and owner generation but expire
+all overlapping UTF-8 observations, including native `str` construction. Owner
+move, replacement, Drop, into_raw and exclusive whole-owner calls end the view.
+Aliases from one resource cannot prove disjointness. Ordinary helper returns
+remain read-only under Plan240; a producer helper performs writes while explicitly
+borrowing the owner mutably. Plan244 owns the exact admission and temporal matrix.
+
 Deliberately deferred beyond the shipped FFI slices (draft §15): target ABIs
 other than LP64 x86-64 Linux and LP64 ARM64 Linux/macOS;
 `bool`/`char` as FFI types (use the integer types — a C `char` is `i8`/`u8`, a `char32_t` is `u32`;
@@ -1903,6 +1920,27 @@ File shell allocate. The borrowed path is not retained. Existing positional
 methods, short reads, EOF, read-only pwrite denial and Drop apply unchanged.
 Path replacement cannot switch the descriptor after admission; content stability,
 path confinement and remote-filesystem interruptibility are not promised.
+
+
+`f.read_at(offset: i64, destination: slice<u8>) -> Result<i64, Error>` reads
+synchronously into an initialized writable byte view. The File receiver is a
+bound local shared borrow; the destination is a bound exclusive view, including
+existing fixed-array coercion and `borrow mut`/`out` helper parameters. Bind a
+subrange to select a window. Operands evaluate once left to right; later operands
+cannot invalidate completed native owners. Negative offset/length, unrepresentable
+length, nonempty null, address overflow and File-shell overlap are Invalid before
+I/O. File/destination pointer admission precedes descriptor access; a negative fd
+is Invalid even for zero length. Valid zero length performs no syscall. One pread
+retries only EINTR, preserves the cursor and uses the existing errno mapping.
+Success returns the actual prefix count, including short reads and EOF zero;
+bytes beyond that prefix remain unchanged. Admission failures/zero/EOF preserve
+bytes; native Err may alter bytes inside the selected window and yields no valid
+count. Bytes outside the window and full initialization always survive. No Align
+allocation, resize, initialization, copy, address retention or descriptor rebind
+occurs. File, view and owner generation survive Ok/Err; every call expires earlier
+overlapping byte-validation observations. The unsafe producer must already have
+initialized the whole range. `pread_into` remains the owning Buffer operation
+that may extend initialized length. Plan244 fixes the complete contract.
 
 `f.pread_into(b, destination_offset, length, file_offset) -> Result<i64, Error>`
 reads directly into a selected range of the existing buffer. The receiver is a
