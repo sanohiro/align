@@ -2665,6 +2665,8 @@ pub enum ExprKind {
         message: Box<Expr>,
         signature: Box<Expr>,
     },
+    /// Detached Copy request view, minted from a live owner place.
+    HttpCtxView { ctx: Box<Expr> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]

@@ -13089,8 +13089,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // HttpRespondTimeoutNs adds one checked three-operand native action.
         // HttpCtxPeerEof adds a checked shared receiver and Copy bool/Error result.
         // FileReadAt adds one explicit initialized byte-view native writer.
+        // HttpCtxView adds headerless Copy request observation with exact owner provenance.
         variants,
-        364,
+        365,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -22025,6 +22026,51 @@ fn builder_bytes_hir_rejects_forged_receiver_and_result() -> Result<(), &'static
             _ => expression.kind = hir::ExprKind::BufferBytes { buffer: builder.clone() },
         }
         assert_body_entrypoints_empty(&format!("builder-bytes-{mutation}"), &bad);
+    }
+    Ok(())
+}
+
+#[test]
+fn http_request_view_hir_authority_and_replay() -> Result<(), String> {
+    let source = "import std.http\nfn mint(borrow ctx:http_request_ctx)->http_request_view=ctx.view()\nfn path(view:http_request_view)->str=view.path()\nfn headers(view:http_request_view)->http_headers=view.headers()\nfn body(view:http_request_view)->slice<u8> = view.body()\nfn observe(view:http_request_view)->Result<bool,Error> = view.peer_eof()\nfn stream(borrow ctx:http_request_ctx)->Result<http_stream,Error> = ctx.respond_stream(http.response(200))\nfn main(){}";
+    let original = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&original));
+    let effects = align_sema::fn_effects(&original, &Default::default());
+    assert_eq!(effects.get("mint"), Some(&FnEffect::Pure));
+    assert_eq!(effects.get("observe"), Some(&FnEffect::Impure));
+    for name in ["mint", "path", "headers", "body", "observe"] {
+        for mutation in 0..4 {
+            let mut bad = original.clone();
+            let function = bad.fns.iter_mut().find(|f| f.name == name).ok_or("function")?;
+            let expression = function.body.value.as_deref_mut().ok_or("expression")?;
+            let ctx = match &mut expression.kind {
+                hir::ExprKind::HttpCtxView { ctx } | hir::ExprKind::HttpCtxPath { ctx }
+                | hir::ExprKind::HttpCtxHeaders { ctx } | hir::ExprKind::HttpCtxBody { ctx }
+                | hir::ExprKind::HttpCtxPeerEof { ctx } => ctx,
+                _ => return Err("HTTP read shape".into()),
+            };
+            match mutation {
+                0 => ctx.ty = Ty::HttpHeaders,
+                1 => ctx.kind = hir::ExprKind::Local(u32::MAX),
+                2 => expression.ty = Ty::HttpRequestCtx,
+                _ if name == "mint" => {
+                    let value = ctx.as_ref().clone();
+                    ctx.kind = hir::ExprKind::Block(hir::Block { stmts: Vec::new(), value: Some(Box::new(value)) });
+                }
+                _ => ctx.ty = Ty::Raw,
+            }
+            assert_body_entrypoints_empty("request-view malformed HIR", &bad);
+        }
+    }
+    let mut bad = original.clone();
+    let function = bad.fns.iter_mut().find(|f| f.name == "stream").ok_or("stream")?;
+    assert_ne!(function.mutable_access, Default::default(), "native fd transfer must export an access conflict");
+    function.mutable_access = Default::default();
+    assert_replay_rejects_without_mutating(bad.clone(), "request-view transition summary");
+    let source_map = SourceMap::new();
+    for lowered in [lower_program(&bad), lower_program_located(&bad, &source_map),
+        lower_program_per_unit(&bad), lower_program_per_unit_located(&bad, &source_map)] {
+        assert!(is_empty(&lowered), "missing transition summary published MIR");
     }
     Ok(())
 }

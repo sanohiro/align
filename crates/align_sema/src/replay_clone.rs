@@ -1594,6 +1594,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::HttpCtxMethod { ctx } => ExprKind::HttpCtxMethod { ctx: boxed!(ctx) },
         ExprKind::HttpCtxPath { ctx } => ExprKind::HttpCtxPath { ctx: boxed!(ctx) },
         ExprKind::HttpCtxHeaders { ctx } => ExprKind::HttpCtxHeaders { ctx: boxed!(ctx) },
+        ExprKind::HttpCtxView { ctx } => ExprKind::HttpCtxView { ctx: boxed!(ctx) },
         ExprKind::HttpCtxHeader { headers, name } => ExprKind::HttpCtxHeader {
             headers: boxed!(headers),
             name: boxed!(name),
@@ -2919,6 +2920,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::HttpAccept { server: recv }
         | ExprKind::HttpCtxMethod { ctx: recv }
         | ExprKind::HttpCtxPath { ctx: recv }
+        | ExprKind::HttpCtxView { ctx: recv }
         | ExprKind::HttpCtxHeaders { ctx: recv }
         | ExprKind::HttpCtxBody { ctx: recv }
         | ExprKind::HttpResponseBuilder { status: recv }

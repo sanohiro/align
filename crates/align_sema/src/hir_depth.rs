@@ -994,6 +994,7 @@ fn walk_body_records<'a>(
                 | ExprKind::HttpAccept { server: recv }
                 | ExprKind::HttpCtxMethod { ctx: recv }
                 | ExprKind::HttpCtxPath { ctx: recv }
+                | ExprKind::HttpCtxView { ctx: recv }
                 | ExprKind::HttpCtxHeaders { ctx: recv }
                 | ExprKind::HttpCtxBody { ctx: recv }
                 | ExprKind::HttpResponseBuilder { status: recv }

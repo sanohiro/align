@@ -562,6 +562,7 @@ impl<V: SourceShapeView + ?Sized, O: SourceShapeObserver + ?Sized> SourceShapeCo
             | Ty::HttpUpgrade
             | Ty::HttpReadStream
             | Ty::HttpSseStream
+            | Ty::HttpRequestView
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::Unit

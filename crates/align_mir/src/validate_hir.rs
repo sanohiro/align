@@ -1656,7 +1656,7 @@ impl<'a> PlacementValidator<'a> {
             }
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
             _ if align_sema::is_move_handle(ty) => true,
-            Ty::HttpHeaders => true,
+            Ty::HttpHeaders | Ty::HttpRequestView => true,
             _ => false,
         }
     }
@@ -2107,7 +2107,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Command | Ty::RunOutput | Ty::RunBytes => true,
             Ty::CliCommand => false,
             _ if align_sema::is_move_handle(ty) => true,
-            Ty::Rng | Ty::HttpHeaders | Ty::JsonDoc => true,
+            Ty::Rng | Ty::HttpHeaders | Ty::HttpRequestView | Ty::JsonDoc => true,
             // These are body-produced or compiler-internal values, not results of `resolve_type`
             // in a declaration/header position.
             Ty::IntVar(_)
@@ -2609,6 +2609,7 @@ impl<'a> Validator<'a> {
             | Ty::HttpUpgrade
             | Ty::HttpReadStream
             | Ty::HttpSseStream
+            | Ty::HttpRequestView
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::Unit => true,
@@ -3703,6 +3704,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpClient
             | Ty::HttpServer
             | Ty::HttpRequestCtx
+            | Ty::HttpRequestView
             | Ty::HttpHeaders
             | Ty::ResponseBuilder
             | Ty::HttpStream
@@ -4937,6 +4939,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
+            | hir::ExprKind::HttpCtxView { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
             | hir::ExprKind::HttpHeadersCount { .. }
@@ -5320,6 +5323,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
+            | hir::ExprKind::HttpCtxView { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
             | hir::ExprKind::HttpHeadersCount { .. }
@@ -10287,8 +10291,12 @@ impl<'a> BodyValidator<'a> {
                     && server.ty == Ty::HttpServer && limit.ty == i64)
                     .then(|| strict(Ty::Unit, &[server, limit]))?
             }
-            hir::ExprKind::HttpCtxPeerEof { ctx } => {
+            hir::ExprKind::HttpCtxView { ctx } => {
                 (self.http_request_ctx_place(ctx, context) && ctx.ty == Ty::HttpRequestCtx)
+                    .then(|| strict(Ty::HttpRequestView, &[ctx]))?
+            }
+            hir::ExprKind::HttpCtxPeerEof { ctx } => {
+                (ctx.ty == Ty::HttpRequestView || (self.http_request_ctx_place(ctx, context) && ctx.ty == Ty::HttpRequestCtx))
                     .then(|| result(Ty::Bool, &[ctx]))?
             }
             hir::ExprKind::HttpCtxMethod { ctx }
@@ -10296,7 +10304,8 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpCtxHeaders { ctx }
             | hir::ExprKind::HttpCtxBody { ctx }
             | hir::ExprKind::HttpCtxUpgradeReady { ctx } => {
-                if !self.http_request_ctx_place(ctx, context) || ctx.ty != Ty::HttpRequestCtx {
+                if ctx.ty != Ty::HttpRequestView
+                    && (!self.http_request_ctx_place(ctx, context) || ctx.ty != Ty::HttpRequestCtx) {
                     return None;
                 }
                 let ty = match kind {
@@ -10609,6 +10618,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::HttpClient
             | Ty::HttpServer
             | Ty::HttpRequestCtx
+            | Ty::HttpRequestView
             | Ty::HttpHeaders
             | Ty::ResponseBuilder
             | Ty::HttpStream

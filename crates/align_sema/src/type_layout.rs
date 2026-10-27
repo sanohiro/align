@@ -208,7 +208,7 @@ impl<'a> TypeLayoutCache<'a> {
                         work.push(Work::Enter(scalar_to_ty(err)));
                         work.push(Work::Enter(scalar_to_ty(ok)));
                     }
-                    Ty::Raw | Ty::HttpHeaders | Ty::Resource(_) | Ty::ResourceRef(_) => {
+                    Ty::Raw | Ty::HttpHeaders | Ty::HttpRequestView | Ty::Resource(_) | Ty::ResourceRef(_) => {
                         built.push((8, 8));
                     }
                     ty if is_move_handle(ty) => built.push((8, 8)),

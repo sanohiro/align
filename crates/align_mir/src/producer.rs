@@ -1166,7 +1166,8 @@ pub fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
         // `ctx.headers()` is the request-context pointer retyped as a detached,
         // non-owning header-table view. MIR deliberately represents that zero-cost
         // conversion as `Use`, just like the owned collection-to-view cases above.
-        (Ty::HttpRequestCtx, Ty::HttpHeaders) => true,
+        (Ty::HttpRequestCtx, Ty::HttpHeaders | Ty::HttpRequestView)
+        | (Ty::HttpRequestView, Ty::HttpHeaders) => true,
         (
             Ty::DynStructArray(actual, Layout::Aos),
             Ty::Slice(Scalar::Struct(expected)),
@@ -1330,7 +1331,8 @@ fn xml_access_paths(
             if is_owner { leaves.push((ty, path.clone())); }
             // A Copy view never owns its pointees, even inside an owning record.
             if matches!(ty, Ty::Slice(_) | Ty::Soa(_)) { continue; }
-        } else if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) || http_client_owner_leaf(ty) {
+        } else if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)
+            | Ty::HttpHeaders | Ty::HttpRequestView) || http_client_owner_leaf(ty) {
             leaves.push((ty, path));
             continue;
         }
@@ -1664,6 +1666,10 @@ pub fn native_owner_mir_contract<'a>(
         Some(ty) if ty == bytes => ty,
         _ => Ty::Error,
     };
+    let request_read = |operand| match xml_operand_base_ty(function, operand) {
+        Some(ty @ (Ty::HttpRequestCtx | Ty::HttpRequestView)) => ty,
+        _ => Ty::Error,
+    };
     let mut contract = NativeOwnerMirContract {
         result: Ty::Unit,
         outputs: Vec::new(),
@@ -1761,10 +1767,24 @@ pub fn native_owner_mir_contract<'a>(
             contract.result = i32_ty;
             contract.operands = vec![(writer, Ty::Writer, read)];
         }
+        Rvalue::HttpCtxMethod { ctx } | Rvalue::HttpCtxPath { ctx } => {
+            contract.result = Ty::Str;
+            contract.operands = vec![(ctx, request_read(ctx), read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
+        Rvalue::HttpCtxBody { ctx } => {
+            contract.result = bytes;
+            contract.operands = vec![(ctx, request_read(ctx), read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
+        Rvalue::HttpCtxUpgradeReady { ctx } => {
+            contract.result = i32_ty;
+            contract.operands = vec![(ctx, request_read(ctx), read)];
+        }
         Rvalue::HttpCtxPeerEof { ctx, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::Bool)];
-            contract.operands = vec![(ctx, Ty::HttpRequestCtx, read)];
+            contract.operands = vec![(ctx, request_read(ctx), read)];
         }
         Rvalue::StrParseI64 { input, out } => {
             contract.result = i32_ty;
@@ -6351,12 +6371,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Rvalue::HttpCtxMethod { ctx } | Rvalue::HttpCtxPath { ctx } => {
                 if result_ty != Ty::Str
                     || !path.is_empty()
-                    || xml_operand_base_ty(self.graph.function, &ctx)
-                        != Some(Ty::HttpRequestCtx)
+                    || !matches!(xml_operand_base_ty(self.graph.function, &ctx), Some(Ty::HttpRequestCtx | Ty::HttpRequestView))
                 {
                     equation.invalid = true;
                 } else {
-                    self.check_operand(&mut equation, &ctx, Ty::HttpRequestCtx);
+                    if let Some(ty) = xml_operand_base_ty(self.graph.function, &ctx) {
+                        self.check_operand(&mut equation, &ctx, ty);
+                    }
                     equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
@@ -9802,6 +9823,16 @@ fn validate_resource_rvalues_component(
         let xml_access = |operand: &Operand, expected: Ty| {
             cached_path_access(operand, expected, Vec::new())
         };
+        // Copy HTTP views still carry native pointer authority. Memoize type-graph
+        // membership so every producer is checked, including unused aggregate values.
+        let mut http_view_types = HashMap::new();
+        let mut has_http_view = |ty| {
+            *http_view_types.entry(ty).or_insert_with(|| {
+                xml_owned_leaf_paths(program, ty).is_none_or(|leaves| {
+                    leaves.iter().any(|(leaf, _)| matches!(leaf, Ty::HttpHeaders | Ty::HttpRequestView))
+                })
+            })
+        };
         let return_leaves = xml_owned_leaf_paths(program, function.ret)
             .ok_or_else(|| fail(function, "producer return type graph is malformed"))?;
         let return_leaf_valid = |operand: &Operand, selected: Ty, path: &[XmlAccessPathSegment]| {
@@ -10118,6 +10149,15 @@ fn validate_resource_rvalues_component(
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
+                let produces_http_view = has_http_view(result);
+                let retypes_http_view = if let Rvalue::Use(source) = rvalue {
+                    xml_operand_base_ty(function, source).is_some_and(&mut has_http_view)
+                } else { false };
+                if (produces_http_view || retypes_http_view)
+                    && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
+                {
+                    return Err(fail(function, "HTTP view producer or retype contract mismatch"));
+                }
                 // Builder construction certifies its allocation, not arbitrary bytes later
                 // pushed into it. Authenticate every transferred owner at the writer boundary,
                 // including numeric buffers below allocating record/container leaves.
@@ -11518,6 +11558,7 @@ fn validate_tagged_program_inner(
                         | Ty::HttpUpgrade
                         | Ty::HttpReadStream
                         | Ty::HttpSseStream
+                        | Ty::HttpRequestView
                         | Ty::HttpHeaders
                         | Ty::JsonDoc
                         | Ty::Fn(_)

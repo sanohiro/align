@@ -630,6 +630,7 @@ impl MoveCheck<'_> {
                 | Ty::Bool
                 | Ty::Char
                 | Ty::Unit
+                | Ty::HttpRequestView
                 | Ty::HttpHeaders => {}
                 Ty::Struct(id) => {
                     if let Some(def) = self.structs.get(id as usize) {
@@ -1231,7 +1232,7 @@ impl MoveCheck<'_> {
                 d.kind == StorageHeaderKind::View
                     && !matches!(
                         expand_tagged_ty(d.ty, self.tagged_types),
-                        Ty::Str | Ty::HttpHeaders
+                        Ty::Str | Ty::HttpHeaders | Ty::HttpRequestView
                     )
             }) {
                 let selected = ProjectedHeaderFact {

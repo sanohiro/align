@@ -1634,6 +1634,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("http_sse_event", 0, BuiltinCapability::BorrowLeaf),
     ("http.http_sse_event", 0, BuiltinCapability::BorrowLeaf),
     ("http_headers", 0, BuiltinCapability::BorrowLeaf),
+    ("http_request_view", 0, BuiltinCapability::BorrowLeaf),
     ("json.doc", 0, BuiltinCapability::BorrowLeaf),
     ("slice", 1, BuiltinCapability::BorrowLeaf),
     ("soa", 1, BuiltinCapability::BorrowLeaf),
