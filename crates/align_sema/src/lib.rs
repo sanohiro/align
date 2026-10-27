@@ -5360,6 +5360,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("http_client", Ty::HttpClient),
     ("http_request", Ty::HttpRequest),
     ("http_response", Ty::HttpResponse),
+    ("http_server", Ty::HttpServer),
     ("http_request_ctx", Ty::HttpRequestCtx),
     ("response_builder", Ty::ResponseBuilder),
     ("http_stream", Ty::HttpStream),
@@ -78103,7 +78104,7 @@ fn resolve_type(
             }
             Ty::RunBytes
         }
-        "http_client" | "http_request" | "http_response" => {
+        "http_client" | "http_request" | "http_response" | "http_server" => {
             if !args.is_empty() {
                 diags.error(format!("{name} takes no type arguments"), span);
                 return Ty::Error;
@@ -78111,6 +78112,7 @@ fn resolve_type(
             match name {
                 "http_client" => Ty::HttpClient,
                 "http_request" => Ty::HttpRequest,
+                "http_server" => Ty::HttpServer,
                 _ => Ty::HttpResponse,
             }
         }
@@ -94648,6 +94650,7 @@ fn exit_branch(flag: bool) -> i64 {
             ("udp_socket", ""),
             ("child", ""),
             ("http_request_ctx", ""),
+            ("http_server", ""),
             ("http_headers", ""),
             ("response_builder", ""),
             ("http_stream", ""),

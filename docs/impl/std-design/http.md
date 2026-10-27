@@ -115,6 +115,17 @@ cl.get_many(urls: slice<str>, max_concurrency: i64) -> Result<array<response>, E
   views) never share a usage site, so one overloaded type would add an internal Parsed|Built branch
   to every getter for zero convergence gain. The symmetry that matters is by direction and holds:
   `response_builder` ≅ `request` (builders), `http_request_ctx` reads ≅ `response` reads (views).
+- `http_server` is a globally nameable nullary Move type. Owning parameters,
+  returns, ordinary record fields and existing Option/Result carriers retain the
+  same exactly-once transfer/Drop behavior. A shared helper parameter may call
+  `accept`; borrowed configuration requires `borrow mut`. Existing local-only
+  method receivers remain: a record field reaches `accept` through a shared
+  helper or after ownership extraction into a local. Accepted request contexts
+  may outlive the listener binding; their own connection and parking-cell owner
+  preserve response/Drop safety. Direct collections, owning captures, escaping
+  borrows and partial exclusive field calls remain excluded. Moves allocate
+  nothing and the native/interface representations are unchanged. See
+  [Plan249](../249-http-server-nameability.md) for the complete boundary.
 - **`response_builder` is a nameable type and a valid `Option`/`Result` payload** (2026-07-20). It
   was originally neither: unspellable in source, and refused by `scalar_arg` outright, on the
   reasoning that `http.response` returns one directly so no API would ever wrap it. pkg.web's

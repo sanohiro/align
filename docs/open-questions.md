@@ -549,6 +549,18 @@ canonicalization, not provider discovery, transport, response interpretation or
 credential refresh. Its HTTP prerequisite distinguishes an unset body from an
 explicit empty body and emits Content-Length for the latter. The contract is implemented. No language invariant is reopened.
 
+### Nameable HTTP listener — SETTLED 2026-10-27
+
+`http_server` names the existing nullary Move listener type. Owning helper
+parameters/returns, record fields and existing Option/Result carriers use the
+ordinary transfer and Drop rules. `accept` permits a shared borrowed local;
+configuration requires owned or exclusively borrowed authority. A record field
+can be passed to a shared helper; direct method receivers still require locals.
+Accepted contexts own their connections independently of the listener binding.
+No capture, partial exclusive borrow, collection or runtime ABI rule changes.
+The exact contract and acceptance owners are in
+`docs/impl/249-http-server-nameability.md`.
+
 ### HTTP client package composition — SETTLED 2026-09-09
 
 The implemented cloud prerequisite names the existing `http_client`, `http_request` and

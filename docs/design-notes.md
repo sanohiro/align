@@ -2083,6 +2083,18 @@ domains stay explicit and consumer-driven.
 
 Align is a data-oriented language that aligns human intent, AI generation, compiler optimization, and modern hardware.
 
+### Nameable HTTP listener
+
+`http_server` names the existing nullary Move listener type. Owning helper
+parameters/returns, record fields and existing Option/Result carriers use the
+ordinary transfer and Drop rules. `accept` permits a shared borrowed local;
+configuration requires owned or exclusively borrowed authority. A record field
+can be passed to a shared helper; direct method receivers still require locals.
+Accepted contexts own their connections independently of the listener binding.
+No capture, partial exclusive borrow, collection or runtime ABI rule changes.
+The exact contract and acceptance owners are in
+`docs/impl/249-http-server-nameability.md`.
+
 ### HTTP client package composition — implemented
 
 `http_client`, `http_request`, and `http_response` name the existing distinct

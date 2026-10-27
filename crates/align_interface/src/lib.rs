@@ -1697,6 +1697,7 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("http_client", 0, BuiltinCapability::Opaque),
     ("http_request", 0, BuiltinCapability::Opaque),
     ("http_response", 0, BuiltinCapability::Opaque),
+    ("http_server", 0, BuiltinCapability::Opaque),
     ("http_request_ctx", 0, BuiltinCapability::Opaque),
     ("response_builder", 0, BuiltinCapability::Opaque),
     ("http_stream", 0, BuiltinCapability::Opaque),

@@ -19,8 +19,8 @@ fn server_accept_budget_rejects_wrong_arguments_and_shared_authority() {
     }
     let source = "import std.http\nfn configure() -> Result<(), Error> { mut s := http.serve(\"127.0.0.1\", 0)?; s.accept_timeout_ns(0) }\nfn main() -> i32 = 0\n";
     assert!(!check_errs("server-budget-inferred", source));
-    // HttpServer has no source type spelling. Shared/exclusive borrowed authority is
-    // checked by the independently forged HIR owner, without widening nameability.
+    // Typed shared/exclusive authority is also covered by http_server_nameable
+    // and the independent checked-HIR native owner.
 }
 
 #[test]
