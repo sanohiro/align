@@ -82880,9 +82880,17 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // FileReadAt borrows File and writes an initialized byte view, returning count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 364,
+            variants, 365,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
+
+        // Pointer views use the headerless native-read policy. Their dependencies
+        // live in the ordinary borrow/region lanes, not an owning storage header.
+        let ctx = Box::new(Expr { kind: ExprKind::Local(0), ty: Ty::HttpRequestCtx, span: Span::new(0, 0, 0) });
+        for kind in [ExprKind::HttpCtxView { ctx: ctx.clone() }, ExprKind::HttpCtxHeaders { ctx }] {
+            assert_eq!(storage_variant_policy(&kind),
+                StorageVariantPolicy::Fresh(StorageContentInitializer::Missing));
+        }
 
         for filled in [false, true] {
             let child = || Box::new(Expr { kind: ExprKind::Int(1), ty: Ty::Int(IntTy { bits: 64, signed: true }), span: Span::new(0, 0, 0) });

@@ -28062,6 +28062,61 @@ fn main() -> i32 {
     }
 
     #[test]
+    fn http_request_view_producer_publication() -> Result<(), String> {
+        for (ty, method) in [(Ty::HttpRequestView, "view"), (Ty::HttpHeaders, "headers")] {
+            for shape in ["bare", "record", "unused", "call"] {
+                let spelling = if ty == Ty::HttpRequestView { "http_request_view" } else { "http_headers" };
+                let tail = match shape {
+                    "bare" => format!("-> {spelling} = ctx.{method}()"),
+                    "record" => format!("-> Held = Held {{ value: ctx.{method}() }}"),
+                    "call" => format!("{{ accept(ctx.{method}()) }}"),
+                    _ => format!("{{ unused := ctx.{method}() }}"),
+                };
+                let original = mir(&format!("Held {{ value: {spelling} }}\nfn accept(v:{spelling}){{}}\nfn mint(borrow ctx:http_request_ctx) {tail}\nfn main(){{}}"));
+                emit_llvm_ir(&original, &BuildTarget::Baseline, Profile::Release, false, &[], None)
+                    .map_err(|error| error.to_string())?;
+                let mut bad = original.clone();
+                let function = bad.fns.iter_mut().find(|f| f.name.as_str() == "mint").ok_or("mint")?;
+                let (block, statement) = function.blocks.iter().enumerate().find_map(|(b, block)| {
+                    block.stmts.iter().enumerate().find_map(|(i, statement)| match statement {
+                        Stmt::Let(result, Rvalue::Use(_)) if function.value_tys[*result as usize] == ty => Some((b, i)),
+                        _ => None,
+                    })
+                }).ok_or("mint operation")?;
+                let raw = u32::try_from(function.value_tys.len()).map_err(|error| error.to_string())?;
+                function.value_tys.push(Ty::Raw);
+                let Stmt::Let(_, Rvalue::Use(input)) = &mut function.blocks[block].stmts[statement] else { return Err("mint shape".into()); };
+                *input = Operand::Value(raw);
+                function.blocks[block].stmts.insert(statement, Stmt::Let(raw, Rvalue::RawNull));
+                // Preserve the declared view result and enclosing return/call type. Both
+                // operands have LLVM pointer representation, so LLVM cannot detect this cast.
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "accepted unauthenticated {spelling}/{shape}");
+            }
+            for aggregate in [false, true] {
+                for reverse in [false, true] {
+                    let spelling = if ty == Ty::HttpRequestView { "http_request_view" } else { "http_headers" };
+                    let original = mir(&format!("View {{ value:{spelling} }}\nOther {{ value:raw }}\nfn ignored(value:View, other:Other, view:{spelling}, pointer:raw){{}}\nfn main(){{}}"));
+                    let mut bad = original.clone();
+                    let view_record = u32::try_from(bad.structs.iter().position(|s| s.source_name == "View").ok_or("View")?).map_err(|error| error.to_string())?;
+                    let raw_record = u32::try_from(bad.structs.iter().position(|s| s.source_name == "Other").ok_or("Other")?).map_err(|error| error.to_string())?;
+                    let function = bad.fns.iter_mut().find(|f| f.name.as_str() == "ignored").ok_or("ignored")?;
+                    let (source, target) = match (aggregate, reverse) {
+                        (true, false) => (1, Ty::Struct(view_record)),
+                        (true, true) => (0, Ty::Struct(raw_record)),
+                        (false, false) => (3, ty),
+                        (false, true) => (2, Ty::Raw),
+                    };
+                    let value = u32::try_from(function.value_tys.len()).map_err(|error| error.to_string())?;
+                    function.value_tys.push(target);
+                    function.blocks[0].stmts.push(Stmt::Let(value, Rvalue::Use(Operand::Arg(source))));
+                    assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "accepted unused {spelling}/{aggregate}/{reverse}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn http_request_view_mir_authority() -> Result<(), String> {
         let types = [Ty::HttpRequestCtx, Ty::HttpRequestView, Ty::HttpHeaders, Ty::Raw, Ty::HttpResponse];
         for from in types { for to in types {

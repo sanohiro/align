@@ -13089,8 +13089,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // HttpRespondTimeoutNs adds one checked three-operand native action.
         // HttpCtxPeerEof adds a checked shared receiver and Copy bool/Error result.
         // FileReadAt adds one explicit initialized byte-view native writer.
+        // HttpCtxView adds headerless Copy request observation with exact owner provenance.
         variants,
-        364,
+        365,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

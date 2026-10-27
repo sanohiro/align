@@ -3670,7 +3670,7 @@ mod tests {
     }
 
     #[test]
-    fn http_request_view_canonical_golden() {
+    fn http_request_view_canonical_golden() -> Result<(), String> {
         let mut source = baseline_program();
         let record = &mut source.structs[0];
         record.name = "Request".into();
@@ -3685,13 +3685,14 @@ mod tests {
         // one field named view with leaf83, then root Struct(ordinal0).
         let expected = [3, 1, 0, 0, 0, 0, 7, 0, 0, 0, b'R', b'e', b'q', b'u', b'e', b's', b't',
             0, 0, 1, 0, 0, 0, 4, 0, 0, 0, b'v', b'i', b'e', b'w', 83, 50, 0, 0, 0, 0];
-        let encoded = CanonicalTy::from_program(Ty::Struct(0), &program).unwrap();
+        let encoded = CanonicalTy::from_program(Ty::Struct(0), &program).map_err(|error| format!("{error:?}"))?;
         assert_eq!(encoded.as_bytes(), expected);
-        assert_eq!(CanonicalTy::decode(&expected).unwrap(), encoded);
+        assert_eq!(CanonicalTy::decode(&expected).map_err(|error| format!("{error:?}"))?, encoded);
         for end in 0..expected.len() { assert!(CanonicalTy::decode(&expected[..end]).is_err()); }
         let mut trailing = expected.to_vec(); trailing.push(0);
         assert!(CanonicalTy::decode(&trailing).is_err());
         assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 84]).is_err());
+        Ok(())
     }
 
     #[test]

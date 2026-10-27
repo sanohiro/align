@@ -1331,7 +1331,8 @@ fn xml_access_paths(
             if is_owner { leaves.push((ty, path.clone())); }
             // A Copy view never owns its pointees, even inside an owning record.
             if matches!(ty, Ty::Slice(_) | Ty::Soa(_)) { continue; }
-        } else if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)) || http_client_owner_leaf(ty) {
+        } else if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)
+            | Ty::HttpHeaders | Ty::HttpRequestView) || http_client_owner_leaf(ty) {
             leaves.push((ty, path));
             continue;
         }
@@ -9822,6 +9823,16 @@ fn validate_resource_rvalues_component(
         let xml_access = |operand: &Operand, expected: Ty| {
             cached_path_access(operand, expected, Vec::new())
         };
+        // Copy HTTP views still carry native pointer authority. Memoize type-graph
+        // membership so every producer is checked, including unused aggregate values.
+        let mut http_view_types = HashMap::new();
+        let mut has_http_view = |ty| {
+            *http_view_types.entry(ty).or_insert_with(|| {
+                xml_owned_leaf_paths(program, ty).is_none_or(|leaves| {
+                    leaves.iter().any(|(leaf, _)| matches!(leaf, Ty::HttpHeaders | Ty::HttpRequestView))
+                })
+            })
+        };
         let return_leaves = xml_owned_leaf_paths(program, function.ret)
             .ok_or_else(|| fail(function, "producer return type graph is malformed"))?;
         let return_leaf_valid = |operand: &Operand, selected: Ty, path: &[XmlAccessPathSegment]| {
@@ -10138,6 +10149,15 @@ fn validate_resource_rvalues_component(
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
+                let produces_http_view = has_http_view(result);
+                let retypes_http_view = if let Rvalue::Use(source) = rvalue {
+                    xml_operand_base_ty(function, source).is_some_and(&mut has_http_view)
+                } else { false };
+                if (produces_http_view || retypes_http_view)
+                    && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
+                {
+                    return Err(fail(function, "HTTP view producer or retype contract mismatch"));
+                }
                 // Builder construction certifies its allocation, not arbitrary bytes later
                 // pushed into it. Authenticate every transferred owner at the writer boundary,
                 // including numeric buffers below allocating record/container leaves.
