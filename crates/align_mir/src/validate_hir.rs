@@ -2095,6 +2095,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::HttpClient
             | Ty::HttpRequest
             | Ty::HttpResponse
+            | Ty::HttpServer
             | Ty::HttpRequestCtx
             | Ty::ResponseBuilder
             | Ty::HttpStream
@@ -2102,8 +2103,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::HttpReadStream | Ty::HttpSseStream => true,
             // These handles are body-produced only. They are valid local/expression types but have
             // no source `resolve_type` spelling and therefore cannot occur in a declaration header.
-            Ty::CliParsed
-            | Ty::HttpServer => false,
+            Ty::CliParsed => false,
             Ty::Command | Ty::RunOutput | Ty::RunBytes => true,
             Ty::CliCommand => false,
             _ if align_sema::is_move_handle(ty) => true,

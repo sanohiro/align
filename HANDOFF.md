@@ -2,6 +2,11 @@
 
 ## Current direction
 
+The owner selected R161 implementation and AM-R25 assessment on 2026-10-27.
+[Plan249](docs/impl/249-http-server-nameability.md) makes the existing HTTP
+listener nameable through ordinary owning/borrowed helpers and record transport.
+Consumer adoption remains separate. AM-R26 retains the settled R132 restriction.
+
 K1's selected compiler repair is complete under
 [Plan240](docs/impl/240-call-boundary-view-authority.md). All three consumers
 record adoption of that compiler on 2026-10-25, within their named native
@@ -11,7 +16,7 @@ interpret its older handoff as unfinished production work.
 The owner resumed the selected batch on 2026-10-25 and authorized merging
 completed capability PRs. The five selected provider capabilities and the
 private-evidence investigations are complete at the boundaries below. AM-R24
-was delivered by #1410 before this batch. Consumer adoption remains pending;
+was delivered by #1410 before this batch. The latest LLM and media receipts below supersede earlier adoption waits;
 R132/R142 are settled 1.0 language restrictions. The selected R37 and both R80
 repairs are implemented under Plans245–248 without a language restriction.
 When external evidence or a machine dependency is unavailable, request the
@@ -52,7 +57,8 @@ Consumer receipts, read on 2026-10-25:
   scoped Linux/RTX 4070 Ti evidence; Mac and other GPUs are not qualified.
 - [align-media](../align-media/docs/align-requests.md): #1409 adopted after
   Linux/WSL2 native build and runtime qualification without a K1 source rewrite.
-  AM-R07 and the new AM-R22/23/24 requests remain separate.
+  The 2026-10-26 receipt adopts AM-R16/22/23/24 at `50da001b`; AM-R07 was
+  measured and rejected, as recorded below.
 - [align-voice](../align-voice/docs/align-requests.md): #1409 adopted and V006
   receiving work completed, including CPU admission, shape lifetime, generic
   CUDA and the named full-model/lifecycle owners. Historical candidate and
@@ -69,11 +75,11 @@ The selected provider capabilities are implemented:
 
 | Request | Delivery | Consumer-owned work |
 | --- | --- | --- |
-| AM-R22 | [Plan241](docs/impl/241-bounded-http-responses.md), #1412: positive total response budget, HEAD framing and checked keep-alive restoration. | Media adoption and native receiving qualification. |
-| R28 / R49 | [Plan210](docs/impl/210-text-builder-byte-views.md), #1413: read-only builder bytes and independent headerless-owner precision; authentic helper/control pass both frontends. | Repinning and actual application verification. |
-| AM-R16 / R137 | [Plan242](docs/impl/242-indexed-field-views.md), #1414: retained read-only fixed/dynamic indexed-field ranges. | Consumer integration; the plan's wider producer limits remain. |
-| AM-R23 | [Plan243](docs/impl/243-peer-eof-observation.md), #1415: one nonblocking, nonconsuming receive-EOF peek. | Cancellation policy and GPU cleanup; false is not liveness and true includes half-close. |
-| AM-R07 | [Plan244](docs/impl/244-external-writable-file-windows.md), #1416: unsafe initialized external views and synchronous File.read_at windows. | Native initialization/unique ownership, transfer completion, adoption and GPU performance qualification. |
+| AM-R22 | [Plan241](docs/impl/241-bounded-http-responses.md), #1412: positive total response budget, HEAD framing and checked keep-alive restoration. | Adopted and qualified on Linux/WSL2 on 2026-10-26. |
+| R28 / R49 | [Plan210](docs/impl/210-text-builder-byte-views.md), #1413: read-only builder bytes and independent headerless-owner precision; authentic helper/control pass both frontends. | LLM adoption and original-owner acceptance completed on 2026-10-25. |
+| AM-R16 / R137 | [Plan242](docs/impl/242-indexed-field-views.md), #1414: retained read-only fixed/dynamic indexed-field ranges. | LLM acceptance completed on 2026-10-25; media adoption on 2026-10-26. Wider producer limits remain. |
+| AM-R23 | [Plan243](docs/impl/243-peer-eof-observation.md), #1415: one nonblocking, nonconsuming receive-EOF peek. | Media adopted pre/post-generation observation on 2026-10-26. Mid-generation EOF cancellation is AM-R25; false is not liveness and true includes half-close. |
+| AM-R07 | [Plan244](docs/impl/244-external-writable-file-windows.md), #1416: unsafe initialized external views and synchronous File.read_at windows. | Media implemented and qualified the candidate, then rejected it on 2026-10-26 after no LoRA benefit and a post-preload regression. Original loading remains selected; no experiment is scheduled. |
 
 The subsequent selected repair batch is complete at the provider boundary:
 
@@ -89,8 +95,9 @@ and the historical reproductions. Fresh phase tracing corrected the original
 R37 attribution: the module peak was MIR builder-reservation validation, not
 MoveCheck loop replay. The plans retain exact local measurement limits and
 owner inventories; these are macOS arm64 observations, not global complexity
-or cross-machine promises. Consumer repinning and runtime qualification remain
-external. No missing evidence request remains open for these repairs.
+or cross-machine promises. LLM receiving acceptance completed on 2026-10-25 at `50da001b`, including
+the bounded original-source and runtime owners; its receipt owns platform limits.
+No missing evidence request remains open for these repairs.
 
 R132 exclusive owned-subrecord access and R142 exclusive matched owned payloads
 are deliberate 1.0 language restrictions, selected by the owner on 2026-10-25,

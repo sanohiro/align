@@ -7680,10 +7680,29 @@ fn region_only_array_builder_headers_are_placement_valid() {
 }
 
 #[test]
+fn http_server_header_placement() {
+    for mode in [align_ast::ParamMode::ByValue, align_ast::ParamMode::Borrow, align_ast::ParamMode::BorrowMut] {
+        let mut program = baseline_program();
+        program.structs[0].fields[0].ty = Ty::HttpServer;
+        program.fn_types[0].params = vec![(mode, Scalar::HttpServer)];
+        program.fn_types[0].ret = Ty::HttpServer;
+        let mut imported = imported_fn("dep$listener", vec![Ty::HttpServer], Ty::HttpServer);
+        imported.param_modes = vec![mode];
+        program.imported_fns.push(imported);
+        assert!(validate_hir::global_type_metadata_is_valid(&program));
+        assert!(validate_hir::type_placement_metadata_is_valid(&program));
+        for invalid in [Ty::Slice(Scalar::HttpServer), Ty::DynArray(Scalar::HttpServer), Ty::Box(Scalar::HttpServer)] {
+            let mut rejected = program.clone();
+            rejected.fn_types[0].ret = invalid;
+            assert_placement_rejected("listener collection", &rejected);
+        }
+    }
+}
+
+#[test]
 fn body_only_header_types_fail_placement_closed() {
     for (label, ty) in [
         ("cli parsed", Ty::CliParsed),
-        ("http server", Ty::HttpServer),
     ] {
         let mut program = baseline_program();
         program.fn_types[0].ret = ty;
@@ -15747,9 +15766,8 @@ fn hir_body_validator_native() {
         }
         assert!(!body_core_metadata_is_valid(&reject), "server budget forged field {fault}");
     }
-    // HttpServer remains inferred-only: the owned local baseline is valid, while
-    // forged typed borrow signatures must fail the existing placement boundary.
-    for mode in [align_ast::ParamMode::BorrowMut, align_ast::ParamMode::Borrow] {
+    // Nameable server headers retain the same exclusive configuration authority.
+    for mode in [align_ast::ParamMode::ByValue, align_ast::ParamMode::BorrowMut, align_ast::ParamMode::Borrow] {
         let mut owned = program.clone();
         let Some(function) = owned.fns.iter_mut().find(|function| function.name == "native_http_server_accept_timeout_ns") else {
             panic!("server budget fixture missing");
@@ -15758,7 +15776,7 @@ fn hir_body_validator_native() {
         function.param_modes = vec![mode];
         function.locals[0].is_param = true;
         function.locals[0].is_mut = mode == align_ast::ParamMode::BorrowMut;
-        assert!(!body_core_metadata_is_valid(&owned), "unnamed server is not admitted in a forged borrowed signature");
+        assert_eq!(body_core_metadata_is_valid(&owned), mode != align_ast::ParamMode::Borrow, "server budget exclusive authority");
     }
 
     for name in [
