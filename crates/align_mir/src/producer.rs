@@ -1166,7 +1166,8 @@ pub fn xml_ty_is_view_retype(actual: Ty, expected: Ty) -> bool {
         // `ctx.headers()` is the request-context pointer retyped as a detached,
         // non-owning header-table view. MIR deliberately represents that zero-cost
         // conversion as `Use`, just like the owned collection-to-view cases above.
-        (Ty::HttpRequestCtx, Ty::HttpHeaders) => true,
+        (Ty::HttpRequestCtx, Ty::HttpHeaders | Ty::HttpRequestView)
+        | (Ty::HttpRequestView, Ty::HttpHeaders) => true,
         (
             Ty::DynStructArray(actual, Layout::Aos),
             Ty::Slice(Scalar::Struct(expected)),
@@ -1664,6 +1665,10 @@ pub fn native_owner_mir_contract<'a>(
         Some(ty) if ty == bytes => ty,
         _ => Ty::Error,
     };
+    let request_read = |operand| match xml_operand_base_ty(function, operand) {
+        Some(ty @ (Ty::HttpRequestCtx | Ty::HttpRequestView)) => ty,
+        _ => Ty::Error,
+    };
     let mut contract = NativeOwnerMirContract {
         result: Ty::Unit,
         outputs: Vec::new(),
@@ -1761,10 +1766,24 @@ pub fn native_owner_mir_contract<'a>(
             contract.result = i32_ty;
             contract.operands = vec![(writer, Ty::Writer, read)];
         }
+        Rvalue::HttpCtxMethod { ctx } | Rvalue::HttpCtxPath { ctx } => {
+            contract.result = Ty::Str;
+            contract.operands = vec![(ctx, request_read(ctx), read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
+        Rvalue::HttpCtxBody { ctx } => {
+            contract.result = bytes;
+            contract.operands = vec![(ctx, request_read(ctx), read)];
+            contract.access = XmlAccessProvenance::Shared;
+        }
+        Rvalue::HttpCtxUpgradeReady { ctx } => {
+            contract.result = i32_ty;
+            contract.operands = vec![(ctx, request_read(ctx), read)];
+        }
         Rvalue::HttpCtxPeerEof { ctx, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::Bool)];
-            contract.operands = vec![(ctx, Ty::HttpRequestCtx, read)];
+            contract.operands = vec![(ctx, request_read(ctx), read)];
         }
         Rvalue::StrParseI64 { input, out } => {
             contract.result = i32_ty;
@@ -6351,12 +6370,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Rvalue::HttpCtxMethod { ctx } | Rvalue::HttpCtxPath { ctx } => {
                 if result_ty != Ty::Str
                     || !path.is_empty()
-                    || xml_operand_base_ty(self.graph.function, &ctx)
-                        != Some(Ty::HttpRequestCtx)
+                    || !matches!(xml_operand_base_ty(self.graph.function, &ctx), Some(Ty::HttpRequestCtx | Ty::HttpRequestView))
                 {
                     equation.invalid = true;
                 } else {
-                    self.check_operand(&mut equation, &ctx, Ty::HttpRequestCtx);
+                    if let Some(ty) = xml_operand_base_ty(self.graph.function, &ctx) {
+                        self.check_operand(&mut equation, &ctx, ty);
+                    }
                     equation.seed = Some(XmlAccessProvenance::Shared);
                 }
             }
@@ -11518,6 +11538,7 @@ fn validate_tagged_program_inner(
                         | Ty::HttpUpgrade
                         | Ty::HttpReadStream
                         | Ty::HttpSseStream
+                        | Ty::HttpRequestView
                         | Ty::HttpHeaders
                         | Ty::JsonDoc
                         | Ty::Fn(_)

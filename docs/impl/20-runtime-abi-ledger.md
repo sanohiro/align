@@ -2497,3 +2497,12 @@ inventories increase by one without adding an ABI shape or probe family.
 ## Plan244: initialized File destination windows
 
 A139 takes const File*, i64 offset, mutable byte pointer and i64 length, returning a nonnegative count or existing negative status. HostState conservatively exposes operands 0 and 2, with no release. File and destination are borrowed only during synchronous pread. Admission is file pointer/alignment/shell-end, nonnegative offset and representable length, destination null/end/shell-overlap, negative fd, then zero or EINTR-only native read. No output counter or allocation is added. Plan244 fixes byte preservation and native-error limits.
+
+### Plan250 request-view operands
+
+The existing `HttpCtxMethod`, `HttpCtxPath`, `HttpCtxBody`, `HttpCtxUpgradeReady`
+and `HttpCtxPeerEof` calls accept exactly `HttpRequestCtx` or `HttpRequestView`
+semantic operands. Native signatures/effects remain unchanged; both lower to the
+same context pointer. Header projection remains `Use`, followed by the existing
+`HttpHeaders` calls. Independent MIR contracts reject unrelated pointers and
+wrong results even for discarded reads. No runtime symbol or allocation is added.

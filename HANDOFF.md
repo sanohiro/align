@@ -2,10 +2,13 @@
 
 ## Current direction
 
-The owner selected R161 implementation and AM-R25 assessment on 2026-10-27.
-[Plan249](docs/impl/249-http-server-nameability.md) makes the existing HTTP
-listener nameable through ordinary owning/borrowed helpers and record transport.
-Consumer adoption remains separate. AM-R26 retains the settled R132 restriction.
+The owner's 2026-10-27 request batch delivers R161 listener nameability under
+[Plan249](docs/impl/249-http-server-nameability.md) and AM-R25 request observation
+under [Plan250](docs/impl/250-http-request-views.md). `ctx.view()` supplies a Copy,
+non-owning value for ordinary checkpoint captures, with exact context lifetime
+and structured task protection. Consumer adoption and media engine/GPU qualification
+remain separate. AM-R26 retains the settled R132 restriction; R128/R131 retain
+their existing evidence prerequisites rather than becoming selected work.
 
 K1's selected compiler repair is complete under
 [Plan240](docs/impl/240-call-boundary-view-authority.md). All three consumers

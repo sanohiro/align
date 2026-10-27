@@ -90,6 +90,7 @@ hs.get(name: str) -> Option<str>             // RFC 9110 §5.1 case-insensitive 
                                              // region (so a wrapper taking the view through a
                                              // parameter compiles — item 10 ④)
 ctx.peer_eof() -> Result<bool, Error>         // one nonblocking incoming EOF observation (Plan243)
+ctx.view() -> http_request_view              // Copy request observation; exact owner generation (Plan250)
 ctx.body() -> bytes                          // view into ctx (region-bound)
 rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
                                              // the build-dual of `request`; named apart from the
@@ -871,11 +872,10 @@ deferred. Header parsing uses the memchr-backed scan described in **R2**.
       that is the current perf target — and the lookup would then live in pkg.web, a second RFC 9110
       implementation. *Let `Ctx` borrow the `http_request_ctx`* is dead on arrival: the handle is
       Move, so `Ctx` becomes Move and every reason recorded in `types.align` reappears.
-      *Generalize to a full detached request view* (`.method()/.path()/.body()` on one value) is the
-      natural "shouldn't this generalize?" question and loses today: those three already work on the
-      handle, pkg.web's `path`/`query`/`pattern` are DERIVED rather than passed through, so `Ctx`
-      would not collapse anyway, and each extra accessor is another node through a sweep that fails
-      open. The name stays header-shaped because that is what it is for.
+      A full detached request view was deferred until a consumer needed it. AM-R25 now
+      supplies that need: `ctx.view()` exposes ordinary Copy observation to callbacks.
+      [Plan250](../250-http-request-views.md) reuses these existing view rules and native
+      reads; `http_headers` remains the narrower header-table projection.
     - **Test matrix (spec):** wrapper-through-parameter compiles and returns the view (the property
       that motivates the split); a view minted from a LOCAL handle cannot be returned, nor `break`
       out of a loop, nor survive its ctx across a `serve` iteration; `hs.get()` after
@@ -1786,3 +1786,35 @@ with Invalid before recv. Success writes exactly 0 or 1; other admitted errors
 leave zero. The unsafe caller supplies a live context and disjoint writable byte.
 Generated code uses dedicated scratch and reads it only on status-zero success.
 Plan243 owns the complete validation and acceptance matrix.
+
+### Detached request observation (Plan250)
+
+`ctx.view() -> http_request_view` exposes a Copy, non-owning request view.
+Creation requires a live context local/field; it copies one pointer and allocates
+nothing. The view offers `method`, `path`, `body`, `headers`, `upgrade_ready` and
+`peer_eof` with the owner's existing signatures/effects; derived views inherit
+its exact owner generation. It grants no response, mutation or ownership
+transfer authority. Named helpers, record fields and ordinary Copy captures
+preserve that provenance; scalar payload/element and callable-formation rules
+are unchanged. Synchronous capture allocates nothing. Structured tasks retain
+existing group allocation and protect the backing owner through their covering
+join, including against non-consuming `respond_stream`/`respond_upgrade` fd
+transfers. Sequential byte views survive those transfers; EOF observation then
+returns `Invalid`. The existing by-value capture model is unchanged. Exact
+contract: [Plan250](../250-http-request-views.md).
+
+```text
+view.method() -> str
+view.path() -> str
+view.body() -> slice<u8>
+view.headers() -> http_headers
+view.upgrade_ready() -> bool
+view.peer_eof() -> Result<bool, Error>
+```
+
+All except `peer_eof` are Pure; that operation remains Impure. A view receiver
+may be any well-typed expression. Unknown shared-parameter roots conservatively
+overlap for task protection. Direct Option/Result/array/slice/box payloads and
+bare callable parameters remain excluded. Function-type return annotations may
+name the view, while named/lambda function-value formation retains its existing
+non-Scalar return exclusion. No runtime symbol or closure ABI changes.

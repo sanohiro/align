@@ -1319,7 +1319,7 @@ predicate, not type equality alone:
   the `Index` row, and whose result is `HttpResponse`. `HttpRespStatus`,
   `HttpRespHeader`, and `HttpRespBody` use it.
 - `HttpRequestCtxPlace(e)` is `LocalHandle(HttpRequestCtx,e)` or a valid
-  `Field` place of that exact type. Every `HttpCtx*`, `HttpRespondTimeoutNs`, `HttpRespond`, and
+  `Field` place of that exact type. Every owner-only `HttpCtx*`, `HttpRespondTimeoutNs`, `HttpRespond`, and
   `HttpRespondStream` receiver uses it. `HttpHeaders` is a Copy view and has no
   stable-handle restriction, preserving `ctx.headers().get(name)`.
 - `SourceMutLocal(T,e)` is exactly a bare source local whose checked child is
@@ -1490,15 +1490,15 @@ merely because its `Ty` matches.
 | `HttpGetMany` | `env[]; child[client,urls,max_concurrency]`; `HttpClient,Slice(Str),i64; result ERR(DynResponseArray); inputs borrowed, deep-owned response array; Impure`. |
 | `HttpServe` | `env[shared]`; `child[host,port]`; `Str,i64; result ERR(HttpServer); shared selects SO_REUSEPORT only; new owned listener; Impure`. |
 | `HttpAccept` | `env[]; child[server]`; `HttpServer; result ERR(HttpRequestCtx); server borrowed, result owns accepted fd/request; Impure`. |
-| `HttpCtxMethod` | `env[]; child[ctx]`; `HttpRequestCtx; result Str; view inherits ctx provenance; Pure`. |
-| `HttpCtxPath` | `env[]; child[ctx]`; `HttpRequestCtx; result Str; view inherits ctx provenance; Pure`. |
-| `HttpCtxHeaders` | `env[]; child[ctx]`; `HttpRequestCtx; result HttpHeaders; Copy view is Frame-capped to ctx provenance; Pure`. |
+| `HttpCtxMethod` | `env[]; child[ctx]`; `HttpRequestCtx place or HttpRequestView expression; result Str; inherits provenance, owner place capped and view input uncapped; Pure`. |
+| `HttpCtxPath` | `env[]; child[ctx]`; `HttpRequestCtx place or HttpRequestView expression; result Str; inherits provenance, owner place capped and view input uncapped; Pure`. |
+| `HttpCtxHeaders` | `env[]; child[ctx]`; `HttpRequestCtx place or HttpRequestView expression; result HttpHeaders; owner place capped, view input inherits provenance; Pure`. |
 | `HttpCtxHeader` | `env[]; child[headers,name]`; `HttpHeaders,Str; result Option<Str>; view inherits headers provenance without additional Frame cap; Pure`. |
-| `HttpCtxBody` | `env[]; child[ctx]`; `HttpRequestCtx; result bytes; view inherits ctx provenance; Pure`. |
+| `HttpCtxBody` | `env[]; child[ctx]`; `HttpRequestCtx place or HttpRequestView expression; result bytes; inherits read-only provenance, owner place capped and view input uncapped; Pure`. |
 | `HttpResponseBuilder` | `env[]; child[status]`; `i64; result ResponseBuilder; new owned builder; Pure`. |
 | `HttpRbHeader` | `env[]; child[rb,name,value]`; `LocalHandle(ResponseBuilder,rb),Str,Str; result Unit; rb native state mutated without source mut; Pure`. |
 | `HttpRbBody` | `env[]; child[rb,data]`; `LocalHandle(ResponseBuilder,rb),byte-view; result Unit; rb native state mutated without source mut, bytes copied; Pure`. |
-| `HttpCtxPeerEof` | `env[]; child[ctx]`; `bound Local/Field HttpRequestCtx; result ERR(Bool); shared non-consuming receiver; Impure; independent receiver/result/effect replay` (Plan243). |
+| `HttpCtxPeerEof` | `env[]; child[ctx]`; `bound Local/Field HttpRequestCtx or arbitrary HttpRequestView; result ERR(Bool); shared non-consuming receiver; Impure; independent receiver/result/effect replay` (Plan243). |
 | `HttpRespondTimeoutNs` | `env[]; child[ctx,rb,timeout_ns]`; `HttpRequestCtx,ResponseBuilder,i64; result ERR(Unit); both owners consumed exactly once after all operands complete; staged temporary cleanup on eager exits; Impure` (Plan241). |
 | `HttpRespond` | `env[]; child[ctx,rb]`; `HttpRequestCtx,ResponseBuilder; result ERR(Unit); both consumed exactly once on the runtime call; Impure`. |
 | `HttpRespondStream` | `env[]; child[ctx,rb]`; `HttpRequestCtx,ResponseBuilder; result ERR(HttpStream); ctx borrowed then marked spent on success, rb consumed; stream owns lifted fd; Impure`. |
@@ -2567,3 +2567,15 @@ Plan244 raw comparison classifications (the detector remains unchanged):
 | `owner.ty == view.owner_ty(*resource)` | Split-free nominal identity: owner_ty returns exactly Resource(resource) or ResourceRef(resource) from the node's existing resource id. It derives no generic struct/enum shape. Preserve exact resource identity. |
 | `owner.ty != view.owner_ty(*resource)` | Same split-free identity check at independent body-flow derivation; do not structurally equate unrelated resources. |
 | `!local(file, Ty::File) || offset.ty != i64 || destination.ty != bytes` | Split-free closed primitives: i64 is signed 64-bit Int and bytes is Slice(unsigned 8-bit Int), both defined locally; File is a fixed native handle. No nominal payload can split. |
+
+### Plan250 request-view delta
+
+`HttpCtxView` has `env[]; child[ctx]`, accepts exactly a live Local/Field
+`HttpRequestCtx`, yields Copy `HttpRequestView`, and records the owner's region
+cap and storage generation. It is Pure and never grants owning authority.
+`HttpCtxUpgradeReady` accepts the same owner/view read domain as the other reads.
+`HttpRespondStream` and `HttpRespondUpgrade` independently replay access-only
+mutation summaries: pending tasks retaining the same backing conflict, while
+parsed-byte generations remain live. Missing exported access facts reject.
+MIR authenticates context-to-request-view and request-view-to-headers `Use`
+retypes, preserving context-to-headers and rejecting inverse/sibling casts.

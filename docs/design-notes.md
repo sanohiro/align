@@ -2095,6 +2095,21 @@ No capture, partial exclusive borrow, collection or runtime ABI rule changes.
 The exact contract and acceptance owners are in
 `docs/impl/249-http-server-nameability.md`.
 
+`ctx.view() -> http_request_view` exposes a Copy, non-owning request view.
+Creation requires a live context local/field; it copies one pointer and allocates
+nothing. The view offers `method`, `path`, `body`, `headers`, `upgrade_ready` and
+`peer_eof` with the owner's existing signatures/effects; derived views inherit
+its exact owner generation. It grants no response, mutation or ownership
+transfer authority. Named helpers, record fields and ordinary Copy captures
+preserve that provenance; scalar payload/element and callable-formation rules
+are unchanged. Synchronous capture allocates nothing. Structured tasks retain
+existing group allocation and protect the backing owner through their covering
+join, including against non-consuming `respond_stream`/`respond_upgrade` fd
+transfers. Sequential byte views survive those transfers; EOF observation then
+returns `Invalid`. The existing by-value capture model is unchanged. Exact
+contract: `docs/impl/250-http-request-views.md`.
+
+
 ### HTTP client package composition — implemented
 
 `http_client`, `http_request`, and `http_response` name the existing distinct

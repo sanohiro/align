@@ -88,6 +88,7 @@ hs.get(name: str) -> Option<str>             // RFC 9110 §5.1 case-insensitive 
                                              // region (so a wrapper taking the view through a
                                              // parameter compiles — item 10 ④)
 ctx.peer_eof() -> Result<bool, Error>         // 非消費・nonblocking の受信 EOF 観測（Plan243）
+ctx.view() -> http_request_view              // Copy の観測ビュー。所有者の世代を保持（Plan250）
 ctx.body() -> bytes                          // view into ctx (region-bound)
 rb := http.response(status: i64)             // response_builder (Move — owns header list + body buf;
                                              // the build-dual of `request`; named apart from the
@@ -842,12 +843,10 @@ OpenSSL libssl を使う。サーバー側 TLS は未実装である。ヘッダ
       オフセットのスパンなので、slice の実体化は**リクエストごとの割り当て**になる — しかも現在の性能
       目標である 4.1 µs の予算の上で — そして lookup は pkg.web 側に住むことになり、2 つ目の RFC 9110
       実装になる。*`Ctx` に `http_request_ctx` を借用させる*は最初から論外である: ハンドルは Move なので
-      `Ctx` が Move になり、`types.align` に記録された理由がすべて再来する。*切り離したリクエストビュー
-      全体へ一般化する*（1 つの値の上の `.method()/.path()/.body()`）は「これは一般化すべきでは?」という
-      自然な問いだが、今日は負ける: その 3 つは既にハンドル上で動くし、pkg.web の `path`/`query`/`pattern`
-      は素通しではなく**導出**されるので、どのみち `Ctx` は畳めない。そしてアクセサが 1 つ増えるたびに、
-      fail open する掃きを通るノードが 1 つ増える。名前がヘッダーの形のままなのは、それがこの型の用途
-      だからである。
+      `Ctx` が Move になり、`types.align` に記録された理由がすべて再来する。リクエスト全体の独立したビューは、必要とする利用側が現れるまで保留していた。
+      AM-R25 のコールバックがその用途となり、`ctx.view()` で通常の Copy 値として観測を渡せる。
+      [Plan250](../../250-http-request-views.md) は既存のビュー規則と native 読み取りを再利用する。
+      `http_headers` はヘッダーテーブルだけを投影する型として残る。
     - **テストマトリクス（仕様）:** パラメータ経由のラッパーがコンパイルでき、ビューを返せること
       （分離を動機づけている性質そのもの）; **ローカル**のハンドルから作ったビューは、返すことも、
       ループから `break` して出すことも、`serve` の反復をまたいで自分の ctx より長生きすることもできない
@@ -1713,3 +1712,31 @@ recv の前に Invalid。u8 出力の alignment は1。pointer 検証後に出�
 負の fd を recv 前に Invalid とする。成功は厳密に0または1、他の検証後エラーは zero を保持する。
 unsafe 呼出側が生存する context と重複しない書き込み可能な1 byte を保証する。
 生成コードは専用 scratch を使い、status-zero 成功時だけ読む。Plan243 が検証行列を管理する。
+
+### 独立したリクエスト観測ビュー（Plan250）
+
+`ctx.view() -> http_request_view` は Copy・非所有のリクエストビューを返す。
+生成元は生存中のコンテキストのローカル変数またはフィールドに限る。ポインタをコピーし、
+メモリ確保は行わない。次のメソッドは所有者側と同じシグネチャ・動作を持つ。
+
+```text
+view.method() -> str
+view.path() -> str
+view.body() -> slice<u8>
+view.headers() -> http_headers
+view.upgrade_ready() -> bool
+view.peer_eof() -> Result<bool, Error>
+```
+
+`peer_eof` だけが Impure で、それ以外は Pure。ビューのレシーバは任意の適正な型の式でよい。
+派生ビューは所有者の正確な世代を継承し、応答・変更・所有権移動の権限は得ない。
+名前付きヘルパー、レコードフィールド、通常の Copy キャプチャでも寿命を保持する。
+同期キャプチャはメモリ確保を追加しない。構造化タスクの環境・結果は既存のグループ確保を使い、
+対応する join まで所有者の backing を保護する。非消費の `respond_stream` と
+`respond_upgrade` による fd 移動も保護中は競合する。共有パラメータ間の別名関係が不明なら
+保守的に競合とする。逐次実行では移動後もバイトビューを読めるが、EOF 観測は `Invalid` を返す。
+
+直接の Option/Result ペイロード、array/slice/box 要素、裸の関数値パラメータには使えない。
+関数型の戻り値注釈には書けるが、名前付き関数・ラムダからの関数値生成は既存の非 Scalar
+戻り値制限に従う。値によるキャプチャ規則、runtime symbol、closure ABI は変えない。
+正確な契約は [Plan250](../../250-http-request-views.md) を参照する。

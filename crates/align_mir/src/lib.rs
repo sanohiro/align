@@ -8419,6 +8419,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
+            | hir::ExprKind::HttpCtxView { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
             | hir::ExprKind::HttpHeadersCount { .. }
@@ -8625,6 +8626,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpAccept { .. }
         | hir::ExprKind::HttpCtxMethod { .. }
         | hir::ExprKind::HttpCtxPath { .. }
+        | hir::ExprKind::HttpCtxView { .. }
         | hir::ExprKind::HttpCtxHeaders { .. }
         | hir::ExprKind::HttpCtxHeader { .. }
         | hir::ExprKind::HttpHeadersCount { .. }
@@ -10085,6 +10087,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
             | hir::ExprKind::HttpCtxPath { .. }
+            | hir::ExprKind::HttpCtxView { .. }
             | hir::ExprKind::HttpCtxHeaders { .. }
             | hir::ExprKind::HttpCtxHeader { .. }
             | hir::ExprKind::HttpHeadersCount { .. }
@@ -22518,7 +22521,7 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         // `ctx.headers()` → a `Rvalue::Use` of the ctx operand: the header-table view IS the ctx
         // pointer (http.md item 10 ②), so this is a pointer copy and adds no runtime call at all.
-        hir::ExprKind::HttpCtxHeaders { ctx } => {
+        hir::ExprKind::HttpCtxView { ctx } | hir::ExprKind::HttpCtxHeaders { ctx } => {
             let cx = lower_required!(b, lower_expr(b, ctx), Operand::Const(Const::Unit));
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::Use(cx)));
@@ -25217,6 +25220,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::HttpServer => "http_server".to_string(),
         Ty::HttpRequestCtx => "http_request_ctx".to_string(),
         Ty::HttpHeaders => "http_headers".to_string(),
+        Ty::HttpRequestView => "http_request_view".to_string(),
         Ty::Regex => "regex".to_string(),
         Ty::Captures => "captures".to_string(),
         Ty::ResponseBuilder => "response_builder".to_string(),

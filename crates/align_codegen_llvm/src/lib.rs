@@ -5273,6 +5273,7 @@ fn parallel_capture_ty_is_valid(ty: Ty, program: &Program) -> bool {
             | Ty::Soa(_)
             | Ty::Str
             | Ty::Raw
+            | Ty::HttpRequestView
             | Ty::HttpHeaders
             | Ty::JsonDoc
             | Ty::JsonScanner(_)
@@ -7269,7 +7270,7 @@ fn scalar_type<'c>(
         // off that same predicate, and a hand-copied list here would let a future handle type land in
         // one and not the other — sema 8 / codegen `i32` 4, caught only where the layout-parity
         // table happens to have a row.
-        Ty::HttpHeaders => ctx.ptr_type(AddressSpace::default()).into(),
+        Ty::HttpHeaders | Ty::HttpRequestView => ctx.ptr_type(AddressSpace::default()).into(),
         Ty::Raw | Ty::Resource(_) | Ty::ResourceRef(_) => ctx.ptr_type(AddressSpace::default()).into(),
         _ if align_sema::is_move_handle(ty) => ctx.ptr_type(AddressSpace::default()).into(),
         // `vecN<T>` (M6) → the LLVM vector `<N x T>`.
@@ -11122,6 +11123,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 | Ty::Soa(_)
                 | Ty::Str
                 | Ty::Raw
+                | Ty::HttpRequestView
                 | Ty::HttpHeaders
                 | Ty::JsonDoc
                 | Ty::JsonScanner(_)
@@ -28060,6 +28062,44 @@ fn main() -> i32 {
     }
 
     #[test]
+    fn http_request_view_mir_authority() -> Result<(), String> {
+        let types = [Ty::HttpRequestCtx, Ty::HttpRequestView, Ty::HttpHeaders, Ty::Raw, Ty::HttpResponse];
+        for from in types { for to in types {
+            if from == to { continue; }
+            let allowed = matches!((from, to),
+                (Ty::HttpRequestCtx, Ty::HttpRequestView | Ty::HttpHeaders)
+                | (Ty::HttpRequestView, Ty::HttpHeaders));
+            assert_eq!(xml_ty_is_view_retype(from, to), allowed, "{from:?} -> {to:?}");
+        }}
+        let original = mir("fn mint(borrow ctx:http_request_ctx)->http_request_view = ctx.view()\nfn headers(v:http_request_view)->http_headers = v.headers()\nfn path(v:http_request_view)->str=v.path()\nfn body(v:http_request_view)->slice<u8> = v.body()\nfn ready(v:http_request_view)->bool=v.upgrade_ready()\nfn observe(v:http_request_view)->Result<bool,Error> = v.peer_eof()\nfn invoke(callback:fn()->bool)->bool=callback()\nfn checkpoint(borrow ctx:http_request_ctx)->bool { view:=ctx.view(); return invoke(fn { view.peer_eof() else false }) }\nfn main(){}");
+        for optimized in [false, true] {
+            let ir = emit_llvm_ir(&original, &BuildTarget::Baseline, Profile::Release, optimized, &[], None)
+                .map_err(|error| error.to_string())?;
+            assert!(!ir.contains("call ptr @align_rt_alloc("));
+            assert!(!ir.contains("call ptr @align_rt_tg_alloc("));
+            assert!(!ir.contains("call void @llvm.memcpy"));
+        }
+        for name in ["mint", "headers", "path", "body", "ready", "observe"] {
+            for mutation in 0..2 {
+                let mut bad = original.clone();
+                let function = bad.fns.iter_mut().find(|f| f.name.as_str() == name).ok_or("function")?;
+                let (result, operand) = function.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|statement| {
+                    match statement {
+                        Stmt::Let(result, Rvalue::Use(input)) if matches!(name, "mint" | "headers") => Some((*result, input)),
+                        Stmt::Let(result, Rvalue::HttpCtxPath { ctx } | Rvalue::HttpCtxBody { ctx }
+                            | Rvalue::HttpCtxUpgradeReady { ctx } | Rvalue::HttpCtxPeerEof { ctx, .. }) => Some((*result, ctx)),
+                        _ => None,
+                    }
+                }).ok_or("operation")?;
+                if mutation == 0 { *operand = Operand::Const(Const::Bool(false)); }
+                else { function.value_tys[result as usize] = Ty::HttpRequestCtx; }
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Baseline, Profile::Release, false, &[], None).is_err(), "{name}/{mutation}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn http_peer_eof_mir_shape() -> Result<(), String> {
         for used in [false, true] {
             let tail = if used { "-> Result<bool, Error> = ctx.peer_eof()" }
@@ -40528,6 +40568,7 @@ fn main() -> i32 = 0
             // pin only the arm it names, and this table is hand-written — nothing else notices a
             // family member drifting.
             sdef("ReaderField", false, &[i(8, true), Ty::Reader]),           // { ptr, i8 } → (16, 8)
+            sdef("RequestViewField", false, &[i(8, true), Ty::HttpRequestView]), // (16, 8)
             sdef("HeadersField", false, &[i(8, true), Ty::HttpHeaders]),     // { ptr, i8 } → (16, 8)
             sdef("BothPtrs", false, &[Ty::HttpRequestCtx, Ty::Bool, Ty::HttpHeaders]), // (24, 8)
             sdef("FnField", false, &[Ty::Bool, Ty::Fn(0)]),                 // { {ptr,ptr}, i8 } → (24, 8)

@@ -1724,6 +1724,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         45 => Ok(Ty::ResponseBuilder),
         46 => Ok(Ty::HttpStream),
         47 => Ok(Ty::HttpHeaders),
+        83 => Ok(Ty::HttpRequestView),
         48 => Ok(Ty::JsonDoc),
         49 => Ok(Ty::JsonScanner(node(cursor)?)),
         50 => Ok(Ty::Struct(node(cursor)?)),
@@ -2777,6 +2778,7 @@ fn ty(
             Ty::ResponseBuilder => leaf!(45),
             Ty::HttpStream => leaf!(46),
             Ty::HttpHeaders => leaf!(47),
+            Ty::HttpRequestView => leaf!(83),
             Ty::JsonDoc => leaf!(48),
             Ty::JsonScanner(id) => node!(49, Struct, id),
             Ty::Struct(id) => node!(50, Struct, id),
@@ -3668,6 +3670,31 @@ mod tests {
     }
 
     #[test]
+    fn http_request_view_canonical_golden() {
+        let mut source = baseline_program();
+        let record = &mut source.structs[0];
+        record.name = "Request".into();
+        record.source_name = "Request".into();
+        record.align = None;
+        record.c_repr = false;
+        record.fields.truncate(1);
+        record.fields[0].name = "view".into();
+        record.fields[0].ty = Ty::HttpRequestView;
+        let program = mir_program(&source);
+        // v3, one struct definition, source name, no explicit alignment/C layout,
+        // one field named view with leaf83, then root Struct(ordinal0).
+        let expected = [3, 1, 0, 0, 0, 0, 7, 0, 0, 0, b'R', b'e', b'q', b'u', b'e', b's', b't',
+            0, 0, 1, 0, 0, 0, 4, 0, 0, 0, b'v', b'i', b'e', b'w', 83, 50, 0, 0, 0, 0];
+        let encoded = CanonicalTy::from_program(Ty::Struct(0), &program).unwrap();
+        assert_eq!(encoded.as_bytes(), expected);
+        assert_eq!(CanonicalTy::decode(&expected).unwrap(), encoded);
+        for end in 0..expected.len() { assert!(CanonicalTy::decode(&expected[..end]).is_err()); }
+        let mut trailing = expected.to_vec(); trailing.push(0);
+        assert!(CanonicalTy::decode(&trailing).is_err());
+        assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 84]).is_err());
+    }
+
+    #[test]
     fn canonical_type_codec() {
         let program = mir_program(&baseline_program());
         for (root, expected) in [
@@ -3679,6 +3706,7 @@ mod tests {
             (Ty::HttpSseStream, vec![3, 0, 0, 0, 0, 62]),
             (Ty::HttpUpgrade, vec![3, 0, 0, 0, 0, 71]),
             (Ty::XmlReader, vec![3, 0, 0, 0, 0, 72]),
+            (Ty::HttpRequestView, vec![3, 0, 0, 0, 0, 83]),
         ] {
             let encoded = CanonicalTy::from_program(root, &program).unwrap();
             assert_eq!(encoded.as_bytes(), expected);
@@ -3789,6 +3817,7 @@ mod tests {
             Ty::HttpSseStream,
             Ty::SignatureKey(align_sema::SignatureKeyKind::Rs256Private),
             Ty::HttpHeaders,
+            Ty::HttpRequestView,
             Ty::JsonDoc,
             Ty::JsonScanner(0),
             Ty::Struct(0),
@@ -4038,7 +4067,7 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
-        error(&[3, 0, 0, 0, 0, 83], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 84], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 4, 64], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 4, 62], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
@@ -4440,7 +4469,7 @@ mod tests {
             Ty::Command => [38], Ty::RunOutput => [39], Ty::HttpRequest => [40],
             Ty::HttpResponse => [41], Ty::HttpClient => [42], Ty::HttpServer => [43],
             Ty::HttpRequestCtx => [44], Ty::ResponseBuilder => [45], Ty::HttpStream => [46],
-            Ty::HttpHeaders => [47], Ty::JsonDoc => [48],
+            Ty::HttpHeaders => [47], Ty::HttpRequestView => [83], Ty::JsonDoc => [48],
             Ty::JsonScanner(1) => [49, 1, 0x10, 0, 0],
             Ty::Struct(1) => [50, 1, 0x10, 0, 0], Ty::Tuple(1) => [51, 1, 0x30, 0, 0],
             Ty::Fn(1) => [52, 1, 0x50, 0, 0], Ty::Enum(1) => [53, 1, 0x20, 0, 0],
