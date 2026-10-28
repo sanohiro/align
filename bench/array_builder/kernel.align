@@ -1,0 +1,20 @@
+pub fn build_checked(length: i64, capacity: i64, seed: i64) -> i64 {
+  mut output: array_builder<i64> := array_builder(capacity)
+  mut index := 0
+  loop {
+    if index == length { break }
+    output.push(index * 17 + seed)
+    index = index + 1
+  }
+  values := output.build()
+  if values.len() != length { return -1 }
+  mut sum := 0
+  index = 0
+  loop {
+    if index == length { break }
+    if values[index] != index * 17 + seed { return -1 }
+    sum = sum + values[index]
+    index = index + 1
+  }
+  return sum
+}

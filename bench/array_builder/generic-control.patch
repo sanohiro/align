@@ -1,0 +1,15 @@
+diff --git a/crates/align_codegen_llvm/src/lib.rs b/crates/align_codegen_llvm/src/lib.rs
+index 7a7b961d..c7c1c9bd 100644
+--- a/crates/align_codegen_llvm/src/lib.rs
++++ b/crates/align_codegen_llvm/src/lib.rs
+@@ -25074,6 +25074,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
+             .builder
+             .build_and(fast, has_capacity, "ab.fast.eligible")
+             .map_err(|error| self.err(error))?;
++        let fast = self
++            .builder
++            .build_and(fast, self.ctx.bool_type().const_zero(), "r100.generic.control")
++            .map_err(|error| self.err(error))?;
+         let fast_block = self.ctx.append_basic_block(self.func, "ab.push.fast");
+         let slow_block = self.ctx.append_basic_block(self.func, "ab.push.slow");
+         let done_block = self.ctx.append_basic_block(self.func, "ab.push.done");

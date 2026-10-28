@@ -16,6 +16,10 @@ reuses that lowering for column projection after ordinal and exact-kind
 admission. R109's global necessary-versus-removable check census
 remains separate acceptance work. The owner selected R100's same-source
 comparison and R131's remaining constructor qualification on 2026-10-28.
+[Plan256](docs/impl/256-scalar-builder-matched-qualification.md) completes R100's
+matched generic-path comparison: identical tokenizer output, fewer executed
+push/reserve instructions and lower native time on Linux. The missing original
+Mac baseline is retained as an attribution limit, not pending implementation.
 [Plan255](docs/impl/255-conditional-record-construction-qualification.md)
 qualifies R131's current imported construction and cleanup on Linux with the
 retained model data; no current compiler defect was reproduced. The original
