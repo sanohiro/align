@@ -6,13 +6,22 @@
 
 mod common;
 use common::*;
+#[cfg(unix)]
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
 
 const DECL: &str = "Item { detail: Option<string>, n: i64 }\n";
 
 #[test]
+#[cfg(unix)]
 fn conditional_options_reuse_the_join_slot_across_loop_iterations() {
-    if !backend_available() { return; }
-    let provider = r#"module probe
+    if !backend_available() {
+        return;
+    }
+    owned_fixture::run(
+        "conditional_options_reuse_the_join_slot_across_loop_iterations",
+        |_| {
+            let provider = r#"module probe
 pub fn score(text: str, raw: slice<u8>) -> i64 {
   mut total: i64 := 0
   mut i: i64 := 0
@@ -33,7 +42,7 @@ pub fn score(text: str, raw: slice<u8>) -> i64 {
   return total
 }
 "#;
-    let consumer = r#"module main
+            let consumer = r#"module main
 import probe
 fn main() -> i32 {
   mut data := buffer(0)
@@ -44,12 +53,24 @@ fn main() -> i32 {
   return 0
 }
 "#;
-    let files = [("probe.align", provider), ("main.align", consumer)];
-    let whole = build_and_run_multi("conditional-option-loop-whole", &files, "main.align");
-    assert_eq!(whole.status.code(), Some(0), "{}", String::from_utf8_lossy(&whole.stderr));
-    let units = build_per_unit_multi("conditional-option-loop-units", &files, "main.align");
-    let output = units.link_and_run();
-    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+            let files = [("probe.align", provider), ("main.align", consumer)];
+            let whole = build_and_run_multi("conditional-option-loop-whole", &files, "main.align");
+            assert_eq!(
+                whole.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&whole.stderr)
+            );
+            let units = build_per_unit_multi("conditional-option-loop-units", &files, "main.align");
+            let output = units.link_and_run();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        },
+    );
 }
 
 fn mir_text(src: &str) -> String {

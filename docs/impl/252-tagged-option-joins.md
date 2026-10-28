@@ -76,8 +76,8 @@ The new structural owner is a regression gate; timing is evidence only.
 
 The new 27-function structural owner fails on the baseline with an aggregate
 join around the scalar result and passes on the implementation. All 274 active
-backend unit tests pass (nine existing ignored tests), together with 64 owned
-tagged-payload owners, six arithmetic owners, the four find/rfind owners, five
+backend unit tests pass (nine existing ignored tests), together with the owned
+tagged-payload suite, six arithmetic owners, the four find/rfind owners, five
 checked-byte-view owners, 14 Q5b2 owners and three selected callback owners.
 The existing defined-before-store and omitted-active-payload assertions now
 check the field-wise freeze spelling, retaining their tag-only reverse control.
@@ -100,3 +100,9 @@ Every sample passes the independent 81-input-pair oracle and timed checksum.
 These are local measurements with run-to-run variation, not a cross-platform
 latency guarantee. Runtime search semantics, bounds checks and ABI attributes
 are unchanged; R109's whole-consumer sign-count acceptance remains external.
+
+Independent code review found one test-execution issue: the new loop regression
+used common helpers with unbounded native children. Its complete whole/per-unit
+compile/link/run action now uses the existing `owned_fixture` supervisor. The
+focused positive owner and `owned_fixture::stalled_linker_is_retired_before_scratch`
+pass; production code and the measurement remain unchanged.

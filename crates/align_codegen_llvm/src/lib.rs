@@ -40510,7 +40510,7 @@ fn main() -> i32 = 0
     }
 
     #[test]
-    fn conditional_option_joins_promote_scalar_results() {
+    fn conditional_option_joins_promote_scalar_results() -> Result<(), CodegenError> {
         let mut source = String::from(
             "pub fn first(text: str, needle: str) -> i64 = text.find(needle) else -1\n\
              pub fn last(text: str, needle: str) -> i64 = text.rfind(needle) else 99\n\
@@ -40533,7 +40533,7 @@ fn main() -> i32 = 0
         let program = mir(&source);
         let llvm = emit_llvm_ir(
             &program, &BuildTarget::Baseline, Profile::Release, true, &names, None,
-        ).expect("conditional Option results must lower");
+        )?;
         for name in names {
             let body = function_body(&llvm, &name);
             assert!(!body.contains("alloca "), "{name} retains conditional scratch:\n{body}");
@@ -40543,6 +40543,7 @@ fn main() -> i32 = 0
                 "{name} retains an aggregate join around a scalar result:\n{body}"
             );
         }
+        Ok(())
     }
 
     #[test]
