@@ -14,15 +14,21 @@ the shared lowering to guarded codec accessors without moving their reads
 before range success. [Plan254](docs/impl/254-codec-column-projection-joins.md)
 reuses that lowering for column projection after ordinal and exact-kind
 admission. R109's global necessary-versus-removable check census
-and R100's missing matched historical baseline remain separate acceptance work.
+remains separate acceptance work. The owner selected R100's same-source
+comparison and R131's remaining constructor qualification on 2026-10-28.
+[Plan255](docs/impl/255-conditional-record-construction-qualification.md)
+qualifies R131's current imported construction and cleanup on Linux with the
+retained model data; no current compiler defect was reproduced. The original
+failed snapshot is unavailable, so historical causal attribution is archived
+separately from the completed provider qualification and consumer adoption.
 
 The owner's 2026-10-27 request batch delivers R161 listener nameability under
 [Plan249](docs/impl/249-http-server-nameability.md) and AM-R25 request observation
 under [Plan250](docs/impl/250-http-request-views.md). `ctx.view()` supplies a Copy,
 non-owning value for ordinary checkpoint captures, with exact context lifetime
 and structured task protection. Consumer adoption and media engine/GPU qualification
-remain separate. AM-R26 retains the settled R132 restriction; R128/R131 retain
-their existing evidence prerequisites rather than becoming selected work.
+remain separate. AM-R26 retains the settled R132 restriction; R128 retains
+its existing evidence prerequisite rather than becoming selected work.
 
 K1's selected compiler repair is complete under
 [Plan240](docs/impl/240-call-boundary-view-authority.md). All three consumers
