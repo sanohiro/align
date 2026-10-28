@@ -9,7 +9,9 @@ The actual LLM classifier loses its six residual suffix calls; the original
 whole-product acceptance remains consumer-owned.
 [Plan252](docs/impl/252-tagged-option-joins.md) removes temporary Option join
 overhead for search, checked arithmetic and typed byte views while preserving
-defined tagged storage. R109's global necessary-versus-removable check census
+defined tagged storage. [Plan253](docs/impl/253-guarded-codec-joins.md) extends
+the shared lowering to guarded codec accessors without moving their reads
+before range success. R109's global necessary-versus-removable check census
 and R100's missing matched historical baseline remain separate acceptance work.
 
 The owner's 2026-10-27 request batch delivers R161 listener nameability under
