@@ -1,0 +1,17 @@
+import core.codec
+pub fn integers(batch: codec.batch, index: i64) -> i64 {
+  column := batch.i64s(index) else { return -1 }
+  return column.len()
+}
+pub fn floats(batch: codec.batch, index: i64) -> i64 {
+  column := batch.f64s(index) else { return -1 }
+  return column.len()
+}
+pub fn flags(batch: codec.batch, index: i64) -> i64 {
+  column := batch.bools(index) else { return -1 }
+  return column.len()
+}
+pub fn texts(batch: codec.batch, index: i64) -> i64 {
+  column := batch.strs(index) else { return -1 }
+  return column.len()
+}
