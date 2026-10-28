@@ -1,0 +1,23 @@
+pub fn suffix_kind(s: str) -> i64 {
+  if s.ends_with(".alpha") { return 1 }
+  if s.ends_with(".beta") { return 2 }
+  if s.ends_with(".gamma") { return 3 }
+  if s.ends_with(".delta") { return 4 }
+  if s.ends_with(".epsilon") { return 5 }
+  if s.ends_with(".zeta") { return 6 }
+  return 0
+}
+pub fn prefix_kind(s: str) -> i64 {
+  if s.starts_with("alpha/") { return 1 }
+  if s.starts_with("beta/") { return 2 }
+  if s.starts_with("gamma/") { return 3 }
+  if s.starts_with("delta/") { return 4 }
+  if s.starts_with("epsilon/") { return 5 }
+  if s.starts_with("zeta/") { return 6 }
+  return 0
+}
+pub fn dynamic_predicates(s: str, needle: str) -> i64 {
+  a := if s.starts_with(needle) { 1 } else { 0 }
+  b := if s.ends_with(needle) { 2 } else { 0 }
+  return a + b
+}

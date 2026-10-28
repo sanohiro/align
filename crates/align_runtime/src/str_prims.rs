@@ -93,6 +93,11 @@ pub unsafe extern "C" fn align_rt_str_starts_with(hptr: *const u8, hlen: i64, pp
     if plen > hlen {
         return 0;
     }
+    // Resolve the empty-slice normalization together so constant-length comparisons
+    // do not carry two conditional lengths and substitute pointers into LLVM.
+    if hptr.is_null() || pptr.is_null() {
+        return i32::from(hptr == pptr);
+    }
     let (hay, pre) = unsafe {
         (
             safe_slice(hptr, plen),
@@ -113,6 +118,10 @@ pub unsafe extern "C" fn align_rt_str_ends_with(hptr: *const u8, hlen: i64, sptr
     }
     if slen > hlen {
         return 0;
+    }
+    // Keep the same nullable-pair normalization as starts_with, before tail arithmetic.
+    if hptr.is_null() || sptr.is_null() {
+        return i32::from(hptr == sptr);
     }
     // Compare the trailing `slen` bytes of the haystack against the suffix.
     let tail = unsafe { hptr.add((hlen - slen) as usize) };
