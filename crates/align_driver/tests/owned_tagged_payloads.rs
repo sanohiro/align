@@ -9,6 +9,49 @@ use common::*;
 
 const DECL: &str = "Item { detail: Option<string>, n: i64 }\n";
 
+#[test]
+fn conditional_options_reuse_the_join_slot_across_loop_iterations() {
+    if !backend_available() { return; }
+    let provider = r#"module probe
+pub fn score(text: str, raw: slice<u8>) -> i64 {
+  mut total: i64 := 0
+  mut i: i64 := 0
+  empty: slice<u32> := []
+  loop {
+    if i == 4 { break }
+    even := i % 2 == 0
+    needle := if even { "a" } else { "!" }
+    total = total + (text.find(needle) else -5)
+    total = total + (text.rfind(needle) else -5)
+    small: i8 := if even { 4 } else { 127 }
+    total = total + (small.checked_add(1) else -5) as i64
+    end := if even { raw.len() } else { raw.len() - 1 }
+    words: slice<u32> := raw[..end].view_le() else empty
+    if words.len() != 0 { total = total + words[0] as i64 }
+    i = i + 1
+  }
+  return total
+}
+"#;
+    let consumer = r#"module main
+import probe
+fn main() -> i32 {
+  mut data := buffer(0)
+  data.put_u32_le(9)
+  // Two successful first/last searches contribute 8, four misses -20,
+  // alternating checked results cancel, and two typed views contribute 18.
+  if probe.score("ababa", data.bytes()) != 6 { return 1 }
+  return 0
+}
+"#;
+    let files = [("probe.align", provider), ("main.align", consumer)];
+    let whole = build_and_run_multi("conditional-option-loop-whole", &files, "main.align");
+    assert_eq!(whole.status.code(), Some(0), "{}", String::from_utf8_lossy(&whole.stderr));
+    let units = build_per_unit_multi("conditional-option-loop-units", &files, "main.align");
+    let output = units.link_and_run();
+    assert_eq!(output.status.code(), Some(0), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
 fn mir_text(src: &str) -> String {
     let mut sm = SourceMap::new();
     let checked = check(&mut sm, "owned-tagged-payload.align", src);

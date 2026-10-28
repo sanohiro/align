@@ -6,9 +6,11 @@ The owner's 2026-10-28 continuation selects measured compiler improvements.
 [Plan251](docs/impl/251-string-predicate-specialization.md) implements R97's
 constant prefix/suffix specialization follow-up with unchanged language and ABI.
 The actual LLM classifier loses its six residual suffix calls; the original
-whole-product acceptance remains consumer-owned. R109 requires attribution of
-the current necessary versus removable checks, and R100 still lacks a matched
-historical baseline; neither is closed by the R97 measurement.
+whole-product acceptance remains consumer-owned.
+[Plan252](docs/impl/252-tagged-option-joins.md) removes temporary Option join
+overhead for search, checked arithmetic and typed byte views while preserving
+defined tagged storage. R109's global necessary-versus-removable check census
+and R100's missing matched historical baseline remain separate acceptance work.
 
 The owner's 2026-10-27 request batch delivers R161 listener nameability under
 [Plan249](docs/impl/249-http-server-nameability.md) and AM-R25 request observation

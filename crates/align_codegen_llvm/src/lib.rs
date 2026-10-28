@@ -113,17 +113,17 @@ use inkwell::values::{
     FastMathFlags, FunctionValue, IntValue, OperandBundle, PointerValue, StructValue,
 };
 
-fn freeze_struct_value<'c>(
+fn freeze_basic_value<'c>(
     builder: &Builder<'c>,
-    value: StructValue<'c>,
+    value: BasicValueEnum<'c>,
     name: &str,
-) -> Result<StructValue<'c>, CodegenError> {
+) -> Result<BasicValueEnum<'c>, CodegenError> {
     let name = std::ffi::CString::new(name)
         .map_err(|_| CodegenError::Lowering("LLVM value name contains NUL".into()))?;
-    // Inkwell 0.9 does not wrap LLVMBuildFreeze. `value` is a live struct value owned by the
+    // Inkwell 0.9 does not wrap LLVMBuildFreeze. `value` is a live basic value owned by the
     // builder's context, and LLVMBuildFreeze returns a value of that same type and lifetime.
     Ok(unsafe {
-        StructValue::new(llvm_sys::core::LLVMBuildFreeze(
+        BasicValueEnum::new(llvm_sys::core::LLVMBuildFreeze(
             builder.as_mut_ptr(),
             value.as_value_ref(),
             name.as_ptr(),
@@ -139,7 +139,22 @@ fn finish_union_value<'c>(
     name: &str,
 ) -> Result<StructValue<'c>, CodegenError> {
     if value.get_type().count_fields() > 1 {
-        freeze_struct_value(builder, value, name)
+        // Aggregate freeze is element-wise. Keep the tag independent of the storage freeze so
+        // SROA can promote conditional joins without selecting and rebuilding every payload byte.
+        // Freeze the complete storage carrier at once, including all inactive bytes; this does
+        // not expand with the payload size or change the defined-before-store boundary.
+        let mut completed = value.get_type().get_poison();
+        for index in 0..value.get_type().count_fields() {
+            let field = builder
+                .build_extract_value(value, index, &format!("{name}.field.{index}"))
+                .map_err(|error| CodegenError::Lowering(error.to_string()))?;
+            let frozen = freeze_basic_value(builder, field, &format!("{name}.freeze.{index}"))?;
+            completed = builder
+                .build_insert_value(completed, frozen, index, name)
+                .map_err(|error| CodegenError::Lowering(error.to_string()))?
+                .into_struct_value();
+        }
+        Ok(completed)
     } else {
         Ok(value)
     }
@@ -10706,6 +10721,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         value: BasicValueEnum<'c>,
         name: &str,
     ) -> Result<StructValue<'c>, CodegenError> {
+        let ty = option_struct_type(self.ctx, payload, self.struct_types, self.enum_types, self.tagged_types);
+        let result = self.alloca_at_entry(ty.into(), &format!("{name}.slot"))?;
         let some_block = self.ctx.append_basic_block(self.func, &format!("{name}.some"));
         let none_block = self.ctx.append_basic_block(self.func, &format!("{name}.none"));
         let join = self.ctx.append_basic_block(self.func, &format!("{name}.join"));
@@ -10715,21 +10732,19 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
         self.builder.position_at_end(some_block);
         let some = self.option_some_value(payload, value)?;
+        self.builder.build_store(result, some).map_err(|error| self.err(error))?;
         self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
-        let some_end = self.builder.get_insert_block().ok_or_else(|| self.err("Option Some block is absent"))?;
 
         self.builder.position_at_end(none_block);
         let none = self.option_none_value(payload)?;
+        self.builder.build_store(result, none).map_err(|error| self.err(error))?;
         self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
-        let none_end = self.builder.get_insert_block().ok_or_else(|| self.err("Option None block is absent"))?;
 
         self.builder.position_at_end(join);
-        let phi = self
-            .builder
-            .build_phi(some.get_type(), name)
-            .map_err(|error| self.err(error))?;
-        phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
-        Ok(phi.as_basic_value().into_struct_value())
+        // Let SROA split the tag and storage into independent joins. A direct aggregate phi
+        // otherwise keeps byte reconstruction alive even when only a scalar payload is consumed.
+        Ok(self.builder.build_load(ty, result, name)
+            .map_err(|error| self.err(error))?.into_struct_value())
     }
 
     fn schedule_clone_in_union(
@@ -40425,8 +40440,8 @@ fn main() -> i32 = 0
         )
         .unwrap_or_else(|error| panic!("joined Option<string> must lower: {error}"));
         let body = function_body(&llvm, "selected");
-        assert!(body.contains("union.frozen = freeze"), "Some must freeze inactive payload bytes before the join:\n{body}");
-        assert!(body.contains("option.none.frozen = freeze"), "None must use the same frozen construction boundary:\n{body}");
+        assert!(body.contains("union.frozen.freeze.1 = freeze"), "Some must freeze inactive payload bytes before the join:\n{body}");
+        assert!(body.contains("option.none.frozen.freeze.1 = freeze"), "None must use the same frozen construction boundary:\n{body}");
     }
 
     #[test]
@@ -40456,10 +40471,10 @@ fn main() -> i32 = 0
             let body = function_body(&llvm, name);
             assert_eq!(
                 body.matches(" = freeze ").count(),
-                3,
-                "both arms must define union storage and the stored arm must finalize it in {name}:\n{body}"
+                6,
+                "both arms must freeze tag and storage and the stored arm must finalize them in {name}:\n{body}"
             );
-            let base_freeze = body.find("union.base.frozen = freeze").unwrap_or_else(|| {
+            let base_freeze = body.find("union.base.frozen.freeze.1 = freeze").unwrap_or_else(|| {
                 panic!("{name} must define inactive bytes before scratch initialization:\n{body}")
             });
             let aggregate_store = body.find(", ptr %union.write").unwrap_or_else(|| {
@@ -40491,6 +40506,42 @@ fn main() -> i32 = 0
             let body = function_body(&llvm, name);
             assert!(body.contains("clonein.union.variant"), "{name} omitted its tagged clone branches:\n{body}");
             assert!(body.contains("@align_rt_arena_alloc"), "{name} did not clone its active view into the region:\n{body}");
+        }
+    }
+
+    #[test]
+    fn conditional_option_joins_promote_scalar_results() {
+        let mut source = String::from(
+            "pub fn first(text: str, needle: str) -> i64 = text.find(needle) else -1\n\
+             pub fn last(text: str, needle: str) -> i64 = text.rfind(needle) else 99\n\
+             pub fn view_len(bytes: slice<u8>) -> i64 {\n\
+               values: slice<u16> := bytes.view_le() else { return -1 }\n\
+               return values.len()\n\
+             }\n",
+        );
+        let mut names = vec!["first".to_string(), "last".to_string(), "view_len".to_string()];
+        for ty in ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"] {
+            for operation in ["add", "sub", "mul"] {
+                let name = format!("checked_{operation}_{ty}");
+                source.push_str(&format!(
+                    "pub fn {name}(a: {ty}, b: {ty}) -> {ty} = a.checked_{operation}(b) else 0\n"
+                ));
+                names.push(name);
+            }
+        }
+        source.push_str("fn main() -> i32 = 0\n");
+        let program = mir(&source);
+        let llvm = emit_llvm_ir(
+            &program, &BuildTarget::Baseline, Profile::Release, true, &names, None,
+        ).expect("conditional Option results must lower");
+        for name in names {
+            let body = function_body(&llvm, &name);
+            assert!(!body.contains("alloca "), "{name} retains conditional scratch:\n{body}");
+            assert!(
+                !body.lines().filter_map(|line| line.split_once(" = phi "))
+                    .any(|(_, tail)| tail.starts_with('{') || tail.starts_with('%')),
+                "{name} retains an aggregate join around a scalar result:\n{body}"
+            );
         }
     }
 
