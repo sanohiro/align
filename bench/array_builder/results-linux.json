@@ -1,0 +1,164 @@
+{
+  "platform": "Linux x86_64 / WSL2 / Ryzen 5950X, CPU 2 affinity",
+  "production_base": "cf8d5495c88e34d2bb6833ecb45b12afcacf4f37",
+  "consumer_commit": "9e3eb7284dbb21657f22c9debb943d93e112edd3",
+  "compiler_sha256": {
+    "control": "98a8fa6ce62f409b6c180bf409f58fe5cba4d6bd308dd895920a066c3538aa7c",
+    "candidate": "ec2cecef853157d5810139a815709f150fc75d61378a8af42b0ce8fe6b3dcb99"
+  },
+  "runtime_sha256": "4106e66bf64c00498d61fc57a0f81340e55ddf815903656a840b1b0009610014",
+  "control_patch_sha256": "9cac08a1787fe267cbcc945e1733ffa418798e54bc69f3aba538ccbf9dba4111",
+  "model_sha256": "509287f78cb4d4cf6b3843734733b914b2c158e43e22a7f4bf5e963800894d3c",
+  "tokenizer_source_sha256": "3be3ac100b6d3a56d283b21dc65d57342b6ce95f4e1559104dab259f4ac2b105",
+  "caller_sha256": "a2d44307caa940ba583f8e18290ada3bd1cd3cdd80efddefc1b0fd7e3a14d04e",
+  "timing_glue_sha256": "16b9abf4fb70d6229b37c0fd43a43b48b1ac13f9f0a5df9e7abafd78470748a0",
+  "input_sha256": "64ce0123d8217cbe54bf3689f0735036b57b2371c0b32cf2ed68b12f440e2237",
+  "native_binary_sha256": {
+    "control": "dcb71a4fb3096fea8836da548f6983919cce09f9e6a23a43a04abfdcc4b77a55",
+    "candidate": "d96b44dc2a8e041738dfdfd58c9d8a08e11efba23a5aaeb7dd8e60a6c024a52a"
+  },
+  "tokenizer_rounds_per_timing": 120,
+  "tokenizer_timing": [
+    {
+      "repeat": 0,
+      "arm": "control",
+      "ns": 1314834909,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 0,
+      "arm": "candidate",
+      "ns": 796568090,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 1,
+      "arm": "candidate",
+      "ns": 793309972,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 1,
+      "arm": "control",
+      "ns": 1313274973,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 2,
+      "arm": "control",
+      "ns": 1306686580,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 2,
+      "arm": "candidate",
+      "ns": 784813407,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 3,
+      "arm": "candidate",
+      "ns": 783597012,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 3,
+      "arm": "control",
+      "ns": 1317203452,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 4,
+      "arm": "control",
+      "ns": 1306274237,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 4,
+      "arm": "candidate",
+      "ns": 787757270,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 5,
+      "arm": "candidate",
+      "ns": 781622099,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 5,
+      "arm": "control",
+      "ns": 1310622141,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 6,
+      "arm": "control",
+      "ns": 1318226045,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    },
+    {
+      "repeat": 6,
+      "arm": "candidate",
+      "ns": 782910121,
+      "prompt_bytes": 58315,
+      "tokens": 19220,
+      "ids_sha256": "bc7d81800123e37b88c1a8030111ad1e23618937e6ac5882b2b937b62af93701"
+    }
+  ],
+  "profile_tool": "Callgrind 3.24.0, Ir only; instrumentation starts after model load and reference tokenization",
+  "profile_rounds": 5,
+  "profile": {
+    "control": {
+      "instructions": {
+        "total": 826733610,
+        "reserve": 161474490,
+        "push": 139259680
+      },
+      "dynamic_calls": {
+        "align_rt_array_builder_push": 4973560,
+        "align_runtime::ArrayBuilder::reserve": 5045635
+      },
+      "push_reserve_self_instruction_percent": 36.37618772992669
+    },
+    "candidate": {
+      "instructions": {
+        "total": 508332490,
+        "reserve": 2332570,
+        "push": 10500
+      },
+      "dynamic_calls": {
+        "align_rt_array_builder_push": 375,
+        "align_runtime::ArrayBuilder::reserve": 72450
+      },
+      "push_reserve_self_instruction_percent": 0.46093256797337506
+    }
+  },
+  "limit": "Current same-source generic-path control; not the historical Mac baseline or consumer adoption."
+}
