@@ -630,6 +630,37 @@ fn gate8_guarded_rows_inline_at_every_target_cpu() {
     }
 }
 
+#[test]
+fn gate10_constant_predicate_chains_specialize() {
+    if !backend() {
+        return;
+    }
+    // A chain of literal tests exposes the nullable-slice normalization cost that a
+    // single predicate in a filter does not. Keep the input dynamic and exported.
+    let mut source = String::new();
+    for method in ["starts_with", "ends_with"] {
+        source.push_str(&format!("pub fn {method}_chain(s: str) -> i64 {{\n"));
+        for (index, word) in [".alpha", ".beta", ".gamma", ".delta", ".epsilon", ".zeta"].iter().enumerate() {
+            source.push_str(&format!("  if s.{method}(\"{word}\") {{ return {} }}\n", index + 1));
+        }
+        source.push_str("  return 0\n}\n");
+    }
+    let exports = ["starts_with_chain", "ends_with_chain"];
+    for target in cpu_matrix() {
+        for rt_lto in [false, true] {
+            let out = ir_at(target.clone(), "predicate_chains", &source, &exports, true, rt_lto);
+            for symbol in ["align_rt_str_starts_with", "align_rt_str_ends_with"] {
+                let calls = call_sites(&out, symbol);
+                if rt_lto {
+                    assert_eq!(calls, 0, "{target:?}: constant {symbol} chain must specialize:\n{out}");
+                } else {
+                    assert_eq!(calls, 6, "{target:?}: flag-off control must retain all {symbol} calls:\n{out}");
+                }
+            }
+        }
+    }
+}
+
 // -- Gate 9: the merged module is target-independent, at every --target-cpu (#1069) -------------
 
 #[test]

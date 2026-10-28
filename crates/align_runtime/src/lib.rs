@@ -37598,6 +37598,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn str_predicate_range_matrix() {
+        let bytes: Vec<u8> = (0..192).map(|i| (i * 37) as u8).collect();
+        let predicates: [unsafe extern "C" fn(*const u8, i64, *const u8, i64) -> i32; 2] = [
+            align_rt_str_starts_with, align_rt_str_ends_with,
+        ];
+        for (suffix, predicate) in predicates.into_iter().enumerate() {
+            for offset in [0, 1, 7] {
+                for length in 0..=80 {
+                    let hay = &bytes[offset..offset + length];
+                    for needle_len in 0..=84 {
+                        // Equal-content distinct storage, overlapping interior views, and a
+                        // changed byte cross empty/fit/overlong lengths and byte alignments.
+                        let start = if suffix == 1 { length.saturating_sub(needle_len) } else { 0 };
+                        let needle = &bytes[offset + start..offset + start + needle_len];
+                        let copy = needle.to_vec();
+                        let mut changed = copy.clone();
+                        if let Some(last) = changed.last_mut() { *last ^= 0x80; }
+                        for candidate in [needle, copy.as_slice(), changed.as_slice()] {
+                            let expected = if suffix == 1 { hay.ends_with(candidate) } else { hay.starts_with(candidate) };
+                            let actual = unsafe { predicate(hay.as_ptr(), length as i64, candidate.as_ptr(), needle_len as i64) };
+                            assert_eq!(actual, i32::from(expected), "suffix={suffix} offset={offset} length={length} needle={needle_len}");
+                        }
+                    }
+                }
+            }
+            let null = std::ptr::null();
+            // Defensive normalization retains length precedence and never reads these nulls.
+            for (hlen, nlen, expected) in [
+                (0, 0, 1), (-2, -1, 1), (-1, 1, 0), (0, 1, 0), (1, 1, 1),
+                (i64::MIN, i64::MIN, 1), (i64::MAX - 1, i64::MAX, 0), (i64::MAX, i64::MAX, 1),
+            ] {
+                assert_eq!(unsafe { predicate(null, hlen, null, nlen) }, expected);
+            }
+            assert_eq!(unsafe { predicate(null, 1, bytes.as_ptr(), 1) }, 0);
+            assert_eq!(unsafe { predicate(bytes.as_ptr(), 1, null, 1) }, 0);
+        }
+    }
+
     /// Differential oracle for the generic `str` search ops, in the same discipline as the JSON
     /// structural-index SIMD tests (`json_decode_index_simd_matches_scalar_oracle`).
     ///
