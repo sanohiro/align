@@ -10714,13 +10714,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.build_union_from_values(ty, self.ctx.i8_type().const_int(1, false), shape.variant(1)?, &[value])
     }
 
-    fn conditional_option_value(
-        &self,
+    fn conditional_option_with<F>(
+        &mut self,
         is_some: IntValue<'c>,
         payload: Scalar,
-        value: BasicValueEnum<'c>,
         name: &str,
-    ) -> Result<StructValue<'c>, CodegenError> {
+        build_payload: F,
+    ) -> Result<BasicValueEnum<'c>, CodegenError>
+    where
+        F: FnOnce(&mut Self) -> Result<BasicValueEnum<'c>, CodegenError>,
+    {
         let ty = option_struct_type(self.ctx, payload, self.struct_types, self.enum_types, self.tagged_types);
         let result = self.alloca_at_entry(ty.into(), &format!("{name}.slot"))?;
         let some_block = self.ctx.append_basic_block(self.func, &format!("{name}.some"));
@@ -10731,6 +10734,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))?;
 
         self.builder.position_at_end(some_block);
+        // A checked accessor may form an address or read memory only after this guard.
+        let value = build_payload(self)?;
         let some = self.option_some_value(payload, value)?;
         self.builder.build_store(result, some).map_err(|error| self.err(error))?;
         self.builder.build_unconditional_branch(join).map_err(|error| self.err(error))?;
@@ -10743,8 +10748,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
         self.builder.position_at_end(join);
         // Let SROA split the tag and storage into independent joins. A direct aggregate phi
         // otherwise keeps byte reconstruction alive even when only a scalar payload is consumed.
-        Ok(self.builder.build_load(ty, result, name)
-            .map_err(|error| self.err(error))?.into_struct_value())
+        self.builder.build_load(ty, result, name)
+            .map_err(|error| self.err(error))
     }
 
     fn schedule_clone_in_union(
@@ -14428,7 +14433,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .builder
                             .build_not(ovf, "checked.some")
                             .map_err(|e| self.err(e))?;
-                        self.conditional_option_value(is_some, s, res, "checked.result")?.into()
+                        self.conditional_option_with(is_some, s, "checked.result", |_| Ok(res))?
                     }
                 }
             }
@@ -16648,7 +16653,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .builder
                             .build_int_compare(IntPredicate::SGE, idx, i64t.const_zero(), "found")
                             .map_err(|e| self.err(e))?;
-                        self.conditional_option_value(found, s, idx.into(), "str.find.result")?.into()
+                        self.conditional_option_with(found, s, "str.find.result", |_| Ok(idx.into()))?
                     }
                 }
             }
@@ -17239,7 +17244,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 if result_ty != Ty::Option(payload) {
                     return Err(self.err("byte view result type does not match its element"));
                 }
-                self.conditional_option_value(valid, payload, slice.into(), "bytes.view")?.into()
+                self.conditional_option_with(valid, payload, "bytes.view", |_| Ok(slice.into()))?
             }
             Rvalue::SliceAsBytes { slice, elem } => {
                 let (pointer, length) = self.split_str(slice)?;
@@ -23457,60 +23462,6 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))
     }
 
-    fn codec_option_if<F>(
-        &mut self,
-        condition: IntValue<'c>,
-        payload_scalar: Scalar,
-        name: &str,
-        payload: F,
-    ) -> Result<BasicValueEnum<'c>, CodegenError>
-    where
-        F: FnOnce(&mut Self) -> Result<BasicValueEnum<'c>, CodegenError>,
-    {
-        let option_type = option_struct_type(
-            self.ctx,
-            payload_scalar,
-            self.struct_types,
-            self.enum_types,
-            self.tagged_types,
-        );
-        let some_block = self.ctx.append_basic_block(self.func, &format!("{name}.some"));
-        let none_block = self.ctx.append_basic_block(self.func, &format!("{name}.none"));
-        let join_block = self.ctx.append_basic_block(self.func, &format!("{name}.join"));
-        self.builder
-            .build_conditional_branch(condition, some_block, none_block)
-            .map_err(|error| self.err(error))?;
-
-        self.builder.position_at_end(some_block);
-        let payload = payload(self)?;
-        let some = self.option_some_value(payload_scalar, payload)?;
-        self.builder
-            .build_unconditional_branch(join_block)
-            .map_err(|error| self.err(error))?;
-        let some_end = self
-            .builder
-            .get_insert_block()
-            .ok_or_else(|| self.err("codec option some block is absent"))?;
-
-        self.builder.position_at_end(none_block);
-        let none = self.option_none_value(payload_scalar)?;
-        self.builder
-            .build_unconditional_branch(join_block)
-            .map_err(|error| self.err(error))?;
-        let none_end = self
-            .builder
-            .get_insert_block()
-            .ok_or_else(|| self.err("codec option none block is absent"))?;
-
-        self.builder.position_at_end(join_block);
-        let phi = self
-            .builder
-            .build_phi(option_type, name)
-            .map_err(|error| self.err(error))?;
-        phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
-        Ok(phi.as_basic_value())
-    }
-
     fn codec_valid_index(
         &mut self,
         index: IntValue<'c>,
@@ -23839,7 +23790,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_int_z_extend(columns, self.ctx.i64_type(), "codec.name.columns64")
             .map_err(|error| self.err(error))?;
         let valid = self.codec_valid_index(index, columns, "codec.name.valid")?;
-        self.codec_option_if(valid, Scalar::Str, "codec.name", |this| {
+        self.conditional_option_with(valid, Scalar::Str, "codec.name", |this| {
             let offset_field = this.codec_descriptor_offset(index, 0, "codec.name.offset.field")?;
             let offset = this.codec_load_le(
                 base,
@@ -23898,7 +23849,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .build_int_z_extend(columns, self.ctx.i64_type(), "codec.kind.columns64")
             .map_err(|error| self.err(error))?;
         let valid = self.codec_valid_index(index, columns, "codec.kind.valid")?;
-        self.codec_option_if(valid, Scalar::Enum(enum_id), "codec.kind", |this| {
+        self.conditional_option_with(valid, Scalar::Enum(enum_id), "codec.kind", |this| {
             let field = this.codec_descriptor_offset(index, 12, "codec.kind.field")?;
             let tag = this.codec_load_le(base, field, this.ctx.i8_type(), "codec.kind.byte")?;
             let tag = this
@@ -24092,7 +24043,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))?
             .into_int_value();
         let valid = self.codec_valid_index(index, length, "codec.at.valid")?;
-        self.codec_option_if(valid, payload_scalar, "codec.at", |this| {
+        self.conditional_option_with(valid, payload_scalar, "codec.at", |this| {
             let data = this
                 .builder
                 .build_extract_value(column, 0, "codec.at.data")
@@ -40542,6 +40493,49 @@ fn main() -> i32 = 0
                     .any(|(_, tail)| tail.starts_with('{') || tail.starts_with('%')),
                 "{name} retains an aggregate join around a scalar result:\n{body}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codec_options_keep_payloads_guarded_and_promote_scalar_consumers() -> Result<(), CodegenError> {
+        let source = r#"import core.codec
+pub fn integer(column: codec.i64_column, index: i64) -> i64 = column.at(index) else -1
+pub fn real(column: codec.f64_column, index: i64) -> f64 = column.at(index) else -1.0
+pub fn flag(column: codec.bool_column, index: i64) -> bool = column.at(index) else false
+pub fn text_length(column: codec.str_column, index: i64) -> i64 = (column.at(index) else "").len()
+pub fn name_length(batch: codec.batch, index: i64) -> i64 = (batch.name(index) else "").len()
+pub fn kind_tag(batch: codec.batch, index: i64) -> i64 = match batch.kind(index) { Some(kind) => match kind { I64 => 0, F64 => 1, Bool => 2, Str => 3 }, None => -1 }
+fn main() -> i32 = 0
+"#;
+        let cases: [(&str, &str, &[&str]); 6] = [
+            ("integer", "codec.at", &["%codec.at.bits"]),
+            ("real", "codec.at", &["%codec.at.bits"]),
+            ("flag", "codec.at", &["%codec.at.bool.pointer"]),
+            ("text_length", "codec.at", &["%codec.at.str.start", "%codec.at.str.end"]),
+            ("name_length", "codec.name", &["%codec.name.offset", "%codec.name.length"]),
+            ("kind_tag", "codec.kind", &["%codec.kind.byte"]),
+        ];
+        let names = cases.iter().map(|(name, _, _)| (*name).to_string()).collect::<Vec<_>>();
+        let program = mir(source);
+        let raw = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, false, &names, None)?;
+        let optimized = emit_llvm_ir(&program, &BuildTarget::Baseline, Profile::Release, true, &names, None)?;
+        for (name, prefix, pointers) in cases {
+            let body = function_body(&raw, name);
+            let (_, tail) = body.split_once(&format!("\n{prefix}.some:"))
+                .ok_or_else(|| CodegenError::Lowering(format!("missing guarded {name} payload block")))?;
+            let some = tail.split_once("\n\n").map_or(tail, |(block, _)| block);
+            for pointer in pointers {
+                assert!(some.contains(&format!("{pointer} = getelementptr ")),
+                    "{name} must form {pointer} only after the range guard:\n{body}");
+                assert!(some.lines().any(|line| line.contains(" = load ")
+                    && line.contains(&format!("ptr {pointer}, align 1"))),
+                    "{name} must load {pointer} only after the range guard:\n{body}");
+            }
+            let body = function_body(&optimized, name);
+            assert!(!body.lines().filter_map(|line| line.split_once(" = phi "))
+                .any(|(_, tail)| tail.starts_with('{') || tail.starts_with('%')),
+                "{name} retains an aggregate join around a scalar consumer:\n{body}");
         }
         Ok(())
     }
