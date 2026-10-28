@@ -10,6 +10,96 @@ mod owned_fixture;
 
 #[test]
 #[cfg(unix)]
+fn codec_column_projection_admission_matrix() {
+    if !backend_available() {
+        return;
+    }
+    owned_fixture::run("codec_column_projection_admission_matrix", |_| {
+        let api = r#"module codec_column_api
+import core.codec
+pub fn integers(batch: codec.batch, index: i64) -> i64 {
+  column := batch.i64s(index) else { return -1 }
+  return column.len()
+}
+pub fn floats(batch: codec.batch, index: i64) -> i64 {
+  column := batch.f64s(index) else { return -1 }
+  return column.len()
+}
+pub fn flags(batch: codec.batch, index: i64) -> i64 {
+  column := batch.bools(index) else { return -1 }
+  return column.len()
+}
+pub fn texts(batch: codec.batch, index: i64) -> i64 {
+  column := batch.strs(index) else { return -1 }
+  return column.len()
+}
+
+pub fn verify(batch: codec.batch, rows: i64, columns: i64) -> bool {
+  indices := [-1, 0, 1, 2, 3, 4, 9223372036854775807]
+  mut step := 0
+  loop {
+    if step >= indices.len() { break }
+    index := indices[step]
+    a := if index == 0 && index < columns { rows } else { -1 }
+    b := if index == 1 && index < columns { rows } else { -1 }
+    c := if index == 2 && index < columns { rows } else { -1 }
+    d := if index == 3 && index < columns { rows } else { -1 }
+    if integers(batch, index) != a || floats(batch, index) != b
+      || flags(batch, index) != c || texts(batch, index) != d { return false }
+    step = step + 1
+  }
+  return true
+}
+"#;
+        let main = r#"module main
+import core.codec
+import codec_column_api
+fn main() -> Result<(), Error> {
+  ids := [7, 9]
+  scores := [1.5, -2.5]
+  flags := [false, true]
+  names := ["", "second"]
+  mut full := codec.encoder(2)?
+  full.put_i64("i", ids)?
+  full.put_f64("f", scores)?
+  full.put_bool("b", flags)?
+  full.put_str("s", names)?
+  full_bytes := full.finish()
+  full_batch := codec.open(full_bytes.bytes())?
+  if !codec_column_api.verify(full_batch, 2, 4) { return Err(Error.Invalid) }
+  mut zero := codec.encoder(0)?
+  zero.put_i64("i", ids[0..0])?
+  zero.put_f64("f", scores[0..0])?
+  zero.put_bool("b", flags[0..0])?
+  zero.put_str("s", names[0..0])?
+  zero_bytes := zero.finish()
+  zero_batch := codec.open(zero_bytes.bytes())?
+  if !codec_column_api.verify(zero_batch, 0, 4) { return Err(Error.Invalid) }
+  empty := codec.encoder(0)?
+  empty_bytes := empty.finish()
+  empty_batch := codec.open(empty_bytes.bytes())?
+  if !codec_column_api.verify(empty_batch, 0, 0) { return Err(Error.Invalid) }
+  return Ok(())
+}
+"#;
+        let files = [("codec_column_api.align", api), ("main.align", main)];
+        for output in [
+            build_and_run_multi("codec-column-admission-whole", &files, "main.align"),
+            build_per_unit_multi("codec-column-admission-unit", &files, "main.align")
+                .link_and_run(),
+        ] {
+            assert!(
+                output.status.success(),
+                "stdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    });
+}
+
+#[test]
+#[cfg(unix)]
 fn codec_batch_result_survives_imported_generic_cache_replay() {
     owned_fixture::run("codec_batch_result_survives_imported_generic_cache_replay", |stage| {
         let api = r#"module codec_api

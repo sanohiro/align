@@ -23904,24 +23904,24 @@ impl<'c, 'a> FnGen<'c, 'a> {
             .map_err(|error| self.err(error))?;
         let bounds = self.codec_valid_index(index, columns, "codec.column.bounds")?;
 
-        let option_type = option_struct_type(
-            self.ctx,
-            payload_scalar,
-            self.struct_types,
-            self.enum_types,
-            self.tagged_types,
-        );
-        let inspect_block = self.ctx.append_basic_block(self.func, "codec.column.inspect");
-        let some_block = self.ctx.append_basic_block(self.func, "codec.column.some");
-        let none_block = self.ctx.append_basic_block(self.func, "codec.column.none");
-        let join_block = self.ctx.append_basic_block(self.func, "codec.column.join");
+        let inspect_block = self
+            .ctx
+            .append_basic_block(self.func, "codec.column.inspect");
+        let decision_block = self
+            .ctx
+            .append_basic_block(self.func, "codec.column.checked");
+        let range_end = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| self.err("codec column range block is absent"))?;
         self.builder
-            .build_conditional_branch(bounds, inspect_block, none_block)
+            .build_conditional_branch(bounds, inspect_block, decision_block)
             .map_err(|error| self.err(error))?;
 
         self.builder.position_at_end(inspect_block);
         let kind_field = self.codec_descriptor_offset(index, 12, "codec.column.kind.field")?;
-        let actual = self.codec_load_le(base, kind_field, self.ctx.i8_type(), "codec.column.kind")?;
+        let actual =
+            self.codec_load_le(base, kind_field, self.ctx.i8_type(), "codec.column.kind")?;
         let expected = match kind {
             hir::CodecPutKind::I64 => 0,
             hir::CodecPutKind::F64 => 1,
@@ -23937,81 +23937,89 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 "codec.column.exact_kind",
             )
             .map_err(|error| self.err(error))?;
-        self.builder
-            .build_conditional_branch(exact, some_block, none_block)
-            .map_err(|error| self.err(error))?;
-
-        self.builder.position_at_end(some_block);
-        let data_field = self.codec_descriptor_offset(index, 16, "codec.column.data.field")?;
-        let data_offset =
-            self.codec_load_le(base, data_field, self.ctx.i64_type(), "codec.column.data.offset")?;
-        let data = self.codec_byte_ptr(base, data_offset, "codec.column.data")?;
-        let rows = self.codec_load_le(
-            base,
-            self.ctx.i64_type().const_int(16, false),
-            self.ctx.i64_type(),
-            "codec.column.rows",
-        )?;
-        let payload: BasicValueEnum<'c> = if kind == hir::CodecPutKind::Str {
-            let aux_field = self.codec_descriptor_offset(index, 32, "codec.column.aux.field")?;
-            let aux_offset =
-                self.codec_load_le(base, aux_field, self.ctx.i64_type(), "codec.column.aux.offset")?;
-            let aux = self.codec_byte_ptr(base, aux_offset, "codec.column.aux")?;
-            let column_type = codec_str_column_type(self.ctx);
-            let column = self
-                .builder
-                .build_insert_value(column_type.const_zero(), data, 0, "codec.column.offsets")
-                .map_err(|error| self.err(error))?
-                .into_struct_value();
-            let column = self
-                .builder
-                .build_insert_value(column, aux, 1, "codec.column.strings")
-                .map_err(|error| self.err(error))?
-                .into_struct_value();
-            self.builder
-                .build_insert_value(column, rows, 2, "codec.column.rows")
-                .map_err(|error| self.err(error))?
-                .into_struct_value()
-                .into()
-        } else {
-            let column_type = slice_struct_type(self.ctx);
-            let column = self
-                .builder
-                .build_insert_value(column_type.const_zero(), data, 0, "codec.column.data")
-                .map_err(|error| self.err(error))?
-                .into_struct_value();
-            self.builder
-                .build_insert_value(column, rows, 1, "codec.column.rows")
-                .map_err(|error| self.err(error))?
-                .into_struct_value()
-                .into()
-        };
-        let some = self.option_some_value(payload_scalar, payload)?;
-        self.builder
-            .build_unconditional_branch(join_block)
-            .map_err(|error| self.err(error))?;
-        let some_end = self
+        let inspected_end = self
             .builder
             .get_insert_block()
-            .ok_or_else(|| self.err("codec column some block is absent"))?;
-
-        self.builder.position_at_end(none_block);
-        let none = self.option_none_value(payload_scalar)?;
+            .ok_or_else(|| self.err("codec column inspection block is absent"))?;
         self.builder
-            .build_unconditional_branch(join_block)
+            .build_unconditional_branch(decision_block)
             .map_err(|error| self.err(error))?;
-        let none_end = self
-            .builder
-            .get_insert_block()
-            .ok_or_else(|| self.err("codec column none block is absent"))?;
 
-        self.builder.position_at_end(join_block);
-        let phi = self
+        self.builder.position_at_end(decision_block);
+        // Join only the admission decision. The payload remains behind both range and kind checks.
+        let admitted = self
             .builder
-            .build_phi(option_type, "codec.column.option")
+            .build_phi(self.ctx.bool_type(), "codec.column.admitted")
             .map_err(|error| self.err(error))?;
-        phi.add_incoming(&[(&some, some_end), (&none, none_end)]);
-        Ok(phi.as_basic_value())
+        let rejected = self.ctx.bool_type().const_zero();
+        admitted.add_incoming(&[(&rejected, range_end), (&exact, inspected_end)]);
+        self.conditional_option_with(
+            admitted.as_basic_value().into_int_value(),
+            payload_scalar,
+            "codec.column",
+            |this| {
+                let data_field =
+                    this.codec_descriptor_offset(index, 16, "codec.column.data.field")?;
+                let data_offset = this.codec_load_le(
+                    base,
+                    data_field,
+                    this.ctx.i64_type(),
+                    "codec.column.data.offset",
+                )?;
+                let data = this.codec_byte_ptr(base, data_offset, "codec.column.data")?;
+                let rows = this.codec_load_le(
+                    base,
+                    this.ctx.i64_type().const_int(16, false),
+                    this.ctx.i64_type(),
+                    "codec.column.rows",
+                )?;
+                let payload: BasicValueEnum<'c> = if kind == hir::CodecPutKind::Str {
+                    let aux_field =
+                        this.codec_descriptor_offset(index, 32, "codec.column.aux.field")?;
+                    let aux_offset = this.codec_load_le(
+                        base,
+                        aux_field,
+                        this.ctx.i64_type(),
+                        "codec.column.aux.offset",
+                    )?;
+                    let aux = this.codec_byte_ptr(base, aux_offset, "codec.column.aux")?;
+                    let column_type = codec_str_column_type(this.ctx);
+                    let column = this
+                        .builder
+                        .build_insert_value(
+                            column_type.const_zero(),
+                            data,
+                            0,
+                            "codec.column.offsets",
+                        )
+                        .map_err(|error| this.err(error))?
+                        .into_struct_value();
+                    let column = this
+                        .builder
+                        .build_insert_value(column, aux, 1, "codec.column.strings")
+                        .map_err(|error| this.err(error))?
+                        .into_struct_value();
+                    this.builder
+                        .build_insert_value(column, rows, 2, "codec.column.rows")
+                        .map_err(|error| this.err(error))?
+                        .into_struct_value()
+                        .into()
+                } else {
+                    let column_type = slice_struct_type(this.ctx);
+                    let column = this
+                        .builder
+                        .build_insert_value(column_type.const_zero(), data, 0, "codec.column.data")
+                        .map_err(|error| this.err(error))?
+                        .into_struct_value();
+                    this.builder
+                        .build_insert_value(column, rows, 1, "codec.column.rows")
+                        .map_err(|error| this.err(error))?
+                        .into_struct_value()
+                        .into()
+                };
+                Ok(payload)
+            },
+        )
     }
 
     fn gen_codec_column_at(
@@ -40536,6 +40544,91 @@ fn main() -> i32 = 0
             assert!(!body.lines().filter_map(|line| line.split_once(" = phi "))
                 .any(|(_, tail)| tail.starts_with('{') || tail.starts_with('%')),
                 "{name} retains an aggregate join around a scalar consumer:\n{body}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codec_column_projections_keep_both_guards_and_promote_consumers() -> Result<(), CodegenError>
+    {
+        let source = r#"import core.codec
+pub fn integers(batch: codec.batch, index: i64) -> i64 {
+  column := batch.i64s(index) else { return -1 }
+  return column.len()
+}
+pub fn floats(batch: codec.batch, index: i64) -> i64 {
+  column := batch.f64s(index) else { return -1 }
+  return column.len()
+}
+pub fn flags(batch: codec.batch, index: i64) -> i64 {
+  column := batch.bools(index) else { return -1 }
+  return column.len()
+}
+pub fn texts(batch: codec.batch, index: i64) -> i64 {
+  column := batch.strs(index) else { return -1 }
+  return column.len()
+}
+fn main() -> i32 = 0
+"#;
+        let names = ["integers", "floats", "flags", "texts"].map(str::to_string);
+        let program = mir(source);
+        let raw = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            false,
+            &names,
+            None,
+        )?;
+        let optimized = emit_llvm_ir(
+            &program,
+            &BuildTarget::Baseline,
+            Profile::Release,
+            true,
+            &names,
+            None,
+        )?;
+        for name in names {
+            let body = function_body(&raw, &name);
+            for (block, pointers) in [
+                ("codec.column.inspect", vec!["%codec.column.kind"]),
+                (
+                    "codec.column.some",
+                    if name == "texts" {
+                        vec![
+                            "%codec.column.data.offset",
+                            "%codec.column.rows",
+                            "%codec.column.aux.offset",
+                        ]
+                    } else {
+                        vec!["%codec.column.data.offset", "%codec.column.rows"]
+                    },
+                ),
+            ] {
+                let (_, tail) = body.split_once(&format!("\n{block}:")).ok_or_else(|| {
+                    CodegenError::Lowering(format!("missing guarded {name}/{block}"))
+                })?;
+                let guarded = tail.split_once("\n\n").map_or(tail, |(block, _)| block);
+                for pointer in pointers {
+                    assert!(
+                        guarded.contains(&format!("{pointer} = getelementptr ")),
+                        "{name} must form {pointer} only in {block}:\n{body}"
+                    );
+                    assert!(
+                        guarded.lines().any(|line| line.contains(" = load ")
+                            && line.contains(&format!("ptr {pointer}, align 1"))),
+                        "{name} must read {pointer} only in {block}:\n{body}"
+                    );
+                }
+            }
+            let body = function_body(&optimized, &name);
+            assert!(
+                !body
+                    .lines()
+                    .filter_map(|line| line.split_once(" = phi "))
+                    .any(|(_, tail)| tail.starts_with('{') || tail.starts_with('%')),
+                "{name} retains an aggregate join around a scalar consumer:\n{body}"
+            );
         }
         Ok(())
     }

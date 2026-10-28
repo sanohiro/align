@@ -11,7 +11,9 @@ whole-product acceptance remains consumer-owned.
 overhead for search, checked arithmetic and typed byte views while preserving
 defined tagged storage. [Plan253](docs/impl/253-guarded-codec-joins.md) extends
 the shared lowering to guarded codec accessors without moving their reads
-before range success. R109's global necessary-versus-removable check census
+before range success. [Plan254](docs/impl/254-codec-column-projection-joins.md)
+reuses that lowering for column projection after ordinal and exact-kind
+admission. R109's global necessary-versus-removable check census
 and R100's missing matched historical baseline remain separate acceptance work.
 
 The owner's 2026-10-27 request batch delivers R161 listener nameability under
