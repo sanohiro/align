@@ -2,6 +2,16 @@
 
 ## Current direction
 
+The owner's 2026-10-30 request check selects R109's concrete byte-access guard
+residual. [Plan257](docs/impl/257-byte-access-guard-fusion.md) fuses fixed-width
+read/write guards and updates both proof consumers together. Current LLM module
+IR has fewer comparisons and traps; matched native timing is neutral. The
+whole-product count remains consumer-owned. R97's remaining dynamic prefix is
+an ordinary LLVM inline-cost decision, with no selected forced-inline change.
+New R162 is deferred because its originating cache trial was withdrawn and no
+current consumer needs direct fixed-array Result payloads. Media and voice
+registers introduce no additional selected compiler work.
+
 The owner's 2026-10-28 continuation selects measured compiler improvements.
 [Plan251](docs/impl/251-string-predicate-specialization.md) implements R97's
 constant prefix/suffix specialization follow-up with unchanged language and ABI.

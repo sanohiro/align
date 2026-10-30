@@ -114,8 +114,8 @@ pub enum KeptReason {
     ArithmeticUnproved,
     /// The body exceeds [`LOOP_FACTS_VERSION_BUDGET`].
     OverBudget,
-    /// A guard in the body is not in the fused unsigned form — a borrowed-element guard, or a byte
-    /// accessor guard, which `byte_ranges` owns and re-derives in its signed form (§3.7).
+    /// A guard in the body is not in an authenticated fused form, such as a borrowed-element
+    /// guard whose independent validation still requires the signed predicate (§3.7).
     GuardNotFused,
     /// A value defined in the body is used after the loop, so a second copy of the body would leave
     /// that use dominated by neither copy (§3.7).
@@ -1052,7 +1052,7 @@ struct Guard {
     end: Option<Operand>,
     /// The length operand the guard compares against.
     len: Operand,
-    /// Width-one byte reads authenticated by this signed byte-accessor guard. Empty for ordinary
+    /// Width-one byte reads authenticated by this byte-accessor guard. Empty for ordinary
     /// fused element/range guards.
     byte_reads: Vec<ValueId>,
 }
@@ -1114,7 +1114,8 @@ impl<'a> Analysis<'a> {
                     from,
                     to,
                 },
-            ) if *from == i64_ty() && *to == u64_ty() => Some(operand),
+            ) if *from == i64_ty() && *to == u64_ty()
+                && self.value_ty(operand) == Some(*from) && self.value_ty(op) == Some(*to) => Some(operand),
             _ => None,
         }
     }
@@ -1126,10 +1127,10 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// Recognize the exact signed width-one range guard emitted for `bytes.u8/i8(offset)` and name
+    /// Recognize the exact unsigned width-one range guard emitted for `bytes.u8/i8(offset)` and name
     /// every matching read dominated by its success edge. Wider byte guards remain Plan 64's
     /// territory and therefore return `None` here.
-    fn signed_width_one_byte_guard(
+    fn width_one_byte_guard(
         &self,
         block: BlockId,
         fail: BlockId,
@@ -1138,17 +1139,11 @@ impl<'a> Analysis<'a> {
         range: [&Operand; 3],
     ) -> Option<Guard> {
         let [start, end, len] = range;
-        let (prefix, over) = self.binary(condition, BinOp::Or)?;
-        let (negative, inverted) = self.binary(prefix, BinOp::Or)?;
-        let (negative_start, zero) = self.binary(negative, BinOp::Lt)?;
-        let (inverted_start, inverted_end) = self.binary(inverted, BinOp::Gt)?;
-        let (over_end, over_len) = self.binary(over, BinOp::Gt)?;
-        if !same_operand(negative_start, start)
-            || !same_operand(zero, &int(0))
-            || !same_operand(inverted_start, start)
-            || !same_operand(inverted_end, end)
-            || !same_operand(over_end, end)
-            || !same_operand(over_len, len)
+        let (index, length) = self.binary(condition, BinOp::Ge)?;
+        if self.value_ty(condition) != Some(Ty::Bool)
+            || self.value_ty(end) != Some(i64_ty())
+            || !same_operand(self.unsigned_cast_source(index)?, start)
+            || !same_operand(self.unsigned_cast_source(length)?, len)
         {
             return None;
         }
@@ -1241,7 +1236,7 @@ impl<'a> Analysis<'a> {
                 }))
             }
             (RuntimeKey::RangeFail, [start, end, len]) => {
-                if let Some(guard) = self.signed_width_one_byte_guard(
+                if let Some(guard) = self.width_one_byte_guard(
                     block,
                     *fail,
                     *ok,
@@ -2082,9 +2077,9 @@ fn admit(
             }
         }
     }
-    // Every trap edge in the body must be fused, except the exact signed width-one byte guard
-    // authenticated by `Analysis::signed_width_one_byte_guard`. This is decided before the
-    // unmodelled-statement default so a wider or malformed signed guard reports the specific
+    // Every trap edge in the body must be fused, including the exact width-one byte guard
+    // authenticated by `Analysis::width_one_byte_guard`. This is decided before the
+    // unmodelled-statement default so a malformed guard reports the specific
     // `guard-not-fused` reason.
     let mut guards = Vec::new();
     for block in body {
@@ -3570,12 +3565,13 @@ mod tests {
     }
 
     #[test]
-    fn live_width_one_byte_guard_authenticates_only_its_dominated_read() {
+    fn live_width_one_byte_guard_authenticates_only_its_dominated_read() -> Result<(), String> {
         for accessor in ["u8", "i8"] {
             let source = format!(
                 "fn all_zero(borrow view: slice<u8>) -> bool {{\n  mut at := 0\n  loop {{\n    if at >= view.len() {{ break }}\n    if view.{accessor}(at) as i64 != 0 {{ return false }}\n    at = at + 1\n  }}\n  return true\n}}\n"
             );
-            let mut function = unchecked_source(&source);
+            let original = unchecked_source(&source);
+            let mut function = original.clone();
             let (decisions, counted) = version_loops(&mut function, &[]);
             assert!(
                 decisions
@@ -3589,7 +3585,69 @@ mod tests {
                 1,
                 "the live guard supplies one exact view extent"
             );
+            let (guard_block, condition, start, end, ok) = original.blocks.iter().find_map(|block| {
+                let Term::Branch(condition, fail, ok) = &block.term else { return None };
+                let [Stmt::Let(_, Rvalue::Call(DirectCall::Runtime(RuntimeKey::RangeFail), args))] =
+                    original.blocks.get(*fail as usize)?.stmts.as_slice() else { return None };
+                Some((block.id, condition.clone(), args.first()?.clone(), args.get(1)?.clone(), *ok))
+            }).ok_or("width-one guard fixture")?;
+            let Operand::Value(condition_id) = condition else { return Err("guard condition".into()) };
+            let Operand::Value(start_id) = start else { return Err("guard start".into()) };
+            let Operand::Value(end_id) = end else { return Err("guard end".into()) };
+            let cast_id = original.blocks[guard_block as usize].stmts.iter().find_map(|s| {
+                if let Stmt::Let(id, Rvalue::Cast { operand: Operand::Value(value), .. }) = s
+                    && *value == start_id { Some(*id) } else { None }
+            }).ok_or("guard index cast")?;
+            for mutation in 0..10 {
+                let mut bad = original.clone();
+                let mut changed = false;
+                for block in &mut bad.blocks {
+                    for statement in &mut block.stmts {
+                        match (mutation, statement) {
+                            (0, Stmt::Let(id, Rvalue::Bin(op, _, _))) if *id == condition_id => {
+                                *op = BinOp::Gt; changed = true;
+                            }
+                            (1, Stmt::Let(id, Rvalue::Cast { from, .. })) if *id == cast_id => {
+                                *from = u64_ty(); changed = true;
+                            }
+                            (2, Stmt::Let(id, Rvalue::Cast { to, .. })) if *id == cast_id => {
+                                *to = i64_ty(); changed = true;
+                            }
+                            (6, Stmt::Let(id, Rvalue::Bin(_, _, width))) if *id == end_id => {
+                                *width = int(2); changed = true;
+                            }
+                            (7, Stmt::Let(_, Rvalue::BytesRead { bytes, .. })) => {
+                                *bytes = Operand::Const(Const::Unit); changed = true;
+                            }
+                            (8, Stmt::Let(_, Rvalue::BytesRead { offset, .. })) => {
+                                *offset = int(0); changed = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                match mutation {
+                    3 => { bad.value_tys[cast_id as usize] = i64_ty(); changed = true; }
+                    4 => { bad.value_tys[start_id as usize] = u64_ty(); changed = true; }
+                    5 => { bad.value_tys[condition_id as usize] = i64_ty(); changed = true; }
+                    9 => {
+                        let position = bad.blocks[ok as usize].stmts.iter().position(|s|
+                            matches!(s, Stmt::Let(_, Rvalue::BytesRead { .. })))
+                            .ok_or("success-edge read")?;
+                        let read = bad.blocks[ok as usize].stmts.remove(position);
+                        bad.blocks[guard_block as usize].stmts.push(read);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+                assert!(changed, "mutation {mutation}");
+                let (decisions, counted) = version_loops(&mut bad, &[]);
+                assert!(!decisions.iter().any(|d| matches!(d, LoopDecision::Versioned { .. })),
+                    "{accessor} malformed live guard {mutation}: {decisions:?}");
+                assert!(counted.is_empty(), "malformed live guard must publish no extent: {mutation}");
+            }
         }
+        Ok(())
     }
 
     /// A body with one `i64` slot, one `i64` value and one `slice<i64>` slot, enough to build every

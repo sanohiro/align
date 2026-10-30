@@ -13218,8 +13218,7 @@ fn lower_bytes_read(
             Operand::Const(Const::Int(width, i64_ty())),
         ),
     ));
-    // `byte_ranges` re-derives this predicate literally (plan 69 §3.7), so it keeps the signed form.
-    emit_signed_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
+    emit_byte_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len), width);
     let v = b.fresh_value(scalar);
     b.push(Stmt::Let(
         v,
@@ -13257,8 +13256,7 @@ fn lower_bytes_set(
             Operand::Const(Const::Int(width, i64_ty())),
         ),
     ));
-    // `byte_ranges` re-derives this predicate literally (plan 69 §3.7), so it keeps the signed form.
-    emit_signed_range_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len));
+    emit_byte_bounds_check(b, &off, &Operand::Value(end), Operand::Value(len), width);
     let t = b.fresh_value(Ty::Unit);
     b.push(Stmt::Let(
         t,
@@ -14016,20 +14014,32 @@ fn emit_range_bounds_check_kind(
     emit_range_failure_edge(b, start, end, len, oob, kind);
 }
 
-/// The original three-way signed range guard: `start < 0 || start > end || end > len`.
-///
-/// Plan 69 §3.4 leaves the byte accessors to `byte_ranges`, and §3.7 records why that means they
-/// keep this form: `byte_ranges::simplify` re-derives `Or(Or(Lt(start, 0), Gt(start, end)),
-/// Gt(end, len))` literally before it may prove a byte recurrence safe, exactly as codegen's
-/// `checked_borrowed_element_guard` re-derives the element guard. Fusing a byte guard would not be
-/// unsound, but it would silently disable plan 64's proof.
-fn emit_signed_range_bounds_check(
+/// A width-one byte range is exactly an element guard, but keeps the range failure ABI and its
+/// signed, wrapping end. Wider reads/writes use the ordinary fused range predicate. Both proof
+/// consumers authenticate these forms independently before removing a reached check (Plan257).
+fn emit_byte_bounds_check(
     b: &mut Builder,
     start: &Operand,
     end: &Operand,
     len: Operand,
+    width: i128,
 ) {
-    emit_signed_range_bounds_check_kind(b, start, end, len, ExceptionalKind::RangeCheck);
+    if width != 1 || !b.length_is_non_negative(&len) || !b.operand_is_i64(start) {
+        return emit_range_bounds_check(b, start, end, len);
+    }
+    let unsigned_start = b.fresh_value(u64_ty());
+    b.push(Stmt::Let(unsigned_start, Rvalue::Cast {
+        operand: start.clone(), from: i64_ty(), to: u64_ty(),
+    }));
+    let unsigned_len = b.fresh_value(u64_ty());
+    b.push(Stmt::Let(unsigned_len, Rvalue::Cast {
+        operand: len.clone(), from: i64_ty(), to: u64_ty(),
+    }));
+    let oob = b.fresh_value(Ty::Bool);
+    b.push(Stmt::Let(oob, Rvalue::Bin(
+        BinOp::Ge, Operand::Value(unsigned_start), Operand::Value(unsigned_len),
+    )));
+    emit_range_failure_edge(b, start, end, len, oob, ExceptionalKind::RangeCheck);
 }
 
 fn emit_signed_range_bounds_check_kind(

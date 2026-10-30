@@ -927,22 +927,34 @@ fn paired_byte_ranges_keep_unproved_guards() {
 
 #[test]
 fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
+    for (width, scalar, accessor) in [(1, "u8", "u8"), (4, "u32", "u32_le")] {
+        byte_range_malformed_case(width, scalar, accessor);
+    }
+}
+
+fn byte_range_malformed_case(width: i64, scalar: &str, accessor: &str) {
     use align_ast::BinOp;
     use align_mir::{Const, Operand, Rvalue, Stmt, Term};
     use align_sema::{IntTy, Ty};
-    let source = "fn sum(src: slice<u8>, other: slice<u8>) -> u32 { mut result: u32 := 0; mut i := 9223372036854775807; loop { if i >= src.len() / 4 { break }; result = result + src.u32_le(i * 4); i = i + 1 }; return result }\n";
+    let source = format!("fn sum(src: slice<u8>, other: slice<u8>) -> {scalar} {{ mut result: {scalar} := 0; mut i := -1; loop {{ if i >= src.len() / {width} {{ break }}; result = result + src.{accessor}(i * {width}); i = i + 1 }}; return result }}\n");
     let mut map = SourceMap::new();
-    let checked = check(&mut map, "byte-range-proof", source);
+    let checked = check(&mut map, "byte-range-proof", &source);
     assert!(!checked.diags.has_errors());
     let mut base = lower_to_mir(&checked.hir).fns.remove(0);
     let integer = Ty::Int(IntTy { bits: 64, signed: true });
-    // Start beyond the scalable domain to retain the original checked CFG during source lowering,
+    // Start outside the nonnegative recurrence domain to retain the checked CFG during lowering,
     // then supply the exact zero-based recurrence to the private MIR pass.
+    let initial = base.blocks.iter().flat_map(|block| &block.stmts).find_map(|stmt| {
+        if let Stmt::Let(id, Rvalue::Un(_, Operand::Const(Const::Int(1, ty)))) = stmt
+            && *ty == integer { Some(*id) } else { None }
+    }).expect("negative initial value");
     let mut induction = None;
     for block in &mut base.blocks {
         for statement in &mut block.stmts {
-            if let Stmt::Store(slot, Operand::Const(Const::Int(value, ty))) = statement {
-                if *ty == integer && *value == i128::from(i64::MAX) { *value = 0; induction = Some(*slot); }
+            if let Stmt::Store(slot, value @ Operand::Value(_)) = statement {
+                if matches!(value, Operand::Value(id) if *id == initial) {
+                    *value = Operand::Const(Const::Int(0, integer)); induction = Some(*slot);
+                }
             }
         }
     }
@@ -985,7 +997,7 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
             assert_eq!(reached_byte_guards(&bad), 1, "rejected arm: lt={use_lt}, rejoin={rejoin}");
         }
     }
-    for mutation in 0..10 {
+    for mutation in 0..18 {
         let mut bad = base.clone();
         let mut changed = false;
         for block in &mut bad.blocks {
@@ -998,6 +1010,13 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
                     (4, Stmt::Let(_, Rvalue::BytesRead { scalar, .. })) => { *scalar = Ty::Int(IntTy { bits: 64, signed: false }); changed = true; }
                     (5, Stmt::Let(id, Rvalue::Load(slot))) if *slot == induction => { bad.value_tys[*id as usize] = Ty::Int(IntTy { bits: 32, signed: true }); changed = true; }
                     (6, Stmt::Let(_, Rvalue::Bin(BinOp::Div, _, Operand::Const(Const::Int(value, _))))) => { *value = 2; changed = true; }
+                    (10, Stmt::Let(_, Rvalue::Cast { from, .. })) => { *from = Ty::Int(IntTy { bits: 64, signed: false }); changed = true; }
+                    (11, Stmt::Let(_, Rvalue::Cast { to, .. })) => { *to = integer; changed = true; }
+                    (12, Stmt::Let(id, Rvalue::Cast { .. })) => { bad.value_tys[*id as usize] = integer; changed = true; }
+                    (13, Stmt::Let(_, Rvalue::Cast { operand: Operand::Value(id), .. })) => { bad.value_tys[*id as usize] = Ty::Int(IntTy { bits: 64, signed: false }); changed = true; }
+                    (14, Stmt::Let(_, Rvalue::Bin(op, _, _))) if *op == (if width == 1 { BinOp::Ge } else { BinOp::Gt }) => { *op = BinOp::Lt; changed = true; }
+                    (15, Stmt::Let(_, Rvalue::Cast { operand, .. })) => { *operand = Operand::Const(Const::Int(0, integer)); changed = true; }
+                    (17, Stmt::Let(id, Rvalue::Bin(BinOp::Or | BinOp::Ge | BinOp::Gt, _, _))) => { bad.value_tys[*id as usize] = integer; changed = true; }
                     _ => {}
                 }
             }
@@ -1009,6 +1028,17 @@ fn byte_range_malformed_and_invalidated_proofs_fail_closed() {
                 let guard = bad.blocks.iter_mut().find(|block| matches!(block.term, Term::Branch(_, yes, _) if base.blocks[yes as usize].stmts.iter().any(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::Call(_, _)))))).expect("range guard");
                 let duplicate = guard.stmts.last().expect("guard condition").clone();
                 guard.stmts.push(duplicate); changed = true;
+            }
+            16 => {
+                for block in &mut bad.blocks {
+                    if let Some(position) = block.stmts.iter().position(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::Cast { .. }))) {
+                        // The condition now uses a cast defined later in the same block.
+                        let cast = block.stmts.remove(position);
+                        block.stmts.push(cast);
+                        changed = true;
+                        break;
+                    }
+                }
             }
             _ => {}
         }
