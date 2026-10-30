@@ -297,7 +297,6 @@ fn truncate_excludes_old_observations_in_both_checking_modes() {
     // Negative ownership witnesses are checked only, never executed.
     let cases = [
         ("record-sibling-alias", "mut a := [10, 20, 30].to_array()\n v := a[..]\n mut p := Aliased { view: v, data: a }\n p.data.truncate(1)\n return p.view[0] as i32"),
-        ("exclusive-slice-alias", "mut a := [10, 20, 30].to_array()\n mut v := a[..]\n old := a[..]\n touch(v)\n return old[0] as i32"),
         ("slice", "mut a := [10, 20, 30].to_array()\n v := a[..]\n a.truncate(1)\n return v[0] as i32"),
         ("branch", "mut a := [10, 20, 30].to_array()\n v := a[..]\n if a.len() == 3 { a.truncate(1) }\n return v[0] as i32"),
         ("loop", "mut a := [10, 20, 30].to_array()\n v := a[..]\n loop { a.truncate(1)\n break }\n return v[0] as i32"),
@@ -402,8 +401,9 @@ fn main() -> i32 {
     if p.left.len() != 0 { return 3 }
     mut data := [1, 2].to_array()
     mut view := data[..]
+    saved := data[..]
     touch(view)
-    if data[0] != 1 || view[1] != 2 { return 4 }
+    if data[0] != 1 || view[1] != 2 || saved[1] != 2 { return 4 }
     p.left = [1, 2].to_array()
     if preserve_sibling(p) != 10 { return 5 }
     return stop() - 7

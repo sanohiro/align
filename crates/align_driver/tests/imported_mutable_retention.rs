@@ -369,10 +369,10 @@ pub fn install(borrow mut dst: slice<u8>, value: slice<u8>, ignored: i64) { dst 
 pub fn buffer_view(borrow mut dst: slice<u8>, borrow data: buffer) { dst = data.bytes() }
 "#;
     for (name, body, valid) in [
-        ("local-destination", "mut data := buffer(1); mut dst := seed; helper.put(dst, data.bytes())", true),
+        ("local-destination", "mut data := buffer(1); mut initial := [0 as u8]; mut dst := initial[..]; helper.put(dst, data.bytes())", true),
         ("caller-destination", "mut data := buffer(1); helper.put(destination, data.bytes())", false),
         ("borrowed-buffer", "mut data := buffer(1); helper.buffer_view(destination, data)", false),
-        ("borrowed-buffer-local", "mut data := buffer(1); mut dst := seed; helper.buffer_view(dst, data)", true),
+        ("borrowed-buffer-local", "mut data := buffer(1); mut initial := [0 as u8]; mut dst := initial[..]; helper.buffer_view(dst, data)", true),
         ("arena", "arena { n := 42; text := template \"value={n}\"; helper.put(destination, text.bytes()) }", false),
         ("completion", "mut data := buffer(1); mut bytes := data.bytes(); helper.install(destination, bytes, { bytes = seed; 0 })", false),
         ("known-join", "values := [65 as u8].to_array(); bytes := if flag { values[..] } else { seed }; helper.put(destination, bytes)", false),

@@ -2687,6 +2687,20 @@ awk -F'\t' '
 # and the per-binary cap documented where someone tempted to raise the job
 # timeout will read it.
 nightly_workflow="$repo_root/.github/workflows/nightly.yml"
+for compact_setting in 'CARGO_INCREMENTAL: "0"' 'CARGO_PROFILE_DEV_DEBUG: "0"' 'CARGO_PROFILE_TEST_DEBUG: "0"'; do
+  grep -Fq "      $compact_setting" "$nightly_workflow" || {
+    echo "nightly.yml lost compact artifact setting: $compact_setting" >&2
+    exit 1
+  }
+done
+if grep -Eq '^ *(key: )?cargo-nightly-\$\{\{' "$nightly_workflow"; then
+  echo "nightly.yml can restore the obsolete full-debug/incremental profile" >&2
+  exit 1
+fi
+grep -Fq 'key: cargo-nightly-compact-' "$nightly_workflow" || {
+  echo "nightly.yml lost its distinct compact profile cache" >&2
+  exit 1
+}
 if grep -Eq '^ *run: scripts/run-quiet\.sh ".*: ' \
   "$ci_workflow" "$nightly_workflow"; then
   echo "a quiet workflow command contains an unquoted YAML mapping colon" >&2

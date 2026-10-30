@@ -188,7 +188,7 @@ fn json_encode_bounded_surface_and_schema_fail_closed() {
         "json-encode-bounded-arity",
         "import core.json\nRow { value: i64 }\nfn main() -> i32 {\n  row := Row { value: 1 }\n  json.encode_bounded(row)\n  return 0\n}\n",
     );
-    assert!(arity.contains("expects 2 arguments"), "{arity}");
+    assert!(arity.contains("expects 2 or 3 arguments"), "{arity}");
 
     let limit = check_diagnostics(
         "json-encode-bounded-limit-type",

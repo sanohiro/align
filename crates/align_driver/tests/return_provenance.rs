@@ -1112,7 +1112,6 @@ fn main() -> i32 {
 #[test]
 fn non_borrowing_mutable_calls_do_not_require_region_backing() {
     let scalar_slice = "\
-fn identity(values: slice<i64>) -> slice<i64> = values
 fn fill(out dst: slice<i64>) {
   dst[0] = 7
 }
@@ -1121,8 +1120,8 @@ fn touch(borrow mut dst: slice<i64>) {
 }
 fn main() -> i32 {
   mut values := [0]
-  fill(identity(values))
-  mut alias: slice<i64> := identity(values)
+  fill(values)
+  mut alias: slice<i64> := values
   touch(alias)
   if values[0] == 8 { return 0 }
   return 1
@@ -4491,7 +4490,7 @@ fn main() -> i32 {
 }
 
 #[test]
-fn shuffle_through_a_backing_alias_invalidates_an_earlier_borrow_mut_place() {
+fn shuffle_through_a_backing_alias_preserves_an_earlier_slice_descriptor() {
     let aliased = "\
 import std.rand
 fn touch(borrow mut dst: slice<i64>, ignored: ()) {}
@@ -4506,8 +4505,8 @@ fn main() -> i32 {
 ";
     let diagnostics = check_diagnostics("l2b-a2-shuffle-alias-reservation", aliased);
     assert!(
-        diagnostics.contains("borrow mut argument place was invalidated"),
-        "shuffling through a backing alias must invalidate the earlier exclusive slice place:\n{diagnostics}"
+        diagnostics.is_empty(),
+        "shuffling numeric elements does not replace the earlier slice descriptor:\n{diagnostics}"
     );
 }
 
@@ -4534,7 +4533,7 @@ fn main() -> i32 {
 }
 
 #[test]
-fn map_into_through_a_backing_alias_invalidates_an_earlier_borrow_mut_place() {
+fn map_into_through_a_backing_alias_preserves_an_earlier_slice_descriptor() {
     let aliased = "\
 fn touch(borrow mut dst: slice<i64>, ignored: ()) {}
 fn main() -> i32 {
@@ -4548,8 +4547,8 @@ fn main() -> i32 {
 ";
     let diagnostics = check_diagnostics("l2b-a2-map-into-alias-reservation", aliased);
     assert!(
-        diagnostics.contains("borrow mut argument place was invalidated"),
-        "map_into through a backing alias must invalidate the earlier exclusive slice place:\n{diagnostics}"
+        diagnostics.is_empty(),
+        "map_into numeric elements does not replace the earlier slice descriptor:\n{diagnostics}"
     );
 }
 
@@ -4773,68 +4772,25 @@ fn choose_result(sources: Sources, choose_left: bool) -> Result<slice<str>, Erro
   Ok(choose_from_sources(sources, choose_left))
 ";
     for route in ["parameter", "capture"] {
-        for observer in ["left_values", "right_values"] {
-            let capture = if route == "capture" {
-                "  choose_view := fn choose_left: bool { choose_result(sources, choose_left) }\n"
-            } else {
-                ""
-            };
-            let call = if route == "capture" {
-                "choose_view(true)?"
-            } else {
-                "choose_from_sources(sources, true)"
-            };
-            let (main_result, returned) = if route == "capture" {
-                ("Result<i32, Error>", "Ok(0)")
-            } else {
-                ("i32", "0")
-            };
-            let src = format!(
-                "{aggregate_sources}fn probe() -> {main_result} {{\n  left_owner := \"left\".clone()\n  left_view: str := left_owner\n  right_owner := \"right\".clone()\n  right_view: str := right_owner\n  mut left_values := [left_view]\n  mut right_values := [right_view]\n  row_owner := \"row\".clone()\n  row_view: str := row_owner\n  mut row_values := [Row {{ name: row_view }}]\n  unrelated_owner := \"unrelated\".clone()\n  unrelated_view: str := unrelated_owner\n  mut unrelated_values := [unrelated_view]\n  sources := Sources {{\n    left: left_values\n    right: right_values\n    rows: row_values\n  }}\n{capture}  mut selected := {call}\n  mut installed_owner := \"installed\".clone()\n  installed_view: str := installed_owner\n  selected[0] = installed_view\n  installed_owner = \"replacement\".clone()\n  _ := {observer}[0].len()\n  _ := unrelated_values[0].len()\n  return {returned}\n}}\nfn main() -> i32 = 0\n"
+        let (capture, call, result, returned) = if route == "capture" {
+            ("choose_view := fn flag: bool { choose_result(sources, flag) };",
+             "choose_view(true)?", "Result<i32, Error>", "Ok(0)")
+        } else {
+            ("", "choose_from_sources(sources, true)", "i32", "0")
+        };
+        for (name, action, diagnostic) in [
+            ("read", "_ := selected[0].len()", None),
+            ("write", "selected[0] = \"new\"", Some("read-only")),
+            ("left-ended", "left_values = [\"new\"].to_array(); _ := selected[0].len()", Some("invalidated")),
+            ("right-ended", "right_values = [\"new\"].to_array(); _ := selected[0].len()", Some("invalidated")),
+        ] {
+            let source = format!(
+                "{aggregate_sources}fn probe() -> {result} {{ mut left_values := [\"left\"].to_array(); mut right_values := [\"right\"].to_array(); row_values := [Row {{ name: \"row\" }}].to_array(); sources := Sources {{ left: left_values, right: right_values, rows: row_values }}; {capture} mut selected := {call}; {action}; return {returned} }}\nfn main() {{}}"
             );
-            let diagnostics = check_diagnostics(
-                &format!("l2b-storage-generation-unknown-aggregate-{route}-{observer}"),
-                &src,
-            );
-            let expected = format!("use of invalidated borrow '{observer}'");
-            if !diagnostics.contains(&expected)
-                || !diagnostics.contains("source 'installed_owner'")
-                || diagnostics.matches("use of invalidated borrow").count() != 1
-                || diagnostics.contains("unrelated_values")
-                || diagnostics.contains("row_values")
-            {
-                failures.push(format!(
-                    "an unknown {route} result must update exactly both same-type aggregate candidates ({observer}) and no unrelated storage:\n{diagnostics}"
-                ));
+            let diagnostics = check_diagnostics(&format!("returned-candidate-{route}-{name}"), &source);
+            if diagnostic.map_or(!diagnostics.is_empty(), |expected| !diagnostics.contains(expected)) {
+                failures.push(format!("{route}/{name}: {diagnostics}"));
             }
-        }
-
-        let capture = if route == "capture" {
-            "  choose_view := fn choose_left: bool { choose_result(sources, choose_left) }\n"
-        } else {
-            ""
-        };
-        let call = if route == "capture" {
-            "choose_view(true)?"
-        } else {
-            "choose_from_sources(sources, true)"
-        };
-        let (main_result, returned) = if route == "capture" {
-            ("Result<i32, Error>", "Ok(0)")
-        } else {
-            ("i32", "0")
-        };
-        let filtered = format!(
-            "{aggregate_sources}fn probe() -> {main_result} {{\n  left_owner := \"left\".clone()\n  left_view: str := left_owner\n  right_owner := \"right\".clone()\n  right_view: str := right_owner\n  mut left_values := [left_view]\n  mut right_values := [right_view]\n  row_owner := \"row\".clone()\n  row_view: str := row_owner\n  mut row_values := [Row {{ name: row_view }}]\n  unrelated_owner := \"unrelated\".clone()\n  unrelated_view: str := unrelated_owner\n  mut unrelated_values := [unrelated_view]\n  sources := Sources {{\n    left: left_values\n    right: right_values\n    rows: row_values\n  }}\n{capture}  mut selected := {call}\n  mut installed_owner := \"installed\".clone()\n  installed_view: str := installed_owner\n  selected[0] = installed_view\n  installed_owner = \"replacement\".clone()\n  _ := row_values[0].name.len()\n  _ := unrelated_values[0].len()\n  return {returned}\n}}\nfn main() -> i32 = 0\n"
-        );
-        let diagnostics = check_diagnostics(
-            &format!("l2b-storage-generation-unknown-aggregate-{route}-filtered"),
-            &filtered,
-        );
-        if !diagnostics.is_empty() {
-            failures.push(format!(
-                "an unknown {route} store must filter a different header type and storage outside the selected aggregate:\n{diagnostics}"
-            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));

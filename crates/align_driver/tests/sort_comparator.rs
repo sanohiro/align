@@ -272,10 +272,8 @@ fn main() {{
 fn comparator_capture_write_authority_body() {
     let legal = r#"fn write(out values:slice<i64>,n:i64) { values[0] = n }
 fn main() {
-  mut output := [0]
-  target := output[..]
-  sorted := [3,1,2].sort_by(fn a,b { mut captured:=target; write(captured,a); a < b })
-  print(sorted[0]); print(output[0])
+  sorted := [3,1,2].sort_by(fn a,b { mut output := [0]; write(output,a); output[0] < b })
+  print(sorted[0]); print(sorted[1])
 }
 "#;
     let checked = diff_check_multi("comparator-independent-write", &[("main.align", legal)], "main.align");
@@ -298,7 +296,9 @@ fn main()->Result<(),Error> {
     ] {
         let checked = diff_check_multi("comparator-source-write", &[("main.align", &source)], "main.align");
         assert!(checked.whole_errors && checked.per_unit_errors, "{source}\n{}\n{}", checked.whole_diags, checked.per_unit_diags);
-        assert!(checked.whole_diags.contains("invalidated"), "{}", checked.whole_diags);
+        for diagnostics in [&checked.whole_diags, &checked.per_unit_diags] {
+            assert!(diagnostics.contains("read-only"), "{diagnostics}");
+        }
     }
     if backend_available() {
         let output = build_and_run("comparator-independent-write-run", legal);

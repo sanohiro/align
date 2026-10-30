@@ -19879,6 +19879,8 @@ impl EscapeState {
         let mut matched = false;
         if let Some(value) = self.storage_values.get(&local) {
             resolved.content.regions = value.non_storage.clone();
+            resolved.content.ended = value.content_ended.clone();
+            resolved.content.unknown = value.content_unknown.clone();
             for leaf in value.headers.leaves.values() {
                 let compatible = match (expected, leaf.descriptor) {
                     (Some(expected), Some(candidate)) => {
@@ -19894,7 +19896,11 @@ impl EscapeState {
         }
         if !matched {
             resolved.identity_known = false;
-            resolved.content.unknown.insert(Vec::new());
+            // Headerless resources/references still carry an exact lifetime. That proves
+            // retention, not identity; absent lifetime or explicit unknown content stays closed.
+            if resolved.content.regions.shortest_region().is_none() {
+                resolved.content.unknown.insert(Vec::new());
+            }
         }
         debug_assert_eq!(visiting.pop(), Some(key));
         resolved
@@ -22253,6 +22259,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::SoaColumn { base: local, .. }
             | ExprKind::IndexField { base: local, .. }
             | ExprKind::ArrayDictEncode { base: local, .. } => Some(local_root(*local)),
+            ExprKind::BorrowedIndex { base, .. } => Some(local_root(base.root_local)),
             ExprKind::TupleIndex { recv, .. }
             | ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. }
@@ -23079,24 +23086,35 @@ impl<'a> EscapeCheck<'a> {
                             });
                             continue;
                         }
-                        // A native producer can prove the returned view's lifetime without
-                        // proving writable header identity. Resource owners/references are the
-                        // canonical cases. Ordinary call summaries must first close every
-                        // selected candidate before discarding broad lifetime dependencies.
-                        // Keep the leaf unknown for aliasing, but do not replace that region with a
-                        // synthetic local fallback.
+                        // Unknown identity does not erase the completed call's lifetime cap:
+                        // borrowing an indexed element of a by-value owner still caps it at Frame.
+                        // This additional constraint never replaces candidate fallback evidence.
+                        value.non_storage = value.non_storage.join(&EscapeRegionFact::at_path(
+                            &result.path, baseline_content_region,
+                        ));
+                        // Keep explicit content failures separate from unknown identity. A known
+                        // lifetime alone must not trigger the lifetime-only exception for stale or
+                        // unknown selected content when no header/fallback can represent it.
+                        for (path, ended) in &frozen.content_ended {
+                            let mut selected = result.path.clone();
+                            selected.extend(path);
+                            value.content_ended.entry(selected)
+                                .and_modify(|current| *current = (*current).min(*ended))
+                                .or_insert(*ended);
+                        }
+                        for path in &frozen.content_unknown {
+                            let mut selected = result.path.clone();
+                            selected.extend(path);
+                            value.content_unknown.insert(selected);
+                        }
+                        // Native producers can prove lifetime without writable header identity.
+                        // Ordinary calls still retain every unmatched source fallback (Plan242).
                         if result.initializer != StorageContentInitializer::CallSummary
                             && sources.iter().all(|source| {
                                 source.content_ended.is_empty() && source.content_unknown.is_empty()
                             }) {
                             fallback_roots = inline_owned_fallback_roots(
                                 &fallback_roots, self.f, self.storage_type_context(),
-                            );
-                            value.non_storage = value.non_storage.join(
-                                &EscapeRegionFact::at_path(
-                                    &result.path,
-                                    baseline_content_region,
-                                ),
                             );
                         }
                         value.headers.leaves.insert(
@@ -89424,6 +89442,72 @@ fn main() -> i32 = 0
         let mut missing = program.clone();
         missing.fns[write].mutable_view_effect = None;
         assert!(!checked_hir_body_facts_are_valid(&missing));
+    }
+
+    #[test]
+    fn headerless_escape_fallback_preserves_lifetime_and_content_evidence() {
+        let descriptor = StorageHeaderDescriptor {
+            ty: Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })),
+            kind: StorageHeaderKind::View,
+        };
+        for region in [Region::Caller(0), Region::Frame, Region::Arena(1)] {
+            for ended in [false, true] {
+                for unknown in [false, true] {
+                    let mut state = EscapeState::default();
+                    let mut value = EscapeValueFact {
+                        non_storage: EscapeRegionFact::from_direct(region),
+                        ..Default::default()
+                    };
+                    if ended { value.content_ended.insert(Vec::new(), BorrowEnd::Consumed); }
+                    if unknown { value.content_unknown.insert(Vec::new()); }
+                    state.storage_values.insert(0, value);
+                    let resolved = state.resolve_fallback_root(
+                        BorrowRoot::Local(0), Some(descriptor), &mut Vec::new(),
+                    );
+                    assert_eq!(resolved.content.regions.shortest_region(), Some(region));
+                    assert_eq!(!resolved.content.ended.is_empty(), ended);
+                    assert_eq!(!resolved.content.unknown.is_empty(), unknown);
+                    assert!(!resolved.identity_known);
+                    assert!(resolved.releases.is_empty() && resolved.allocation.is_none());
+                    assert!(resolved.storage_region.is_none());
+                }
+            }
+        }
+        for cyclic in [false, true] {
+            let mut state = EscapeState::default();
+            if cyclic {
+                let mut value = EscapeValueFact::default();
+                value.headers.leaves.insert(Vec::new(), StorageHeaderLeaf::unknown(
+                    [BorrowRoot::Local(0)].into(),
+                ));
+                state.storage_values.insert(0, value);
+            }
+            let resolved = state.resolve_fallback_root(
+                BorrowRoot::Local(0), Some(descriptor), &mut Vec::new(),
+            );
+            assert!(!resolved.content.unknown.is_empty());
+            assert!(!resolved.identity_known);
+        }
+    }
+
+    #[test]
+    fn indexed_borrow_return_keeps_owner_lifetime_cap() {
+        let prefix = "Item { data: buffer }\nfn bytes(borrow item: Item)->slice<u8> = item.data.bytes()\n";
+        for (name, declaration, valid) in [
+            ("borrowed", "fn first(borrow rows:array<Item>)->slice<u8> = bytes(rows[0])", true),
+            ("by-value", "fn first(rows:array<Item>)->slice<u8> = bytes(rows[0])", false),
+            ("local", "fn first()->slice<u8> { rows := [Item {data:buffer(1)}].to_array(); return bytes(rows[0]) }", false),
+            ("arena", "fn first()->slice<u8> { arena { rows := [Item {data:buffer(1)}].to_array(); return bytes(rows[0]) } }", false),
+        ] {
+            let (program, diagnostics) = check(&format!("{prefix}{declaration}\nfn main() {{}}"));
+            let messages = diagnostics.iter().map(|entry| entry.message.as_str()).collect::<Vec<_>>();
+            assert_eq!(!diagnostics.has_errors(), valid, "{name}: {messages:?}");
+            if valid {
+                assert!(checked_hir_body_facts_are_valid(&program));
+            } else {
+                assert!(messages.iter().any(|message| message.contains("cannot return")), "{name}: {messages:?}");
+            }
+        }
     }
 
     #[test]
