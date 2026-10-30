@@ -173,9 +173,10 @@ items and is not an unstarted queue.
 
 M0–M15, LLVM22, separate compilation, caches, parallel codegen, ThinLTO and PGO
 are implemented. Existing package and optimization deliveries are recorded in
-[the roadmap](docs/impl/07-roadmap.md) and their narrow ledgers. v0.12.0 collects
-the completed Plan240 K1 boundary, the selected capabilities and repairs through
-Plan248, the settled R132/R142 restrictions, and the documentation synchronization.
+[the roadmap](docs/impl/07-roadmap.md) and their narrow ledgers. v0.13.0 collects
+the HTTP listener and request-view capabilities in Plans249–250, measured codegen
+and construction qualifications through Plan257, and Plan258's borrowed-return
+lifetime and nightly qualification repairs.
 The former long completed-capability narrative is preserved in the
 [2026-10-25 archive](docs/archive/HANDOFF-2026-10-25.md).
 
