@@ -151,7 +151,7 @@ fn align_checks(record: &Record, variable: &str, changed: bool) -> String {
 
 /// Returns the C oracle, Align declarations/exercise function, and exact foreign call count.
 pub fn sources() -> (String, String, usize) {
-    sources_for_revision(0)
+    sources_for_records(records())
 }
 
 pub fn sources_for_revision(revision: u8) -> (String, String, usize) {
@@ -162,6 +162,14 @@ pub fn sources_for_revision(revision: u8) -> (String, String, usize) {
         2 => records[0].fields[0].count = Some(5),
         _ => panic!("fixture revision"),
     }
+    // The native ABI owner covers every record once in both compilation modes.
+    // Cache invalidation needs the changed field and one unchanged floating-point
+    // control, not five repetitions of the entire register-pressure matrix.
+    records.retain(|record| matches!(record.name.as_str(), "Cfai8" | "Cfaf32"));
+    sources_for_records(records)
+}
+
+fn sources_for_records(records: Vec<Record>) -> (String, String, usize) {
     let mut c = String::from(
         "#include <stdint.h>\n#include <stddef.h>\n#include <stdlib.h>\n#include <string.h>\n#include <stdalign.h>\nstatic int64_t seen;\nstatic unsigned char storage[4096];\nint64_t cfa_seen(void){return seen;}\nvoid *cfa_storage(void){memset(storage,0xA5,sizeof(storage));return storage;}\n",
     );

@@ -205,7 +205,8 @@ fn fixed_array_cache(stage: &Path) {
     let context = align_driver::CacheContext::at(stage.join("cache"));
     let mut original = Vec::new();
     for (round, revision) in [0, 0, 1, 2, 0].into_iter().enumerate() {
-        let (c, source, _) = ffi_fixed_array_cases::sources_for_revision(revision);
+        let (c, source, calls) = ffi_fixed_array_cases::sources_for_revision(revision);
+        assert_eq!(calls, 28, "fixed C-field cache inventory changed");
         compile_c(stage, &c);
         fs::write(stage.join("factory.align"), format!("module factory\n{source}")).unwrap();
         let mut sm = SourceMap::new();
