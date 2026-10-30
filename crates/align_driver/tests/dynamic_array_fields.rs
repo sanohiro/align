@@ -148,15 +148,15 @@ pub fn main()->Result<(),Error> {
                 stage,
                 r#"
 Inner {a:array<i64>,other:array<i64>}
-Outer {inner:Inner,readonly:slice<u8>,name:string}
+Outer {inner:Inner,name:string}
 Text {a:array<str>,fixed:[str;2]}
 fn change(borrow mut value:Outer){value.inner.a[0]=8}
 fn main()->i32 {
- mut value:=Outer{inner:Inner{a:[1,2].to_array(),other:[3,4].to_array()},readonly:"ok".bytes(),name:"owner".clone()}
+ mut value:=Outer{inner:Inner{a:[1,2].to_array(),other:[3,4].to_array()},name:"owner".clone()}
+ value.inner.a[1]=9
  change(value)
  view:=value.inner.a[..]
- value.inner.a[1]=9
- if value.inner.a[0]!=8 || view[1]!=9 || value.inner.other[0]!=3 || value.name!="owner" || value.readonly[0]!=111 {return 1}
+ if value.inner.a[0]!=8 || view[1]!=9 || value.inner.other[0]!=3 || value.name!="owner" {return 1}
  arena {
   source:="kept".clone()
   borrowed:str:=source

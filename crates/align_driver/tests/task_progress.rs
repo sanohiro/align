@@ -9,7 +9,7 @@ use std::path::Path;
 const MODEL: &str = r#"module model
 pub fn observe(text: str) -> i64 = text.len()
 pub fn read(values: slice<i64>) -> i64 = values[0]
-pub fn change(values: slice<i64>) { mut alias := values; alias[0] = 9 }
+pub fn change(borrow mut values: slice<i64>) { values[0] = 9 }
 pub fn identity<T>(value: T) -> T = value
 "#;
 
@@ -111,34 +111,34 @@ fn tasks_progress_before_wait_across_compilation_modes() {
 fn imported_access_facts_reject_shared_writes() {
     owned_fixture::run("imported_access_facts_reject_shared_writes", |stage| {
         std::fs::write(stage.join("model.align"), MODEL).unwrap();
-        for (index, (body, valid)) in [
-            ("spawn(fn { model.read(view) }); model.change(view); wait()", false),
-            ("spawn(fn { model.change(view) }); wait()", false),
-            ("spawn(fn { model.read(view) }); wait(); model.change(view)", true),
-            ("spawn(fn { model.read(view) }); model.read(view); wait()", true),
-            ("spawn(fn { model.read(view) }); model.change(model.identity(view)); wait()", false),
-            ("spawn(fn { model.read(view) }); [1].map(fn x { model.identity(Holder { values: view }) }).map(fn item { model.change(item.values); 1 }).sum(); wait()", false),
-            ("spawn(fn { model.read(view) }); wait(); [1].map(fn x { model.identity(Holder { values: view }) }).map(fn item { model.change(item.values); 1 }).sum()", true),
-            ("spawn(fn { local := view; [1].map(fn x { model.identity(Holder { values: local }) }).map(fn item { model.change(item.values); 1 }).sum() }); wait()", false),
-            ("spawn(fn { local := view; [1].map(fn x { model.identity(Holder { values: local }) }).map(fn item { model.read(item.values) }).sum() }); wait()", true),
-            ("spawn(fn { model.read(view) }); { rows := [1].map(fn x { model.identity(Holder { values: view }) }).to_array(); rows.map(fn item { model.change(item.values); 1 }).sum() }; wait()", false),
-            ("spawn(fn { model.read(view) }); wait(); { rows := [1].map(fn x { model.identity(Holder { values: view }) }).to_array(); rows.map(fn item { model.change(item.values); 1 }).sum() }", true),
-            ("spawn(fn { local := view; { rows := [1].map(fn x { model.identity(Holder { values: local }) }).to_array(); rows.map(fn item { model.change(item.values); 1 }).sum() } }); wait()", false),
-            ("spawn(fn { local := view; { rows := [1].map(fn x { model.identity(Holder { values: local }) }).to_array(); rows.map(fn item { model.read(item.values) }).sum() } }); wait()", true),
+        for (index, (body, diagnostic)) in [
+            ("spawn(fn { model.read(view) }); model.change(view); wait()", Some("spawned task")),
+            ("spawn(fn { mut captured := view; model.change(captured) }); wait()", Some("read-only")),
+            ("spawn(fn { model.read(view) }); wait(); model.change(view)", None),
+            ("spawn(fn { model.read(view) }); model.read(view); wait()", None),
+            ("spawn(fn { model.read(view) }); mut returned := model.identity(view); model.change(returned); wait()", Some("read-only")),
+            ("spawn(fn { model.read(view) }); [1].map(fn x { model.identity(Holder { values: view }) }).map(fn item { mut alias := item.values; model.change(alias); 1 }).sum(); wait()", Some("read-only")),
+            ("spawn(fn { model.read(view) }); wait(); [1].map(fn x { model.identity(Holder { values: view }) }).map(fn item { mut alias := item.values; model.change(alias); 1 }).sum()", Some("read-only")),
+            ("spawn(fn { local := view; [1].map(fn x { model.identity(Holder { values: local }) }).map(fn item { mut alias := item.values; model.change(alias); 1 }).sum() }); wait()", Some("read-only")),
+            ("spawn(fn { local := view; [1].map(fn x { model.identity(Holder { values: local }) }).map(fn item { model.read(item.values) }).sum() }); wait()", None),
+            ("spawn(fn { model.read(view) }); { rows := [1].map(fn x { model.identity(Holder { values: view }) }).to_array(); rows.map(fn item { mut alias := item.values; model.change(alias); 1 }).sum() }; wait()", Some("read-only")),
+            ("spawn(fn { model.read(view) }); wait(); { rows := [1].map(fn x { model.identity(Holder { values: view }) }).to_array(); rows.map(fn item { mut alias := item.values; model.change(alias); 1 }).sum() }", Some("read-only")),
+            ("spawn(fn { local := view; { rows := [1].map(fn x { model.identity(Holder { values: local }) }).to_array(); rows.map(fn item { mut alias := item.values; model.change(alias); 1 }).sum() } }); wait()", Some("read-only")),
+            ("spawn(fn { local := view; { rows := [1].map(fn x { model.identity(Holder { values: local }) }).to_array(); rows.map(fn item { model.read(item.values) }).sum() } }); wait()", None),
         ].into_iter().enumerate() {
-            let source = format!("module main\nimport model\nHolder {{ values: slice<i64> }}\nfn main() {{ mut values := [1,2]; view := values[..]; task_group {{ {body}; () }} }}");
+            let source = format!("module main\nimport model\nHolder {{ values: slice<i64> }}\nfn main() {{ mut values := [1,2]; mut view := values[..]; task_group {{ {body}; () }} }}");
             let entry = stage.join(format!("input-{index}.align"));
             std::fs::write(&entry, &source).unwrap();
             let mut sources = SourceMap::new();
             let checked = align_driver::check(&mut sources, entry.to_str().unwrap(), &source);
             let messages = align_driver::format_diagnostics(&sources, &checked.diags);
-            assert_eq!(!checked.diags.has_errors(), valid, "whole {index}: {messages}");
-            if !valid { assert!(messages.contains("spawned task"), "whole {index}: {messages}"); }
+            assert_eq!(!checked.diags.has_errors(), diagnostic.is_none(), "whole {index}: {messages}");
+            if let Some(diagnostic) = diagnostic { assert!(messages.contains(diagnostic), "whole {index}: {messages}"); }
             let mut sources = SourceMap::new();
             let built = align_driver::build_per_unit(&mut sources, entry.to_str().unwrap(), &source);
             let messages = align_driver::format_diagnostics(&sources, &built.diags);
-            assert_eq!(!built.diags.has_errors(), valid, "{index}: {messages}");
-            if !valid { assert!(messages.contains("spawned task"), "{index}: {messages}"); }
+            assert_eq!(!built.diags.has_errors(), diagnostic.is_none(), "{index}: {messages}");
+            if let Some(diagnostic) = diagnostic { assert!(messages.contains(diagnostic), "{index}: {messages}"); }
         }
     });
 }

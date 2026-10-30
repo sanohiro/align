@@ -658,7 +658,9 @@ fn child(parent: resource_ref<memory>) -> dependent_memory = unsafe { return res
         "main.align",
     );
     assert!(result.whole_errors && result.per_unit_errors);
-    assert!(result.whole_diags.contains("private") && result.per_unit_diags.contains("private"));
+    let expected = "module 'main' cannot construct a native view for this resource";
+    assert!(result.whole_diags.contains(expected) && result.per_unit_diags.contains(expected),
+        "whole:\n{}\nper-unit:\n{}", result.whole_diags, result.per_unit_diags);
 }
 
 #[test]

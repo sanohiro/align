@@ -997,7 +997,13 @@ pub fn main() -> Result<(), Error> {
     ] {
         let label = format!("xml.next.{arm}:");
         let block = llvm.split(&label).nth(1).and_then(|tail| tail.split("\n\n").next()).expect("XML status arm");
-        assert!(block.contains("{ i8 1,") && block.contains(&format!("store %xml.event {payload}, ptr %union.payload")), "XML {arm} must construct Some with its selected event payload:\n{block}");
+        let some_tag = block.lines().find_map(|line| {
+            line.trim().strip_suffix(" = freeze i8 1")
+        }).expect("XML Some tag must be frozen before publication");
+        assert!(block.lines().any(|line| {
+            line.contains("insertvalue { i8,")
+                && line.ends_with(&format!("poison, i8 {some_tag}, 0"))
+        }) && block.contains(&format!("store %xml.event {payload}, ptr %union.payload")), "XML {arm} must construct Some with its selected event payload:\n{block}");
     }
     assert!(llvm.lines().any(|line| line.contains("%xml.next.result = phi") && ["%xml.next.start", "%xml.next.end", "%xml.next.text"].iter().all(|arm| line.contains(arm))), "all event arms must join in the Option result:\n{llvm}");
     for operation in [

@@ -352,25 +352,25 @@ fn mutation_flags_cover_aliases_callbacks_and_returning_paths() {
     for (name, body, expected) in [
         ("unchanged", "_ := flag", false),
         ("out", "install(row.numbers)", true),
-        ("by-value", "change(row.numbers)", true),
+        ("borrow-mut", "mut view := row.numbers[..]; change(view)", true),
         (
             "open-target",
-            "writer := if flag { ignore } else { action }; writer(row.numbers)",
+            "writer := if flag { ignore } else { action }; mut view := row.numbers[..]; writer(view)",
             true,
         ),
         (
             "captured",
-            "view := row.numbers[..]; writer := fn { change(view) }; writer()",
+            "view := row.numbers[..]; writer := fn { mut captured := view; change(captured) }; writer()",
             true,
         ),
         (
             "pipeline",
-            "view := row.numbers[..]; _ := [1].map(fn x { change(view); x }).sum()",
+            "view := row.numbers[..]; _ := [1].map(fn x { mut captured := view; change(captured); x }).sum()",
             true,
         ),
         (
             "map-err",
-            "view := row.numbers[..]; result: Result<(), i64> := Err(1); _ := result.map_err(fn e: i64 { change(view); e })",
+            "view := row.numbers[..]; result: Result<(), i64> := Err(1); _ := result.map_err(fn e: i64 { mut captured := view; change(captured); e })",
             true,
         ),
         (
@@ -383,19 +383,21 @@ fn mutation_flags_cover_aliases_callbacks_and_returning_paths() {
             r#"
 Row {{ numbers: array<i64>, text: str }}
 fn install(out values: slice<i64>) {{ values[0] = 7 }}
-fn change(values: slice<i64>) {{ mut alias := values; alias[0] = 7 }}
-fn ignore(values: slice<i64>) {{}}
-fn forward(borrow mut row: Row, flag: bool, action: fn(slice<i64>) -> ()) {{ {body} }}
+fn change(borrow mut values: slice<i64>) {{ values[0] = 7 }}
+fn ignore(borrow mut values: slice<i64>) {{}}
+fn forward(borrow mut row: Row, flag: bool, action: fn(borrow mut slice<i64>) -> ()) {{ {body} }}
 fn main() {{}}
 "#
         );
         let mut sources = SourceMap::new();
         let checked = check(&mut sources, "mutation-flags.align", &source);
-        assert!(
-            !checked.diags.has_errors(),
-            "{name}: {}",
-            align_driver::format_diagnostics(&sources, &checked.diags)
-        );
+        let diagnostics = align_driver::format_diagnostics(&sources, &checked.diags);
+        if matches!(name, "captured" | "pipeline" | "map-err") {
+            assert!(checked.diags.has_errors() && diagnostics.contains("read-only"),
+                "{name}: {diagnostics}");
+            continue;
+        }
+        assert!(!checked.diags.has_errors(), "{name}: {diagnostics}");
         let function = checked
             .hir
             .fns
@@ -463,30 +465,30 @@ fn main() {{ owner := "live".clone(); mut values := ["old"].to_array(); {call}; 
 }
 
 const MODEL: &str = r#"module model
-pub Row { numbers: array<i64>, words: array<str> }
-pub fn patch(borrow mut row: Row, number: i64, word: str) {
+pub Row { numbers: array<str>, words: array<str> }
+pub fn patch(borrow mut row: Row, number: str, word: str) {
   row.numbers[0] = number
   row.words[0] = word
 }
-pub fn replace(borrow mut row: Row, number: i64, word: str) {
+pub fn replace(borrow mut row: Row, number: str, word: str) {
   row = Row { numbers: [number].to_array(), words: [word].to_array() }
 }
 pub fn keep(borrow mut row: Row, ignored: str) {}
-pub fn number(borrow mut row: Row, value: i64) { row.numbers[0] = value }
+pub fn number(borrow mut row: Row, value: str) { row.numbers[0] = value }
 pub fn generic<T>(borrow mut row: Row, marker: T) {
   callback := number
-  callback(row, 17)
+  callback(row, "seventeen")
 }
 fn guard(fail: bool) -> Result<(), i64> { if fail { return Err(7) }; return Ok(()) }
 fn translate(value: i64) -> i64 = value + 1
 pub fn run(borrow mut row: Row, word: str, fail: bool) -> Result<i64, i64> {
   callback := replace
-  callback(row, 9, word)
+  callback(row, "nine", word)
   generic(row, 1)
   noop := keep
   noop(row, "ignored")
   guard(fail).map_err(translate)?
-  return Ok(row.numbers[0])
+  return Ok(if row.numbers[0] == "seventeen" { 17 } else { 0 })
 }
 "#;
 const MAIN: &str = r#"import model
@@ -497,16 +499,16 @@ extern "C" fn align_rt_free_count() -> i64
 fn exercise(fail: bool) -> Result<i64, i64> {
   owner := "alive".clone()
   next_owner := "next".clone()
-  mut row := model.Row { numbers: [1].to_array(), words: ["old"].to_array() }
+  mut row := model.Row { numbers: ["one"].to_array(), words: ["old"].to_array() }
   if unsafe { align_rt_requested_live_bytes() } <= 0 { return Err(1) }
   before_alloc := unsafe { align_rt_alloc_count() }
   before_free := unsafe { align_rt_free_count() }
   patch := model.patch
-  patch(row, 7, owner)
+  patch(row, "seven", owner)
   number := model.number
   mut index := 0
-  loop { if index == 3 { break }; number(row, 7); index = index + 1 }
-  if row.numbers[0] != 7 || row.words[0] != "alive" { return Err(2) }
+  loop { if index == 3 { break }; number(row, "seven"); index = index + 1 }
+  if row.numbers[0] != "seven" || row.words[0] != "alive" { return Err(2) }
   if unsafe { align_rt_alloc_count() } != before_alloc || unsafe { align_rt_free_count() } != before_free { return Err(3) }
   run := model.run
   result := run(row, next_owner, fail)?
@@ -584,7 +586,7 @@ fn native_lifecycle_and_replay() {
         let mut original = Vec::new();
         for round in 0..4 {
             let body = if round == 2 {
-                MODEL.replace("  row.numbers[0] = number", "  row.numbers[0] = number + 0")
+                MODEL.replace("  row.numbers[0] = number", "  row.numbers[0] = if true { number } else { number }")
             } else {
                 MODEL.to_owned()
             };

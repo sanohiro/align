@@ -18,7 +18,8 @@ fn assert_check(source: &str, valid: bool, label: &str) {
     );
     if !valid {
         assert!(
-            diagnostics.contains("use of moved value") || diagnostics.contains("borrow"),
+            diagnostics.contains("use of moved value") || diagnostics.contains("borrow")
+                || diagnostics.contains("value snapshot was invalidated"),
             "{label}: expected target lifetime diagnostic, got {diagnostics}"
         );
     }
@@ -143,11 +144,11 @@ fn eager_owner_invalidation_rejects() {
 
 #[test]
 fn conservative_view_backing_survives_without_header_metadata() {
-    for materializer in [
-        "copied := [Bytes {data: input}].to_array(); mut view := copied[0].data",
-        "mut builder: array_builder<Bytes> := array_builder(out); builder.push(Bytes {data: input}); copied := builder.build(); mut view := copied[0].data",
-        "result := [1].reduce(Bytes {data: input}, keep); mut view := result.data",
-        "mut view := choose_bytes(Bytes {data: input})",
+    for (materializer, writable) in [
+        ("copied := [Bytes {data: input}].to_array(); mut view := copied[0].data", true),
+        ("mut builder: array_builder<Bytes> := array_builder(out); builder.push(Bytes {data: input}); copied := builder.build(); mut view := copied[0].data", true),
+        ("result := [1].reduce(Bytes {data: input}, keep); mut view := result.data", false),
+        ("mut view := choose_bytes(Bytes {data: input})", false),
     ] {
         for invalidates in [false, true] {
             for in_index in [false, true] {
@@ -160,7 +161,20 @@ fn conservative_view_backing_survives_without_header_metadata() {
                 let source = format!(
                     "Bytes {{ data: slice<u8> }}\nfn keep(acc: Bytes, value: i64) -> Bytes = acc\nfn choose_bytes(value: Bytes) -> slice<u8> = value.data\nfn consume(value: array<u8>) -> i64 = 0\nfn main() {{ owner := \"xx\".bytes().to_array(); input: slice<u8> := owner; arena out {{ {materializer}; view[{index}] = {value} }} }}"
                 );
-                assert_check(&source, !invalidates, materializer);
+                if writable {
+                    assert_check(&source, !invalidates, materializer);
+                } else {
+                    let mut sources = SourceMap::new();
+                    let checked = check(&mut sources, "returned-view-write.align", &source);
+                    let diagnostics = align_driver::format_diagnostics(&sources, &checked.diags);
+                    assert!(checked.diags.has_errors() && diagnostics.contains("read-only"),
+                        "{materializer}: {diagnostics}");
+                    // Returned views still retain their source lifetime, even though the call
+                    // boundary now forbids writing through them. Exercise that axis by reading.
+                    let read = source.replace(&format!("view[{index}] = {value}"),
+                        &format!("_ := view[{{ {operand}; 0 }}]"));
+                    assert_check(&read, !invalidates, materializer);
+                }
             }
         }
     }
