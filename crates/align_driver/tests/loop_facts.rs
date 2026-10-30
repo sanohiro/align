@@ -897,24 +897,21 @@ fn g2_borrowed_element_guard_keeps_its_signed_form() {
     );
 }
 
-/// The §3.7 deviation, pinned. A byte accessor's range guard also keeps the signed form, for the
-/// same class of reason: `byte_ranges::simplify` re-derives `Or(Or(Lt(start, 0), Gt(start, end)),
-/// Gt(end, len))` literally before it may prove a byte recurrence safe. Fusing it would not be
-/// unsound, but it would silently disable plan 64's proof — which `runway_a2_binary_codec` owns.
+/// Plan257 fuses byte guards together with their independent proof consumers.
 #[test]
-fn g2_byte_accessor_guard_keeps_its_signed_form() {
+fn g2_byte_accessor_guard_uses_unsigned_range_predicates() {
     let src = "\
 fn read_at(borrow b: slice<u8>, off: i64) -> u32 = b.u32_le(off)
 ";
-    let body = mir_fn(&mir_text("g2-byte-signed", src), "read_at");
+    let body = mir_fn(&mir_text("g2-byte-fused", src), "read_at");
     let guard = guard_blocks(&body).join("\n");
     assert!(
-        guard.contains("< 0_i64") && body.contains("call runtime range_fail"),
-        "a byte accessor keeps the signed three-way range predicate:\n{body}"
+        !guard.contains("< 0_i64") && body.contains("call runtime range_fail"),
+        "a byte accessor preserves its range trap without the signed negative test:\n{body}"
     );
     assert!(
-        !guard.contains("as u64 (from i64)"),
-        "a byte accessor guard is not fused:\n{guard}"
+        guard.contains("as u64 (from i64)"),
+        "a byte accessor guard uses unsigned comparisons:\n{guard}"
     );
 }
 
@@ -1393,8 +1390,8 @@ fn main() -> i32 {
     let report = loop_facts_report("byte-prepare-straddle", src);
     assert_eq!(
         decision(&report, "leaf"),
-        "kept checks: guard-not-fused",
-        "a leaf holding a byte-accessor guard keeps its checks, and says which channel refused it"
+        "kept checks: unmodelled-statement",
+        "a wider byte read keeps its checks even after predicate fusion"
     );
     let out = build_and_run("loop-facts-byte-prepare", src);
     assert_eq!(

@@ -317,6 +317,12 @@ impl<'a> Facts<'a> {
                         }
                     }
                     Rvalue::SliceLen(op) | Rvalue::Use(op) => pending.push((op, *block, *index)),
+                    Rvalue::Cast { operand, from, to }
+                        if *from == integer() && *to == crate::u64_ty()
+                            && self.ty(operand) == Some(*from) && self.ty(op) == Some(*to) =>
+                    {
+                        pending.push((operand, *block, *index));
+                    }
                     Rvalue::Bin(_, a, b) => {
                         pending.push((a, *block, *index));
                         pending.push((b, *block, *index));
@@ -483,6 +489,39 @@ impl<'a> Facts<'a> {
         true
     }
 
+    /// An exact, type-preserving reinterpretation of the signed guard operand.
+    fn unsigned_source(&self, op: &'a Operand) -> Option<&'a Operand> {
+        let Rvalue::Cast { operand, from, to } = self.rv(op)? else { return None };
+        (*from == integer() && *to == crate::u64_ty()
+            && self.ty(operand) == Some(*from) && self.ty(op) == Some(*to))
+            .then_some(operand)
+    }
+
+    fn byte_guard_matches(
+        &self,
+        condition: &'a Operand,
+        start: &Operand,
+        end: &Operand,
+        length: &Operand,
+        width: i128,
+    ) -> bool {
+        if self.ty(condition) != Some(Ty::Bool) { return false; }
+        if width == 1 {
+            let Some((index, len)) = self.bin(condition, BinOp::Ge) else { return false };
+            return self.unsigned_source(index).is_some_and(|op| same(op, start))
+                && self.unsigned_source(len).is_some_and(|op| same(op, length));
+        }
+        let Some((inverted, over)) = self.bin(condition, BinOp::Or) else { return false };
+        if self.ty(inverted) != Some(Ty::Bool) || self.ty(over) != Some(Ty::Bool) {
+            return false;
+        }
+        let (Some((us, ue)), Some((ue2, ul))) =
+            (self.bin(inverted, BinOp::Gt), self.bin(over, BinOp::Gt))
+        else { return false };
+        [(us, start), (ue, end), (ue2, end), (ul, length)].into_iter()
+            .all(|(cast, original)| self.unsigned_source(cast).is_some_and(|op| same(op, original)))
+    }
+
     fn safe_guard(&self, block: BlockId) -> Option<SafeGuard> {
         let current = &self.f.blocks[block as usize];
         let Term::Branch(condition, fail, ok) = &current.term else {
@@ -498,25 +537,6 @@ impl<'a> Facts<'a> {
             return None;
         }
         let (start, end, length) = (&args[0], &args[1], &args[2]);
-        let (prefix, over) = self.bin(condition, BinOp::Or)?;
-        let (negative, inverted) = self.bin(prefix, BinOp::Or)?;
-        let (n_start, zero) = self.bin(negative, BinOp::Lt)?;
-        let (i_start, i_end) = self.bin(inverted, BinOp::Gt)?;
-        let (o_end, o_length) = self.bin(over, BinOp::Gt)?;
-        if !same(n_start, start)
-            || !literal(zero, 0)
-            || !same(i_start, start)
-            || !same(i_end, end)
-            || !same(o_end, end)
-            || !same(o_length, length)
-        {
-            return None;
-        }
-        for operand in [condition, prefix, over, negative, inverted] {
-            if self.ty(operand) != Some(Ty::Bool) {
-                return None;
-            }
-        }
         let (scaled, amount) = self.bin(end, BinOp::Add)?;
         if !same(scaled, start) || self.ty(end) != Some(integer()) {
             return None;
@@ -524,7 +544,9 @@ impl<'a> Facts<'a> {
         let width = [1, 2, 4, 8]
             .into_iter()
             .find(|width| literal(amount, *width))?;
-        if self.ty(start) != Some(integer()) {
+        if self.ty(start) != Some(integer())
+            || !self.byte_guard_matches(condition, start, end, length, width)
+        {
             return None;
         }
         let (address, scaled) = if let Some((index, factor)) = self.bin(start, BinOp::Mul) {
