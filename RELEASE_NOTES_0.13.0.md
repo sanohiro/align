@@ -22,7 +22,7 @@ Align v0.13.0 adds nameable HTTP listener ownership and Copy request views, redu
 
 ## Compatibility and known limits
 
-- Ordinary value parameters, captures and returned non-owning views remain read-only. Partial exclusive owned-field restrictions remain unchanged. No general writable-return or direct fixed-array Result capability is added.
+- Non-owning views entering through ordinary value parameters or captures, and returned non-owning views, remain read-only. Partial exclusive owned-field restrictions remain unchanged. No general writable-return or direct fixed-array Result capability is added.
 - Validation summaries remain conservative across a single aggregate parameter: text may refer to a numeric sibling's byte view. Keep independent mutable domains separate when repeated calls cannot prove that distinction.
 - Install the compiler, REPL and matching runtime archive together and rebuild generated programs. Provider delivery does not change external consumers' compiler pins or complete their adoption work.
 
