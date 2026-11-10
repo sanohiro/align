@@ -13283,7 +13283,13 @@ impl<'a> BodyValidator<'a> {
             .zip(captures)
         {
             let Some(flow) = self.expr_flow(capture) else { return false };
-            if !self.body_ty_matches(flow.ty, *expected) || !self.ty_copy_ok(flow.ty, context) {
+            let owned = spawn.is_some() && align_sema::task_owned_capture_type(
+                flow.ty, &self.program.structs, &self.program.tuples,
+                &self.program.enums, &self.program.tagged_types,
+            );
+            if !self.body_ty_matches(flow.ty, *expected)
+                || !(self.ty_copy_ok(flow.ty, context) || (owned && self.body_ty_ok(flow.ty)))
+            {
                 return false;
             }
         }

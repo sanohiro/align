@@ -2149,11 +2149,11 @@ calls, returns, captures, imports, and aggregate reconstruction do not transport
 the originating group, not merely the innermost active group. Entering a nested group preserves
 outer group facts: an inner `wait()` cannot authorize an outer Task, while handling an outer
 fallible Wait Result inside the inner group updates the outer group's success fact. Task result R is self-contained data: primitive Int/Float/Bool/Char/Unit,
-string, buffer, ordinary dynamic scalar arrays, AoS record arrays, records, tuples or sums.
+string, buffer, file, ordinary dynamic scalar arrays, AoS record arrays, records, tuples or sums.
 Every reachable field and payload participates, including inactive variants and zero-length
 array elements. Their complete already-formed graphs may compose independent Copy data and
-owned string/buffer/array storage through records, tuples, sums, Option/Result and fixed arrays.
-Views, raw pointers, callables, boxes, task/region/native/resource handles and inline cycles reject;
+owned string/buffer/array storage and file ownership through records, tuples, sums, Option/Result and fixed arrays.
+Views, raw pointers, callables, boxes, task/region/resource handles, native handles other than file, and inline cycles reject;
 dynamic array headers may break recursive layout cycles. Root fixed arrays, vectors/masks, RNG,
 Option and arbitrary Result remain excluded. A task may instead return `Result<R, Error>` through
 the same successful-wait boundary. Ordinary field/payload formation restrictions still apply.
@@ -2169,7 +2169,7 @@ handling that Result outside cannot authorize an enclosing Task. Proofs for stil
 groups remain.
 
 Unlike a `par_map` lambda (which must be Pure), a spawned task **may** be impure — that is the
-point: it performs I/O. Captures are snapshots of Copy values. A copied view descriptor still
+point: it performs I/O. Copy captures are value snapshots. A copied view descriptor still
 shares backing, so a task may read that backing but cannot modify it or access it exclusively.
 The caller cannot modify, invalidate or release overlapping captured backing until the covering
 join completes. Protection belongs to the group even when its Task handle is discarded; an inner
@@ -2180,9 +2180,21 @@ copies containing no borrowed backing are independent. These rules include trans
 callback calls. By-value capture also requires worker-sendability: a `region` capability is
 rejected before the spawned environment is published.
 
+A literal consumed by `spawn` may also move an already-formed owning local whose complete
+value graph is self-contained task data or `file`. Direct Option/Result capture roots are allowed;
+ordinary result-root restrictions and bare owned fixed-array capture exclusions still apply. All captures are evaluated in first-use order before
+ownership transfers and work is published. The worker receives ordinary owning parameters and may
+mutate or return them. The caller's old owner and aliases into its backing expire at this boundary,
+including aliases captured by the same task in either capture order. Borrowed parameters,
+arena-owned storage and non-transferable native/resource owners cannot move into a task.
+The worker drops unreturned inputs on every ordinary exit; returned inputs follow the existing
+owned-result lifecycle. Moving a file preserves its descriptor identity without reopening or
+duplicating it. Ordinary stored closures and repeated pipeline callbacks keep Copy-only captures;
+there is no exclusive-borrow capture. [Plan259](docs/impl/259-task-owned-captures.md) owns this boundary.
+
 A spawned lambda *escapes* (it outlives the `spawn` call, running later on the task), so it is
-represented as a first-class closure with an environment holding its captured values — distinct
-from a pipeline lambda, which never escapes and is inlined. The compiler's escape analysis chooses
+lowered directly to a task target and an environment holding its captured values, without a
+reusable owning function value. A pipeline lambda never escapes and is inlined. The compiler's escape analysis chooses
 the representation. Non-escaping pipeline captures need no separate environment allocation;
 spawned tasks retain their captures in an environment **owned by the `task_group` scope**.
 The environment is a region allocation, like an `arena {}` allocation, and is freed when that

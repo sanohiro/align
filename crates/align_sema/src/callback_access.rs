@@ -940,6 +940,12 @@ impl MoveCheck<'_> {
         self.check_callback_requirements(lifted, captures, closure.span);
         let mut roots = BorrowRoots::new();
         let mut map = |root: &hir::MutableAccessRoot| -> BorrowRoots {
+            let (hir::MutableAccessRoot::Contained(index) | hir::MutableAccessRoot::Storage(index)) = root;
+            if captures.get(*index as usize).is_some_and(|capture| super::task_owned_capture_type(
+                capture.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+            )) {
+                return BorrowRoots::new();
+            }
             match root {
                 hir::MutableAccessRoot::Contained(i) => captures
                     .get(*i as usize)

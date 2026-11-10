@@ -403,8 +403,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
         }
         Rvalue::ArenaBegin => "arena_begin".to_string(),
         Rvalue::TgBegin => "tg_begin".to_string(),
-        Rvalue::SpawnTask { closure, fallible, .. } => {
-            format!("spawn_task{} {}", if *fallible { " fallible" } else { "" }, operand_str(closure))
+        Rvalue::SpawnTask { lifted, captures, fallible, .. } => {
+            format!("spawn_task{} {}({})", if *fallible { " fallible" } else { "" }, lifted,
+                captures.iter().map(operand_str).collect::<Vec<_>>().join(", "))
         }
         Rvalue::TgWaitResult { tg, fallible } => {
             format!("tg_wait{} {}", if *fallible { " fallible" } else { "" }, operand_str(tg))

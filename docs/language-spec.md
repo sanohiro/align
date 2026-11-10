@@ -1442,6 +1442,17 @@ wait; result access separately requires success. An inner wait cannot clear oute
 Existing borrow invalidation on owner moves remains. Task-local storage and copies containing no
 borrowed backing remain independently writable. Helper and callback invocations obey the same rule.
 
+A literal consumed by `spawn` may move a complete ordinary Move local with a self-contained
+value graph, including `file` and direct Option/Result capture roots. Bare owned fixed-array
+roots retain their capture exclusion. Evaluate all captures in
+first-use order, then transfer ownership before publication. The worker receives ordinary owning
+parameters; the caller's owner and backing aliases expire, including a shared alias captured by the
+same task. Borrowed parameters, arena-owned storage and other native/resource owners reject.
+Worker input cleanup covers every ordinary exit; returned owners use the task result lifecycle.
+A file retains its original descriptor without reopen or duplication. Ordinary stored closures and
+repeated pipeline callbacks remain Copy-only; exclusive-borrow capture stays excluded.
+[Plan259](impl/259-task-owned-captures.md) defines the complete input/output transfer boundary.
+
 `Task.get()` is valid only after a successful `wait()` on every reachable path for its task
 generation. In a fallible group, the Wait Result may be handled directly or through a bare local,
 copy/reassignment, block tail, `map_err`, or value-producing `if`/`match`/`else`/`loop`; only an
@@ -1461,11 +1472,11 @@ Each Task is a Move handle whose compiler-known origin names its spawning group 
 reassignment, block tails, and value-producing control flow preserve that origin; calls, returns,
 captures, imports, and aggregate reconstruction do not. `get()` checks that exact still-active
 group. A nested group preserves outer facts: its own `wait()` cannot authorize an outer Task, while
-handling an outer Wait Result inside it updates the outer group. Task results are self-contained primitive values, string, buffer, ordinary dynamic scalar
+handling an outer Wait Result inside it updates the outer group. Task results are self-contained primitive values, string, buffer, file, ordinary dynamic scalar
 arrays, AoS record arrays, records, tuples or sums. Their complete already-formed graphs may
-compose independent Copy data and owned string/buffer/array storage through records, tuples,
+compose independent Copy data, file ownership and owned string/buffer/array storage through records, tuples,
 sums, Option/Result and fixed arrays. Inactive and zero-length payloads also participate.
-Views, pointers, callables, boxes, task/region/native/resource handles and inline cycles reject;
+Views, pointers, callables, boxes, task/region/resource handles, native handles other than file, and inline cycles reject;
 dynamic headers may break recursive layout cycles. Root fixed arrays, vectors/masks, RNG,
 Option and arbitrary Result stay excluded. `Result<R, Error>` retains the task-error boundary.
 For Copy R, `get()` copies R and may repeat. For Move R, it consumes the handle and transfers

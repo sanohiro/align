@@ -4901,7 +4901,7 @@ fn independent_builder_read(
 }
 
 /// A task result owns its complete graph independently of the worker and group.
-/// Dynamic headers break layout cycles; an inline cycle or any borrowed/native authority rejects.
+/// Dynamic headers break layout cycles; borrowed authority and non-transferable native owners reject.
 pub fn task_result_type(
     ty: Ty,
     structs: &[StructDef],
@@ -4911,9 +4911,34 @@ pub fn task_result_type(
 ) -> bool {
     if !matches!(ty, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit
         | Ty::Struct(_) | Ty::Tuple(_) | Ty::Enum(_) | Ty::String | Ty::Buffer
-        | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos)) || ty_to_scalar(ty).is_none() {
+        | Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos) | Ty::File) || ty_to_scalar(ty).is_none() {
         return false;
     }
+    task_transfer_graph(ty, structs, tuples, enums, tagged_types)
+}
+
+/// An owning task input must have ordinary Move transport and a self-contained worker-safe graph.
+/// Capture roots may include existing Option/Result carriers; result roots have a separate rule.
+pub fn task_owned_capture_type(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
+    !matches!(ty, Ty::Array(..) | Ty::StructArray(..))
+        && ty_is_move(ty, structs, tuples, enums, tagged_types)
+        && needs_drop_flag(ty, structs, tuples, enums, tagged_types)
+        && task_transfer_graph(ty, structs, tuples, enums, tagged_types)
+}
+
+fn task_transfer_graph(
+    ty: Ty,
+    structs: &[StructDef],
+    tuples: &[hir::TupleDef],
+    enums: &[hir::EnumDef],
+    tagged_types: &[hir::TaggedType],
+) -> bool {
     // First inspect the complete reachable graph, including pointees behind dynamic headers.
     // Inline-cycle validation is separate: memoizing a node reached through a header can hide
     // an inline cycle when that same node is also reached by an inline sibling edge.
@@ -4924,7 +4949,7 @@ pub fn task_result_type(
         let mut children = Vec::new();
         let mut indirect = false;
         match ty {
-            _ if independent_copy_leaf(ty) || matches!(ty, Ty::String | Ty::Buffer) => {},
+            _ if independent_copy_leaf(ty) || matches!(ty, Ty::String | Ty::Buffer | Ty::File) => {},
             Ty::Struct(id) => {
                 let Some(record) = structs.get(id as usize) else { return false };
                 children.extend(record.fields.iter().map(|field| field.ty));
@@ -29788,6 +29813,17 @@ impl<'a> EscapeCheck<'a> {
 
     fn check_spawn_capture(&mut self, closure: &Expr, group: Region, depth: u32) {
         let check = |this: &mut Self, capture: &Expr| {
+            if task_owned_capture_type(
+                capture.ty, this.structs, this.tuples, this.enums, this.tagged_types,
+            ) {
+                if this.call_transfer_contains_arena_owned(capture, depth) {
+                    this.diags.error(
+                        "an arena-owned value cannot be moved into a spawned task".to_string(),
+                        capture.span,
+                    );
+                }
+                return;
+            }
             if capture.ty == Ty::ArenaHandle {
                 this.diags.error(
                     "a spawned task cannot capture a region capability (arena allocation is lexical and non-Send)"
@@ -42364,6 +42400,11 @@ impl<'a> MoveCheck<'a> {
         let mut value = MoveValueFact::default();
         if let ExprKind::Closure { captures, .. } = &closure.kind {
             for capture in captures {
+                if task_owned_capture_type(
+                    capture.ty, self.structs, self.tuples, self.enums, self.tagged_types,
+                ) {
+                    continue;
+                }
                 // Inline scalar arrays and ordinary scalar/record copies own their snapshot.
                 // Only values containing borrowed backing retain external storage protection.
                 if ty_may_borrow(capture.ty, self.structs, self.tuples, self.enums, self.tagged_types) {
@@ -47268,9 +47309,12 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ResultOk(value)
             | ExprKind::ResultErr(value) => vec![value],
             ExprKind::EnumValue { payload, .. } => payload.iter().collect(),
-            // Closure captures are Copy aliases. They participate in completion/header staging but
-            // never null their source binding.
+            // Stored closures only read captures. The direct Spawn owns their transfer.
             ExprKind::Closure { .. } => Vec::new(),
+            ExprKind::Spawn { closure, .. } => match &closure.kind {
+                ExprKind::Closure { captures, .. } => captures.iter().collect(),
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         }
     }
@@ -47673,6 +47717,16 @@ impl<'a> MoveCheck<'a> {
                 self.finish_successful_aggregate_action(expression, moved);
             }
             ExprKind::Spawn { closure, .. } => {
+                if let ExprKind::Closure { captures, .. } = &closure.kind {
+                    self.finish_successful_call_arguments(captures, None, false, moved);
+                    // Moving into a worker ends caller backing authority, including aliases
+                    // captured by this same task. Check both capture orders after all transfers.
+                    for capture in captures {
+                        if !self.is_move_ty(capture.ty) {
+                            self.validate_pipeline_capture_use(capture);
+                        }
+                    }
+                }
                 self.register_task_capture(expression, closure);
                 self.parallel_transfer_roots.extend(self.borrows.expand_byte_validation_roots(self.borrow_sources(closure)));
                 let required = self
@@ -47933,6 +47987,7 @@ impl<'a> MoveCheck<'a> {
                 | ExprKind::LogNew { .. }
                 | ExprKind::XmlParse { .. }
                 | ExprKind::Closure { .. }
+                | ExprKind::Spawn { .. }
         )
     }
 
@@ -50123,7 +50178,8 @@ impl<'a> MoveCheck<'a> {
             }
             // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
             ExprKind::FnValue(_) => {}
-            // A closure copies its captured (Copy) values into its env — reads, not moves.
+            // A literal first reads its captures. Only its enclosing Spawn completes owned
+            // transfer; ordinary closures admit Copy inputs alone.
             ExprKind::Closure { captures, .. } => {
                 for c in captures {
                     move_expr!(self, c, moved, false, false);
@@ -55659,7 +55715,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         // Lift with the annotated parameter types as the expected signature; the return type is
         // inferred from the body.
-        let Some((name, ret, captures)) = self.lift_lambda(params, body, &param_tys, None, span) else {
+        let Some((name, ret, captures)) = self.lift_lambda(params, body, &param_tys, None, span, false) else {
             return err;
         };
         // A type error in the annotations or the body has already been reported — don't pile on a
@@ -55756,10 +55812,10 @@ impl<'a, 't> Checker<'a, 't> {
             self.diags.error("a spawned task takes no parameters (`spawn(fn { … })`)".to_string(), arg.span);
             return err;
         }
-        let Some((name, ret, captures)) = self.lift_lambda(params, body, &[], None, arg.span) else {
+        let Some((name, ret, captures)) = self.lift_lambda(params, body, &[], None, arg.span, true) else {
             return err;
         };
-        // The group owns the slot, but the copied result retains no group/capture authority.
+        // The group owns the slot, but the result retains no group/capture authority.
         // Fallible tasks initialize it only on Ok; the existing wait proof gates every read.
         let result = expand_tagged_ty(self.finalize(ret), self.tagged_types);
         let admitted = |scalar| task_result_type(
@@ -55780,9 +55836,9 @@ impl<'a, 't> Checker<'a, 't> {
                 }
             },
         };
-        // The closure value (the `{thunk, env}` machinery is reused as-is; the lifted function may
-        // return `Result` — the thunk just forwards it). Its `Ty::Fn` tag uses the `ok` scalar as
-        // the return (a repr-only tag — a closure value is a pointer pair regardless).
+        // This HIR literal belongs only to Spawn; MIR transports its target/captures directly.
+        // Its Fn tag names the ok scalar, while the lifted function and generated thunk retain
+        // the actual return type, including Result and its cleanup ABI.
         let fid = fresh_fn_type(self.fn_types, Vec::new(), scalar_to_ty(ok), FnEffect::Unknown);
         let cty = Ty::Fn(fid);
         let closure = if captures.is_empty() {
@@ -56561,6 +56617,7 @@ impl<'a, 't> Checker<'a, 't> {
                     &[callback_param],
                     Some(callback_ret),
                     argument.span,
+                    false,
                 ) else {
                     return err();
                 };
@@ -61973,7 +62030,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             StageFn::Lambda { params, body, span } => {
                 let expected_ret = if is_pred { Some(Ty::Bool) } else { None };
-                let lifted = self.lift_lambda(params, body, &[elem], expected_ret, *span)?;
+                let lifted = self.lift_lambda(params, body, &[elem], expected_ret, *span, false)?;
                 (lifted.1 != Ty::Error).then_some(lifted)
             }
         }
@@ -61987,9 +62044,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// analysis and codegen treat it exactly like a named function — including the `par_map` Pure
     /// requirement. The fused-loop lowering is then identical to a named stage function.
     ///
-    /// Slice ① cut: **non-capturing** only — the lambda body sees its parameters and top-level
-    /// functions, but not enclosing locals (capturing those is a follow-up; such a reference
-    /// surfaces as an undefined-variable error here).
+    /// Ordinary lambdas capture Copy values only. Spawn explicitly admits transferable owned
+    /// captures for this one lift; nested ordinary lambdas retain their own Copy-only mode.
     fn lift_lambda(
         &mut self,
         params: &[ast::LambdaParam],
@@ -61997,6 +62053,7 @@ impl<'a, 't> Checker<'a, 't> {
         expected_params: &[Ty],
         expected_ret: Option<Ty>,
         span: Span,
+        owned_captures: bool,
     ) -> Option<(String, Ty, Vec<Expr>)> {
         if params.len() != expected_params.len() {
             self.diags.error(
@@ -62100,8 +62157,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.finalize_block(&mut body_fin);
         task_wait::validate(&body_fin, self.tagged_types, self.diags);
         // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
-        // lint in `finalize_expr`); a box local here is function-local (Move values cannot be
-        // captured), so the scan is self-contained and never double-reports the enclosing function.
+        // lint in `finalize_expr`); a box local here is function-local (boxes cannot be captured),
+        // so the scan is self-contained and never double-reports the enclosing function.
         UnnecessaryHeapScan::run(&body_fin, self.diags);
         // A forbidden extern boundary inside this separately lifted function is a producer error,
         // not a recoverable callback type. Keep the exact diagnostic but do not publish the lifted
@@ -62154,11 +62211,17 @@ impl<'a, 't> Checker<'a, 't> {
         let mut capture_ops = Vec::new();
         for (cname, pid, enc_id) in &captured {
             let ty = locals[*pid as usize].ty;
-            if ty_capture_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types) {
-                self.diags.error(
-                    format!("a lambda cannot capture the owned value '{cname}' yet (capture supports copy values like int/float/bool/char)"),
-                    span,
-                );
+            if ty_capture_is_move(ty, self.structs, self.tuples, self.enums, self.tagged_types)
+                && !(owned_captures && task_owned_capture_type(
+                    ty, self.structs, self.tuples, self.enums, self.tagged_types,
+                ))
+            {
+                let message = if owned_captures {
+                    format!("a spawned task cannot capture non-transferable owned value '{cname}'")
+                } else {
+                    format!("a lambda cannot capture the owned value '{cname}' yet (capture supports copy values like int/float/bool/char)")
+                };
+                self.diags.error(message, span);
             }
             param_ids.push(*pid);
             capture_ops.push(Expr { kind: ExprKind::Local(*enc_id), ty, span });
@@ -62256,7 +62319,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// types are known after `check_pipeline`/the initial value).
     fn resolve_fn(&mut self, arg: &ast::Expr, expected_params: &[Ty], expected_ret: Option<Ty>, label: &str, span: Span) -> Option<(String, Ty, Vec<Expr>)> {
         if let ast::ExprKind::Lambda { params, body } = &arg.kind {
-            let lifted = self.lift_lambda(params, body, expected_params, expected_ret, arg.span)?;
+            let lifted = self.lift_lambda(params, body, expected_params, expected_ret, arg.span, false)?;
             return (lifted.1 != Ty::Error).then_some(lifted);
         }
         let Some(named) = self.pipeline_fn_name(arg) else {
@@ -93984,6 +94047,23 @@ fn exit_branch(flag: bool) -> i64 {
                 d.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn task_owned_transfer_roots_keep_native_and_arena_boundaries() {
+        for ty in [Ty::String, Ty::Buffer, Ty::File,
+            Ty::Option(Scalar::Buffer), Ty::Result(Scalar::File, Scalar::Bool)]
+        {
+            assert!(task_owned_capture_type(ty, &[], &[], &[], &[]), "{ty:?}");
+            assert!(ty_capture_is_move(ty, &[], &[], &[], &[]));
+        }
+        for ty in [Ty::Raw, Ty::ArenaHandle, Ty::HttpServer, Ty::ProcessSignalSubscription,
+            Ty::Array(Scalar::String, 2), Ty::Option(Scalar::Str)]
+        {
+            assert!(!task_owned_capture_type(ty, &[], &[], &[], &[]), "{ty:?}");
+        }
+        assert!(task_result_type(Ty::File, &[], &[], &[], &[]));
+        assert!(!task_result_type(Ty::Option(Scalar::Buffer), &[], &[], &[], &[]));
     }
 
     #[test]

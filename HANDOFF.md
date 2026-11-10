@@ -2,6 +2,15 @@
 
 ## Current direction
 
+The owner's 2026-11-10 request selects R41's admitted-file startup witness.
+[Plan259](docs/impl/259-task-owned-captures.md) supplies owned captures in a
+literal `spawn` and file-bearing results, allowing the same opened file and
+bounded window to move through worker reads. Shared views remain read-only;
+ordinary stored/pipeline lambdas remain Copy-only. Provider owners cover file
+identity, source/alias invalidation, cleanup, imports and cache replay. LLM
+integration, native full-answer comparison and startup measurements remain
+consumer-owned; media and voice require no adoption in this provider change.
+
 The owner's 2026-10-30 request check selects R109's concrete byte-access guard
 residual. [Plan257](docs/impl/257-byte-access-guard-fusion.md) fuses fixed-width
 read/write guards and updates both proof consumers together. Current LLM module

@@ -21941,6 +21941,46 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
 }
 
 #[test]
+fn task_owned_capture_hir_consumption_is_replayed() -> Result<(), String> {
+    let base = checked_source_program("fn main(){owner:=\"owned\".clone();task_group{task:=spawn(fn{owner});wait();task.get();()};()}\n");
+    for per_unit in [false, true] {
+        lower_program_checked(&base, per_unit, None).map_err(|error| format!("{error:?}"))?;
+    }
+    for mutation in 0..4 {
+        let mut bad = base.clone();
+        let main = bad.fns.iter_mut().find(|f| f.name == "main").ok_or("main")?;
+        let group = main.body.stmts.iter_mut().find_map(|stmt| match stmt {
+            hir::Stmt::Expr(hir::Expr { kind: hir::ExprKind::TaskGroup(group), .. }) => Some(group),
+            _ => None,
+        }).ok_or("group")?;
+        let spawn = group.stmts.iter().find_map(|stmt| match stmt {
+            hir::Stmt::Let { init, .. } if matches!(init.kind, hir::ExprKind::Spawn { .. }) => Some(init.clone()),
+            _ => None,
+        }).ok_or("spawn")?;
+        let hir::ExprKind::Spawn { closure, .. } = &spawn.kind else { return Err("spawn kind".into()) };
+        let hir::ExprKind::Closure { captures, .. } = &closure.kind else { return Err("closure".into()) };
+        match mutation {
+            0 => group.stmts.insert(1, hir::Stmt::Expr(captures.first().ok_or("capture")?.clone())),
+            1 => group.stmts.insert(1, hir::Stmt::Expr(spawn)),
+            2 => group.stmts.insert(0, hir::Stmt::Expr(*closure.clone())),
+            _ => {
+                let statement = group.stmts.iter_mut().find_map(|stmt| match stmt {
+                    hir::Stmt::Let { init, .. } if matches!(init.kind, hir::ExprKind::Spawn { .. }) => Some(init),
+                    _ => None,
+                }).ok_or("spawn mutation")?;
+                let hir::ExprKind::Spawn { closure, .. } = &mut statement.kind else { return Err("spawn kind".into()) };
+                let hir::ExprKind::Closure { captures, .. } = &mut closure.kind else { return Err("closure".into()) };
+                captures.first_mut().ok_or("capture")?.ty = Ty::Bool;
+            }
+        }
+        for per_unit in [false, true] {
+            assert!(lower_program_checked(&bad, per_unit, None).is_err(), "{mutation}/{per_unit}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn task_owned_hir_wait_move_and_payload_replay() -> Result<(), String> {
     let valid=checked_source_program("fn main() {task_group {t:=spawn(fn {\"owned\".clone()});wait();t.get();()};()}\n");
     lower_program_checked(&valid,false,None).map_err(|error|format!("{error:?}"))?;

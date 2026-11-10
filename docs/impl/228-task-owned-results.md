@@ -1,5 +1,9 @@
 # Owned data results from structured tasks
 
+[Plan259](259-task-owned-captures.md) extends this contract with self-contained
+owned captures and file-bearing task results. Its input-transfer ledger supersedes
+the earlier Copy-only capture and blanket native-result exclusions below.
+
 Align-llm Request152 needs contiguous output bands without packing bytes into
 scalar task results. The user explicitly selected this request after the initial
 assessment. This is the future owned-result producer already reserved by the

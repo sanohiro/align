@@ -4394,7 +4394,7 @@ fn lower_prepared_module<'c>(
         generated_funcs.insert(id, thunk);
     }
 
-    // Pass 1c: a closure thunk per lifted function used as a *capturing* closure. The env-ABI
+    // Pass 1c: an environment thunk per lifted function used as a closure or direct task. The env-ABI
     // helper loads the captured values out of `env` and forwards them
     // as the lifted function's trailing capture parameters: `lifted(explicit…, env.0, env.1, …)`.
     let mut closure_thunks: std::collections::BTreeMap<ProgramCall, Vec<Ty>> =
@@ -4402,7 +4402,8 @@ fn lower_prepared_module<'c>(
     for f in program.fns.iter().filter(|function| scope.defines(function)) {
         for b in &f.blocks {
             for s in &b.stmts {
-                if let Stmt::Let(_, Rvalue::Closure { lifted, capture_tys, .. }) = s {
+                if let Stmt::Let(_, Rvalue::Closure { lifted, capture_tys, .. }
+                    | Rvalue::SpawnTask { lifted, capture_tys, .. }) = s {
                     closure_thunks.entry(lifted.clone()).or_insert_with(|| capture_tys.clone());
                 }
             }
@@ -5778,46 +5779,35 @@ fn task_slot_type<'c>(ctx: &'c Context, result: BasicTypeEnum<'c>) -> inkwell::t
     ctx.struct_type(&[result, ctx.bool_type().into()], false)
 }
 
-// Spawn consumes one freshly lowered literal closure in the current block. Authenticate its
-// actual callable ABI, not merely the repr-only Fn tag whose return is the successful payload.
+// The task owns its direct inputs; no Copy Fn intermediate can duplicate an owning environment.
 fn task_request_is_valid(
     program: &Program,
     declarations: &HashMap<ProgramCall, ProgramDeclaration>,
     function: &Function,
-    preceding: &[Stmt],
     result: ValueId,
     request: &Rvalue,
 ) -> Result<bool, CodegenError> {
-    let Rvalue::SpawnTask { tg, closure, capture_tys, r, fallible } = request else {
+    let Rvalue::SpawnTask { tg, lifted, captures, capture_tys, r, fallible } = request else {
         return Ok(false);
     };
     if !align_sema::task_result_type(
         *r, &program.structs, &program.tuples, &program.enums, &program.tagged_types,
     ) || function.value_tys.get(result as usize).copied() != ty_to_scalar(*r).map(Ty::Task)
         || preflight_operand_ty(function, tg) != Some(Ty::ArenaHandle)
+        || captures.len() != capture_tys.len()
+        || captures.iter().zip(capture_tys).any(|(operand, ty)| {
+            preflight_operand_ty(function, operand) != Some(*ty)
+                || (align_sema::ty_capture_is_move(*ty, &program.structs, &program.tuples,
+                    &program.enums, &program.tagged_types)
+                    && !align_sema::task_owned_capture_type(*ty, &program.structs,
+                        &program.tuples, &program.enums, &program.tagged_types))
+                || align_sema::ty_mentions_resource(*ty, &program.structs, &program.tuples,
+                    &program.enums, &program.tagged_types)
+        })
     {
         return Ok(false);
     }
-    let Some(Ty::Fn(fid)) = preflight_operand_ty(function, closure) else { return Ok(false) };
-    let Some(signature) = program.fn_types.get(fid as usize) else { return Ok(false) };
-    if !signature.params.is_empty() || !source_ty_matches(signature.ret, *r, program)? {
-        return Ok(false);
-    }
-    let Operand::Value(closure_id) = closure else { return Ok(false) };
-    let mut definitions = preceding.iter().filter_map(|statement| match statement {
-        Stmt::Let(value, definition) if value == closure_id => Some(definition),
-        _ => None,
-    });
-    let Some(definition) = definitions.next() else { return Ok(false) };
-    if definitions.next().is_some() {
-        return Ok(false);
-    }
-    let target = match definition {
-        Rvalue::FnAddr { target, .. } if capture_tys.is_empty() => target,
-        Rvalue::Closure { lifted, capture_tys: actual, .. } if actual == capture_tys => lifted,
-        _ => return Ok(false),
-    };
-    let Some(declaration) = declarations.get(target) else { return Ok(false) };
+    let Some(declaration) = declarations.get(lifted) else { return Ok(false) };
     let expected = if *fallible {
         let Some(error) = program.enums.iter().position(|definition| definition.name == "Error")
             .and_then(|index| u32::try_from(index).ok()) else { return Ok(false) };
@@ -5826,10 +5816,38 @@ fn task_request_is_valid(
     } else {
         *r
     };
-    Ok(declaration.signature.params == *capture_tys
+    Ok(declaration.classes.as_slice() == [ProgramDeclarationClass::Stored]
+        && declaration.signature.params == *capture_tys
+        && declaration.signature.modes.len() == capture_tys.len()
         && declaration.signature.modes.iter().all(|mode| *mode == align_ast::ParamMode::ByValue)
         && declaration.signature.cleanup == if task_result_owned(*r, program) { hir::ReturnCleanupAbi::DynamicBit } else { hir::ReturnCleanupAbi::None }
         && source_ty_matches(declaration.signature.ret, expected, program)?)
+}
+
+fn task_environment_identity(
+    program: &Program,
+    declaration: &ProgramDeclaration,
+    lifted: &ProgramCall,
+    capture_tys: &[Ty],
+) -> Result<GeneratedId, CodegenError> {
+    let count = u32::try_from(capture_tys.len()).map_err(|_| callable_target_error(lifted))?;
+    let signature = ProgramSignature {
+        params: Vec::new(),
+        modes: Vec::new(),
+        ret: declaration.signature.ret,
+        borrow: xml_closure_borrow_summary(&declaration.signature.borrow, 0, count)
+            .ok_or_else(|| callable_target_error(lifted))?,
+        region: xml_closure_region_summary(&declaration.signature.region, 0, count)
+            .ok_or_else(|| callable_target_error(lifted))?,
+        cleanup: declaration.signature.cleanup,
+        drop_state_effects: Vec::new(),
+    };
+    Ok(GeneratedId::Closure {
+        lifted: lifted.clone(),
+        explicit_signature: canonical_signature(&signature, program)?,
+        drop_state_effects: drop_state_effect_tags(&declaration.signature.drop_state_effects),
+        captures: capture_tys.iter().map(|ty| canonical_ty(*ty, program)).collect::<Result<Vec<_>, _>>()?,
+    })
 }
 
 fn callable_preflight(
@@ -5841,7 +5859,7 @@ fn callable_preflight(
     let mut generated = Vec::new();
     for function in program.fns.iter().filter(|function| scope.defines(function)) {
         for block in &function.blocks {
-            for (statement_index, statement) in block.stmts.iter().enumerate() {
+            for statement in &block.stmts {
                 let Stmt::Let(value, rvalue) = statement else {
                     continue;
                 };
@@ -6070,6 +6088,9 @@ fn callable_preflight(
                         if declaration.classes.as_slice() != [ProgramDeclarationClass::Stored]
                             || capture_tys.len() > declaration.signature.params.len()
                             || captures.len() != capture_tys.len()
+                            || capture_tys.iter().any(|ty| align_sema::ty_capture_is_move(
+                                *ty, &program.structs, &program.tuples, &program.enums, &program.tagged_types,
+                            ))
                         {
                             return Err(callable_target_error(lifted).into());
                         }
@@ -6150,6 +6171,7 @@ fn callable_preflight(
                         });
                     }
                     Rvalue::SpawnTask {
+                        lifted,
                         capture_tys,
                         r,
                         fallible,
@@ -6162,11 +6184,13 @@ fn callable_preflight(
                             ));
                         }
                         if !task_request_is_valid(
-                            program, &declarations, function, &block.stmts[..statement_index],
-                            *value, rvalue,
+                            program, &declarations, function, *value, rvalue,
                         )? {
                             return Err(CodegenError::Lowering("spawn result/callable metadata invalid".into()));
                         }
+                        let declaration = declarations.get(lifted)
+                            .ok_or_else(|| callable_target_error(lifted))?;
+                        generated.push(task_environment_identity(program, declaration, lifted, capture_tys)?);
                         if task_result_owned(*r, program) {
                             generated.push(GeneratedId::TaskDrop { result: canonical_ty(*r, program)? });
                         }
@@ -10441,7 +10465,7 @@ fn stack_header_plan(f: &Function) -> StackHeaderPlan {
                         Rvalue::StaticDescriptorView { ptr, .. } => {
                             reject_header_operand(ptr, &load_defs, &owner, &mut bad);
                         }
-                        Rvalue::Closure { captures, .. } => {
+                        Rvalue::Closure { captures, .. } | Rvalue::SpawnTask { captures, .. } => {
                             for op in captures {
                                 reject_header_operand(op, &load_defs, &owner, &mut bad);
                             }
@@ -14825,14 +14849,17 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?;
                 cs.try_as_basic_value().basic().expect("tg_begin returns a pointer")
             }
-            Rvalue::SpawnTask { tg, closure, capture_tys, r, fallible } => {
+            Rvalue::SpawnTask { tg, lifted, captures, capture_tys, r, fallible } => {
                 let i64t = self.ctx.i64_type();
                 let tgv = self.operand(tg)?.into_pointer_value();
-                let clos = self.operand(closure)?.into_struct_value();
-                let thunk = self.builder.build_extract_value(clos, 0, "thunk").map_err(|e| self.err(e))?;
-                let frame_env = self.builder.build_extract_value(clos, 1, "fenv").map_err(|e| self.err(e))?.into_pointer_value();
-                // Snapshot the captures into a fresh env in the task-group region (so a deferred
-                // task reads its own captures, not a frame slot reused by a later `spawn`).
+                let declaration = self.callable_preflight.declarations.get(lifted)
+                    .ok_or_else(|| callable_target_error(lifted))?;
+                let identity = task_environment_identity(self.program, declaration, lifted, capture_tys)?;
+                let thunk = self.generated_funcs.get(&identity)
+                    .ok_or_else(|| self.err("task environment thunk was not collected"))?
+                    .as_global_value().as_pointer_value();
+                // Store each already-evaluated input directly into fresh group-owned staging.
+                // The runtime invokes the typed thunk once; the worker owns moved inputs.
                 let env: BasicValueEnum = if capture_tys.is_empty() {
                     self.ctx.ptr_type(AddressSpace::default()).const_null().into()
                 } else {
@@ -14856,9 +14883,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                         .build_call(self.runtime(RuntimeKey::TgAlloc), &[tgv.into(), i64t.const_int(size, false).into(), i64t.const_int(align, false).into()], "env")
                         .map_err(|e| self.err(e))?
                         .try_as_basic_value().basic().expect("tg_alloc returns a pointer").into_pointer_value();
-                    self.builder
-                        .build_memcpy(re, align as u32, frame_env, align as u32, i64t.const_int(size, false))
-                        .map_err(|e| self.err(e))?;
+                    for (index, capture) in captures.iter().enumerate() {
+                        let index = u32::try_from(index).map_err(|_| self.err("task capture index overflow"))?;
+                        let field = self.builder.build_struct_gep(env_struct, re, index, "task.capture")
+                            .map_err(|e| self.err(e))?;
+                        let value = self.operand(capture)?;
+                        self.builder.build_store(field, value).map_err(|e| self.err(e))?;
+                    }
                     re.into()
                 };
                 // The result slot (a `box<R>` in the region — the `Task<R>` handle).
@@ -38968,13 +38999,13 @@ fn main() -> i32 = 0
                 for block in &mut function.blocks {
                     for statement in &mut block.stmts {
                         let Stmt::Let(value, request) = statement else { continue };
-                        if let Rvalue::SpawnTask { tg, r, fallible, capture_tys, closure } = request {
+                        if let Rvalue::SpawnTask { tg, r, fallible, capture_tys, lifted, .. } = request {
                             match mutation {
                                 0 => *r = Ty::Str,
                                 1 => function.value_tys[*value as usize] = Ty::Task(Scalar::Bool),
                                 2 => *fallible = true,
                                 3 => capture_tys.push(Ty::Bool),
-                                4 => *closure = Operand::Const(Const::Unit),
+                                4 => *lifted = program_call("missing_task_target"),
                                 6 => *request = Rvalue::HeapAlloc(tg.clone(), Operand::Const(Const::Unit)),
                                 _ => continue,
                             }
@@ -38996,6 +39027,88 @@ fn main() -> i32 = 0
                 _ => "spawn result/callable metadata invalid",
             }), "{mutation}: {error}");
         }
+    }
+
+    #[test]
+    fn task_owned_capture_mir_rejects_forged_transfer_and_copy_closure() -> Result<(), String> {
+        let base = mir("fn main(){owner:=\"owned\".clone();task_group{task:=spawn(fn{owner});wait();task.get();()}}\n");
+        emit_llvm_ir(&base, &BuildTarget::Native, Profile::Release, false, &[], None)
+            .map_err(|error| error.to_string())?;
+        for mutation in 0..5 {
+            let mut bad = base.clone();
+            let mut changed = false;
+            for function in &mut bad.fns {
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(_, request) = statement else { continue };
+                        let Rvalue::SpawnTask { lifted, captures, capture_tys, .. } = request else { continue };
+                        match mutation {
+                            0 => { captures.clear(); }
+                            1 => { *captures.first_mut().ok_or("capture")? = Operand::Const(Const::Unit); }
+                            2 => { *capture_tys.first_mut().ok_or("capture type")? = Ty::Raw; }
+                            3 => { *lifted = program_call("missing_task_target"); }
+                            _ => {
+                                *request = Rvalue::Closure {
+                                    lifted: lifted.clone(), captures: captures.clone(), capture_tys: capture_tys.clone(),
+                                    signature: Box::new(align_mir::FnSignatureFacts {
+                                        param_modes: Vec::new(), return_borrow: hir::ReturnBorrowSummary::None,
+                                        return_region: hir::ReturnRegionSummary::None,
+                                        return_cleanup: hir::ReturnCleanupAbi::DynamicBit,
+                                    }),
+                                };
+                            }
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            assert!(changed);
+            assert!(emit_llvm_ir(&bad, &BuildTarget::Native, Profile::Release, false, &[], None).is_err(), "{mutation}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_owned_capture_provenance_rejects_borrowed_inputs() -> Result<(), String> {
+        let mut accepted = Vec::new();
+        for ty in [Ty::Buffer, Ty::File] {
+            let spelling = if ty == Ty::Buffer { "buffer" } else { "file" };
+            let base = mir(&format!("import std.fs\nfn launch(borrow other:{spelling},owner:{spelling}){{task_group{{spawn(fn{{local:=owner;()}});wait()}}}}\nfn main(){{}}\n"));
+            validate_mir_producers(&base).map_err(|error| error.to_string())?;
+            for shape in 0..3 {
+                let mut bad = base.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name.as_str() == "launch")
+                    .ok_or("launch function")?;
+                let slot = *function.params.first().ok_or("borrowed input slot")?;
+                let loaded = u32::try_from(function.value_tys.len()).map_err(|error| error.to_string())?;
+                function.value_tys.push(ty);
+                let block = function.blocks.iter_mut().find(|block| block.stmts.iter().any(|statement|
+                    matches!(statement, Stmt::Let(_, Rvalue::SpawnTask { .. })))).ok_or("spawn block")?;
+                let index = block.stmts.iter().position(|statement|
+                    matches!(statement, Stmt::Let(_, Rvalue::SpawnTask { .. }))).ok_or("spawn index")?;
+                let Some(Stmt::Let(_, Rvalue::SpawnTask { captures, .. })) = block.stmts.get_mut(index)
+                    else { return Err("spawn shape".into()) };
+                *captures.first_mut().ok_or("capture")? = match shape {
+                    0 => Operand::Arg(0),
+                    1 => Operand::Value(loaded),
+                    _ => Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
+                        slot, path: Vec::new(), ty, cleanup: None,
+                    })),
+                };
+                if shape == 1 {
+                    block.stmts.insert(index, Stmt::Let(loaded, Rvalue::Load(slot)));
+                    if !block.stmt_lines.is_empty() { block.stmt_lines.insert(index, (0, 0)); }
+                }
+                if validate_mir_producers(&bad).is_ok() {
+                    accepted.push((ty, shape));
+                    continue;
+                }
+                assert!(validate_thin_partition_program(&bad, &[]).is_err(), "{ty:?}/{shape}");
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Native, Profile::Release, false, &[], None).is_err(), "{ty:?}/{shape}");
+            }
+        }
+        assert!(accepted.is_empty(), "borrowed task inputs accepted as owners: {accepted:?}");
+        Ok(())
     }
 
     #[test]
@@ -39045,23 +39158,29 @@ fn main() -> i32 = 0
 
     #[test]
     fn malformed_parallel_mir_cannot_publish_a_region_capability() {
-        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let mut task = template_mir_function("region_task", Rvalue::Use(Operand::Const(Const::Unit)), vec![Ty::Unit]);
+        task.params = vec![0];
+        task.param_modes = vec![align_ast::ParamMode::ByValue];
+        task.borrow_mut_cleanup_slots = vec![None];
+        task.slots = vec![Ty::ArenaHandle];
+        task.slot_align = vec![None];
         let spawn_error = codegen_program(
-            vec![Stmt::Let(
-                0,
+            vec![Stmt::Let(0, Rvalue::TgBegin), Stmt::Let(
+                1,
                 Rvalue::SpawnTask {
-                    tg: Operand::Const(Const::Unit),
-                    closure: Operand::Const(Const::Unit),
+                    tg: Operand::Value(0),
+                    lifted: program_call("region_task"),
+                    captures: vec![Operand::Value(0)],
                     capture_tys: vec![Ty::ArenaHandle],
-                    r: i32_ty,
+                    r: Ty::Unit,
                     fallible: false,
                 },
             )],
-            vec![Ty::Box(Scalar::Int(IntTy { bits: 32, signed: true }))],
+            vec![Ty::ArenaHandle, Ty::Task(Scalar::Unit)],
             vec![],
             vec![],
             vec![],
-            vec![],
+            vec![task],
         )
         .expect_err("spawn metadata must reject a direct region capability before publication");
         assert_lowering(
