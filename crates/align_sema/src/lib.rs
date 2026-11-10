@@ -50178,7 +50178,8 @@ impl<'a> MoveCheck<'a> {
             }
             // A fn value is Copy (a pointer); an indirect call's callee + args are reads.
             ExprKind::FnValue(_) => {}
-            // A closure copies its captured (Copy) values into its env — reads, not moves.
+            // A literal first reads its captures. Only its enclosing Spawn completes owned
+            // transfer; ordinary closures admit Copy inputs alone.
             ExprKind::Closure { captures, .. } => {
                 for c in captures {
                     move_expr!(self, c, moved, false, false);
@@ -62156,8 +62157,8 @@ impl<'a, 't> Checker<'a, 't> {
         self.finalize_block(&mut body_fin);
         task_wait::validate(&body_fin, self.tagged_types, self.diags);
         // Run the broad unnecessary-heap scan on the lifted lambda body too (parity with the narrow
-        // lint in `finalize_expr`); a box local here is function-local (Move values cannot be
-        // captured), so the scan is self-contained and never double-reports the enclosing function.
+        // lint in `finalize_expr`); a box local here is function-local (boxes cannot be captured),
+        // so the scan is self-contained and never double-reports the enclosing function.
         UnnecessaryHeapScan::run(&body_fin, self.diags);
         // A forbidden extern boundary inside this separately lifted function is a producer error,
         // not a recoverable callback type. Keep the exact diagnostic but do not publish the lifted

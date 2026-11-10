@@ -41,7 +41,7 @@ remain outside this work.
 | Move-out / replacement / return | Existing function and task-result transfer owns returned captures. Direct and record file results, repeated generations, loop-carried replacement and returned buffers run with exact bytes. Repeated get, repeated spawn, use-after-move and borrowed returns reject. |
 | Drop / ownership provenance | Worker parameter cleanup and Plan228 untaken slots close normal, error, ignored handle, ignored/failed wait, implicit join, early return, `?`, replacement and nested group paths. Count live allocations and open descriptors; arena-backed captures must fail rather than be freed by a worker. |
 | Access / control | Distinguish moved self-contained capture authority from shared capture effects. Parameterized owners cross if/match/else/`?`/map_err, branch and loop joins, zero/one/multiple generations, ordinary mutable helpers and shared-view overlap in either capture order. Existing task access and wait-proof owners retain competing-spawn and stale/inner-wait controls. |
-| Independent HIR / malformed MIR | Corrupt capture type, origin, consuming position and ordinary callable use. Checked-HIR closure validation admits owned graphs only under Spawn. MIR preflight authenticates the direct SpawnTask target/operands/signature and refuses Move-bearing ordinary closures without LLVM panic. Existing task result producer checks cover file result cleanup. |
+| Independent HIR / malformed MIR | Corrupt capture type, origin, consuming position and ordinary callable use. Checked-HIR closure validation admits owned graphs only under Spawn. MIR producer validation authenticates ordinary by-value input provenance and certifies task-target dependencies; preflight authenticates the direct SpawnTask target/operands/signature and refuses Move-bearing ordinary closures without LLVM panic. Existing task result producer checks cover file result cleanup. |
 | Imports / monomorphization / cache | Direct/imported owning helpers and generic record carriers run through whole/per-unit checks and native execution; cold/hit interfaces preserve ownership and generated helper identity. Existing generic-lambda exclusions remain. |
 | File identity / I/O | Provider fixture opens one path, replaces/unlinks the name, transfers the admitted file, and reads the original bytes. Cross short read, EOF, read failure, subsequent caller failure and joined cleanup. Bounded repeated read windows return file plus buffer without reopening. |
 | Regression | `task_owned_captures`, `task_owned_results`, `task_group`, `task_progress`, `task_callback_access`, ordinary `lambda`, affected sema/HIR/MIR classifier owners, bounded PR gate and workspace Clippy. No GPU/service changes or consumer qualification are part of these checks. |
@@ -108,3 +108,13 @@ The guide example passes both source-checking modes. Baseline rejects the R41
 admitted-file witness at capture admission; the implemented native witness reads
 successfully. No benchmark is required because this capability makes no startup
 speed claim. Consumer full-answer and startup measurements remain pending.
+
+The full-diff review found one missing producer consumer: direct SpawnTask inputs
+had type checks but bypassed ordinary owning-argument provenance. The corrected
+boundary reuses `xml_call_arguments_valid`, mode validation and target dependency
+ordering. `task_owned_capture_provenance_rejects_borrowed_inputs` crosses Buffer
+and File with shared Arg, shared Load and BorrowedPlace inputs at producer,
+partition and LLVM boundaries. All six mutations were accepted by the reviewed
+candidate before the correction. The same capture inventory now participates
+in the conservative exposed-boolean-slot scan. This closes the existing exact
+input-authentication obligation without changing the public transfer strategy.

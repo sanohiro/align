@@ -8701,7 +8701,7 @@ fn xml_local_call_components(program: &Program) -> Result<Vec<Vec<usize>>, Produ
                     Some(target)
                 }
                 Rvalue::CallWithCleanup(call) => Some(&call.target),
-                Rvalue::Closure { lifted, .. } => Some(lifted),
+                Rvalue::Closure { lifted, .. } | Rvalue::SpawnTask { lifted, .. } => Some(lifted),
                 _ => None,
             };
             if let Some(target) = target.and_then(|target| indices.get(target).copied()) {
@@ -9253,7 +9253,7 @@ fn builder_boolean_slots(function: &Function) -> Vec<bool> {
                     crate::loop_facts::DropStateCall::None => {}
                 }
                 if let Rvalue::Use(operand) = value { address(&mut eligible, operand); }
-                if let Rvalue::Closure { captures, .. } = value {
+                if let Rvalue::Closure { captures, .. } | Rvalue::SpawnTask { captures, .. } = value {
                     for capture in captures { address(&mut eligible, capture); }
                 }
             }
@@ -10206,6 +10206,16 @@ fn validate_resource_rvalues_component(
                         })
                 };
                 let call_arguments_valid = match rvalue {
+                    Rvalue::SpawnTask { lifted, captures, capture_tys, .. } => {
+                        // Direct task inputs are ordinary owning parameters. A matching type
+                        // alone cannot turn a shared borrowed origin into a transferable owner.
+                        xml_direct_call_facts(program, lifted, local_contracts).is_some_and(|facts| {
+                            facts.params == *capture_tys
+                                && facts.modes.iter().all(|mode| *mode == align_ast::ParamMode::ByValue)
+                                && operands_match_modes(captures, &facts.modes, &facts.params, program)
+                                && xml_call_arguments_valid(captures, &facts.params, &facts.modes, *value)
+                        })
+                    }
                     Rvalue::Call(DirectCall::Program(target), args) => {
                         xml_direct_call_facts(program, target, local_contracts).map_or_else(
                             || {
@@ -10325,6 +10335,9 @@ fn validate_resource_rvalues_component(
                 };
                 if !call_arguments_valid {
                     let detail = match rvalue {
+                        Rvalue::SpawnTask { lifted, .. } => {
+                            format!("owned-leaf argument provenance mismatch at task '{lifted}'")
+                        }
                         Rvalue::Call(DirectCall::Program(target), _) => {
                             format!("owned-leaf argument provenance mismatch at call to '{target}'")
                         }

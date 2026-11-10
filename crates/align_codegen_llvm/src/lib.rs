@@ -39069,6 +39069,49 @@ fn main() -> i32 = 0
     }
 
     #[test]
+    fn task_owned_capture_provenance_rejects_borrowed_inputs() -> Result<(), String> {
+        let mut accepted = Vec::new();
+        for ty in [Ty::Buffer, Ty::File] {
+            let spelling = if ty == Ty::Buffer { "buffer" } else { "file" };
+            let base = mir(&format!("import std.fs\nfn launch(borrow other:{spelling},owner:{spelling}){{task_group{{spawn(fn{{local:=owner;()}});wait()}}}}\nfn main(){{}}\n"));
+            validate_mir_producers(&base).map_err(|error| error.to_string())?;
+            for shape in 0..3 {
+                let mut bad = base.clone();
+                let function = bad.fns.iter_mut().find(|function| function.name.as_str() == "launch")
+                    .ok_or("launch function")?;
+                let slot = *function.params.first().ok_or("borrowed input slot")?;
+                let loaded = u32::try_from(function.value_tys.len()).map_err(|error| error.to_string())?;
+                function.value_tys.push(ty);
+                let block = function.blocks.iter_mut().find(|block| block.stmts.iter().any(|statement|
+                    matches!(statement, Stmt::Let(_, Rvalue::SpawnTask { .. })))).ok_or("spawn block")?;
+                let index = block.stmts.iter().position(|statement|
+                    matches!(statement, Stmt::Let(_, Rvalue::SpawnTask { .. }))).ok_or("spawn index")?;
+                let Some(Stmt::Let(_, Rvalue::SpawnTask { captures, .. })) = block.stmts.get_mut(index)
+                    else { return Err("spawn shape".into()) };
+                *captures.first_mut().ok_or("capture")? = match shape {
+                    0 => Operand::Arg(0),
+                    1 => Operand::Value(loaded),
+                    _ => Operand::BorrowedPlace(Box::new(align_mir::BorrowedPlace {
+                        slot, path: Vec::new(), ty, cleanup: None,
+                    })),
+                };
+                if shape == 1 {
+                    block.stmts.insert(index, Stmt::Let(loaded, Rvalue::Load(slot)));
+                    if !block.stmt_lines.is_empty() { block.stmt_lines.insert(index, (0, 0)); }
+                }
+                if validate_mir_producers(&bad).is_ok() {
+                    accepted.push((ty, shape));
+                    continue;
+                }
+                assert!(validate_thin_partition_program(&bad, &[]).is_err(), "{ty:?}/{shape}");
+                assert!(emit_llvm_ir(&bad, &BuildTarget::Native, Profile::Release, false, &[], None).is_err(), "{ty:?}/{shape}");
+            }
+        }
+        assert!(accepted.is_empty(), "borrowed task inputs accepted as owners: {accepted:?}");
+        Ok(())
+    }
+
+    #[test]
     fn task_owned_metadata_rejects_reader_and_callback_forgery() -> Result<(), String> {
         for (owned, source) in [
             (true, "fn main() {task_group {t:=spawn(fn {\"owned\".clone()});wait();v:=t.get();print(v)}}"),
@@ -39115,24 +39158,29 @@ fn main() -> i32 = 0
 
     #[test]
     fn malformed_parallel_mir_cannot_publish_a_region_capability() {
-        let i32_ty = Ty::Int(IntTy { bits: 32, signed: true });
+        let mut task = template_mir_function("region_task", Rvalue::Use(Operand::Const(Const::Unit)), vec![Ty::Unit]);
+        task.params = vec![0];
+        task.param_modes = vec![align_ast::ParamMode::ByValue];
+        task.borrow_mut_cleanup_slots = vec![None];
+        task.slots = vec![Ty::ArenaHandle];
+        task.slot_align = vec![None];
         let spawn_error = codegen_program(
-            vec![Stmt::Let(
-                0,
+            vec![Stmt::Let(0, Rvalue::TgBegin), Stmt::Let(
+                1,
                 Rvalue::SpawnTask {
-                    tg: Operand::Const(Const::Unit),
-                    lifted: program_call("invalid_task"),
-                    captures: vec![Operand::Const(Const::Unit)],
+                    tg: Operand::Value(0),
+                    lifted: program_call("region_task"),
+                    captures: vec![Operand::Value(0)],
                     capture_tys: vec![Ty::ArenaHandle],
-                    r: i32_ty,
+                    r: Ty::Unit,
                     fallible: false,
                 },
             )],
-            vec![Ty::Box(Scalar::Int(IntTy { bits: 32, signed: true }))],
+            vec![Ty::ArenaHandle, Ty::Task(Scalar::Unit)],
             vec![],
             vec![],
             vec![],
-            vec![],
+            vec![task],
         )
         .expect_err("spawn metadata must reject a direct region capability before publication");
         assert_lowering(
