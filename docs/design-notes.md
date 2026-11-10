@@ -871,6 +871,16 @@ cleanup for untaken results across waits. One canonical Drop plan handles both o
 and every error path joins before cleanup. This completes the reserved result lifecycle
 without introducing a second parallel model or hidden output copies.
 
+Owned structured-task inputs ([Plan259](impl/259-task-owned-captures.md)) use the same
+by-value ownership rule as ordinary calls. A literal task runs once, so it can consume a
+self-contained owner; a repeatedly called function value cannot. MIR therefore publishes the
+lifted target and capture operands directly, without a reusable owning Fn intermediate.
+The transfer ends caller backing authority before a worker can run. Ordinary parameter Drop
+and owned-result cleanup cover the two sides of the call. The existing positional file handle
+has no borrowed variant or hidden cursor, so moving it preserves admitted source identity;
+returning it permits bounded read-window reuse. This does not make arbitrary native owners,
+GPU resources or process-global signal leases transferable, and it claims no startup speedup.
+
 ## The loop philosophy
 
 Align has exactly one loop construct, and it is deliberately narrow: `loop { ... break value }`.

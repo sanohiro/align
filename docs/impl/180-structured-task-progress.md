@@ -1,5 +1,9 @@
 # Structured task progress during caller work
 
+[Plan259](259-task-owned-captures.md) extends this contract with self-contained
+owned captures and file-bearing task results. Its input-transfer ledger supersedes
+the earlier Copy-only capture and blanket native-result exclusions below.
+
 [Plan228](228-task-owned-results.md) extends this foundation with self-contained
 owned task results and conditional untaken cleanup; capture and wait authority
 remain unchanged. Its ledger supersedes the Copy-only result limit below.

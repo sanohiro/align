@@ -1107,13 +1107,12 @@ pub enum Rvalue {
     ArenaBegin,
     /// Open a `task_group`; the value is its handle (a `*TaskGroup`).
     TgBegin,
-    /// Publish a task (`spawn`): snapshot the closure's captures into a fresh env in the
-    /// task-group region, allocate the result slot there, and register the task. Yields the slot
-    /// pointer (the `Task<R>` handle). `tg` = the task-group handle, `closure` = the `{fn, env}`
-    /// value, `capture_tys` give the env layout (empty = non-capturing), `r` = the result scalar.
+    /// Transfer captures directly into a fresh task-group environment and publish one invocation.
+    /// No reusable Fn value carries owned inputs. Yields the result slot (`Task<R>` handle).
     SpawnTask {
         tg: Operand,
-        closure: Operand,
+        lifted: ProgramCall,
+        captures: Vec<Operand>,
         capture_tys: Vec<Ty>,
         r: Ty,
         fallible: bool,
@@ -10625,24 +10624,31 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     unreachable!("spawn result is a Task")
                 };
                 let r_ty = align_sema::scalar_to_ty(s);
-                let capture_tys: Vec<Ty> = match &closure.kind {
-                    hir::ExprKind::Closure { captures, .. } => {
-                        captures.iter().map(|c| c.ty).collect()
+                let (lifted, captures) = match &closure.kind {
+                    hir::ExprKind::Closure { lifted, captures } => (lifted.as_str(), captures.as_slice()),
+                    hir::ExprKind::FnValue(lifted) => (lifted.as_str(), &[][..]),
+                    _ => {
+                        b.terminate(Term::Unreachable);
+                        return Operand::Const(Const::Unit);
                     }
-                    _ => Vec::new(),
                 };
-                lower_required_binding!(
-                    b,
-                    clos = lower_expr(b, closure),
-                    Operand::Const(Const::Unit)
-                );
+                let capture_tys = captures.iter().map(|capture| capture.ty).collect();
+                let mut operands = Vec::with_capacity(captures.len());
+                for capture in captures {
+                    operands.push(lower_required!(b, lower_expr(b, capture), Operand::Const(Const::Unit)));
+                }
+                // Snapshot every input before retiring any source; publication may start a worker.
+                for capture in captures {
+                    null_moved_source(b, capture);
+                }
                 let tg = Operand::Value(*b.task_groups.last().expect("spawn outside a task_group"));
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(
                     v,
                     Rvalue::SpawnTask {
                         tg,
-                        closure: clos,
+                        lifted: ProgramCall::from_validated(lifted),
+                        captures: operands,
                         capture_tys,
                         r: r_ty,
                         fallible: *fallible,

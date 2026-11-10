@@ -105,7 +105,41 @@ pool can delay its start. A captured view shares its original bytes: keep that b
 and alive until `wait`. Dropping or reassigning the task handle does not end this protection.
 Tasks may read shared views and modify storage they create themselves.
 
-Unlike `par_map`, spawned tasks may perform I/O and other impure work. `wait()` also helps execute its group's pending tasks, allowing nested groups to progress even when every worker is occupied. It cannot resolve a blocking cycle created by the program. Task results may be self-contained primitive values, strings, buffers, ordinary dynamic arrays, records, tuples or sums, optionally through `Result<R, Error>`. They may contain owned data but cannot contain views, pointers, callables or native/resource handles. After a successful wait, Copy `get()` may repeat; owned `get()` consumes the handle and transfers the result once. Results can outlive the group. Group exit joins all tasks and drops untaken results, including after a failed wait. Shared captures remain read-only. For contiguous output, create one owned band per task and collect the named handles in band order.
+Unlike `par_map`, spawned tasks may perform I/O and other impure work. `wait()` also helps execute its group's pending tasks, allowing nested groups to progress even when every worker is occupied. It cannot resolve a blocking cycle created by the program. Task results may be self-contained primitive values, strings, buffers, files, ordinary dynamic arrays, records, tuples or sums, optionally through `Result<R, Error>`. They may contain owned data but cannot contain views, pointers, callables or native/resource handles other than `file`. After a successful wait, Copy `get()` may repeat; owned `get()` consumes the handle and transfers the result once. Results can outlive the group. Group exit joins all tasks and drops untaken results, including after a failed wait. Shared captures remain read-only. For contiguous output, create one owned band per task and collect the named handles in band order.
+
+A task literal may also move a self-contained owned value into its worker; bare fixed arrays of owned elements remain excluded. The original
+binding and views into its backing cannot be used afterward. The worker may mutate its own
+storage or return it; inputs it does not return are dropped when the worker finishes.
+Borrowed parameters and arena-owned storage cannot transfer this way. Ordinary stored
+closures and pipeline lambdas still capture Copy values only.
+
+An already-open `file` can move into a task without reopening its path:
+
+```align
+import std.fs
+
+fn read_window(pack: file) -> Result<buffer, Error> {
+  mut window := buffer(4096)
+  pack.pread_into(window, 0, 4096, 0)?
+  Ok(window)
+}
+
+fn main() -> Result<(), Error> {
+  pack := fs.open_ro("model.pack")?
+  data := task_group {
+    task := spawn(fn { read_window(pack) })
+    wait()?
+    task.get()
+  }
+  print(data.len())
+  Ok(())
+}
+```
+
+The same file owner may be returned directly or in a record alongside a filled buffer,
+using the ordinary consuming `get()`. This permits bounded window reuse while retaining
+file identity. GPU resources and signal subscriptions remain confined to their owning thread;
+exclusive-borrow capture is not supported.
 
 Tasks that can fail return `Result`. Propagate a group failure with `wait()?`:
 

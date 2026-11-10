@@ -7585,7 +7585,7 @@ fn referenced_program_calls(
                 Rvalue::FnAddr { target, .. } => {
                     targets.insert(target.clone());
                 }
-                Rvalue::Closure { lifted, .. } => {
+                Rvalue::Closure { lifted, .. } | Rvalue::SpawnTask { lifted, .. } => {
                     targets.insert(lifted.clone());
                 }
                 Rvalue::ParMapParallel { func, stages, .. } => {
