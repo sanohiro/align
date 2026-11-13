@@ -1,6 +1,3 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — soa / group_by / dict_encode
 
 > 🌐 **English** · [Japanese](./ja/soa-groupby.md)

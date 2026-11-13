@@ -1,6 +1,3 @@
-このディレクトリには `../std-design/` と同じ深さで `core` ライブラリ各領域の正式な
-設計文書（シグネチャ、ownership/effect 分類、error policy、pitfall、test anchor）を置く。
-
 # core.test — 言語内テスト
 
 > [English](../test.md) · **日本語**

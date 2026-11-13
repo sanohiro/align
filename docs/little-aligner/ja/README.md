@@ -51,7 +51,7 @@ align> 1 + 2
 9. [Turn It Sideways](09-turn-it-sideways.md) — `soa`: 列としてのデータ
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`、`agg`、`dict_encode`
 11. [Do It Until](11-do-it-until.md) — `loop` 式、パイプラインで言い表せないとき
-12. [Do It Apart](12-do-it-apart.md) — Pure な仕事、`par_map`、スコープに属するタスク
+12. [Do It Apart](12-do-it-apart.md) — Pure な仕事、`par_map`、スコープに属するタスクと所有権
 13. [Four at a Time](13-four-at-a-time.md) — 明示的 SIMD、ベクトル、マスク
 14. [The Big Crunch](14-the-big-crunch.md) — mmap、ゼロコピーのパイプライン、そしてすべてを統合する
 15. [Read It Four Ways](15-read-it-four-ways.md) — 答え、流れ、寿命、仕事量

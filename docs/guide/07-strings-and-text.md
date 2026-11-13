@@ -22,7 +22,7 @@ fn main() -> i32 {
 }
 ```
 
-The default in signatures is `str`: take views, return views when the data already exists, and return `string` only when the function genuinely creates new text.
+Use `str` when a function reads text or returns a view whose source remains alive. Return `string` when the caller needs ownership, whether the function creates the text or transfers an existing owned value.
 
 ## Literals, escapes, bytes
 
@@ -118,6 +118,13 @@ fn main() -> i32 {
 ```
 
 The builder uses one growable buffer and produces a final `string`. Buffer growth is amortized across appends. `write` takes a `str` (or an owned `string`); `write_int` formats an integer directly into the buffer without a temporary string. The compiler can combine adjacent writes of literals and integers into one runtime call.
+
+`b.len()` reports the initialized byte count without finishing the builder.
+`b.bytes()` borrows those same bytes as a read-only `slice<u8>`, without a copy
+or allocation. This lets a byte-oriented consumer read the current text without
+first calling `to_string()`. Finish using that view before any `write*` call,
+including an empty write, or before finishing, moving or dropping the builder.
+Obtain a fresh view after a write; reserved capacity is never part of the view.
 
 ## Template strings
 

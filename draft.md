@@ -1572,11 +1572,9 @@ doubled := xs.map(fn x { x * 2 })
 big     := xs.where(fn x { x > limit })   // captures `limit`
 ```
 
-A lambda may **capture** enclosing variables (`limit` above). Capture is by value, and there is
-**no hidden closure environment**: a lambda compiles exactly like a named function — captured
-values are passed as ordinary arguments — so it fuses into the same loop and adds no allocation.
-(Consistent with *Nothing hidden*: a lambda that escaped and outlived its captures would need a
-visible heap environment; the in-loop case never does.)
+An inline pipeline lambda may **capture** enclosing Copy variables (`limit` above).
+Captured values become extra function arguments, so capture adds no separate environment
+allocation. Stored function values and spawned tasks use the representations described below.
 
 `source.scan(init, f) -> array<A>` materializes the running state after each
 surviving element, in source order; `init: A` is evaluated once and never emitted,
@@ -1629,11 +1627,13 @@ selected worker-transfer parameter roots, and imported declarations carry the sa
 set, so checking resumes against completed actual arguments at the caller. The inferred effect and
 provenance summaries remain unwritten.
 
-A passed closure's captured environment lives in the caller's frame for the duration of the call, so
-no heap allocation is needed. A function value that *escapes* — returned from a function, stored
-beyond the frame, or handed to `spawn` (§11) — needs a region-owned environment, owned by the
-enclosing `arena {}` / `task_group {}` scope (never a hidden `malloc`); escape analysis chooses the
-representation.
+A stored or passed capturing function value uses a frame-local environment and may be
+called only while that environment and its borrowed captures remain live. It needs no heap
+allocation. Returning function values or carrying a capturing environment beyond its frame
+remains unsupported; an enclosing `arena` does not make that escape legal. A literal consumed
+by `spawn` (§11) instead receives a fresh environment in the task-group region, which remains
+live until all tasks join. Ordinary function values retain Copy-only captures; the task's
+single invocation also admits the owned inputs specified in §11.
 
 A trusted compile-time library producer may instead require one exact named or non-capturing lifted
 function and compile it into a nominal static descriptor plus a producer-owned C-ABI trampoline.

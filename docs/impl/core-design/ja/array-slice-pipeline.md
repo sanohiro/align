@@ -1,6 +1,3 @@
-このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
-シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
-
 # core — array / slice / パイプライン
 
 > 🌐 [English](../array-slice-pipeline.md) · **日本語**
@@ -124,17 +121,18 @@ Option や array を要素とする array は対象外である。正確な ledg
 `[P; N]` record field を、長さ0も含めて受け入れる。field 自体の allocation と Drop は増えない。
 record 全体が0バイトでも、heap payload を確保せず初期化済み要素数を保持する。
 `shape := values[i].shape` で field 全体を通常の Copy 値として読み、その local を
-index・slice 操作できる。他の固定配列要素型、borrowed payload の拡張、
-indexed parent から直接 fixed field の view を作る構文は別の対応範囲である。独立した値の添字読み出しは Plan232 が扱う。
+index・slice 操作できる。Plan232 は独立した値の直接の添字読み出しを、Plan242 は
+前述の読み取り専用のフィールド範囲を扱う。他の固定長配列要素型と、借用ペイロードの
+拡張はこの対応に含まない。
 
 R78 の payload-free enum field 対応依頼は保留/PROPOSED のままであり、既存の
 閉じた enum-field 除外規則は変わらない。[Plan 56](../../56-r77-r83-composition-plan.md) に
 調査結果と plan 23 の未充足の再検討条件を記録する。この batch では enum field の
 受理、layout、所有権、cleanup の変更を選択していない。
 
-残る6件の composition request は provider branch に実装済みである。indexed Move field の
-shared-call place は slice/AoS view では runtime 添字、source-formed な固定 `StructArray` view
-では整数リテラル添字を使う。provider owner と consumer 側の未完了境界は plan 56 に記録する。
+Plan56 は、添字付き Move フィールドを共有借用の関数へ渡す実装済みの形式も記録する。
+slice/AoS ビューでは実行時の添字を、ソースで構築した固定 `StructArray` ビューでは
+整数リテラルの添字を使う。
 
 region 形式（必須L6、**実装済み**）:
 

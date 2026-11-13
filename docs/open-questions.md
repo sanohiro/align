@@ -1444,14 +1444,28 @@ supplies owned input transfer and file results. Exclusive-borrow captures remain
 
 > **Current status:** first-class closures ①–③ and `task_group` ④a–④c are shipped, including real
 > threads, scoped capture environments, `spawn`/`wait()`/`get()`, and fallible `wait()?`. The plan
-> below is retained as the implementation record. The exact stored-Result/control-flow
-> successful-Wait proof described below is pending the am-w correction after its 2026-07-31 audit.
+> below is retained as the implementation record. The stored-Result/control-flow
+> successful-Wait proof described below is implemented.
 > Returning function values, and environment-bearing or capturing function values carried out of
 > every enclosing region through a struct field or array element, remain deferred pending a
 > heap-owned environment and Drop model with a real consumer. A `Static`/noncapturing named function
 > value may already occupy a locally used struct field or array element; aggregate placement alone
 > is not a full escape.
-**Decision (2026-06-23): escape decides a lambda's representation; `spawn` takes a lambda; `task_group` is a structured scope.** The ideal form, chosen on merit (not legacy): a lambda that **escapes** (stored in a variable, returned, or handed to `spawn`) gets a **closure environment** holding its captured values; a non-escaping lambda (every pipeline stage/reducer) stays inlined with captures-as-parameters (zero allocation, SIMD/GPU-friendly). The compiler's **escape analysis** picks the representation — the same syntax, two representations — so first-class function values and `task_group` exist without eroding the offload-ready pipeline path. The environment is **owned by the enclosing region** (the `task_group {}` / `arena {}` scope) and freed with it — a region allocation, not a hidden `malloc`, so the visible scope is the boundary (consistent with *Nothing hidden*). (The model for a closure that escapes *every* region is part of this deferred design; the `task_group` consumer is scope-bounded.) `task_group` (`draft.md` §11) is a **structured** scope like `arena {}`: `spawn(fn { … })` takes a lambda (the deferral is then visible — *Nothing hidden* — and it is the one lambda mechanism, not a bare-call special form), returns a `Task<R>` handle; `wait()?` is the single error boundary (joins all, propagates the lowest-index `Err`); `a.get()` reads a result after the join. A spawned task **may be impure** (it does I/O — unlike a Pure `par_map`); safety combines by-value snapshots with shared-backing protection until join. Rejected alternative: a bare-call special form `spawn(fs.read_file(p))` — it hides the deferral (against *Nothing hidden*) and is a second deferral mechanism (against *One way*); it was only attractive as a way to dodge the closure-environment work, which escape analysis handles cleanly. **Build order:** first-class closures (escape-driven) as the foundation, then `task_group` as a consumer. Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
+**Decision (2026-06-23): capture storage follows use; `spawn` takes a lambda;
+`task_group` is a structured scope.** Inline pipeline lambdas pass Copy captures as extra
+arguments. Stored or passed capturing function values use a frame-local environment and
+cannot outlive it or their borrowed captures. Returning function values remains deferred;
+an enclosing arena does not extend a frame-local environment's lifetime. A spawned literal
+gets fresh task-group storage for each invocation, released after all tasks join. Plan259
+also allows that single invocation to consume admitted owned inputs; reusable function
+values retain Copy-only captures.
+
+`spawn(fn { … })` makes the separate work visible and returns a `Task<R>` handle.
+`wait()?` joins every task and propagates the lowest-spawn-index error; `get()` reads a result
+after a successful join. A spawned task may perform I/O, while `par_map` callbacks must be
+Pure. Shared captured backing remains read-only and protected until join. A bare-call form
+such as `spawn(fs.read_file(p))` was rejected because it obscures deferred evaluation.
+Rationale: [The lambda philosophy](design-notes.md#the-lambda-philosophy).
 By-value capture still requires worker-sendability: the same general non-Send rule recursively
 rejects a `region` capability in any reachable callable environment before either a spawned
 environment or a `par_map` range is published.

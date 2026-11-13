@@ -139,7 +139,7 @@ factor := 3
 scores.map(fn s { s + 10 }).to_array()
 ```
 
-`.to_array()`. We need to keep the transformed scores as an array.
+We need to keep the transformed scores as an array.
 
 ---
 
@@ -151,7 +151,7 @@ scores.map(fn s { s + 10 }).to_array()
 scores.map(fn s { s + 10 }).sum()
 ```
 
-`.sum()`. We need only the total, so there is no need to store the transformed scores in an array.
+We need only the total, so there is no need to store the transformed scores in an array.
 
 ---
 

@@ -263,17 +263,15 @@ programmer error). Per-request: framework maps malformed requests to 400, unmatc
 handler `Err` to 500 — fixed minimal JSON bodies, loop continues. Application error vocabularies
 (e.g. the OpenAI error object) are app policy via `web.status_json`. Every unary-handler and stream-
 pump `Err` emits one best-effort stderr line with the request method/path and the complete builtin
-error value (`NotFound`, `Invalid`, `Denied`, or `Code(n)`); a logging failure never kills the loop.
+error value (`NotFound`, `Invalid`, `Denied`, `Timeout`, or `Code(n)`); a logging failure never kills the loop.
 Nothing request-derived can panic; everything is `Result` or a view.
 
 ## Middleware (shipped 2026-07-22)
 
-Fiber's `c.Next()` chain needs capturing closures (deferred). The framework-owns-the-handle model
-makes the v1 shape simpler than the original Move-threading design: `Ctx` is Copy, so a
-pre-handler neither consumes nor returns it. The verdict is an or-kind rather than the originally
-sketched nested `Result<Option<response_builder>, Error>`: the current payload model deliberately
-does not nest aggregates, and a single tagged value gives the same three outcomes with one clear
-drop boundary —
+The framework owns the request handle; middleware receives a Copy `Ctx` view and
+returns one of three outcomes. `Middleware` names those outcomes directly:
+continue, respond, or fail. Stateful middleware that retains an escaping closure
+environment remains deferred; ordinary local capturing closures are supported.
 
 ```text
 Middleware { Proceed, Respond(response_builder), Failed(Error) }

@@ -808,9 +808,12 @@ NaN and carries no minimum/maximum semantics — so it is not the vectorizable s
 (`draft.md` §8.)
 
 Stages and reducers take a named function or an inline lambda `fn x { ... }` (parameter types
-inferred). A lambda may capture enclosing variables by value — with no hidden closure
-environment (it compiles like a named function, captures passed as arguments). `where(.active)`
-is shorthand for a one-field lambda.
+inferred). An inline pipeline lambda passes captured Copy values as extra arguments, without
+an allocated closure environment. `where(.active)` is shorthand for a one-field lambda.
+Stored or passed capturing function values instead use a frame-local environment; they cannot
+outlive it or their borrowed captures. Returning function values remains unsupported, and an
+enclosing arena does not extend a closure environment's lifetime. A literal consumed by `spawn`
+uses fresh task-group storage and admits the owned inputs described under Concurrency.
 
 `source.scan(init, f) -> array<A>` materializes the running state after each
 surviving element, in source order; `init: A` is evaluated once and never emitted,

@@ -20,16 +20,19 @@
 
 ```align
 fn pump(r: reader, w: writer) -> Result<(), Error> {
-    mut buf := buffer(4096)
+    mut buf := buffer.try_new(4096)?
     loop {
         n := r.read(buf)?
-        if n == 0 { break Ok(()) }
+        if n == 0 {
+            w.flush()?
+            break Ok(())
+        }
         w.write(buf.bytes())?
     }
 }
 ```
 
-`loop` は `break` が実行されるまでブロックを繰り返します。ここでは読み込みが0バイトになったら終了します。
+`loop` は `break` が実行されるまでブロックを繰り返します。`try_new` で読み込み用の領域を確保してから始め、確保に失敗したら `?` でエラーを返します。0バイト読んだら EOF です。最後に `flush()` で書き込みの完了を確認してから成功を返します。終了時の自動処理だけでは、書き込みエラーを返せません。
 
 ---
 
@@ -44,7 +47,7 @@ fn pump(r: reader, w: writer) -> Result<(), Error> {
 **A5.**
 
 ```align
-mut buf := buffer(4096)
+mut buf := buffer.try_new(4096)?
 mut total := 0
 sum := loop {
     n := r.read(buf)?

@@ -1,6 +1,3 @@
-このディレクトリは、ロードマップを補う `std` モジュールの詳細な設計仕様をまとめる。
-各モジュールの実装は、この仕様に従う。
-
 # std.http — implementation design (M11)
 
 > 🌐 [English](../http.md) · **日本語**

@@ -784,42 +784,29 @@ outside this capability because they require their own complete element/projecti
 
 ## The lambda philosophy
 
-Lambdas (`fn x { ... }`) are not a separate paradigm bolted onto the data-processing core — they
-**are** how you pass behavior to `map` / `where` / `reduce` / `par_map`. A lambda and a named
-function are the same thing; the lambda just spares you a top-level declaration for a one-off.
+Lambdas (`fn x { ... }`) pass behavior to pipelines and other functions without
+requiring a top-level declaration for each callback.
 
-The load-bearing decision is **how capture works**. A lambda that captures an enclosing variable
-does *not* allocate a hidden closure environment: it is lifted to an ordinary function whose
-captured values become extra parameters, passed at the call site. So a captured pipeline lambda
-fuses into the same counted loop as a named function and carries zero allocation — the capture is
-just a loop-invariant argument. The compiler snapshots each stage capture once when that written
-stage is formed, evaluates later terminal arguments, then snapshots terminal/reducer captures; the
-fused loop reuses those SSA operands. It never delegates capture timing to an optimizer by emitting
-an enclosing-local reload per iteration. A view snapshot keeps its owner dependency across the
-intervening arguments, so an ownership-changing `init` is rejected rather than leaving a dangling
-callback argument. This keeps lambdas inside the existing
-guarantees rather than introducing a new cost class: **Nothing hidden** (no silent heap
-environment), **Predictable performance** (a lambda is never secretly slower than the named
-equivalent), and **Compiler-friendly** (the optimizer sees a direct call, not an indirect one
-through a closure object).
+An inline pipeline lambda is lifted to a function with extra parameters for its Copy
+captures. The compiler snapshots each stage's captures at its written position, then
+evaluates terminal arguments and snapshots terminal captures. The fused loop reuses those
+values. A captured view retains its owner dependency across intervening arguments, so an
+ownership-changing `init` cannot leave the callback with a dangling view. No separate
+closure environment is needed on this path.
 
-**Escape decides the representation.** A lambda that *escapes* — stored in a variable, returned,
-or handed to `task_group`'s `spawn` to run later — outlives the locals it captures, so it cannot
-borrow them; it needs a **closure environment** holding the captured values. The compiler's escape
-analysis (the same one that governs views and arenas) chooses: a non-escaping lambda (every
-pipeline `map`/`where`/`reduce`/`par_map`) is inlined with captures-as-parameters — zero
-allocation, SIMD/GPU-friendly; an escaping lambda gets an environment. That environment is not a
-new hidden cost class: it is **owned by the enclosing region** — the `task_group {}` / `arena {}`
-scope it escapes into — and freed with that region, exactly like every other region allocation.
-The task-group region is reserved for spawned environments and result slots; it does not silently
-turn unrelated allocations in the block into arena allocations. So
-it stays inside the one region-based allocation model, and the *visible* act of escaping (and the
-*visible* enclosing scope) is the allocation boundary — consistent with **Nothing hidden** (no
-silent free-floating `malloc`). This is the load-bearing design point: it lets first-class function
-values and `task_group` exist *without* eroding the inlined, offload-ready pipeline path, and the
-two paths are distinguished by escape, not by two different lambda syntaxes. (The allocation model
-for a closure that escapes *every* region — e.g. one returned to an unbounded caller — is part of
-the deferred first-class-closure design; the `task_group` consumer is scope-bounded and clean.)
+A stored or passed capturing function value instead uses a frame-local environment.
+It may be called while that frame and its borrowed captures remain live. Binding a lambda
+therefore does not imply heap allocation or permission to return it. Returning function
+values and carrying a capturing environment beyond its frame remain deferred; wrapping
+the binding in an `arena` does not extend that environment's lifetime.
+
+A spawned literal needs a fresh environment for each task. A frame-local slot reused by
+a loop iteration would let concurrent tasks observe overwritten captures. The visible
+`task_group` scope owns these environments and result slots until every task has joined.
+Other values allocated in its body retain their ordinary ownership, and arena-only
+operations still need an explicit `arena`. The same lambda syntax thus supports direct
+pipeline calls, frame-local function values and structured tasks with distinct storage
+lifetimes. Plan259 adds owned inputs only to the task's single invocation, as described below.
 
 The **Side Effect Rule** completes the picture: a `par_map` lambda must be Pure (it may read
 captured values but not mutate external state), and every worker capture must independently be

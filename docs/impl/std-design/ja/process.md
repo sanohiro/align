@@ -1,15 +1,10 @@
-このディレクトリは、ロードマップを補う `std` モジュールの詳細な設計仕様をまとめる。
-各モジュールの実装は、この仕様に従う。
-
-# std.process — implementation design (M11)
+# std.process — プロセスの実行と観測
 
 > 🌐 [English](../process.md) · **日本語**
 
-> **ステータス:** M11 のコアは完了済みです（exit/abort、spawn/wait/kill、exec は実装済み）。**拡張は
-> 2026-07-24 に設計済み**（align-llm Request 1）です。`process.command` ビルダ + `run_output` ハンドルに
-> よる、出力キャプチャ + cwd / env / timeout — 本ファイル末尾の「Extension」を参照してください。**スライス
-> 4〜6 は実装済み**（`process.command`/`c.cwd`/`c.run` のキャプチャ、`c.timeout_ns` とコアの `Error.Timeout`
-> バリアント、`c.env`/`c.env_clear`）。align-llm Request 11 の有界 text/bytes 拡張も**実装済み**です。
+> **実装済み。** 現在の API は型付きの終了状態、実行中の出力読み取り、明示的な
+> シグナル購読を提供し、プラットフォームの対応範囲は plan 49/50 に従う。
+> 以下の日付付き M11 スライスは実装の履歴であり、置き換え済みの数値ステータス API は使えない。
 
 ## R65 の契約
 
@@ -24,12 +19,41 @@
 取得契約を明記します。監視方針はアプリケーションが持ち、追加サービス、専用ユーザー、
 VM、維持用プロセスは要求しません。
 
-## Overview
+## 現在の終了状態・出力 API
+
+すべての操作には `import std.process` が必要である。所有する値を束縛してから
+メソッドを呼ぶ。子プロセスの状態を変える操作には排他的アクセスが必要となる。
+
+```text
+ch.status()   -> Result<Option<process.termination>, Error>  // 回収せずに観測する
+ch.try_wait() -> Result<Option<process.wait_result>, Error>  // ノンブロッキングで回収する
+ch.wait()     -> Result<process.wait_result, Error>          // 回収、または保存済みの結果を返す
+out.status()  -> process.wait_result                       // run_output と run_bytes
+```
+
+`process.termination` は `Exited(i64)` と `Signaled(i64)` を区別する。
+`process.wait_result` は `termination` と `max_rss_bytes: Option<i64>` を持つ。
+RSS は直接の子プロセスの観測値であり、メモリ上限でもプロセスツリーの合計でもない。
+削除済みの `out.code()` と数値を返す `wait()` に互換別名はない。
+
+`command.start()` は実行中の子プロセスを返す。キャプチャした stdout/stderr は
+`read_stdout`/`read_stderr` で読み、`poll` で必要なイベントを待つ。子が実行中で、
+まだ EOF に達していないキャプチャがある場合、ブロッキングの `wait()` は
+`Error.Invalid` を返す。出力を暗黙に読み捨てることはない。回収に成功すると
+結果全体を保存し、以後の待機は同じ値を返す。準備や実行ファイルの起動失敗は `Err`、
+実際に起動したプログラムの終了コード 127 は `Exited(127)` となる。
+
+完全なシグネチャ、検証順序、ネイティブ資源の寿命は plan 49/50 に従う。
+現在の使用例は[プロセスのガイド](../../../guide/ja/18-std-services.md)にある。
+以下の M11 セクションは当初の実装記録であり、変更されたシグネチャと起動規則は
+plan 49/50 の契約が優先する。
+
+## 当初の M11 の概要（履歴）
 
 spawn / exec / exit(draft §18.2)。fork/exec/waitpid と、子プロセスを表す child Move ハンドルで構成する。
 **`process.exit` の Drop セマンティクスをめぐる Open question(open-questions)は、このモジュールで確定させる。**
 
-## Signatures
+## 当初の M11 シグネチャ（履歴）
 
 ```text
 ch := process.spawn(cmd: str, args: array<str>) -> Result<child, Error>   // fork+exec, child owns pid
@@ -213,7 +237,11 @@ exit は単なるランタイム呼び出しではなく、先に関数(理想�
 - CLOEXEC が子プロセスへの fd リークを防ぐ(P3)
 - import が必須であること
 
-# Extension — captured output + cwd / env / timeout (align-llm Request 1)
+# 過去の拡張 — 出力キャプチャと cwd / env / timeout（align-llm Request 1）
+
+この節は、当時の使用例とネイティブ起動処理を含む最初のキャプチャ設計の記録である。
+数値ステータス、起動エラー、ディスクリプタ継承の規則は plan 49/50 に置き換えられた。
+現在のコードには冒頭の API を使う。
 
 > **ステータス: 出荷済み(Slice 4〜6、#630/#631/#632、2026-07-24)。** `process.command` + `cwd` +
 > `timeout_ns` + `env`/`env_clear` + `run` キャプチャがエンドツーエンドで構築済み。bytes 層と明示 cap は
@@ -221,14 +249,12 @@ exit は単なるランタイム呼び出しではなく、先に関数(理想�
 > コマンドを走らせ、その**出力をパースする**)が動機である。出典:
 > `../align-llm/docs/align-requests.md` の Request 1(優先度: critical — このループを塞いでいた)。
 
-## Why this is genuinely new
+## 当初の動機（2026年7月）
 
-上記のスライス 1–3 は `spawn`/`wait`/`kill`/`exec` を出荷しているが、`spawn` は素の `fork` + `execvp` を
-**パイプも `dup2` も無し**で行う。子は親の fd を継承し、その出力はそのまま端末へ流れる。`child` ハンドルは
-`{ pid, reaped }` だけである。したがって `stdout`/`stderr` を文字列としてキャプチャすること、指定した作業
-ディレクトリで実行すること、子ごとの環境を渡すこと、タイムアウトで実行を打ち切ることは、いずれも**今日は
-不可能**であり、そのどれも本モジュールの記録済み設計空間には無い(過去の先送りは `detach()` と `Never` 型
-だけだった)。これは実ワークロードの要件であって、計画済みのギャップではない。
+この拡張より前の `spawn` は親のディスクリプタを継承して端末へ直接出力し、
+`child` は `{ pid, reaped }` だけを持っていた。align-llm のビルド・テスト・lint の
+実行には、stdout/stderr の取得、作業ディレクトリの指定、子ごとの環境設定、
+タイムアウトが必要だった。Request 1 がこの用途を示し、スライス 4〜6 で実装した。
 
 ## Shared prerequisite — the `Error.Timeout` variant (canonical definition; `std.http`/`std.net` reuse it)
 
@@ -491,14 +517,20 @@ owner は不変。
   `EINTR` remainder recomputation、時間が残る early zero poll result、次の poll 前の exhausted remainder、
   no early expiry。
 
-# 拡張 — 有界 text/byte キャプチャ（align-llm Request 11）
+# 過去の拡張 — 有界 text/byte キャプチャ（align-llm Request 11）
+
+以下の台帳・ABI・レビュー記録は、最初の有界キャプチャの設計を示す。
+バイト数上限と出力の所有権の規則は維持するが、`code()`、数値の終了状態、起動エラーと
+ネイティブ起動処理は plan 49/50 に置き換えられた。旧使用例とステータスの行は履歴として
+残しており、別の対応 API を示すものではない。
 
 > **ステータス: 実装済み（2026-08-14）。** この拡張は上限を選択した呼び出しについて P12 を
 > 閉じ、先送りしていたバイナリ出力層を出荷する。出典: `../align-llm/docs/align-requests.md` Request 11。
 
 ## 公開契約 ledger
 
-次の ledger が本拡張の正本である。本文と実装は独立に範囲を広げてはならない。
+以下は当初の拡張の正本である。変更されていないキャプチャの規則にも、冒頭の現在の
+プロセス契約を適用する。
 
 | Surface | 厳密な契約 |
 |---|---|

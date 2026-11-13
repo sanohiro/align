@@ -1,6 +1,3 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — array / slice / the pipeline
 
 > 🌐 **English** · [Japanese](./ja/array-slice-pipeline.md)
@@ -131,18 +128,18 @@ array field. The complete capability shipped on 2026-08-14.
 fields for primitive Copy scalar P, including zero. The field adds no allocation or Drop.
 A completely zero-sized heap element retains its logical initialized count without payload
 storage. Read a complete fixed field as an ordinary Copy value (`shape := values[i].shape`),
-then index or slice that local. Other fixed element families, broader borrowed payloads
-and direct indexed-parent fixed-field views remain separate; Plan232 adds independent value indexing.
+then index or slice that local. Plan232 adds direct independent value indexing;
+Plan242 adds the read-only indexed-field ranges described above. Other fixed
+element families and broader borrowed payloads remain outside this extension.
 
 R78's request for payload-free enum fields remains deferred/PROPOSED; the
 closed enum-field exclusion above is unchanged. [Plan 56](../56-r77-r83-composition-plan.md) records
 the assessment and plan 23's unmet reopening prerequisite. No enum-field
 admission, layout, ownership or cleanup change is selected for this batch.
 
-The other six composition requests are implemented on the provider branch. Their
-indexed Move-field call place is dynamic-indexed for slice/AoS views and
-integer-literal-indexed for source-formed fixed `StructArray` views; the provider
-owner and consumer-pending boundary are recorded in plan 56.
+Plan56 also records the implemented shared-call forms for indexed Move fields:
+runtime indices for slice/AoS views and integer-literal indices for source-formed
+fixed `StructArray` views.
 
 Region form (required L6, **shipped**):
 
