@@ -1,7 +1,3 @@
-This directory holds the authoritative per-area design docs for the `core` library, at the same
-depth as `../std-design/` (signatures, ownership/effect classification, error policy, pitfalls,
-and test anchors).
-
 # core.test — in-language tests
 
 > 🌐 **English** · [Japanese](./ja/test.md)

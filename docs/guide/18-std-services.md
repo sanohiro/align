@@ -66,6 +66,46 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 HTTP status is data: a 404 is a successful HTTP response, not an `Err`. Transport, TLS, and malformed-message failures are errors. `cl.get_many(urls, degree)` performs bounded blocking-I/O overlap while preserving input order. Server primitives are deliberately below framework level: `http.serve`, `accept`, request views, `http.response`, and `respond`. For SSE or another streaming body, `respond_stream` yields an `http_stream` while the request context stays readable (borrowed, spent); call `send` for each chunk and `finish` for the sole clean terminator — or, before the first `send`, `reject(rb)` to answer with a normal error response instead.
 
+### Keep the listener owned and capture a request view
+
+The listener returned by `http.serve` has the Move type `http_server`. A helper
+can borrow it for `accept`, while the caller keeps ownership. `ctx.view()` gives
+a Copy `http_request_view` for reading the request or capturing it in a callback:
+
+```align
+import std.http
+
+fn receive(borrow server: http_server) -> Result<http_request_ctx, Error> = server.accept()
+fn checkpoint(read: fn() -> Result<bool, Error>) -> Result<bool, Error> = read()
+
+fn main() -> Result<(), Error> {
+    server := http.serve("127.0.0.1", 8080)?
+    ctx := receive(server)?
+    request := ctx.view()
+    print(request.path())
+    print(checkpoint(fn { request.peer_eof() })?)
+    return ctx.respond(http.response(200))
+}
+```
+
+This program accepts one request, prints its path and the EOF observation, and
+sends an empty 200 response. The callback captures the view, leaving `ctx`
+available to respond after the last view use. Creating the view allocates no
+storage and copies no request bytes. It supports `method`, `path`, `body`,
+`headers`, `upgrade_ready`, and `peer_eof`; it cannot send a response or own the
+connection.
+
+`peer_eof()` makes one nonblocking, nonconsuming observation. `true` includes a
+peer that closed only its sending half, which may still expect a response;
+`false` does not guarantee the peer is alive. The application decides whether
+an observation should cancel work. The example propagates observation errors
+with `?` and responds regardless of the Boolean result.
+
+A request view must not outlive its context. If a spawned task captures it,
+join that task before responding or starting a response/upgrade stream.
+See [the HTTP contract](../impl/std-design/http.md) for the full lifetime and
+response rules.
+
 ### Receive binary bodies without retaining the whole response
 
 The runnable [http_fetch example](../../examples/http_fetch.align) composes

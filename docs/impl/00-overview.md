@@ -14,7 +14,9 @@ Approach                  Fix the whole design first / drive a vertical skeleton
 
 ### Implementation language: Rust
 
-The standard choice for compiler implementation. Lexer/parser generators, LLVM bindings (`inkwell`), and strong types + ownership for self-checking are all available. It also serves as the foundation for later writing Align in Align (self-hosting).
+Rust provides LLVM bindings (`inkwell`) and types that help enforce compiler invariants.
+Align uses a handwritten lexer and parser. The compiler remains implemented in Rust;
+self-hosting is not a prerequisite for language or library work.
 
 ### Backend: straight to LLVM, but through MIR
 
@@ -75,6 +77,8 @@ alignc/                  workspace root
     align_fmt/           token-preserving source formatter
     align_driver/        CLI, import DAG, object cache, parallel codegen, link
                         (end-to-end tests live under this crate)
+    align_watch/         filesystem observation and rebuild scheduling for build --watch
+    align_repl/          interactive frontend, persistent session state, native execution
 ```
 
 Stage responsibilities and IR-boundary details in `01-pipeline.md`.
@@ -145,4 +149,6 @@ The design invariants in `draft.md` / `docs/design-notes.md` remain binding at t
 
 - allocation / error / side effects / parallelism / unsafe must be **traceable even in generated code** (nothing hidden).
 - Restrictions are an information source for compiler inference. Infer no-alias / non-null / arena lifetime / cold error path without exposing lifetimes in source (`03-types.md`).
-- Achieve, in MIR, the lowering by which `map` / `reduce` / `scan` / `filter` / `mask` vectorize naturally (`04-mir.md`).
+- Preserve the information needed to fuse and vectorize `map` / `where` / `reduce` / `scan`
+  pipelines and mask operations in MIR. Effects, traps, layout and target cost can prevent
+  vectorization; the source spelling alone does not guarantee SIMD (`04-mir.md`).

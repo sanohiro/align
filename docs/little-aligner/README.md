@@ -51,7 +51,7 @@ For examples that show a complete program with `fn main`, save the code to a fil
 9. [Turn It Sideways](09-turn-it-sideways.md) — `soa`: data as columns
 10. [Count Me by Name](10-count-me-by-name.md) — `group_by`, `agg`, `dict_encode`
 11. [Do It Until](11-do-it-until.md) — the `loop` expression, when a pipeline can't say it
-12. [Do It Apart](12-do-it-apart.md) — Pure work, `par_map`, and structured tasks
+12. [Do It Apart](12-do-it-apart.md) — Pure work, `par_map`, and ownership across structured tasks
 13. [Four at a Time](13-four-at-a-time.md) — explicit SIMD, vectors, and masks
 14. [The Big Crunch](14-the-big-crunch.md) — mmap, zero-copy pipelines, and putting it all together
 15. [Read It Four Ways](15-read-it-four-ways.md) — answer, flow, lifetime, and work

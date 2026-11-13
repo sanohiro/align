@@ -195,7 +195,14 @@ and the existing handle shell allocate; no read buffer or mmap is allocated.
 The result retains no path lifetime.
 
 The result is the same Move file, owning one descriptor that Drop closes, with
-existing bound-receiver, aggregate and single-threaded restrictions. Pread uses
+existing bound-receiver and aggregate rules. A literal `spawn(fn { ... })` may
+consume the file, and the task may return it directly or in an admitted owning
+record. The same descriptor moves between caller and worker; there is no reopen,
+duplication or new allocation for the file transfer. Caller aliases expire at
+transfer, and borrowed files cannot be moved into tasks. Ordinary stored closures,
+`par_map` captures and other native resource owners retain their restrictions.
+[Plan259](../259-task-owned-captures.md) defines the complete transfer and cleanup
+contract. Pread uses
 the caller's mutable buffer window, returns actual/short counts and zero EOF;
 len is live descriptor metadata. Negative pread/pwrite offsets abort before permission checks.
 Pwrite queries kernel-owned descriptor mode before reading source bytes and

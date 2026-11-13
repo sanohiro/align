@@ -252,14 +252,15 @@ web.serve          Impure。テーブル借用。セットアップ Err まで�
 リクエスト毎: 不正リクエスト → 400、不一致 → 404/405、ハンドラ `Err` → 500 — 固定最小 JSON、
 ループ継続。アプリのエラー語彙（OpenAI error object 等）は `web.status_json` で構築するアプリ
 ポリシー。unary handler と stream pump の全 `Err` は request method/path と組み込みエラー値全体
-（`NotFound`、`Invalid`、`Denied`、`Code(n)`）を best-effort の stderr 1 行に残し、ログ失敗で
+（`NotFound`、`Invalid`、`Denied`、`Timeout`、`Code(n)`）を best-effort の stderr 1 行に残し、ログ失敗で
 ループを殺さない。リクエスト由来の panic はゼロ。
 
 ## Middleware（2026-07-22 出荷済み）
 
-Fiber の `c.Next()` チェーンはキャプチャクロージャ（延期）を要する。framework がハンドルを所有する
-モデルでは、v1 の形は元の Move 連鎖設計より単純になる: `Ctx` は Copy なので、pre-handler は
-それを消費も返却もしない。判定には三つの結果を持つ sum 型を使う。
+フレームワークがリクエストのハンドルを所有し、ミドルウェアは Copy の `Ctx` ビューを
+受け取る。戻り値の `Middleware` は、続行・応答・失敗の三つを直接表す。
+クロージャの環境を生成元のフレームより長く保持する状態付きミドルウェアは未対応だが、
+通常のローカルなキャプチャ付きクロージャは使える。
 
 ```text
 Middleware { Proceed, Respond(response_builder), Failed(Error) }

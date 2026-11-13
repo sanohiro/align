@@ -152,7 +152,7 @@ task_group {
 - the same expensive Pure function over many independent items
 - three different independent operations
 
-**A18.** Sequential pipeline; `par_map`; `task_group`. SIMD lanes, data-parallel workers, task-parallel workers — three scales, three visible choices.
+**A18.** Sequential pipeline; `par_map`; `task_group`.
 
 ---
 
@@ -188,6 +188,42 @@ It prints `ready`. The task creates an owned `string`; after the join, `get()` t
 **Q22.** May we call `task.get()` twice to get two owned strings?
 
 **A22.** No. Getting a Move result consumes the task handle. To keep two strings, clone the retrieved string explicitly. Q15's `i64` results are Copy and may be read repeatedly after a successful wait. If an owned result is never taken, the group drops it after joining its tasks. Chapter 8's rule still holds: each owned value has one owner.
+
+---
+
+**Q23.** The string already exists. Must the task make another copy?
+
+**A23.** No. A lambda written directly inside `spawn` can take ownership:
+
+```align
+text := "ready".clone()
+message := task_group {
+    task := spawn(fn { text })
+    wait()
+    task.get()
+}
+print(message)
+```
+
+Again, `ready`. This time the string moves into the task at `spawn`, then back to the caller through `get()`. The bytes are not copied at either boundary. The task may work on storage it owns; a shared view still permits only reading.
+
+---
+
+**Q24.** After `wait()`, may we use the old name `text` again?
+
+**A24.** No. Waiting completes the task; it does not undo the move. Use `message`, the new owner. A view borrowed from `text` before the spawn cannot be used afterward either. Moving the owner to a worker must not leave another task reading the same storage while the worker changes or frees it.
+
+---
+
+**Q25.** Can we first store that lambda in `work`, then give `work` to `spawn`?
+
+**A25.** No. An ordinary stored lambda still captures only Copy values. The owning form is the literal directly inside `spawn(fn { ... })`: it runs once. The same distinction prevents a repeatedly called pipeline lambda from consuming one captured owner many times.
+
+---
+
+**Q26.** Could we move an already-open file and a read buffer to a task, then get them back for another read?
+
+**A26.** Yes, using the `file` owner and an independent `buffer`, for example as fields of one owned record. The task receives the same open file; it does not reopen its pathname. After a successful wait, `get()` can return the record for reuse. A `reader`, an arena allocation, or a record containing a borrowed view cannot be transferred this way. The [parallelism guide](../guide/10-closures-and-parallelism.md) shows a task that reads from an owned file.
 
 ---
 

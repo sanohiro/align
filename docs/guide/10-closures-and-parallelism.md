@@ -58,7 +58,7 @@ ys := [1, 2].par_map(fn x { show(x) })
 //        for an accumulation
 ```
 
-Sequential `map` may call `show`: it prints in input order. Changing that call to `par_map` is not valid, because the observable order would depend on worker scheduling. Parallel callables must satisfy both purity and capture restrictions. Move captures are rejected, and a `region` allocation capability cannot be sent to a worker even though its type is Copy. These checks are inferred; no `Send` or `Sync` annotation is written.
+Sequential `map` may call `show`: it prints in input order. Changing that call to `par_map` is not valid, because the observable order would depend on worker scheduling. `par_map` callables must satisfy both purity and capture restrictions. They cannot capture Move values, and a `region` allocation capability cannot be sent to a worker even though its type is Copy. These checks are inferred; no `Send` or `Sync` annotation is written.
 
 ## `par_map` — data parallelism
 
@@ -103,7 +103,7 @@ fn main() -> Result<(), Error> {
 The task is eligible to run before `spawn` returns, even when it is the only task. A busy worker
 pool can delay its start. A captured view shares its original bytes: keep that backing unchanged
 and alive until `wait`. Dropping or reassigning the task handle does not end this protection.
-Tasks may read shared views and modify storage they create themselves.
+Tasks may read shared views and modify storage they create or receive by ownership transfer, as shown below.
 
 Unlike `par_map`, spawned tasks may perform I/O and other impure work. `wait()` also helps execute its group's pending tasks, allowing nested groups to progress even when every worker is occupied. It cannot resolve a blocking cycle created by the program. Task results may be self-contained primitive values, strings, buffers, files, ordinary dynamic arrays, records, tuples or sums, optionally through `Result<R, Error>`. They may contain owned data but cannot contain views, pointers, callables or native/resource handles other than `file`. After a successful wait, Copy `get()` may repeat; owned `get()` consumes the handle and transfers the result once. Results can outlive the group. Group exit joins all tasks and drops untaken results, including after a failed wait. Shared captures remain read-only. For contiguous output, create one owned band per task and collect the named handles in band order.
 
@@ -119,7 +119,7 @@ An already-open `file` can move into a task without reopening its path:
 import std.fs
 
 fn read_window(pack: file) -> Result<buffer, Error> {
-  mut window := buffer(4096)
+  mut window := buffer.try_new(4096)?
   pack.pread_into(window, 0, 4096, 0)?
   Ok(window)
 }
@@ -135,6 +135,10 @@ fn main() -> Result<(), Error> {
   Ok(())
 }
 ```
+
+`buffer.try_new(4096)?` reserves the requested window or propagates an allocation
+error before the read. `pread_into` fills at most that window; a short read
+produces a shorter result, so this example reads one window rather than an entire file.
 
 The same file owner may be returned directly or in a record alongside a filled buffer,
 using the ordinary consuming `get()`. This permits bounded window reuse while retaining

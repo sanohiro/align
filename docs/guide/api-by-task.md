@@ -36,7 +36,9 @@ name, such as `pkg.csv.decode`, after `import pkg.csv`. Follow the complete
 Choose an explicit materialization terminal when you need stored output.
 Borrowed views must stay within their owner's lifetime. `par_map` requires a
 Pure callable. Spawned tasks may perform I/O, but shared captures remain read-only
-until the group joins.
+until the group joins. A literal `spawn(fn { ... })` can also take ownership of
+self-contained inputs such as a buffer or an open file; the original owner
+and its borrowed views become unavailable. See the task chapter for supported types.
 
 ## Handle text and data formats
 
@@ -44,6 +46,7 @@ until the group joins.
 |---|---|---|---|
 | Keep text after its source is gone | `str.clone()` → owned `string` | [Strings and text](07-strings-and-text.md) | [Strings and builders](../impl/core-design/string.md) |
 | Assemble text without repeated concatenation | `builder`, `.write`, `.write_int`, `.to_string` | [Builder examples](07-strings-and-text.md#the-builder) | [Strings and builders](../impl/core-design/string.md) |
+| Inspect text before finishing its builder | `builder.len`, `.bytes` | [Builder views](07-strings-and-text.md#the-builder) | [Strings and builders](../impl/core-design/string.md#unfinished-builder-bytes) |
 | Decode JSON with independently owned fields | `json.decode`, record fields of `string` / `array<T>` | [Complete owned JSON example](../../examples/json_owned.align) | [JSON types and ownership](../impl/core-design/json.md) |
 | Read JSON through borrowed text or columns | `json.decode`, `str`, `soa<T>`, `arena` | [JSON](08-json.md) | [JSON types and ownership](../impl/core-design/json.md) |
 | Inspect or forward JSON whose schema is not known | `json.doc`, `.get`, `.at`, `json.encode_options` | [Document views](08-json.md#when-the-schema-is-not-known) | [JSON types and ownership](../impl/core-design/json.md) |
@@ -81,9 +84,10 @@ has been written.
 | I want to… | API or language feature | Start here | Exact contract |
 |---|---|---|---|
 | Make an HTTP request | `http.client`, `.get`, `.request` | [HTTP](18-std-services.md#stdhttp) | [HTTP](../impl/std-design/http.md) |
+| Pass an HTTP listener to a helper or inspect a request in a callback | `http_server`, `borrow`, `ctx.view`, `http_request_view` | [Listener and request view](18-std-services.md#keep-the-listener-owned-and-capture-a-request-view) | [HTTP](../impl/std-design/http.md) |
 | Download binary HTTP data with an explicit limit | `.request_stream`, stream `.read` | [Complete fetch example](../../examples/http_fetch.align) | [Streaming receive](../impl/std-design/http.md#client-streaming-receive-post-pkgdb-convergence-item-1--implemented-2026-08-30) |
 | Connect a TCP stream or resolve a hostname | `tcp.connect`, `dns.resolve` via `import std.net` | [Networking](18-std-services.md#stdnet) | [Networking](../impl/std-design/net.md) |
-| Run a child program and inspect its output | `process.command`, `.run`, `.code`, `.stdout` | [Captured output example](../impl/std-design/process.md#surface) | [Processes](../impl/std-design/process.md) |
+| Run a child program and inspect its output | `process.command`, `.run`, `.status`, `.stdout` | [Process status and output](../impl/std-design/process.md#current-status-and-output-api) | [Processes](../impl/std-design/process.md) |
 | Compress bytes or hash a file incrementally | `compress.gzip_compress`, `crypto.sha256_stream` | [Services and hashing examples](18-std-services.md) | [Compression](../impl/std-design/compress.md), [cryptography](../impl/std-design/crypto.md) |
 | Write logs through an explicit writer | `log.new`, `.line`, `.flush` | [Logging](18-std-services.md#stdlog) | [Logging](../impl/std-design/log.md) |
 

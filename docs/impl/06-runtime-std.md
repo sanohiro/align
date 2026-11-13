@@ -194,13 +194,17 @@ void*      align_rt_tg_wait(TaskGroup*)   // lowest-index error slot, or null
 void       align_rt_tg_end(TaskGroup*)
 ```
 
-I/O-wait concurrency (`draft.md` §11). Spawn snapshots captures into the task-group region; `wait`
+I/O-wait concurrency (`draft.md` §11). Spawn stores evaluated captures in the task-group region; `wait`
 joins registered tasks using the persistent shared pool and reports the failure from the lowest spawn index.
 The caller also claims work, so nested groups can progress without a free worker.
 Owned result slots supply a cleanup thunk and an initialized flag: `get()` transfers
 one owned result, and group exit drops untaken results after joining. Cleanup remains
-registered across waits. Copy results allow repeated reads. The result and capture
-domains are fixed by [Plan228](228-task-owned-results.md). There is no async/await.
+registered across waits. Copy results allow repeated reads.
+[Plan228](228-task-owned-results.md) defines the owned-result lifecycle;
+[Plan259](259-task-owned-captures.md) adds owned inputs and file-bearing results.
+A literal task moves admitted self-contained owners into ordinary worker parameters,
+which drop unreturned inputs. Shared Copy views remain read-only until join.
+Ordinary stored and pipeline closures retain Copy-only captures. There is no async/await.
 
 ---
 

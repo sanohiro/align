@@ -1,6 +1,3 @@
-このディレクトリは、ロードマップを補う `std` モジュールの詳細な設計仕様をまとめる。
-各モジュールの実装は、この仕様に従う。
-
 # std.compress — implementation design (M11)
 
 > 🌐 [English](../compress.md) · **日本語**

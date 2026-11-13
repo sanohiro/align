@@ -20,16 +20,19 @@
 
 ```align
 fn pump(r: reader, w: writer) -> Result<(), Error> {
-    mut buf := buffer(4096)
+    mut buf := buffer.try_new(4096)?
     loop {
         n := r.read(buf)?
-        if n == 0 { break Ok(()) }
+        if n == 0 {
+            w.flush()?
+            break Ok(())
+        }
         w.write(buf.bytes())?
     }
 }
 ```
 
-`loop` repeats its block until a `break` runs. Until empty — then out.
+`loop` repeats its block until a `break` runs. `try_new` obtains the read window first; `?` returns an allocation error if it cannot. A zero-byte read then means EOF. Before reporting success, `flush()` delivers any buffered output and lets us handle a final write error. Automatic cleanup alone cannot report that error.
 
 ---
 
@@ -44,7 +47,7 @@ fn pump(r: reader, w: writer) -> Result<(), Error> {
 **A5.**
 
 ```align
-mut buf := buffer(4096)
+mut buf := buffer.try_new(4096)?
 mut total := 0
 sum := loop {
     n := r.read(buf)?

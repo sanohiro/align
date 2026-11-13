@@ -35,7 +35,9 @@
 結果を保存したい場合は、明示的に実体化する終端操作を選びます。借用ビューは所有者の
 寿命の範囲内で使います。`par_map` に渡す関数には Pure が必要です。
 spawn したタスクは I/O を実行できますが、共有キャプチャはグループの join まで
-読み取り専用です。
+読み取り専用です。リテラルの `spawn(fn { ... })` には、buffer や開いた file など、
+外部の記憶域を借用しない所有値も渡せます。移転後は元の所有者とそのビューを使えません。
+対応する型はタスクの章を参照してください。
 
 ## 文字列やデータ形式を扱う
 
@@ -43,6 +45,7 @@ spawn したタスクは I/O を実行できますが、共有キャプチャは
 |---|---|---|---|
 | 元のデータがなくなった後も文字列を保持する | `str.clone()` → 所有文字列 `string` | [文字列とテキスト](07-strings-and-text.md) | [文字列とbuilder](../../impl/core-design/ja/string.md) |
 | 連結を繰り返さずに文字列を組み立てる | `builder`, `.write`, `.write_int`, `.to_string` | [builderの例](07-strings-and-text.md) | [文字列とbuilder](../../impl/core-design/ja/string.md) |
+| 組み立て中のテキストを読む | `builder.len`, `.bytes` | [builder のビュー](07-strings-and-text.md#builder) | [文字列と builder](../../impl/core-design/ja/string.md) |
 | JSONから独立した所有フィールドを読み出す | `json.decode`, `string` / `array<T>` のレコードフィールド | [所有JSONの完全な例](../../../examples/json_owned.align) | [JSONの型と所有権](../../impl/core-design/ja/json.md) |
 | JSONを借用文字列や列として読む | `json.decode`, `str`, `soa<T>`, `arena` | [JSON](08-json.md) | [JSONの型と所有権](../../impl/core-design/ja/json.md) |
 | スキーマが未知の JSON を調べる・転送する | `json.doc`, `.get`, `.at`, `json.encode_options` | [ドキュメントビュー](08-json.md#スキーマが未知の場合) | [JSONの型と所有権](../../impl/core-design/ja/json.md) |
@@ -79,9 +82,10 @@ UTF-8が必要な操作に渡すまでは、バイナリデータをバイト列
 | やりたいこと | API・言語機能 | 使用例・解説 | 詳しい契約 |
 |---|---|---|---|
 | HTTPリクエストを送る | `http.client`, `.get`, `.request` | [HTTP](18-std-services.md) | [HTTP](../../impl/std-design/ja/http.md) |
+| HTTPリスナーを補助関数へ渡す・コールバックでリクエストを調べる | `http_server`, `borrow`, `ctx.view`, `http_request_view` | [リスナーとリクエストビュー](18-std-services.md#リスナーを所有しリクエストビューをキャプチャする) | [HTTP](../../impl/std-design/ja/http.md) |
 | 上限を指定してHTTPのバイナリをダウンロードする | `.request_stream`, ストリームの `.read` | [取得処理の完全な例](../../../examples/http_fetch.align) | [HTTPストリーム受信](../../impl/std-design/ja/http.md) |
 | TCP接続やホスト名の解決を行う | `import std.net` の `tcp.connect`, `dns.resolve` | [ネットワーク](18-std-services.md) | [ネットワーク](../../impl/std-design/ja/net.md) |
-| 子プログラムを動かし、その出力を調べる | `process.command`, `.run`, `.code`, `.stdout` | [出力キャプチャの例](../../impl/std-design/ja/process.md) | [プロセス](../../impl/std-design/ja/process.md) |
+| 子プログラムを動かし、その出力を調べる | `process.command`, `.run`, `.status`, `.stdout` | [終了状態と出力](../../impl/std-design/ja/process.md#現在の終了状態出力-api) | [プロセス](../../impl/std-design/ja/process.md) |
 | バイト列を圧縮する・ファイルを逐次ハッシュする | `compress.gzip_compress`, `crypto.sha256_stream` | [サービスとハッシュの例](18-std-services.md) | [圧縮](../../impl/std-design/ja/compress.md)、[暗号](../../impl/std-design/ja/crypto.md) |
 | 明示したwriterへログを書く | `log.new`, `.line`, `.flush` | [ログ](18-std-services.md) | [ログ](../../impl/std-design/ja/log.md) |
 

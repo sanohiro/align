@@ -1,15 +1,11 @@
-This directory records the detailed `std` module designs that supplement the roadmap.
-These specifications define the contract for each module's implementation.
-
-# std.process — implementation design (M11)
+# std.process — process execution and observation
 
 > 🌐 **English** · [Japanese](./ja/process.md)
 
-> **Status:** M11 core complete (exit/abort, spawn/wait/kill, exec shipped). **Extension DESIGNED
-> 2026-07-24** (align-llm Request 1): captured output + cwd / env / timeout via a `process.command`
-> builder + `run_output` handle — see "Extension" at the end of this file. **Slices 4–6 SHIPPED**
-> (`process.command`/`c.cwd`/`c.run` capture; `c.timeout_ns` + the core `Error.Timeout` variant;
-> `c.env`/`c.env_clear`). The bounded text/bytes extension is **SHIPPED** for align-llm Request 11.
+> **Status:** implemented. The current API uses typed process status, live capture,
+> explicit signal subscriptions and the platform boundaries in plans 49/50.
+> The dated M11 slices below preserve implementation history; their replaced
+> numeric status APIs are not available.
 
 ## R65 contract
 
@@ -26,12 +22,41 @@ Linux/macOS. Verified sealed-image selection, namespace inheritance and exclusiv
 child_scope retain explicit Linux-only acquisition contracts. Application code
 owns supervision; no additional service, dedicated user, VM or keeper is required.
 
-## Overview
+## Current status and output API
+
+All operations require `import std.process`. Bind owners before calling methods;
+stateful child operations require exclusive access.
+
+```text
+ch.status()   -> Result<Option<process.termination>, Error>  // observe without reaping
+ch.try_wait() -> Result<Option<process.wait_result>, Error>  // nonblocking reap
+ch.wait()     -> Result<process.wait_result, Error>          // reap or return cached result
+out.status()  -> process.wait_result                       // run_output and run_bytes
+```
+
+`process.termination` distinguishes `Exited(i64)` from `Signaled(i64)`.
+`process.wait_result` contains `termination` and `max_rss_bytes: Option<i64>`;
+RSS is an observation for the direct child, not a memory limit or process-tree total.
+The removed `out.code()` accessor and numeric `wait()` result have no aliases.
+
+`command.start()` returns a live child. Drain captured stdout/stderr with
+`read_stdout`/`read_stderr` and use `poll` to wait for selected readiness. A pending
+child with a capture that has not reached EOF makes blocking `wait()` return
+`Error.Invalid`; it does not silently drain or discard output. Successful waits
+cache the complete result. Setup and executable-launch failures return `Err`;
+a program that starts and exits with code 127 returns `Exited(127)`.
+
+Plans 49/50 define the complete signatures, validation order and native lifecycle.
+The [process guide](../../guide/18-std-services.md) shows current usage. The following
+M11 sections record the original implementation and are superseded where those
+plans replace a signature or launch rule.
+
+## Original M11 overview (historical)
 
 spawn, exec, exit (draft §18.2). Fork/exec/waitpid + a child Move handle. **This module settles
 the `process.exit` Drop-semantics Open question** (open-questions).
 
-## Signatures
+## Original M11 signatures (historical)
 
 ```text
 ch := process.spawn(cmd: str, args: array<str>) -> Result<child, Error>   // fork+exec, child owns pid
@@ -217,7 +242,11 @@ current-frame + global flush. (Record the gap honestly.)
 
 ---
 
-# Extension — captured output + cwd / env / timeout (align-llm Request 1)
+# Historical extension — captured output + cwd / env / timeout (align-llm Request 1)
+
+This section records the original capture design, including its then-current
+examples and native launch mechanism. Plans 49/50 supersede numeric status,
+launch-error and inherited-descriptor rules; use the current API above.
 
 > **Status: SHIPPED (Slices 4–6, #630/#631/#632, 2026-07-24).** `process.command` + `cwd` +
 > `timeout_ns` + `env`/`env_clear` + `run` capture are built end-to-end. The bytes tier and explicit
@@ -225,15 +254,13 @@ current-frame + global flush. (Record the gap honestly.)
 > whose core loop runs build/test/lint commands and **parses their output**. Source:
 > `../align-llm/docs/align-requests.md` Request 1 (priority: critical — it blocked that loop).
 
-## Why this is genuinely new
+## Original motivation (July 2026)
 
-Slices 1–3 above ship `spawn`/`wait`/`kill`/`exec`, but `spawn` does a bare `fork` + `execvp` with
-**no pipes and no `dup2`**: the child inherits the parent's fds and its output goes straight to the
-terminal. The `child` handle is `{ pid, reaped }` only. So capturing `stdout`/`stderr` as strings,
-running in a chosen working directory, passing a per-child environment, and bounding the run with a
-timeout are all **impossible today** — and none of them are in this module's recorded design space
-(the only prior deferrals were `detach()` and a `Never` type). This is a real-workload requirement,
-not a planned gap.
+Before this extension, `spawn` inherited the parent's descriptors and wrote directly
+to the terminal; `child` held only `{ pid, reaped }`. The align-llm build/test/lint
+loop needed captured stdout/stderr, an explicit working directory, per-child
+environment settings and a timeout. Request 1 supplied that use case; these
+operations shipped in slices 4–6.
 
 ## Shared prerequisite — the `Error.Timeout` variant (canonical definition; `std.http`/`std.net` reuse it)
 
@@ -510,7 +537,13 @@ cleanup, and UTF-8 owners remain unchanged.
   budgets; `EINTR` remainder recomputation; an early zero poll result with time remaining; exhausted
   remainder before another poll; and no early expiry.
 
-# Extension — bounded text and byte capture (align-llm Request 11)
+# Historical extension — bounded text and byte capture (align-llm Request 11)
+
+The following ledger, ABI and review records describe the original bounded-capture
+capability. Its byte-limit and output-ownership rules remain; plans 49/50 replace
+`code()`, decoded numeric termination, launch-error handling and native launch
+mechanisms. The old examples and status rows are retained as history, not as a
+second supported API.
 
 > **Status: SHIPPED (2026-08-14).** This extension closes P12 for
 > callers that select a bound and ships the previously deferred binary-output tier. Source:
@@ -518,8 +551,8 @@ cleanup, and UTF-8 owners remain unchanged.
 
 ## Public-contract ledger
 
-The ledger below is authoritative for the extension. The prose and implementation must not broaden
-it independently.
+This was the authoritative ledger for the original extension. Its unchanged
+capture rules remain subject to the current process contract above.
 
 | Surface | Exact contract |
 |---|---|

@@ -170,7 +170,7 @@ Which names may still be used?
 fn count_bytes(s: str) -> i64 = s.len()
 ```
 
-Pass a view while retaining the owner. Passing a `string` by value transfers ownership; passing a `str` lets the function borrow the text.
+Passing a `string` by value transfers ownership; passing a `str` lets the function borrow the text.
 
 ---
 
@@ -249,10 +249,6 @@ The elements live inside the record. `Table` is Copy because its elements are Co
 
 ---
 
-To see the ownership changes as diagrams, read the guide's [memory chapter](../guide/05-memory.md). It follows Move, borrowing, and a string copied out of an arena.
-
----
-
 **Q26.** May this function change the first byte?
 
 ```align
@@ -260,6 +256,8 @@ fn first(bytes: slice<u8>) -> u8 = bytes[0]
 ```
 
 **A26.** It may read it. A value slice parameter is read-only.
+
+---
 
 **Q27.** Then how do we ask a function to change it?
 
@@ -274,16 +272,24 @@ fn mark(borrow mut bytes: slice<u8>) {
 Give `mark` a mutable view of owned storage. It writes a byte and leaves the view
 in place. You may use the same view for the next call.
 
+---
+
 **Q28.** What if a function returns that view? May we write through the result?
 
 **A28.** No. Returned views are read-only. The caller's original writable view
 still works. A returned owner, such as an `array<u8>`, owns its storage and may
 be changed.
 
+---
+
 **Q29.** Could we hide the view in a record to make it writable?
 
 **A29.** No. A view inside a parameter or result follows the same rule. Pass the
 selected view itself to `mark`. We need a mutable parameter.
+
+---
+
+To see the ownership changes as diagrams, read the guide's [memory chapter](../guide/05-memory.md). It follows Move, borrowing, and a string copied out of an arena.
 
 > **The Eighth Commandment**
 >

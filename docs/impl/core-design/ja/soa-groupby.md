@@ -1,6 +1,3 @@
-このディレクトリは `core` ライブラリの各領域の設計仕様をまとめる。
-シグネチャ、所有権と effect の分類、エラー方針、注意点、関連テストを記載する。
-
 # core — soa / group_by / dict_encode
 
 > 🌐 [English](../soa-groupby.md) · **日本語**

@@ -101,7 +101,7 @@ alignc explain-opt file.align --verbose
 alignc size file.align --profile tiny
 ```
 
-`emit-mir` is the semantic lens. Raw LLVM IR shows lowering before optimization; optimized IR shows the code LLVM actually shaped. `explain-opt` reports the compiler's current storage and explicit-parallel execution choices, then translates vectorization and other LLVM optimization remarks back to source lines. `size` builds the same artifact as `build` under the selected profile and reports where its bytes went. For standalone objects or IR, repeat `--export name` to keep selected entry-unit functions externally visible.
+`emit-mir` prints the compiler's mid-level representation. Raw LLVM IR shows lowering before optimization; optimized IR shows the result of LLVM's optimization passes. `explain-opt` reports the compiler's current storage and explicit-parallel execution choices, then translates vectorization and other LLVM optimization remarks back to source lines. `size` builds the same artifact as `build` under the selected profile and reports where its bytes went. For standalone objects or IR, repeat `--export name` to keep selected entry-unit functions externally visible.
 
 Roots for linking an executable and roots for inspecting a unit are different questions. A build keeps `main` plus whatever `--export` names, and `emit-obj` keeps the same set because its output is linked, not read. The inspection verbs report the unit you pointed them at: when that file defines no `main` and you pass no `--export`, every `pub` function it defines is a root, so `emit-llvm --stage optimized` emits the unit's own bodies and `explain-opt` reports its own optimizer decisions instead of an empty module. The seeded set is noted on stderr, so a redirected IR or report stream is unchanged. `--export` is accepted by `emit-obj`, `emit-llvm` and `explain-opt`, and narrows that set exactly as before. `emit-mir` needs no rule: it prints every lowered function.
 
@@ -123,11 +123,16 @@ runtime LTO off; it does not describe a linked ThinLTO executable.
 --thin-lto                             # cross-unit ThinLTO
 ```
 
-On an Apple target the deployment target is part of the resolved target identity, exactly as the CPU is: one resolution point, one stated precedence, and one string that the objects, the module IR, the link and the cache key all derive from. It resolves to the first of `--deployment-target`, the platform's `MACOSX_DEPLOYMENT_TARGET` (or `IPHONEOS_`/`WATCHOS_`/`TVOS_`/`XROS_`) environment variable, the host's `sw_vers -productVersion`, and a documented per-platform floor. Every layer is read at `major.minor` precision, and a malformed value at any layer is an error naming that layer rather than a fall-through to the next: an unset environment variable moves on, but a variable that is set to an empty or unusable value is a supplied value and is rejected. `--deployment-target` on a non-Apple host is an error rather than a silently ignored flag. Because the version is part of the identity and the OS patch level is not, a patch-level OS update does not invalidate the build cache, and changing the deployment target does.
+On an Apple target, the deployment target specifies the minimum OS version for generated artifacts and participates in the build cache identity. It resolves to the first of `--deployment-target`, the platform's `MACOSX_DEPLOYMENT_TARGET` (or `IPHONEOS_`/`WATCHOS_`/`TVOS_`/`XROS_`) environment variable, the host's `sw_vers -productVersion`, and a documented per-platform floor. Every layer is read at `major.minor` precision, and a malformed value at any layer is an error naming that layer rather than a fall-through to the next: an unset environment variable moves on, but a variable that is set to an empty or unusable value is a supplied value and is rejected. `--deployment-target` on a non-Apple host is an error rather than a silently ignored flag. Because the version is part of the identity and the OS patch level is not, a patch-level OS update does not invalidate the build cache, and changing the deployment target does.
 
 `--sdk-version` separately records explicit SDK provenance in Apple objects' `LC_BUILD_VERSION`. It accepts `major`, `major.minor`, or `major.minor.patch`; omission leaves the object SDK unspecified (`sdk n/a`) exactly as before. It does not select an SDK or sysroot and has no ambient `SDKROOT`/`xcrun` fallback. The selected canonical version participates in codegen and ThinLTO cache identities but not the frontend cache. An invalid value, or any value on a non-Apple target, is an error before source or artifact work.
 
-The default is portable `baseline` plus `release`. `native` is for the current machine; a named LLVM CPU such as `x86-64-v3` is useful for a known deployment fleet. Runtime LTO is **on by default** under the optimizing `release`/`fast` profiles (measured 2-3× on string-predicate pipelines, non-regressing elsewhere, +1-2ms compile) and off under `dev`/`small`/`tiny`; `--no-rt-lto` / `--rt-lto` force either direction. `--thin-lto` stays explicit because it changes compile cost and optimization scope; it requires `release` or `fast`, applies to linked `build`/`run`/`size` operations, is parallel and cached, and composes with runtime LTO.
+The default is portable `baseline` plus `release`. `native` is for the current machine; a named LLVM CPU such as `x86-64-v3` is useful for a known deployment fleet. Runtime LTO is **on by default** under the optimizing `release`/`fast` profiles and off under `dev`/`small`/`tiny`; `--no-rt-lto` / `--rt-lto` force either direction. `--thin-lto` stays explicit because it changes compile cost and optimization scope; it requires `release` or `fast`, applies to linked `build`/`run`/`size` operations, is parallel and cached, and composes with runtime LTO.
+
+Runtime LTO lets the optimizer see runtime helper bodies, which can remove calls from
+string predicates. The [recorded benchmark](../../bench/rt_lto/README.md) shows
+one workload and target; measure your program with both settings before drawing
+a performance conclusion.
 
 For a representative production workload, instrumented PGO is available:
 
@@ -245,8 +250,8 @@ spliced in, the whole program is recompiled through the same driver calls `align
 the resulting native binary is executed. Behavior is therefore identical to a production compile —
 the same profile, the same `rt-lto` default, the same object.
 
-Re-execution is the model, not an implementation detail. Because the whole program runs again every
-entry, output you have already seen is elided and only the new lines are printed:
+The whole program runs again after every entry, including earlier I/O and other side
+effects. The REPL hides unchanged output and prints only the new lines:
 
 ```text
 align> x := 5

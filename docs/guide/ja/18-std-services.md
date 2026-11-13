@@ -70,6 +70,43 @@ pub fn main(args: array<str>) -> Result<(), Error> {
 
 `cl.get_many(urls, degree)` は、入力順を保ちつつ、指定した上限内で複数のブロッキング I/O を並行して進めます。サーバー側には `http.serve`、`accept`、リクエストビュー、`http.response`、`respond` などの基本操作があります。SSE などでボディをストリーミングする場合は `respond_stream` が `http_stream` を返します。リクエストコンテキストは借用された spent 状態になり、内容のビューは引き続き参照できます。チャンクを `send` で送り、正常に完了するには `finish` を呼びます。最初の `send` より前なら、`reject(rb)` で通常のエラーレスポンスに切り替えることもできます。
 
+### リスナーを所有し、リクエストビューをキャプチャする
+
+`http.serve` が返すリスナーは Move 型の `http_server` です。呼び出し元が所有したまま、
+補助関数が借用して `accept` できます。`ctx.view()` は Copy 型の
+`http_request_view` を返し、リクエストの読み取りやコールバックへのキャプチャに使えます。
+
+```align
+import std.http
+
+fn receive(borrow server: http_server) -> Result<http_request_ctx, Error> = server.accept()
+fn checkpoint(read: fn() -> Result<bool, Error>) -> Result<bool, Error> = read()
+
+fn main() -> Result<(), Error> {
+    server := http.serve("127.0.0.1", 8080)?
+    ctx := receive(server)?
+    request := ctx.view()
+    print(request.path())
+    print(checkpoint(fn { request.peer_eof() })?)
+    return ctx.respond(http.response(200))
+}
+```
+
+このプログラムはリクエストを一つ受け付け、パスと EOF の観測結果を表示し、
+本文が空の 200 レスポンスを返します。コールバックがキャプチャするのはビューなので、
+最後にビューを使った後で `ctx` から応答できます。ビューの生成では領域を確保せず、
+リクエストのバイト列もコピーしません。`method`、`path`、`body`、`headers`、
+`upgrade_ready`、`peer_eof` を使えますが、応答の送信や接続の所有はできません。
+
+`peer_eof()` は、ブロックせず、受信データを消費せず、一度だけ状態を観測します。
+`true` には送信側だけを閉じた相手も含まれ、その相手が応答を待っている場合もあります。
+`false` も相手の生存を保証しません。観測結果によって処理を中止するかは、
+アプリケーションが決めます。この例は観測エラーを `?` で伝播し、真偽値にかかわらず応答します。
+
+リクエストビューはコンテキストより長く使えません。spawn したタスクにキャプチャした場合は、
+応答の送信やレスポンス・アップグレードのストリーム開始前にタスクを join します。
+ライフタイムと応答の詳しい規則は [HTTP の仕様](../../impl/std-design/ja/http.md)を参照してください。
+
 ### 本文全体を保持せずバイナリを受信する
 
 実行できる [http_fetch の例](../../../examples/http_fetch.align) は、

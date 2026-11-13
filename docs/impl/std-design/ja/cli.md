@@ -1,6 +1,3 @@
-このディレクトリは、ロードマップを補う `std` モジュールの詳細な設計仕様をまとめる。
-各モジュールの実装は、この仕様に従う。
-
 # std.cli — implementation design (M10 Slice 3)
 
 > 🌐 [English](../cli.md) · **日本語**

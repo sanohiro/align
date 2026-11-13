@@ -1,6 +1,3 @@
-This directory records the detailed `std` module designs that supplement the roadmap.
-These specifications define the contract for each module's implementation.
-
 # std.http — implementation design (M11)
 
 > 🌐 **English** · [Japanese](./ja/http.md)

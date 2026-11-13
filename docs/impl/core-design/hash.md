@@ -1,6 +1,3 @@
-This directory records the per-area design of the `core` library: signatures,
-ownership and effect classification, error policy, pitfalls, and related tests.
-
 # core — hash (+ scalar math)
 
 > 🌐 **English** · [Japanese](./ja/hash.md)

@@ -267,7 +267,7 @@ every item below has since completed as recorded in the per-milestone sections, 
    first-class-closures → `task_group` arc (slices ①–④c) is COMPLETE**: closures as values /
    captures / higher-order arguments, and a real parallel `task_group` with structured join,
    sound `get`-before-`wait`, and a `wait()?` error boundary.
-   **Successful-Wait flow correction pending am-w (2026-07-31):** the settled proof follows an
+   **Successful-Wait flow correction implemented:** the proof follows an
    exact group/generation/Wait id through bare Result locals, copy/reassignment, `map_err`, and value-producing
    control, is consumed on the Ok continuation of `?`/Result `match`/Result `else`, and
    requires every earlier Wait for that drained generation to resolve Ok. A later empty Wait cannot
@@ -280,14 +280,15 @@ every item below has since completed as recorded in the per-milestone sections, 
    it also invalidates covered Tasks, while after completion one later Wait can reauthorize old and
    new handles.
    Calls/returns/captures/imports/aggregate
-   reconstruction do not transport it. The current traversal does not implement the complete
-   stored-result, match, and loop joins and can admit `get()` on an uninitialized slot. Each Move
+   reconstruction do not transport it. `align_sema::task_wait` implements the stored-result,
+   match and loop joins, rejecting reads without successful completion. Each Move
    Task handle also carries its originating group through transparent local/control transfer;
    `get()` checks that group rather than the innermost active group. Nested entry retains outer
    facts, inner Wait cannot authorize an outer Task, and handling an outer Wait Result inside the
    inner group updates the outer fact. Exit clears proofs naming the exited group, including one on
    its Result block value, without clearing outer proofs. Current primitive `get()` is
-   non-consuming and repeatable. Am-w owns the producer correction and scale matrix.
+   non-consuming and repeatable. Owned results and captures follow the later Plan228/Plan259
+   lifecycle; this paragraph records the successful-Wait proof rather than its result domain.
 4. **Language-spec stock-take (2026-06-24) → the "big three" expressiveness gaps.** Before `std`,
    the language itself needs three interlocked features to be expressively complete (model any
    domain, handle errors well). Validated against an external review pass (Codex/Gemini); these are
