@@ -29540,7 +29540,7 @@ mod tests {
         let finder = unsafe { align_rt_str_finder_new(needle.as_ptr(), needle.len() as i64) };
         assert!(!finder.is_null());
 
-        let mut rows: [(&str, Box<dyn FnMut() + '_>); 24] = [
+        let mut rows: [(&str, Box<dyn FnMut() + '_>); CLAIMING_ROWS.len()] = [
             ("F32ToBits", Box::new(|| { std::hint::black_box(align_rt_f32_to_bits(1.25)); })),
             ("F32FromBits", Box::new(|| { std::hint::black_box(align_rt_f32_from_bits(1)); })),
             ("F64ToBits", Box::new(|| { std::hint::black_box(align_rt_f64_to_bits(1.25)); })),
