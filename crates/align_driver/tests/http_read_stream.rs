@@ -1219,7 +1219,7 @@ fn main() -> i32 {
             .mir
             .link_libs
             .iter()
-            .any(|library| library == "ssl"),
+            .any(|library| library.name() == "ssl"),
         "a unit that only moves/drops http_read_stream still needs its TLS-aware free ABI",
     );
 }

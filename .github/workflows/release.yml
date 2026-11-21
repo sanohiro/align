@@ -117,6 +117,13 @@ jobs:
           echo "$LIBPQ_PREFIX/bin" >> "$GITHUB_PATH"
           echo "LIBRARY_PATH=$LIBPQ_PREFIX/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
 
+      - name: Build the distributable BLAKE3 provider
+        shell: bash
+        run: |
+          if [[ -x scripts/install-blake3.sh ]]; then
+            scripts/install-blake3.sh "$RUNNER_TEMP/blake3" static --github-env
+          fi
+
       - name: Verify libpq client baseline
         shell: bash
         run: |
@@ -226,6 +233,13 @@ jobs:
             alignc align-repl libalign_runtime.a
             LICENSE-APACHE LICENSE-MIT README.md README.ja.md
           )
+          if [[ -x scripts/install-blake3.sh ]]; then
+            cp "$RUNNER_TEMP/blake3/lib/libblake3.a" package/
+            mkdir -p package/share/licenses
+            cp -R "$RUNNER_TEMP/blake3/share/licenses/blake3" package/share/licenses/
+            ARCHIVE_MEMBERS+=(libblake3.a)
+            scripts/test-blake3-package.sh package package/libblake3.a
+          fi
           if [[ -x scripts/build-prebuilt-cache.sh && \
                 -x scripts/verify-prebuilt-cache-layout.sh ]]; then
             mkdir -p package/share/align/cache/1
@@ -270,6 +284,9 @@ jobs:
           test "$(shasum -a 256 "$FORMULA_ROOT/alignc" | awk '{ print $1 }')" = \
             "$(cat "$RUNNER_TEMP/packaged-alignc.sha256")"
           scripts/verify-prebuilt-cache-layout.sh "$FORMULA_ROOT"
+          if [[ -x scripts/test-blake3-package.sh ]]; then
+            scripts/test-blake3-package.sh "$FORMULA_ROOT" "$FORMULA_ROOT/libblake3.a"
+          fi
           brew uninstall "$RELEASE_TAP/align"
           brew untrust --formula "$RELEASE_TAP/align"
           brew untap "$RELEASE_TAP"
@@ -346,6 +363,9 @@ jobs:
             ARCHIVE="release/alignc-linux-$ARCHIVE_ARCH.tar.gz"
             ARCHIVE_MEMBERS=(alignc align-repl libalign_runtime.a)
             tar -tzf "$ARCHIVE" > "$RUNNER_TEMP/$DEB_ARCH.archive-members"
+            if grep -qx 'libblake3.a' "$RUNNER_TEMP/$DEB_ARCH.archive-members"; then
+              ARCHIVE_MEMBERS+=(libblake3.a)
+            fi
             if grep -q '^share/' "$RUNNER_TEMP/$DEB_ARCH.archive-members"; then
               ARCHIVE_MEMBERS+=(share)
             fi
@@ -380,6 +400,12 @@ jobs:
            entry natively.
           EOF
             dpkg-deb --root-owner-group --build "$ROOT" "release/alignc_${VERSION}_${DEB_ARCH}.deb"
+            if grep -qx 'libblake3.a' "$RUNNER_TEMP/$DEB_ARCH.archive-members"; then
+              extracted="$RUNNER_TEMP/check-deb-$DEB_ARCH"
+              dpkg-deb -x "release/alignc_${VERSION}_${DEB_ARCH}.deb" "$extracted"
+              cmp "$ROOT/usr/lib/align/libblake3.a" "$extracted/usr/lib/align/libblake3.a"
+              test -s "$extracted/usr/lib/align/share/licenses/blake3/LICENSE_A2"
+            fi
           done
 
       - name: Generate Homebrew formula

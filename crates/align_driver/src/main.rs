@@ -1850,8 +1850,8 @@ enum DiagnosticEcho {
 /// The deterministic capability-library union across units: first-seen in DAG (unit) order, never
 /// completion order (parallel codegen may finish out of order). Identical for a lowered unit and a
 /// reused one — a reused unit carries its `link_libs` precisely because the link never needs MIR.
-fn link_lib_union<'a>(per_unit: impl Iterator<Item = &'a [String]>) -> Vec<String> {
-    let mut union: Vec<String> = Vec::new();
+fn link_lib_union<'a>(per_unit: impl Iterator<Item = &'a [align_driver::NativeLibrary]>) -> Vec<align_driver::NativeLibrary> {
+    let mut union: Vec<align_driver::NativeLibrary> = Vec::new();
     for libs in per_unit {
         for lib in libs {
             if !union.contains(lib) {
@@ -2316,7 +2316,7 @@ fn build_package_to(cc: &align_driver::CDriver, path: &str, exe: &Path, target: 
 /// Link the per-unit objects into `exe`: the deterministic capability-library union (first-seen in
 /// DAG order) + link + atomic-rename publish. Shared by the normal cached path and the `--thin-lto`
 /// path (the objects differ; the link step is identical).
-fn finish_link(cc: &align_driver::CDriver, link_libs: &[String], obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
+fn finish_link(cc: &align_driver::CDriver, link_libs: &[align_driver::NativeLibrary], obj_paths: &[PathBuf], exe: &Path, profile: Profile, target: &BuildTarget, pgo: &align_driver::PgoMode) -> Result<(), ExitCode> {
 
     let parent = exe.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let publish_stage = align_driver::ArtifactStage::in_dir(parent, "align-publish").map_err(|e| {

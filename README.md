@@ -30,32 +30,39 @@ The install script configures the package repositories, then `apt install alignc
 
 ### Build from source
 
-Building the workspace needs **Rust 1.96+**, **LLVM 22** and a native C toolchain. Matching **clang 22** and its compiler runtime are also needed for instrumented PGO. The native libraries include OpenSSL, zstd, SQLite and **libpq 17+**; a PostgreSQL server is only needed for database applications and integration tests.
+Building the workspace needs **Rust 1.96+**, **LLVM 22** and a native C toolchain. Matching **clang 22** and its compiler runtime are also needed for instrumented PGO. The native libraries include OpenSSL, libblake3, zstd, SQLite and **libpq 17+**; a PostgreSQL server is only needed for database applications and integration tests.
 
 #### Linux (Ubuntu 24.04)
 
 From the repository root, use the same signed LLVM and PostgreSQL package repositories as CI. Ubuntu 24.04's default libpq 16 is too old for the streamed database API:
 ```sh
-sudo apt install build-essential curl wget gnupg pkg-config
+sudo apt install build-essential curl wget gnupg pkg-config cmake
 scripts/ci-pgdg.sh
 align_deps_tmp="$(mktemp -d)"
 RUNNER_TEMP="$align_deps_tmp" \
 ALIGN_APT_PACKAGES="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev" \
   scripts/ci-apt-llvm.sh install --uncached
 rmdir "$align_deps_tmp"
+scripts/install-blake3.sh "$HOME/.local/align-blake3" shared
+export BLAKE3_INCLUDE_DIR="$HOME/.local/align-blake3/include"
+export LIBRARY_PATH="$HOME/.local/align-blake3/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$HOME/.local/align-blake3/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 scripts/check-libpq-version.sh
 ```
+
+A distribution-provided `libblake3-dev` also supplies the header and link library. Prebuilt Align packages include the static provider.
 
 #### macOS (Apple Silicon)
 
 Install the dependencies with Homebrew:
 ```sh
-brew install llvm@22 openssl@3 libpq zstd
+brew install llvm@22 openssl@3 libpq zstd blake3
 ```
 `scripts/cargo.sh` locates LLVM 22 and supplies Homebrew library paths during the compiler build. For later `alignc` invocations, make the keg-only tools and native libraries available in your shell:
 ```sh
 export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix libpq)/bin:$PATH"
-export LIBRARY_PATH="$(brew --prefix libpq)/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export BLAKE3_INCLUDE_DIR="$(brew --prefix blake3)/include"
+export LIBRARY_PATH="$(brew --prefix libpq)/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib:$(brew --prefix blake3)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
 scripts/check-libpq-version.sh
 ```
 

@@ -46,6 +46,18 @@ if [[ -z "$runtime_ir" ]]; then
   exit 1
 fi
 
+# Compile the isolated C export for the same native target as rustc above.
+if [[ -n "${LLVM_CONFIG:-}" ]]; then
+  clang="$("$LLVM_CONFIG" --bindir)/clang"
+elif command -v clang-22 >/dev/null 2>&1; then
+  clang=clang-22
+else
+  clang="$(dirname "$llvm_nm")/clang"
+fi
+include="${BLAKE3_INCLUDE_DIR:-$(pkg-config --variable=includedir libblake3)}"
+"$clang" -target "$(rustc -vV | sed -n 's/^host: //p')" -I"$include" -S -emit-llvm \
+  "$repo_root/crates/align_runtime/src/crypto_blake3.c" -o "$work_dir/blake3.ll"
+
 perl -ne '
   sub native_type {
     my ($text) = @_;
@@ -112,7 +124,7 @@ perl -ne '
   my ($ret, $symbol, $params) = ($1, $2, $3);
   my @params = length($params) ? map { native_type($_) } split_params($params) : ();
   print join("|", $symbol, native_type($ret), @params), "\n";
-' "$runtime_ir" | sort > "$work_dir/runtime-abi"
+' "$runtime_ir" "$work_dir/blake3.ll" | sort > "$work_dir/runtime-abi"
 
 if [[ "$(wc -l < "$work_dir/golden-abi" | tr -d ' ')" != "$base_count" ]] \
   || [[ "$(wc -l < "$work_dir/runtime-abi" | tr -d ' ')" != "$base_count" ]]; then

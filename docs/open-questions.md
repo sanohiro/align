@@ -7074,9 +7074,7 @@ primitive natively in one trust surface (HKDF + Argon2id via `EVP_KDF` — libso
 has no HKDF, which would force a self-hosted HKDF seam or a second engine), its AES-GCM is
 constant-time on supported targets without libsodium's hardware API-gating (AES-NI/PCLMULQDQ path,
 CT vpaes fallback; T-table AES only on exotic targets — recorded as an unsupported-platform note),
-and it is a universal system lib (libsodium isn't even linkable on a default install). **blake3 is
-deferred with record** (no system engine provides it; self-hosting violates the borrow-the-engine
-rule; aliasing BLAKE2b under the name is forbidden). The AEAD wrapper's mandatory all-or-nothing
+and it is a universal system lib (libsodium isn't even linkable on a default install). **BLAKE3** was deferred pending a system provider. The official C library is now packaged, and `crypto.blake3` uses that provider under the [BLAKE3 contract](impl/264-std-crypto-blake3.md). The AEAD wrapper's mandatory all-or-nothing
 shape under EVP (internal buffer, SET_TAG before Final, `OPENSSL_cleanse` on failure, single
 opaque error) is specified in `impl/std-design/crypto.md` P2. Slice 1 (`constant_time_equal` +
 `crypto.random`, engine-independent) started the same day.
@@ -7093,7 +7091,7 @@ branchless property was confirmed by disassembling both shipped profiles (no con
 branch, no memcmp idiom; vectorized OR-reduction + `black_box` barrier + lone `sete`), and the
 AEAD all-or-nothing path was traced line-by-line with `OPENSSL_cleanse` confirmed live in the
 optimized artifact. Full shipped-feature record in the roadmap's M11 section. Deferred with
-record: blake3, zeroize-on-drop key buffers (P6), nonce-generating seal convenience (P3),
+record at the time: blake3 (subsequently implemented), zeroize-on-drop key buffers (P6), nonce-generating seal convenience (P3),
 `OSSL_set_max_threads`, fixed-size `array<u8; N>` returns.
 
 **Status update (2026-08-30, post-pkg.db asymmetric suite IMPLEMENTED):**

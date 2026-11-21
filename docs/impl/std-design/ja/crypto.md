@@ -11,7 +11,7 @@ SHA-1 を耐衝突性が必要な安全上の識別に採用しない。スト�
 > 🌐 [English](../crypto.md) · **日本語**
 
 > **ステータス:** M11 の symmetric/hash/KDF surface と post-pkg.db の asymmetric signature
-> suite は完了済みです（2026-08-30 実装）。文書に記載した BLAKE3 の例外は引き続き保留です。
+> suite は完了済みです（2026-08-30 実装）。鍵なし BLAKE3 ダイジェストも公式 C ライブラリで実装済みです。
 
 ## Overview
 
@@ -19,7 +19,7 @@ SHA-1 を耐衝突性が必要な安全上の識別に採用しない。スト�
 
 **方針:** AEAD（aes_gcm、chacha20_poly1305）、ハッシュ（sha256/512）、KDF（hkdf、argon2id）、hmac は、監査済みの C ライブラリを FFI 経由で利用する。プリミティブの実装と constant-time 性の分析を外部ライブラリに集約し、ラッパーでもその性質を維持する。自前実装は、分岐なしでバイト差分を OR 縮約する `constant_time_equal` のみ。`crypto.random` は鍵材料の生成に OS の CSPRNG（`rand.seed` と同じ getrandom / getentropy）を使う。
 
-**エンジン: OpenSSL libcrypto(EVP)、2026-07-07 決定**（`open-questions.md` Settled に記録。本ドキュメント当初の「libsodium 推奨」を置き換える）。独立したセキュリティレビューと依存関係レビューが収束した根拠は次のとおり。libcrypto は必要なプリミティブを *すべて* ネイティブにカバーする — HKDF と Argon2id も `EVP_KDF` 経由で提供される — 単一の信頼境界（trust surface）に収まり、エンジンの混在も、自前 HKDF の統合による隙間（継ぎ目）も生じない。これらの機能の大部分は **OpenSSL ≥ 3.0** で動作する。Argon2id には **OpenSSL ≥ 3.2** で追加された `ARGON2ID` provider が必要であり、存在しない場合は `Error.Code` を返す。ドライバは使用した Crypto / TLS capability が必要とする場合に限り `-lcrypto` をリンクとして追加する。このモジュールでは `crypto.random` と `constant_time_equal` はリンクを要求しない。さらに AES-GCM はサポート対象環境において constant-time である（AES-NI / PCLMULQDQ のハードウェア経路、constant-time な vpaes フォールバック — x86-64 / aarch64 で T-table AES を使うことは決してない）。そのうえ、libsodium の `crypto_aead_aes256gcm_*` と異なり、ハードウェア要件によって API が制限（ゲート）されることがない。libsodium は抽象的には依然として優れたエンジンだが、システム全体の統合面（継ぎ目）で劣る（1.0.18 クラスのリリースには HKDF が無く、AES-GCM がハードウェアゲートされる）。**blake3 は決定記録付きで見送る**: これを提供するシステムの基本エンジンが無く（Debian に `libblake3-dev` は無い。OpenSSL にも BLAKE3 は無い）、自前実装は原則 P5 に反する。また、BLAKE2b を `blake3` という別名として扱うことは禁止されている（誤解を招く API となるため）。システムライブラリとして普及すれば再び候補になるか、あるいは `pkg` レイヤーでの提供対象となる。
+**エンジン: OpenSSL libcrypto(EVP)、2026-07-07 決定**（`open-questions.md` Settled に記録。本ドキュメント当初の「libsodium 推奨」を置き換える）。独立したセキュリティレビューと依存関係レビューが収束した根拠は次のとおり。libcrypto は必要なプリミティブを *すべて* ネイティブにカバーする — HKDF と Argon2id も `EVP_KDF` 経由で提供される — 単一の信頼境界（trust surface）に収まり、エンジンの混在も、自前 HKDF の統合による隙間（継ぎ目）も生じない。これらの機能の大部分は **OpenSSL ≥ 3.0** で動作する。Argon2id には **OpenSSL ≥ 3.2** で追加された `ARGON2ID` provider が必要であり、存在しない場合は `Error.Code` を返す。ドライバは使用した Crypto / TLS capability が必要とする場合に限り `-lcrypto` をリンクとして追加する。このモジュールでは `crypto.random` と `constant_time_equal` はリンクを要求しない。さらに AES-GCM はサポート対象環境において constant-time である（AES-NI / PCLMULQDQ のハードウェア経路、constant-time な vpaes フォールバック — x86-64 / aarch64 で T-table AES を使うことは決してない）。そのうえ、libsodium の `crypto_aead_aes256gcm_*` と異なり、ハードウェア要件によって API が制限（ゲート）されることがない。libsodium は抽象的には依然として優れたエンジンだが、システム全体の統合面（継ぎ目）で劣る（1.0.18 クラスのリリースには HKDF が無く、AES-GCM がハードウェアゲートされる）。BLAKE3 はランタイムの独立したアーカイブメンバーから公式 C ライブラリを呼び出します。他のダイジェストと同じバイトビューを借用し、呼び出し側が所有する32バイトの結果を返します。[プロバイダーと配布の仕様](../../264-std-crypto-blake3.md)。
 
 ## Signatures
 
@@ -27,7 +27,7 @@ SHA-1 を耐衝突性が必要な安全上の識別に採用しない。スト�
 crypto.random(out: mut buffer)                                  // fill with CSPRNG bytes
 crypto.sha256(data: bytes) -> array<u8>    // 32-byte digest (fixed-size)
 crypto.sha512(data: bytes) -> array<u8>
-crypto.blake3(data: bytes) -> array<u8>    // DEFERRED v1 (no system engine provides BLAKE3 — see Overview)
+crypto.blake3(data: bytes) -> array<u8>    // 鍵なし、32バイト
 crypto.hmac_sha256(key: bytes, data: bytes) -> array<u8>
 crypto.hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, len: i64) -> Result<buffer, Error>
 crypto.argon2id(password: bytes, salt: bytes, params: argon2_params) -> Result<buffer, Error>
@@ -61,7 +61,7 @@ AEAD の open における認証失敗は `Error.Invalid`（タグの不一致�
 ## Slice breakdown
 
 1. `constant_time_equal`（自前実装、分岐なし）+ `crypto.random`（OS の CSPRNG） — 外部依存なしで、CT の規律を検証する。
-2. ハッシュ（sha256/512）を EVP 経由で。blake3 は見送り（Overview 参照）。
+2. SHA-256/512 は EVP、BLAKE3 は公式 C ライブラリで計算します。
 3. hmac + hkdf。
 4. AEAD（aes_gcm、chacha20_poly1305） — 全か無かの認証。
 5. argon2id（KDF、設計上コストが高い）。
@@ -78,7 +78,7 @@ AEAD の open における認証失敗は `Error.Invalid`（タグの不一致�
 
 ## Test checklist
 
-- sha256/512 を既知のテストベクタ（NIST/RFC）に照らして検証する。blake3 は見送り。
+- SHA-256/512 は NIST/RFC の既知のベクタ、BLAKE3 は上流のブロック・チャンク境界のベクタで検証します。
 - hmac を RFC 4231 のベクタに照らして検証する。
 - hkdf を RFC 5869 に照らして検証する。
 - aes_gcm / chacha20 をそれぞれのテストベクタに照らして検証する。

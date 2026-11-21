@@ -29,6 +29,9 @@ task-group-probe = []
 # wrapper-owned clear-free DER allocations during construction. Off by default and not a gate.
 crypto-asymmetric-probe = []
 
+[build-dependencies]
+cc = "1"
+
 [dependencies]
 align_hash = { path = "../align_hash" }
 libc = "0.2"

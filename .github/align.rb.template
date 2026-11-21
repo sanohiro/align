@@ -25,7 +25,7 @@ class Align < Formula
   end
 
   def install
-    libexec.install "alignc", "align-repl", "libalign_runtime.a", "share"
+    libexec.install "alignc", "align-repl", "libalign_runtime.a", "libblake3.a", "share"
 
     # OpenSSL is keg-only, and alignc links capability libraries through the system C linker.
     # The wrapper makes the Homebrew prefixes visible without baking a machine-specific path into

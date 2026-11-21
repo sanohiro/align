@@ -145,6 +145,7 @@ name = "align_runtime"
 version = "0.13.0"
 dependencies = [
  "align_hash",
+ "cc",
  "libc",
  "memchr",
  "minimal-lexical",

@@ -1286,14 +1286,14 @@ fn main() -> i32 {
     let built = build_per_unit_multi("pkg-db-q2-common-sqlite", &files.files(), "main.align");
     let link_libs = built.link_libs_union();
     assert!(
-        link_libs.iter().any(|linked| linked == "pq"),
+        link_libs.iter().any(|linked| linked.name() == "pq"),
         "missing libpq: {link_libs:?}"
     );
     let ordered_link_libs = order_link_libs(&link_libs);
     let position = |library: &str| {
         ordered_link_libs
             .iter()
-            .rposition(|linked| linked == library)
+            .rposition(|linked| linked.name() == library)
             .unwrap_or_else(|| {
                 panic!("missing `{library}` in ordered link list: {ordered_link_libs:?}")
             })

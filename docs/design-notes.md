@@ -1762,6 +1762,10 @@ f64 requires a separate `-0.0`/NaN hash-canonicalization decision, so neither is
 analogy. The complete contract and implementation closure matrix are in
 `impl/pkg-design/frame.md`.
 
+## Why BLAKE3 has a separate native archive member
+
+The one-shot BLAKE3 digest follows the existing byte-view and owned-array contract. Its dedicated native archive member keeps the provider independent of OpenSSL and of programs that never use the digest. [Provider and distribution contract](impl/264-std-crypto-blake3.md).
+
 ## Why `pkg.auth` is protocol assembly, not another crypto or identity system
 
 The sensitive primitives already have one owner in `std.crypto`: OS entropy, HMAC-SHA256,

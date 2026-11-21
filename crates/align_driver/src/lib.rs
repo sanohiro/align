@@ -12,7 +12,7 @@ pub use align_codegen_llvm::{
 use align_diag::{Diagnostics, Severity};
 /// The lowered MIR program type (re-exported so callers can name it without depending on
 /// `align_mir` directly).
-pub use align_mir::Program as MirProgram;
+pub use align_mir::{NativeLibrary, Program as MirProgram};
 /// M15 interface-summary types (re-exported so callers can name the [`check_per_unit`] result without
 /// depending on `align_interface` directly).
 pub use align_interface::{Hash128, InterfaceSummary};
@@ -4169,15 +4169,15 @@ enum UnitBody {
     Lowered(MirProgram),
     /// Served from the cache. The MIR is absent; the link libraries are not, because the link never
     /// needs MIR and they cannot be re-derived from the summary's capability set.
-    Reused { link_libs: Vec<String> },
+    Reused { link_libs: Vec<NativeLibrary> },
     /// The pipelined package driver moved this unit's MIR into an owned codegen task. The link
     /// libraries remain because final link order is derived from the DAG record, never from worker
     /// completion order. This private state never escapes through `build_package`.
-    Consumed { link_libs: Vec<String> },
+    Consumed { link_libs: Vec<NativeLibrary> },
 }
 
 impl UnitBody {
-    fn link_libs(&self) -> &[String] {
+    fn link_libs(&self) -> &[NativeLibrary] {
         match self {
             UnitBody::Lowered(mir) => &mir.link_libs,
             UnitBody::Reused { link_libs } | UnitBody::Consumed { link_libs } => link_libs,
@@ -4342,7 +4342,7 @@ pub struct BuiltUnit {
     pub summary: align_interface::InterfaceSummary,
     pub dep_interface_hashes: Vec<(String, align_interface::Hash128)>,
     /// The unit's capability/FFI libraries, in MIR order. Present for both body shapes.
-    pub link_libs: Vec<String>,
+    pub link_libs: Vec<NativeLibrary>,
     /// The unit's static-input manifest — computed for a lowered unit, reconstructed from the
     /// summary for a reused (therefore descriptor-free) one.
     pub static_inputs: StaticInputManifest,
@@ -4542,7 +4542,7 @@ pub struct PipelinedPackageComplete {
 /// The link-facing record for one complete unit, in bottom-up DAG order.
 pub struct PipelinedBuiltUnit {
     pub unit: String,
-    pub link_libs: Vec<String>,
+    pub link_libs: Vec<NativeLibrary>,
     pub frontend: Option<CacheOutcome>,
     object: std::path::PathBuf,
 }
@@ -8093,7 +8093,7 @@ pub struct FunctionThinLtoBuild {
     prelink_bc: Vec<std::path::PathBuf>,
     objects: Vec<std::path::PathBuf>,
     profile: Profile,
-    link_libs: Vec<String>,
+    link_libs: Vec<NativeLibrary>,
     object_stage: ArtifactStage,
 }
 
@@ -8222,12 +8222,12 @@ fn encode_thin_response_records(objects: &[std::path::PathBuf]) -> Result<Vec<u8
     Ok(encoded)
 }
 
-fn thin_link_lib_union(units: &[PerUnitArtifact]) -> Vec<String> {
+fn thin_link_lib_union(units: &[PerUnitArtifact]) -> Vec<NativeLibrary> {
     let mut seen = std::collections::HashSet::new();
     let mut libraries = Vec::new();
     for unit in units {
         for library in &unit.mir.link_libs {
-            if seen.insert(library.as_str()) {
+            if seen.insert(library) {
                 libraries.push(library.clone());
             }
         }
@@ -8992,7 +8992,7 @@ impl CDriver {
 /// The thin runtime (`libalign_runtime.a`, e.g. the builtin `print`) is linked in too. Being a
 /// Rust staticlib, it needs the usual std support libraries (`pthread`/`dl`/`m` on ELF; on Mach-O
 /// they are libSystem re-exports — see [`support_libs`]).
-pub fn link_executable(cc: &crate::CDriver, obj: &std::path::Path, exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+pub fn link_executable(cc: &crate::CDriver, obj: &std::path::Path, exe: &std::path::Path, link_libs: &[NativeLibrary], profile: Profile) -> Result<(), String> {
     link_objects(cc, &[obj], exe, link_libs, profile)
 }
 
@@ -9006,15 +9006,15 @@ pub fn link_executable(cc: &crate::CDriver, obj: &std::path::Path, exe: &std::pa
 /// compression references, so the tail must be after every such suffix library. Programs without
 /// `pq` retain their existing order and therefore keep the established `extern "C" link(...)`
 /// behavior.
-pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
+pub fn order_link_libs(link_libs: &[NativeLibrary]) -> Vec<NativeLibrary> {
     const LIBPQ_CLOSURE: [&str; 5] = ["pq", "ssl", "crypto", "zstd", "z"];
-    if !link_libs.iter().any(|library| library == "pq") {
+    if !link_libs.iter().any(|library| library.name() == "pq") {
         return link_libs.to_vec();
     }
     let mut ordered = link_libs.to_vec();
     for library in LIBPQ_CLOSURE {
-        if link_libs.iter().any(|candidate| candidate == library) {
-            ordered.push(library.to_string());
+        if link_libs.iter().any(|candidate| candidate.name() == library) {
+            ordered.push(NativeLibrary::from(library));
         }
     }
     ordered
@@ -9024,7 +9024,7 @@ pub fn order_link_libs(link_libs: &[String]) -> Vec<String> {
 /// executable. The single-object [`link_executable`] is the common case; multiple objects are used
 /// by the FFI tests that link an Align object against a compiled C-helper object (a by-value struct
 /// callee), and by any future multi-translation-unit build.
-pub fn link_objects(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[String], profile: Profile) -> Result<(), String> {
+pub fn link_objects(cc: &crate::CDriver, objs: &[&std::path::Path], exe: &std::path::Path, link_libs: &[NativeLibrary], profile: Profile) -> Result<(), String> {
     link_objects_inner(cc, objs, exe, link_libs, profile, None, None)
 }
 
@@ -9037,7 +9037,7 @@ pub fn link_objects_with_runtime_archive(
     cc: &crate::CDriver,
     objs: &[&std::path::Path],
     exe: &std::path::Path,
-    link_libs: &[String],
+    link_libs: &[NativeLibrary],
     profile: Profile,
     runtime: &std::path::Path,
 ) -> Result<(), String> {
@@ -9055,7 +9055,7 @@ pub fn link_objects_instrumented(
     cc: &crate::CDriver,
     objs: &[&std::path::Path],
     exe: &std::path::Path,
-    link_libs: &[String],
+    link_libs: &[NativeLibrary],
     profile: Profile,
     profile_rt: &std::path::Path,
 ) -> Result<(), String> {
@@ -9076,7 +9076,9 @@ pub struct LinkPlan<'a> {
     /// `libalign_runtime.a`, linked after the objects that reference it.
     pub runtime: &'a std::path::Path,
     /// The capability + user libraries, already normalized by [`order_link_libs`].
-    pub ordered_link_libs: &'a [String],
+    pub ordered_link_libs: &'a [NativeLibrary],
+    /// Resolved companion for compiler-selected BLAKE3. Explicit system links remain separate.
+    pub blake3_archive: Option<&'a std::path::Path>,
     /// Which flag dialect to speak.
     pub format: ObjectFormat,
     /// Decides the in-link strip on ELF.
@@ -9104,7 +9106,7 @@ pub struct LinkPlan<'a> {
 pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     let &LinkPlan {
         objs, exe, runtime, ordered_link_libs, format, profile, profile_rt, linker,
-        apple_min_version,
+        apple_min_version, blake3_archive,
     } = plan;
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     // Linker selection first: `-B`/`-fuse-ld=` are `cc` driver options, position-independent with
@@ -9117,6 +9119,9 @@ pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     }
     args.extend(objs.iter().map(|obj| obj.as_os_str().to_os_string()));
     args.push(runtime.as_os_str().to_os_string());
+    if let Some(provider) = blake3_archive.filter(|_| ordered_link_libs.contains(&NativeLibrary::Blake3Provider)) {
+        args.push(provider.as_os_str().to_os_string());
+    }
     args.push("-o".into());
     args.push(exe.as_os_str().to_os_string());
     // Link hygiene (M13 Slice 2), spelled per object format by `hygiene_flags`. Dead-code
@@ -9162,7 +9167,12 @@ pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     // resolves left-to-right against preceding inputs). The supported libpq closure is normalized
     // by `order_link_libs` before this call. Each name is a single `-l<name>` argv (no
     // shell/flag injection). A program using no gated feature links none of z/zstd/crypto/ssl.
-    args.extend(ordered_link_libs.iter().map(|lib| std::ffi::OsString::from(format!("-l{lib}"))));
+    for library in ordered_link_libs {
+        if library == &NativeLibrary::Blake3Provider && blake3_archive.is_some() {
+            continue;
+        }
+        args.push(format!("-l{}", library.name()).into());
+    }
     // Runtime, PGO, capability, and user archives can all introduce support-library references.
     // Resolve them after every archive, including the libpq closure tail. On Mach-O these are
     // libSystem re-exports, so the automatic list remains empty.
@@ -9170,11 +9180,22 @@ pub fn link_command_args(plan: &LinkPlan<'_>) -> Vec<std::ffi::OsString> {
     args
 }
 
+fn blake3_companion(runtime: &std::path::Path, libraries: &[NativeLibrary]) -> Option<std::path::PathBuf> {
+    if !libraries.contains(&NativeLibrary::Blake3Provider) {
+        return None;
+    }
+    let archive = runtime.with_file_name("libblake3.a");
+    match std::fs::symlink_metadata(&archive) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(archive),
+    }
+}
+
 fn link_objects_inner(
     cc: &crate::CDriver,
     objs: &[&std::path::Path],
     exe: &std::path::Path,
-    link_libs: &[String],
+    link_libs: &[NativeLibrary],
     profile: Profile,
     runtime: Option<&std::path::Path>,
     profile_rt: Option<&std::path::Path>,
@@ -9188,6 +9209,7 @@ fn link_objects_inner(
         None => runtime_archive()?,
     };
     let ordered_link_libs = order_link_libs(link_libs);
+    let blake3 = blake3_companion(&runtime, link_libs);
     // Which linker `cc` drives (build-perf track item 2, `docs/impl/21-build-perf-plan.md`). ELF
     // only, and optimization-neutral: `ld.lld` produces an equally optimized image, just faster.
     // Resolved before any argv is built so a requested-but-missing lld fails before the link starts.
@@ -9201,6 +9223,7 @@ fn link_objects_inner(
         exe,
         runtime: &runtime,
         ordered_link_libs: &ordered_link_libs,
+        blake3_archive: blake3.as_deref(),
         format,
         profile,
         profile_rt,
@@ -9456,7 +9479,7 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 /// The gated capability libraries (`align_mir::Capability`): the ones a system commonly does NOT
 /// ship in the default linker search path, so a link failure involving them gets a `LIBRARY_PATH`
 /// hint appended ([`link_failure_message`]).
-const GATED_LIBS: [&str; 4] = ["z", "zstd", "crypto", "ssl"];
+const GATED_LIBS: [&str; 5] = ["z", "zstd", "crypto", "ssl", "blake3"];
 
 /// The link-failure error. Always names the linker that ran: the selection is automatic, so a
 /// failure that only a particular linker produces is otherwise invisible, and the reader needs to
@@ -9465,9 +9488,9 @@ const GATED_LIBS: [&str; 4] = ["z", "zstd", "crypto", "ssl"];
 /// outside the default search path (e.g. Homebrew keg-only OpenSSL on macOS), and the fix is the
 /// standard `LIBRARY_PATH` mechanism. The driver never injects search paths itself — what is
 /// linked, and from where, stays visible (Nothing hidden).
-fn link_failure_message(code: Option<i32>, link_libs: &[String], linker: &Linker) -> String {
+fn link_failure_message(code: Option<i32>, link_libs: &[NativeLibrary], linker: &Linker) -> String {
     let mut msg = format!("link failed (cc exit code {code:?}, linker: {})", linker.describe());
-    if link_libs.iter().any(|l| GATED_LIBS.contains(&l.as_str())) {
+    if link_libs.iter().any(|l| GATED_LIBS.contains(&l.name())) {
         msg.push_str(
             "\nnote: libraries in a non-default prefix (e.g. Homebrew keg-only) are found via \
              LIBRARY_PATH, e.g. LIBRARY_PATH=/opt/homebrew/lib:/opt/homebrew/opt/openssl@3/lib",
@@ -9556,7 +9579,7 @@ const RUNTIME_SRC_DIGEST_SEED: u64 = 0x616C_6967_6E5F_7274; // "align_rt"
 /// staleness reference. Empty only if the source tree was absent when `alignc` was built.
 const BAKED_RUNTIME_SRC_DIGEST: &str = env!("ALIGN_RUNTIME_SRC_DIGEST");
 
-/// A deterministic, **mtime-independent** content digest of every `*.rs` file under `dir` (recursive):
+/// A deterministic, **mtime-independent** content digest of every Rust and C source file under `dir` (recursive):
 /// relative paths sorted, then each `(rel_path, len, bytes)` folded into one buffer and wyhashed.
 /// `None` if the tree is absent/unreadable. Mirrors the identical routine in `build.rs` (same seed +
 /// canonical form), so a digest computed here at link time is comparable to the one baked at build.
@@ -9572,7 +9595,7 @@ pub fn runtime_src_digest(dir: &std::path::Path) -> Option<String> {
             let path = entry.path();
             if ft.is_dir() {
                 stack.push(path);
-            } else if ft.is_file() && path.extension().is_some_and(|x| x == "rs") {
+            } else if ft.is_file() && path.extension().is_some_and(|x| x == "rs" || x == "c") {
                 let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
                 files.push((rel, path));
             }
@@ -9786,7 +9809,7 @@ mod tests {
         );
 
         let mut changed_mir = align_mir::Program::default();
-        changed_mir.link_libs.push("m".to_string());
+        changed_mir.link_libs.push("m".into());
         assert_ne!(
             unit_hash,
             test_program_impl_hash(&changed_mir, &roots).expect("changed unit identity")
@@ -9968,6 +9991,14 @@ mod tests {
         std::fs::write(root.join("a.rs"), b"fn a() {}").unwrap();
         assert_eq!(runtime_src_digest(&root).as_deref(), Some(d1.as_str()), "identical content → identical digest (mtime-independent)");
 
+        let adapter = root.join("digest.c");
+        std::fs::write(&adapter, b"int initial;").expect("write C adapter");
+        let c1 = runtime_src_digest(&root).expect("digest with C adapter");
+        assert_ne!(c1, d1);
+        std::fs::write(&adapter, b"int changed;").expect("change C adapter");
+        assert_ne!(runtime_src_digest(&root).as_deref(), Some(c1.as_str()));
+        std::fs::remove_file(adapter).expect("restore original sources");
+
         // A content CHANGE flips the digest (keeps the teeth).
         std::fs::write(root.join("a.rs"), b"fn a() { let _ = 1; }").unwrap();
         assert_ne!(runtime_src_digest(&root).as_deref(), Some(d1.as_str()), "changed content → changed digest");
@@ -10009,7 +10040,7 @@ mod tests {
     fn libpq_closure_is_ordered_after_unrelated_crypto_requests() {
         let input = ["crypto", "z", "zstd", "sqlite3", "pq", "ssl"]
             .into_iter()
-            .map(str::to_string)
+            .map(NativeLibrary::from)
             .collect::<Vec<_>>();
         assert_eq!(
             order_link_libs(&input),
@@ -10025,13 +10056,13 @@ mod tests {
                 "crypto",
                 "zstd",
                 "z",
-            ]
+            ].map(NativeLibrary::from)
         );
     }
 
     #[test]
     fn link_order_without_libpq_is_unchanged() {
-        let input = ["crypto", "z", "zstd"].into_iter().map(str::to_string).collect::<Vec<_>>();
+        let input = ["crypto", "z", "zstd"].into_iter().map(NativeLibrary::from).collect::<Vec<_>>();
         assert_eq!(order_link_libs(&input), input);
     }
 
@@ -10039,11 +10070,11 @@ mod tests {
     fn libpq_closure_preserves_libraries_after_pq() {
         let input = ["pq", "ldap", "ssl", "crypto"]
             .into_iter()
-            .map(str::to_string)
+            .map(NativeLibrary::from)
             .collect::<Vec<_>>();
         assert_eq!(
             order_link_libs(&input),
-            ["pq", "ldap", "ssl", "crypto", "pq", "ssl", "crypto"]
+            ["pq", "ldap", "ssl", "crypto", "pq", "ssl", "crypto"].map(NativeLibrary::from)
         );
     }
 
@@ -10094,11 +10125,11 @@ mod tests {
     #[test]
     fn link_failure_message_hints_library_path_only_for_gated_libs() {
         // No gated library involved → the plain error, no note.
-        let plain = link_failure_message(Some(1), &["m".to_string()], &Linker::System);
+        let plain = link_failure_message(Some(1), &["m".into()], &Linker::System);
         assert!(plain.starts_with("link failed"));
         assert!(!plain.contains("LIBRARY_PATH"), "no hint without a gated lib:\n{plain}");
         // A gated library (Homebrew keg-only class) → the LIBRARY_PATH hint is appended.
-        let hinted = link_failure_message(Some(1), &["z".to_string(), "ssl".to_string()], &Linker::System);
+        let hinted = link_failure_message(Some(1), &["z".into(), "ssl".into()], &Linker::System);
         assert!(hinted.contains("LIBRARY_PATH"), "gated libs get the hint:\n{hinted}");
         assert!(hinted.contains("/opt/homebrew/opt/openssl@3/lib"), "hint shows an example path:\n{hinted}");
     }
@@ -10249,12 +10280,13 @@ mod tests {
     fn link_command_args_are_pinned_per_format() {
         let obj = std::path::Path::new("/tmp/prog.o");
         let objs = [obj];
-        let libs = ["z".to_string()];
+        let libs = [NativeLibrary::from("z")];
         let base = LinkPlan {
             objs: &objs,
             exe: std::path::Path::new("/tmp/prog"),
             runtime: std::path::Path::new("/tmp/libalign_runtime.a"),
             ordered_link_libs: &libs,
+            blake3_archive: None,
             format: ObjectFormat::Elf,
             profile: Profile::Release,
             profile_rt: None,

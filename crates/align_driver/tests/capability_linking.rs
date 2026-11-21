@@ -32,12 +32,12 @@ use align_driver::{link_command_args, order_link_libs, LinkPlan, Linker, ObjectF
 fn support_libraries_follow_all_archive_inputs() {
     use std::path::Path;
     let objects = [Path::new("main.o"), Path::new("imported.o")];
-    let libraries = ["prefix", "crypto", "pq", "ssl", "zstd", "z", "fixture"].map(str::to_owned);
+    let libraries = ["prefix", "crypto", "pq", "ssl", "zstd", "z", "fixture"].map(align_driver::NativeLibrary::from);
     let ordered = order_link_libs(&libraries);
     let expected = [
         "prefix", "crypto", "pq", "ssl", "zstd", "z", "fixture", "pq", "ssl", "crypto", "zstd", "z",
     ];
-    assert_eq!(ordered, expected);
+    assert_eq!(ordered, expected.map(align_driver::NativeLibrary::from));
     for format in [ObjectFormat::Elf, ObjectFormat::MachO] {
         for count in [1, 2] {
             for profile_rt in [None, Some(Path::new("profile.a"))] {
@@ -46,6 +46,7 @@ fn support_libraries_follow_all_archive_inputs() {
                     exe: Path::new("program"),
                     runtime: Path::new("runtime.a"),
                     ordered_link_libs: &ordered,
+                    blake3_archive: None,
                     format,
                     profile: Profile::Release,
                     profile_rt,
@@ -89,8 +90,8 @@ fn gated_link_libs(name: &str, src: &str) -> Vec<String> {
     let mut libs: Vec<String> = mir
         .link_libs
         .iter()
-        .filter(|l| matches!(l.as_str(), "z" | "zstd" | "crypto" | "ssl"))
-        .cloned()
+        .filter(|l| matches!(l.name(), "z" | "zstd" | "crypto" | "ssl" | "blake3"))
+        .map(|l| l.name().to_owned())
         .collect();
     libs.sort();
     libs
@@ -112,6 +113,7 @@ fn gated_link_argv(name: &str, src: &str, format: ObjectFormat) -> Vec<String> {
         exe: std::path::Path::new("prog"),
         runtime: std::path::Path::new("libalign_runtime.a"),
         ordered_link_libs: &ordered,
+        blake3_archive: None,
         format,
         profile: Profile::Release,
         profile_rt: None,
@@ -120,7 +122,7 @@ fn gated_link_argv(name: &str, src: &str, format: ObjectFormat) -> Vec<String> {
     });
     argv.iter()
         .filter_map(|arg| arg.to_str())
-        .filter(|arg| ["-lz", "-lzstd", "-lcrypto", "-lssl"].contains(arg))
+        .filter(|arg| ["-lz", "-lzstd", "-lcrypto", "-lssl", "-lblake3"].contains(arg))
         .map(str::to_string)
         .collect()
 }
@@ -245,6 +247,30 @@ fn http_client_requests_the_full_tls_set() {
         gated_link_libs("cap-https", src),
         vec!["crypto".to_string(), "ssl".to_string(), "z".to_string(), "zstd".to_string()]
     );
+}
+
+#[test]
+fn blake3_requests_its_own_provider_and_preserves_explicit_system_links() {
+    use std::path::Path;
+    let source = "import std.crypto\nfn main() { h := crypto.blake3(\"x\"); print(h.len()) }\n";
+    assert_eq!(gated_link_argv("blake3-only", source, ObjectFormat::Elf), ["-lblake3"]);
+    let archive = Path::new("/toolchain/libblake3.a");
+    for format in [ObjectFormat::Elf, ObjectFormat::MachO] {
+        for explicit in [false, true] {
+            let mut links = vec![align_driver::NativeLibrary::Blake3Provider];
+            if explicit { links.push("blake3".into()); }
+            let args = link_command_args(&LinkPlan {
+                objs: &[Path::new("main.o")], exe: Path::new("main"),
+                runtime: Path::new("/toolchain/libalign_runtime.a"),
+                ordered_link_libs: &links, blake3_archive: Some(archive),
+                profile: Profile::Release, profile_rt: None, linker: &Linker::System,
+                format, apple_min_version: None,
+            });
+            assert!(args.windows(2).any(|pair| pair[0] == "/toolchain/libalign_runtime.a"
+                && pair[1] == archive.as_os_str()));
+            assert_eq!(args.iter().filter(|arg| *arg == "-lblake3").count(), usize::from(explicit));
+        }
+    }
 }
 
 #[test]
@@ -421,7 +447,7 @@ fn http_client_drop_capability_matrix() {
             vec![align_driver::try_lower_to_mir(&checked.hir).expect("checked MIR")]
         };
         for program in &programs {
-            let mut libraries = program.link_libs.clone();
+            let mut libraries: Vec<_> = program.link_libs.iter().map(align_driver::NativeLibrary::name).collect();
             libraries.sort();
             assert_eq!(libraries, tls, "each producer/consumer unit retains TLS");
             for function in &program.fns {

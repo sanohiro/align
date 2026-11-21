@@ -184,7 +184,7 @@ impl ParityProgram {
             align_driver::format_diagnostics(&sm, &walk.diags)
         );
         let mut objects: Vec<PathBuf> = Vec::new();
-        let mut link_libs: Vec<String> = Vec::new();
+        let mut link_libs: Vec<align_driver::NativeLibrary> = Vec::new();
         for (index, unit) in walk.units.iter().enumerate() {
             let object = proj.dir.join(format!("unit{index}.o"));
             emit_object_file(
@@ -206,16 +206,16 @@ impl ParityProgram {
         // The C fixture substitutes libpq itself, but the runtime and any newly split package unit
         // still require libpq's ordered dependent closure. Normalize before removing only `pq`, as
         // the shared C-fixture runner does; filtering first loses ssl/crypto/zstd/z on ELF.
-        let substitutes_libpq = link_libs.iter().any(|library| library == "pq");
+        let substitutes_libpq = link_libs.iter().any(|library| library.name() == "pq");
         link_libs = order_link_libs(&link_libs)
             .into_iter()
-            .filter(|library| library != "pq")
+            .filter(|library| library.name() != "pq")
             .collect();
         if substitutes_libpq {
             link_libs.extend(
                 ["ssl", "crypto", "zstd", "z"]
                     .into_iter()
-                    .map(str::to_owned),
+                    .map(align_driver::NativeLibrary::from),
             );
         }
         let c_source = layout.c_fixture().expect("checked above");

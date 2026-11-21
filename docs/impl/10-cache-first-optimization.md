@@ -681,7 +681,7 @@ later needs its MIR, that ONE unit is rehydrated and the result verified against
 `summary.capabilities`: `align_mir::lower_program` builds it as the user-declared
 `extern "C" link("name")` libraries (validated in sema) followed by the capability-derived ones, so
 a unit that declares an FFI library and uses no gated builtin has a non-empty `link_libs` and an
-empty `capabilities`.
+empty `capabilities`. Manifest version 2 encodes the ordered link list with a little-endian u32 count. Each entry has a one-byte tag. Tag 0 carries the usual length-prefixed UTF-8 system name and tag 1 carries the compiler-selected BLAKE3 provider with no payload. The two origins stay distinct on a hit. Unknown or incomplete entries fail decoding.
 
 #### The key
 

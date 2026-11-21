@@ -657,7 +657,7 @@ fn finalize_and_link(
     inputs: BuildInputSet,
     output: &Path,
     objects: &[&Path],
-    link_libs: &[String],
+    link_libs: &[align_driver::NativeLibrary],
     profile: Profile,
     pgo: &PgoMode,
     target: &BuildTarget,

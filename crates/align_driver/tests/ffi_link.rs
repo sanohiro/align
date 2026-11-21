@@ -38,7 +38,7 @@ fn bogus_library_fails_to_link() {
     let checked = check(&mut sm, "ffi-link-bogus", src);
     assert!(!checked.diags.has_errors(), "should type-check (the library is a link-time concern)");
     let mir = lower_to_mir(&checked.hir);
-    assert_eq!(mir.link_libs, vec!["align_no_such_lib_zzz".to_string()]);
+    assert_eq!(mir.link_libs, vec![align_driver::NativeLibrary::from("align_no_such_lib_zzz")]);
     let pid = std::process::id();
     let dir = std::env::temp_dir();
     let obj = dir.join(format!("align-link-{pid}.o"));

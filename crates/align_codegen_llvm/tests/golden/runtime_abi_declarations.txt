@@ -117,6 +117,7 @@ key|CompressZstdDecompress|compress_zstd_decompress|Foreign|declare i32 @align_r
 key|CryptoAesGcmOpen|crypto_aes_gcm_open|Foreign|declare i32 @align_rt_crypto_aes_gcm_open(ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr) #2
 key|CryptoAesGcmSeal|crypto_aes_gcm_seal|Foreign|declare i32 @align_rt_crypto_aes_gcm_seal(ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr) #2
 key|CryptoArgon2id|crypto_argon2id|Foreign|declare i32 @align_rt_crypto_argon2id(ptr, i64, ptr, i64, i64, i64, i64, i64, ptr) #2
+key|CryptoBlake3|crypto_blake3|Foreign|declare { ptr, i64 } @align_rt_crypto_blake3(ptr, i64) #2
 key|CryptoChacha20Poly1305Open|crypto_chacha20_poly1305_open|Foreign|declare i32 @align_rt_crypto_chacha20_poly1305_open(ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr) #2
 key|CryptoChacha20Poly1305Seal|crypto_chacha20_poly1305_seal|Foreign|declare i32 @align_rt_crypto_chacha20_poly1305_seal(ptr, i64, ptr, i64, ptr, i64, ptr, i64, ptr) #2
 key|CryptoCtEqual|crypto_ct_equal|Foreign|declare i32 @align_rt_crypto_ct_equal(ptr, i64, ptr, i64) #2

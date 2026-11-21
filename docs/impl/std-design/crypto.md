@@ -12,7 +12,7 @@ collision-resistant security identity. No streaming or new engine is added.
 > 🌐 **English** · [Japanese](./ja/crypto.md)
 
 > **Status:** complete for the M11 symmetric/hash/KDF surface and the post-pkg.db asymmetric
-> signature suite (implemented 2026-08-30). The documented BLAKE3 exception remains deferred.
+> signature suite (implemented 2026-08-30). The unkeyed BLAKE3 digest is implemented through the official C library.
 
 ## Overview
 
@@ -44,10 +44,7 @@ The driver adds `-lcrypto` only when a used Crypto or TLS capability requires it
 constant-time vpaes fallback — never T-table AES on x86-64/aarch64) and is not API-gated on
 hardware, unlike libsodium's `crypto_aead_aes256gcm_*`. libsodium remains a fine engine in the
 abstract but loses on whole-system seams (no HKDF in 1.0.18-class releases, hardware-gated
-AES-GCM). **blake3 is deferred with record**: no system engine provides it (no Debian
-`libblake3-dev`; OpenSSL has no BLAKE3), self-hosting violates P5, and aliasing BLAKE2b under the
-`blake3` name is forbidden (misleading API) — it becomes a candidate again when a system lib
-exists, or a `pkg`-layer citizen.
+AES-GCM). BLAKE3 uses the official C provider in a separate runtime archive member. Its one-shot operation borrows the same input views and returns a fresh 32-byte digest. [Provider and distribution contract](../264-std-crypto-blake3.md).
 
 ## Signatures
 
@@ -55,7 +52,7 @@ exists, or a `pkg`-layer citizen.
 crypto.random(out: mut buffer)                                  // fill with CSPRNG bytes
 crypto.sha256(data: bytes) -> array<u8>    // 32-byte digest (fixed-size)
 crypto.sha512(data: bytes) -> array<u8>
-crypto.blake3(data: bytes) -> array<u8>    // DEFERRED v1 (no system engine provides BLAKE3 — see Overview)
+crypto.blake3(data: bytes) -> array<u8>    // 32-byte unkeyed digest
 crypto.hmac_sha256(key: bytes, data: bytes) -> array<u8>
 crypto.hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, len: i64) -> Result<buffer, Error>
 crypto.argon2id(password: bytes, salt: bytes, params: argon2_params) -> Result<buffer, Error>
@@ -112,7 +109,7 @@ all-or-nothing shape. Plus the `constant_time_equal` self-host (branchless, no e
 
 1. `constant_time_equal` (self-host, branchless) + `crypto.random` (OS CSPRNG) — no external dep,
    validates the CT discipline.
-2. hashes (sha256/512) via EVP; blake3 deferred (see Overview).
+2. SHA-256/512 through EVP and BLAKE3 through its C provider.
 3. hmac + hkdf.
 4. AEAD (aes_gcm, chacha20_poly1305) — the all-or-nothing auth.
 5. argon2id (KDF, expensive-by-design).
@@ -154,7 +151,7 @@ all-or-nothing shape. Plus the `constant_time_equal` self-host (branchless, no e
 
 ## Test checklist
 
-- sha256/512 against known test vectors (NIST/RFC); blake3 deferred
+- SHA-256/512 against NIST/RFC vectors and BLAKE3 against the upstream block and chunk boundary vectors
 - hmac against RFC 4231 vectors
 - hkdf against RFC 5869
 - aes_gcm/chacha20 against their test vectors

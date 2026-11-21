@@ -4804,7 +4804,7 @@ machine code, not just the source.
 crypto.random(out: mut buffer)                                  // OS CSPRNG fill
 crypto.sha256(data: bytes) -> array<u8>                         // 32-byte digest
 crypto.sha512(data: bytes) -> array<u8>                         // 64-byte digest
-crypto.blake3                                                   // deferred: no system engine provides BLAKE3
+crypto.blake3(data: bytes) -> array<u8>                         // 32 owned bytes, unkeyed BLAKE3
 crypto.hmac_sha256(key: bytes, data: bytes) -> array<u8>        // 32-byte tag
 crypto.hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, len: i64) -> Result<buffer, Error>
 crypto.argon2id(password: bytes, salt: bytes, params: argon2_params) -> Result<buffer, Error>

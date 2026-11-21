@@ -2329,6 +2329,8 @@ existing Move/Drop rules; direct digest collections, tuple/box storage, native
 exposure and parallel capture are excluded. The complete carrier and native
 contract is [plan 41](impl/41-incremental-sha256-plan.md).
 
+`crypto.blake3(data: bytes) -> array<u8>` borrows its input and returns 32 independently owned bytes. The unkeyed one-shot operation is Impure and uses the official BLAKE3 C provider.
+
 `std.crypto`: EVP-backed operations use OpenSSL libcrypto, linked only when a used capability
 requires it. Most work with OpenSSL 3.0; `argon2id` requires the `ARGON2ID` provider added in OpenSSL 3.2
 and returns `Error.Code` when it is unavailable. The designed asymmetric extension adds distinct

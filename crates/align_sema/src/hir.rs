@@ -2725,8 +2725,8 @@ pub enum AeadDir {
 }
 
 /// Which cryptographic hash an [`ExprKind::CryptoHash`] computes (M11 Slice 2). One node kind serves
-/// both — the algorithm is this `algo`, param-swapping the EVP digest name and the fixed output
-/// length (mirroring [`EncodingKind`] / [`CompressKind`]). The HIR-walking passes treat it opaquely
+/// every one-shot digest. The algorithm selects the provider and fixed output length.
+/// The HIR-walking passes treat it opaquely
 /// (they match `..`); only sema dispatch, capability collection, codegen and the runtime distinguish formats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum HashAlgo {
@@ -2736,6 +2736,8 @@ pub enum HashAlgo {
     Sha256,
     /// SHA-512 (FIPS 180-4) — a 64-byte digest. EVP name `"SHA512"`.
     Sha512,
+    /// Unkeyed BLAKE3 with its standard 32-byte output.
+    Blake3,
 }
 
 /// Which `std.cli` flag an [`ExprKind::CliFlag`] registers — the kind decides the value type and

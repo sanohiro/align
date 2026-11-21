@@ -846,7 +846,7 @@ fn main() -> i32 {
         }
     }
     if cfg!(target_os = "linux") {
-        libraries.push("dl".to_string());
+        libraries.push("dl".into());
     }
     let executable = project.dir.join("probe");
     let refs = objects

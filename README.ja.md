@@ -30,32 +30,39 @@ sudo apt install alignc
 
 ### ソースからのビルド
 
-ワークスペースのビルドには **Rust 1.96 以上**、**LLVM 22**、ネイティブ C ツールチェーンが必要です。計測付き PGO には、対応する **clang 22** とそのコンパイラランタイムも必要です。ネイティブライブラリには OpenSSL、zstd、SQLite、**libpq 17 以上**を使います。PostgreSQL サーバーは、データベースを使うアプリケーションや統合テストでのみ必要です。
+ワークスペースのビルドには **Rust 1.96 以上**、**LLVM 22**、ネイティブ C ツールチェーンが必要です。計測付き PGO には、対応する **clang 22** とそのコンパイラランタイムも必要です。ネイティブライブラリには OpenSSL、libblake3、zstd、SQLite、**libpq 17 以上**を使います。PostgreSQL サーバーは、データベースを使うアプリケーションや統合テストでのみ必要です。
 
 #### Linux (Ubuntu 24.04)
 
 リポジトリのルートから、CI と同じ署名付き LLVM・PostgreSQL パッケージリポジトリを使います。Ubuntu 24.04 標準の libpq 16 は、データベースのストリーム API には古すぎます。
 ```sh
-sudo apt install build-essential curl wget gnupg pkg-config
+sudo apt install build-essential curl wget gnupg pkg-config cmake
 scripts/ci-pgdg.sh
 align_deps_tmp="$(mktemp -d)"
 RUNNER_TEMP="$align_deps_tmp" \
 ALIGN_APT_PACKAGES="llvm-22-dev clang-22 libclang-rt-22-dev lld-22 libpq-dev libsqlite3-dev libssl-dev zlib1g-dev libzstd-dev" \
   scripts/ci-apt-llvm.sh install --uncached
 rmdir "$align_deps_tmp"
+scripts/install-blake3.sh "$HOME/.local/align-blake3" shared
+export BLAKE3_INCLUDE_DIR="$HOME/.local/align-blake3/include"
+export LIBRARY_PATH="$HOME/.local/align-blake3/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$HOME/.local/align-blake3/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 scripts/check-libpq-version.sh
 ```
+
+ディストリビューションが `libblake3-dev` を提供していれば、そのヘッダーとライブラリも利用できます。ビルド済み Align パッケージには静的ライブラリが同梱されています。
 
 #### macOS (Apple Silicon)
 
 Homebrew で依存関係をインストールします：
 ```sh
-brew install llvm@22 openssl@3 libpq zstd
+brew install llvm@22 openssl@3 libpq zstd blake3
 ```
 `scripts/cargo.sh` が LLVM 22 を見つけ、コンパイラのビルド中に Homebrew のライブラリ検索パスを設定します。その後 `alignc` を使うシェルでは、keg-only のツールとネイティブライブラリを参照できるようにします。
 ```sh
 export PATH="$(brew --prefix llvm@22)/bin:$(brew --prefix libpq)/bin:$PATH"
-export LIBRARY_PATH="$(brew --prefix libpq)/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+export BLAKE3_INCLUDE_DIR="$(brew --prefix blake3)/include"
+export LIBRARY_PATH="$(brew --prefix libpq)/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib:$(brew --prefix blake3)/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
 scripts/check-libpq-version.sh
 ```
 

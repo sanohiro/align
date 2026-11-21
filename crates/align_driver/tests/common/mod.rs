@@ -20,6 +20,22 @@ pub use align_span::SourceMap;
 use align_driver::ArtifactStage;
 use std::path::{Component, Path, PathBuf};
 
+/// Preserve the origin when a bounded linker fixture runs in a child process.
+pub fn encode_link_child_library(library: &align_driver::NativeLibrary) -> String {
+    match library {
+        align_driver::NativeLibrary::System(name) => format!("system:{name}"),
+        align_driver::NativeLibrary::Blake3Provider => "blake3-provider".to_owned(),
+    }
+}
+
+pub fn decode_link_child_library(value: String) -> align_driver::NativeLibrary {
+    if value == "blake3-provider" {
+        align_driver::NativeLibrary::Blake3Provider
+    } else {
+        value.strip_prefix("system:").expect("invalid link-child library").into()
+    }
+}
+
 /// Whether a C compiler (`cc`) is available — the FFI by-value-struct tests compile a small C helper
 /// (the by-value struct callee) and link it against the Align object. Skip those tests where `cc`
 /// is absent (the backend itself may still be available for pure-Align tests).
@@ -544,16 +560,16 @@ pub fn build_and_run_multi_with_c(
     // The C object substitutes only libpq itself. Preserve the complete dependent-first libpq
     // closure before removing that one member: filtering `pq` first prevents `order_link_libs`
     // from appending the suffix and can leave zlib before a later OpenSSL reference on ELF.
-    let substitutes_libpq = link_libs.iter().any(|library| library == "pq");
-    let mut link_libs: Vec<String> = order_link_libs(&link_libs)
+    let substitutes_libpq = link_libs.iter().any(|library| library.name() == "pq");
+    let mut link_libs: Vec<align_driver::NativeLibrary> = order_link_libs(&link_libs)
         .into_iter()
-        .filter(|library| library != "pq")
+        .filter(|library| library.name() != "pq")
         .collect();
     if substitutes_libpq {
         link_libs.extend(
             ["ssl", "crypto", "zstd", "z"]
                 .into_iter()
-                .map(str::to_owned),
+                .map(align_driver::NativeLibrary::from),
         );
     }
     std::fs::write(&c_path, c_src).expect("write C fixture");
@@ -723,8 +739,8 @@ impl PerUnitBuilt {
     }
 
     /// The deterministic capability-library union across units (first-seen, unit order).
-    pub fn link_libs_union(&self) -> Vec<String> {
-        let mut libs: Vec<String> = Vec::new();
+    pub fn link_libs_union(&self) -> Vec<align_driver::NativeLibrary> {
+        let mut libs: Vec<align_driver::NativeLibrary> = Vec::new();
         for u in &self.walk.units {
             for l in &u.mir.link_libs {
                 if !libs.contains(l) {
@@ -1032,7 +1048,7 @@ pub struct ThinBuilt {
     pub outcomes: Vec<CacheOutcome>,
     pub objs: Vec<PathBuf>,
     pub bc_paths: Vec<PathBuf>,
-    pub link_libs: Vec<String>,
+    pub link_libs: Vec<align_driver::NativeLibrary>,
     pub units: Vec<String>,
 }
 
@@ -1060,7 +1076,7 @@ pub fn thin_build(proj: &Proj, cache: &CacheContext, jobs: usize) -> ThinBuilt {
     )
     .expect("thin-lto build");
     // First-seen (DAG-order) union of every unit's capability link libs.
-    let mut link_libs: Vec<String> = Vec::new();
+    let mut link_libs: Vec<align_driver::NativeLibrary> = Vec::new();
     for u in &walk.units {
         for l in &u.mir.link_libs {
             if !link_libs.contains(l) {
