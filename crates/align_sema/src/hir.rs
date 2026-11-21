@@ -2885,9 +2885,7 @@ pub enum BuilderWriteKind {
     Float,
 }
 
-/// Which byte-oriented `str` predicate a `StrPredicate` tests (`core.string`). All three are
-/// pure byte comparisons (UTF-8 is the representation, but the scan is byte-level) returning
-/// `bool`; the standard runtime backs them with `memchr::memmem` / slice prefix-suffix checks.
+/// Pure two-input text operations returning a boolean or an optional UTF-8 byte offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum StrPredKind {
     /// `s.contains(needle)` — `needle`'s bytes occur somewhere in `s`.
@@ -2907,6 +2905,8 @@ pub enum StrPredKind {
     /// (`bool`). For protocol/header parsing where case is insignificant; non-ASCII bytes compare
     /// exactly, so it is not Unicode case-folding (that stays package-level).
     EqIgnoreCase,
+    /// First byte offset of a scalar present in the delimiter set.
+    FindAny,
 }
 
 /// Which end(s) a `StrTrim` strips ASCII whitespace from (`core.string`). The result is a

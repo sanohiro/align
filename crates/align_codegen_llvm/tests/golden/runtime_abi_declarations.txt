@@ -429,6 +429,7 @@ key|StrEndsWith|str_ends_with|PureArgRead|declare i32 @align_rt_str_ends_with(pt
 key|StrEq|str_eq|PureArgRead|declare i32 @align_rt_str_eq(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
 key|StrEqIgnoreCase|str_eq_ignore_case|PureArgRead|declare i32 @align_rt_str_eq_ignore_case(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
 key|StrFind|str_find|DispatchCache|declare i64 @align_rt_str_find(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #7
+key|StrFindAny|str_find_any|DispatchCache|declare i64 @align_rt_str_find_any(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #7
 key|StrFinderFind|str_finder_find|DispatchCache|declare i64 @align_rt_str_finder_find(ptr readonly captures(none), ptr readonly captures(none), i64) #7
 key|StrFinderFree|str_finder_free|IndirectStorage|declare void @align_rt_str_finder_free(ptr) #2
 key|StrFinderNew|str_finder_new|AllocNew|declare noalias ptr @align_rt_str_finder_new(ptr readonly captures(none), i64) #4

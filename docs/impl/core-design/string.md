@@ -20,6 +20,7 @@ s.parse_i64()              -> Result<i64, Error>  // checked ASCII decimal; no a
 s.len()                    -> i64        // BYTE length ("あ".len() == 3)
 s.contains(n) / s.starts_with(n) / s.ends_with(n)      -> bool
 s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
+s.find_any(chars: str)      -> Option<i64>   // first byte offset of any scalar in chars
 s.find(n) / s.rfind(n)     -> Option<i64>   // byte index of first/last occurrence
 s.trim() / s.trim_start() / s.trim_end()    -> str   // ASCII-whitespace; zero-copy sub-view
 s[a..b]                    -> str        // range view; region-tied; NO s[i] byte indexing
@@ -127,6 +128,13 @@ remain live and valid through index evaluation; a bool result retains no view.
 The operation is Pure and has no fallible result or bounds trap. Ordinary
 `s[a..b]` keeps its range and UTF-8 boundary traps.
 
+`text.find_any(chars: str) -> Option<i64>` returns the first UTF-8 byte
+offset in `text` at which a Unicode scalar from `chars` occurs. Empty text,
+an empty set or no match yields `None`. Set order and repetitions do not
+affect the result. Matching is exact, including U+0000. Both operands are
+borrowed through the call, evaluated once in source order. The result retains
+neither operand. The operation is Pure and performs no heap allocation.
+
 `starts_with` and `ends_with` compare bounded bytes without forming an interior
 string slice: an empty needle matches and a longer needle does not. They allocate
 nothing and compare at most the needle's byte length; no particular libc call or
@@ -141,7 +149,7 @@ Frame-regioned `str` (owned-structs work).
 
 ## Spec'd but not implemented
 
-- **`split`** and **`find_any`** (§18.1 catalog) — no string-method dispatch arms.
+- **`split`** (§18.1 catalog) remains a separate materializing operation.
   Existing `array<str>` support does not provide a string split method. A selected split
   capability still needs its exact separator, result, lifetime and allocation contract.
   Today: `find`/`rfind` + `s[a..b]` compose the manual split.

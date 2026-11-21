@@ -1046,7 +1046,10 @@ builder based output
 string pools
 ```
 
-Repeated scanning should be avoided.
+Repeated scanning should be avoided. A delimiter-set search returns a byte
+offset so the caller can slice the original UTF-8 text at that position.
+Matching complete scalars prevents a shared encoding byte from selecting the
+middle of a character.
 
 **Owned `string` stays `{ ptr, len }` — no Small-String Optimization.** SSO (inline
 `{ ptr, len, cap }` with a tag bit) was considered and rejected: it adds a branch to every

@@ -13,6 +13,13 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Literal character-set search
+
+`str.find_any(chars)` matches complete Unicode scalars and returns the first
+matching byte offset as `Option<i64>`. The receiver and argument can both be
+borrowed from owned strings. Empty inputs give `None`. Plan260 records the
+native and compiler contract.
+
 ### Non-consuming HTTP peer EOF observation (SETTLED 2026-10-25)
 
 `ctx.peer_eof() -> Result<bool, Error>` is an Impure, non-consuming observation

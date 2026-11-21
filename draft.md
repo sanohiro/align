@@ -2247,6 +2247,13 @@ remain live and valid through index evaluation; a bool result retains no view.
 The operation is Pure and has no fallible result or bounds trap. Ordinary
 `s[a..b]` keeps its range and UTF-8 boundary traps.
 
+`text.find_any(chars: str) -> Option<i64>` returns the first UTF-8 byte
+offset in `text` at which a Unicode scalar from `chars` occurs. Empty text,
+an empty set or no match yields `None`. Set order and repetitions do not
+affect the result. Matching is exact, including U+0000. Both operands are
+borrowed through the call, evaluated once in source order. The result retains
+neither operand. The operation is Pure and performs no heap allocation.
+
 `starts_with` and `ends_with` compare bounded bytes without forming an interior
 string slice: an empty needle matches and a longer needle does not. They allocate
 nothing and compare at most the needle's byte length; no particular libc call or

@@ -1076,7 +1076,7 @@ The result formula in every row is followed by the universal
 | `StrClone` | `env[]`; `child[text]`; `post[text.ty is Str or String; result String; source borrowed without transfer; a fresh owned receiver is kept live only through the copy; result individually owned unless current arena captures it]`. |
 | `StrParseI64` | `child[input]`; `post[input exact Str; result exact Result<i64, builtin Error>; borrowed input; strict child completion; no result borrow roots; Pure]`. Whole-input ASCII signed decimal grammar and Invalid failures are owned by plan 83; independent validation derives the canonical Error enum identity. |
 | `StrCharBoundary` | `child[receiver,index]`; `post[receiver Str; index exact signed i64; result Bool; receiver borrowed; strict child completion]`. |
-| `StrPredicate` | `env[kind]`; `child[haystack,needle]`; `post[both Str; Contains/StartsWith/EndsWith/EqIgnoreCase result Bool; Find/Rfind result Option<i64>; both borrowed]`. |
+| `StrPredicate` | `env[kind]`; `child[haystack,needle]`; `post[both Str; Contains/StartsWith/EndsWith/EqIgnoreCase result Bool; Find/Rfind/FindAny result Option<i64>; both borrowed]`. |
 | `StrTrim` | `env[kind]`; `child[recv]`; `post[recv Str; result Str; view inherits recv roots/region]`. |
 | `StrBorrow` | `env[]`; `child[string]`; `post[string.ty == String; result Str; owned source is borrowed and remains live]`. |
 | `BuilderNew` | `env[capacity presence]`; `child[capacity if present]`; `post[capacity i64; result Builder; one owned builder allocation with current arena/individual fact]`. |
@@ -1096,6 +1096,7 @@ The result formula in every row is followed by the universal
 | `StrPredKind::StartsWith` | Both operands are `Str`; result `Bool`. |
 | `StrPredKind::EndsWith` | Both operands are `Str`; result `Bool`. |
 | `StrPredKind::Find` | Both operands are `Str`; result `Option<i64>`. |
+| `StrPredKind::FindAny` | Both operands are `Str`; result `Option<i64>`. The second operand supplies a set of Unicode scalars. |
 | `StrPredKind::Rfind` | Both operands are `Str`; result `Option<i64>`. |
 | `StrPredKind::EqIgnoreCase` | Both operands are `Str`; result `Bool`; ASCII-only case folding. |
 | `StrTrimKind::Both` | Operand/result are `Str`, share provenance, and trim both ends. |

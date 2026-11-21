@@ -16636,16 +16636,18 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let np = self.builder.build_extract_value(ne, 0, "np").map_err(|e| self.err(e))?;
                 let nl = self.builder.build_extract_value(ne, 1, "nl").map_err(|e| self.err(e))?;
                 let args = [hp.into(), hl.into(), np.into(), nl.into()];
+                let key = match kind {
+                    StrPredKind::Contains => RuntimeKey::StrContains,
+                    StrPredKind::StartsWith => RuntimeKey::StrStartsWith,
+                    StrPredKind::EndsWith => RuntimeKey::StrEndsWith,
+                    StrPredKind::EqIgnoreCase => RuntimeKey::StrEqIgnoreCase,
+                    StrPredKind::Find => RuntimeKey::StrFind,
+                    StrPredKind::Rfind => RuntimeKey::StrRfind,
+                    StrPredKind::FindAny => RuntimeKey::StrFindAny,
+                };
                 match kind {
                     // The bool scans: an `i32` (0/1) returned as a `bool` (`i1`).
                     StrPredKind::Contains | StrPredKind::StartsWith | StrPredKind::EndsWith | StrPredKind::EqIgnoreCase => {
-                        let key = match kind {
-                            StrPredKind::Contains => RuntimeKey::StrContains,
-                            StrPredKind::StartsWith => RuntimeKey::StrStartsWith,
-                            StrPredKind::EndsWith => RuntimeKey::StrEndsWith,
-                            StrPredKind::EqIgnoreCase => RuntimeKey::StrEqIgnoreCase,
-                            StrPredKind::Find | StrPredKind::Rfind => unreachable!(),
-                        };
                         let r = self
                             .builder
                             .build_call(self.runtime(key), &args, "strpred")
@@ -16660,15 +16662,10 @@ impl<'c, 'a> FnGen<'c, 'a> {
                             .map_err(|e| self.err(e))?
                             .into()
                     }
-                    // `find` / `rfind`: an `i64` index (`-1` = absent) shaped into an `Option<i64>`.
-                    StrPredKind::Find | StrPredKind::Rfind => {
+                    // Searches return an `i64` byte index (`-1` = absent) shaped into an `Option<i64>`.
+                    StrPredKind::Find | StrPredKind::Rfind | StrPredKind::FindAny => {
                         let Ty::Option(s) = result_ty else {
                             return Err(self.err("find result is not an Option"));
-                        };
-                        let key = if matches!(kind, StrPredKind::Rfind) {
-                            RuntimeKey::StrRfind
-                        } else {
-                            RuntimeKey::StrFind
                         };
                         let idx = self
                             .builder
