@@ -58778,7 +58778,7 @@ impl<'a, 't> Checker<'a, 't> {
             "is_char_boundary" if matches!(recv_ty, Ty::Str | Ty::String) => {
                 self.check_str_char_boundary(recv_expr, args, span)
             }
-            "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "eq_ignore_ascii_case"
+            "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "find_any" | "eq_ignore_ascii_case"
                 if matches!(recv_ty, Ty::Str | Ty::String) =>
             {
                 self.check_str_predicate(recv_expr, method, args, span)
@@ -64433,6 +64433,7 @@ impl<'a, 't> Checker<'a, 't> {
             "eq_ignore_ascii_case" => (hir::StrPredKind::EqIgnoreCase, Ty::Bool),
             "find" => (hir::StrPredKind::Find, opt_i64),
             "rfind" => (hir::StrPredKind::Rfind, opt_i64),
+            "find_any" => (hir::StrPredKind::FindAny, opt_i64),
             _ => unreachable!("check_str_predicate called with non-scan method"),
         };
         Expr {

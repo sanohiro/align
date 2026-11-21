@@ -8960,7 +8960,7 @@ impl<'a> BodyValidator<'a> {
                     return None;
                 }
                 let result = match kind {
-                    hir::StrPredKind::Find | hir::StrPredKind::Rfind => Ty::Option(Scalar::Int(align_sema::IntTy { bits: 64, signed: true })),
+                    hir::StrPredKind::Find | hir::StrPredKind::Rfind | hir::StrPredKind::FindAny => Ty::Option(Scalar::Int(align_sema::IntTy { bits: 64, signed: true })),
                     hir::StrPredKind::Contains
                     | hir::StrPredKind::StartsWith
                     | hir::StrPredKind::EndsWith

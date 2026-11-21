@@ -15629,6 +15629,45 @@ pub unsafe extern "C" fn align_rt_str_find(hptr: *const u8, hlen: i64, nptr: *co
     }
 }
 
+/// First UTF-8 byte offset occupied by any scalar in the delimiter set, or -1.
+/// Null, nonpositive and unrepresentable ranges are empty.
+///
+/// # Safety
+/// Admitted positive ranges must describe live readable UTF-8 for this call.
+/// The views may overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_find_any(hptr: *const u8, hlen: i64, sptr: *const u8, slen: i64) -> i64 {
+    let haystack = unsafe { safe_slice(hptr, hlen) };
+    let set = unsafe { safe_slice(sptr, slen) };
+    if haystack.is_empty() || set.is_empty() {
+        return -1;
+    }
+    let index = if set.is_ascii() {
+        match set {
+            [a] => memchr::memchr(*a, haystack),
+            [a, b] => memchr::memchr2(*a, *b, haystack),
+            [a, b, c] => memchr::memchr3(*a, *b, *c, haystack),
+            _ => {
+                let mut members = [false; 256];
+                for &byte in set {
+                    members[usize::from(byte)] = true;
+                }
+                haystack.iter().position(|&byte| members[usize::from(byte)])
+            }
+        }
+    } else {
+        // A set member is a complete scalar. Comparing UTF-8 substrings for
+        // complete encodings cannot match an interior continuation byte.
+        let Ok(text) = std::str::from_utf8(haystack) else { return -1 };
+        text.char_indices().find_map(|(at, ch)| {
+            let mut encoded = [0; 4];
+            let scalar = ch.encode_utf8(&mut encoded);
+            memchr::memmem::find(set, scalar.as_bytes()).map(|_| at)
+        })
+    };
+    index.and_then(|at| i64::try_from(at).ok()).unwrap_or(-1)
+}
+
 /// `s.rfind(needle)` (M5, `core.string`) — the byte index of `needle`'s **last** occurrence in `s`,
 /// or `-1` if absent (codegen turns the sentinel into `Option<i64>`). An empty needle matches at the
 /// end (`hlen`). Backed by `memchr::memmem::rfind`.
@@ -29466,7 +29505,7 @@ mod tests {
             "F32ToBits", "F32FromBits", "F64ToBits", "F64FromBits", "F32TextLen",
             "F64TextLen", "Hash128", "Hash64", "PathBase", "PathDir", "PathExt", "StrCmp",
             "StrEndsWith", "StrEq", "StrEqIgnoreCase", "StrStartsWith", "StrTrim", "StrTrimEnd",
-            "StrTrimStart", "StrContains", "StrFind", "StrFinderFind", "StrRfind", "Utf8Valid",
+            "StrTrimStart", "StrContains", "StrFind", "StrFindAny", "StrFinderFind", "StrRfind", "Utf8Valid",
         ];
 
         let registry = include_str!("../../align_codegen_llvm/src/runtime_abi.rs");
@@ -29501,7 +29540,7 @@ mod tests {
         let finder = unsafe { align_rt_str_finder_new(needle.as_ptr(), needle.len() as i64) };
         assert!(!finder.is_null());
 
-        let mut rows: [(&str, Box<dyn FnMut() + '_>); 24] = [
+        let mut rows: [(&str, Box<dyn FnMut() + '_>); CLAIMING_ROWS.len()] = [
             ("F32ToBits", Box::new(|| { std::hint::black_box(align_rt_f32_to_bits(1.25)); })),
             ("F32FromBits", Box::new(|| { std::hint::black_box(align_rt_f32_from_bits(1)); })),
             ("F64ToBits", Box::new(|| { std::hint::black_box(align_rt_f64_to_bits(1.25)); })),
@@ -29523,6 +29562,7 @@ mod tests {
             ("StrTrimStart", Box::new(|| unsafe { std::hint::black_box(align_rt_str_trim_start(haystack.as_ptr(), haystack.len() as i64)); })),
             ("StrContains", Box::new(|| unsafe { std::hint::black_box(align_rt_str_contains(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
             ("StrFind", Box::new(|| unsafe { std::hint::black_box(align_rt_str_find(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
+            ("StrFindAny", Box::new(|| unsafe { std::hint::black_box(align_rt_str_find_any(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
             ("StrFinderFind", Box::new(|| unsafe { std::hint::black_box(align_rt_str_finder_find(finder, haystack.as_ptr(), haystack.len() as i64)); })),
             ("StrRfind", Box::new(|| unsafe { std::hint::black_box(align_rt_str_rfind(haystack.as_ptr(), haystack.len() as i64, needle.as_ptr(), needle.len() as i64)); })),
             ("Utf8Valid", Box::new(|| unsafe { std::hint::black_box(align_rt_utf8_valid(haystack.as_ptr(), haystack.len() as i64)); })),
@@ -37538,6 +37578,28 @@ mod tests {
         assert_eq!((rc, n), (0, 2), "full-decode input still decodes");
         assert_eq!([read_i64(&buf, 0), read_i64(&buf, 16)], [1, 2], "a column");
         assert_eq!([read_i64(&buf, 8), read_i64(&buf, 24)], [10, 20], "b column");
+    }
+
+    #[test]
+    fn str_find_any_matches_scalar_oracle_and_native_boundary() {
+        let texts = ["", "a", "á", "a\0b", "😊ď", "üďあñ𝄞Ê", "cafe\u{301}", "הϟ/:"];
+        for text in texts {
+            for chars in ["", "a", ":/", "/:,", ";;:,:", "a\0", "ê", "Ċ", "𝄞😊", "ñû", "é", "ďあ", "🚀aø"] {
+                let want = text.char_indices().find(|(_, c)| chars.chars().any(|v| v == *c))
+                    .map_or(-1, |(at, _)| i64::try_from(at).unwrap());
+                let actual = unsafe { align_rt_str_find_any(text.as_ptr(), text.len() as i64, chars.as_ptr(), chars.len() as i64) };
+                assert_eq!(actual, want, "text={text:?} chars={chars:?}");
+            }
+        }
+        let text = "aø";
+        let tail = &text[1..];
+        unsafe {
+            assert_eq!(align_rt_str_find_any(text.as_ptr(), 3, tail.as_ptr(), 2), 1);
+            for (ptr, len) in [(std::ptr::null(), 1), (text.as_ptr(), -1), (std::ptr::null(), 0)] {
+                assert_eq!(align_rt_str_find_any(ptr, len, text.as_ptr(), 3), -1);
+                assert_eq!(align_rt_str_find_any(text.as_ptr(), 3, ptr, len), -1);
+            }
+        }
     }
 
     #[test]

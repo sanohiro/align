@@ -1044,6 +1044,13 @@ buffer
 builder
 ```
 
+`text.find_any(chars: str) -> Option<i64>` returns the first UTF-8 byte
+offset in `text` at which a Unicode scalar from `chars` occurs. Empty text,
+an empty set or no match yields `None`. Set order and repetitions do not
+affect the result. Matching is exact, including U+0000. Both operands are
+borrowed through the call, evaluated once in source order. The result retains
+neither operand. The operation is Pure and performs no heap allocation.
+
 `str` carries `.len()` (byte length), `==`/`!=` (byte equality), the byte-oriented
 predicates `.contains(n)` / `.starts_with(p)` / `.ends_with(s)` (all `bool`),
 `.find(n)` / `.rfind(n)` → `Option<i64>` (the first / last byte index, the index

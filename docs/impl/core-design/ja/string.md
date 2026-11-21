@@ -17,6 +17,7 @@ s.parse_i64() -> Result<i64, Error>  // ASCII 十進数の検査付き変換; �
 s.len()                    -> i64        // BYTE length ("あ".len() == 3)
 s.contains(n) / s.starts_with(n) / s.ends_with(n)      -> bool
 s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
+s.find_any(chars: str)      -> Option<i64>   // chars のいずれかの Unicode スカラーが最初に現れるバイト位置
 s.find(n) / s.rfind(n)     -> Option<i64>   // byte index of first/last occurrence
 s.trim() / s.trim_start() / s.trim_end()    -> str   // ASCII-whitespace; zero-copy sub-view
 s[a..b]                    -> str        // range view; region-tied; NO s[i] byte indexing
@@ -115,9 +116,14 @@ builder の aggregate/capture/関数値への格納や typed-builder の要素�
 
 `region_of(trim*/s[a..b]/s.bytes()) = region_of(s)` — サブビューは元の region を継承する。`clone` は owned なデータを返すため region を持たない。`string` の struct フィールドの読み取りは、Frame region の `str` として借用される（所有権を持つ struct は移動する）。
 
+`text.find_any(chars)` は、`chars` に含まれる Unicode スカラーが `text` に最初に現れる
+UTF-8 バイト位置を返す。いずれかが空の場合と、一致がない場合は `None`。
+順序や重複は結果に影響せず、U+0000 もそのまま比較する。両オペランドは左から一度ずつ評価され、
+呼び出し中だけ借用される。結果に借用は残らない。Pure で、ヒープ確保は行わない。
+
 ## 仕様先行(未実装)
 
-- **`split`** および **`find_any`**（§18.1 カタログ） — 文字列メソッドとしての dispatch arm はない。
+- **`split`**（§18.1 カタログ）は複数の結果を作る操作として未実装。
   `array<str>` は既に使えるが、文字列の split メソッドは提供されていない。split の実装には、
   separator・結果・寿命・allocation の正確な契約を定める必要がある。
   現状では `find` / `rfind` と `s[a..b]` を組み合わせて手動で split 処理を構築する。
