@@ -14,20 +14,22 @@ stays deferred (client-first). HTTP/3, routing, middleware = pkg, not std.
 **Module status: v1 COMPLETE** (Slices 1–6 shipped; client-side TLS is Slice 5). The first
 post-`pkg.db` convergence item, client streaming receive, is **IMPLEMENTED 2026-08-30**: the
 dependent raw `http_read_stream` boundary and its consuming `http_sse_stream` transition are both
-shipped. An origin-scoped client supports private trust roots, mutual TLS and mandatory offline CRLs. Server-side TLS and session resumption remain separate backlog items.
+shipped. An origin-scoped client supports private trust roots, mutual TLS and mandatory offline CRLs. Private clients can opt into session resumption. Server-side TLS remains deferred.
 
 ## Origin-scoped HTTPS
 
 ```text
 http.tls_client(origin: str, trust_pem: bytes, certificate_chain_pem: bytes,
-                private_key_pem: bytes, crls_pem: bytes) -> Result<http_client, Error>
+                private_key_pem: bytes, crls_pem: bytes, resume_sessions: bool = false) -> Result<http_client, Error>
 ```
 
-All five inputs are borrowed during construction. Use an HTTPS origin with an optional port and trailing slash. The client checks every request, including streaming and batch entries, against the normalized DNS name or IP address and port before network I/O. A malformed URL or caller-supplied Host, Content-Length or Transfer-Encoding field yields `Error.Invalid`. Another well-formed origin yields `Error.Denied`.
+The five text and byte inputs are borrowed during construction. Use an HTTPS origin with an optional port and trailing slash. The client checks every request, including streaming and batch entries, against the normalized DNS name or IP address and port before network I/O. A malformed URL or caller-supplied Host, Content-Length or Transfer-Encoding field yields `Error.Invalid`. Another well-formed origin yields `Error.Denied`.
 
 Empty trust uses the system store. Explicit trust accepts self-signed CA certificates and replaces that store for this client. Supply an ordered leaf-first client chain and its matching unencrypted PKCS#8 key together for mutual TLS. Two empty fields omit the identity. The chain ends before the root. The constructor rejects malformed PEM, trailing binary data and oversized inputs. Each field accepts up to 4 MiB, each certificate or CRL list up to 64 objects, and a decoded private key up to 64 KiB.
 
 A nonempty CRL list requires explicit trust. Every new connection verifies the peer's chain and identity against current, signed revocation evidence. These clients establish a fresh connection for each request. Missing coverage, revoked certificates, and expired or future evidence yield `Error.Denied`. The configured client owns the parsed credentials and its connection pool. [Full contract](../269-private-http-client-tls.md)
+
+When `resume_sessions` is true, supply explicit roots and an empty CRL list. On a fresh TCP connection the client may offer one TLS 1.2 session or TLS 1.3 ticket from a completed request to the same origin. Each issuance is single-use. The original certificate validity, the native session lifetime and 90 seconds of monotonic time bound reuse. A server can select a new verified handshake. HTTP data follows the handshake. [Session resumption contract](../270-http-session-resumption.md)
 
 ## Signatures
 

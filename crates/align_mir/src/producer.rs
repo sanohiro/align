@@ -1987,13 +1987,19 @@ pub fn native_owner_mir_contract<'a>(
                 (req, Ty::HttpRequest, consume),
             ];
         }
-        Rvalue::HttpTlsClient { views, out } => {
+        Rvalue::HttpTlsClient { views, resume, out } => {
             let valid = views.len() == 5 && views.iter().all(|v| match v {
                 Operand::Arg(i) => function.param_modes.get(*i as usize) == Some(&align_ast::ParamMode::ByValue),
                 Operand::Value(_) | Operand::BorrowedPlace(_) => true,
                 _ => false,
             });
-            contract.result = if valid { i32_ty } else { Ty::Error };
+            let flag_valid = match resume {
+                Operand::Const(Const::Bool(_)) | Operand::Value(_) | Operand::BorrowedPlace(_) => true,
+                Operand::Arg(i) => function.param_modes.get(*i as usize) == Some(&align_ast::ParamMode::ByValue),
+                _ => false,
+            };
+            contract.result = if valid && flag_valid { i32_ty } else { Ty::Error };
+            contract.operands.push((resume, Ty::Bool, read));
             contract.outputs.push((*out, Ty::HttpClient));
             for (index, view) in views.iter().enumerate() {
                 contract.operands.push((view, if index == 0 { Ty::Str } else { byte_view(view) }, read));
@@ -2297,7 +2303,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         Rvalue::HttpReadStreamHeader { stream, name, .. } => vec![stream, name],
         Rvalue::HttpReadStreamRead { stream, buffer, .. }
         | Rvalue::HttpSseStreamNext { stream, buffer, .. } => vec![stream, buffer],
-        Rvalue::HttpTlsClient { views, .. } => views.iter().collect(),
+        Rvalue::HttpTlsClient { views, resume, .. } => views.iter().chain(std::iter::once(resume)).collect(),
         Rvalue::HttpGetMany {
             client,
             urls,

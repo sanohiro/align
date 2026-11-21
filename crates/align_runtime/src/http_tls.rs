@@ -29,6 +29,9 @@ pub(super) struct Policy {
     origin: Origin,
     pub(super) ctx: TlsCtx,
     pub(super) revocation: bool,
+    pub(super) resume: bool,
+    #[cfg(test)]
+    session_clock: std::sync::Mutex<std::collections::VecDeque<SessionClock>>,
     #[cfg(test)]
     verification_time: std::sync::atomic::AtomicI64,
 }
@@ -139,7 +142,18 @@ struct DerView {
     ptr: *const u8,
     len: usize,
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SessionClock {
+    wall: i64,
+    monotonic: i64,
+}
+
 unsafe extern "C" {
+    fn align_tls_sessions_enable(ctx: *mut c_void) -> i32;
+    fn align_tls_sessions_prepare(ssl: *mut c_void, clock: *const SessionClock) -> i32;
+    fn align_tls_sessions_verified(ssl: *mut c_void, clock: *const SessionClock) -> i32;
+    fn align_tls_sessions_complete(ssl: *mut c_void, clock: *const SessionClock);
     fn align_tls_policy_init(system_trust: i32, out: *mut *mut c_void) -> i32;
     fn align_tls_policy_field(
         ctx: *mut c_void,
@@ -151,6 +165,44 @@ unsafe extern "C" {
 }
 
 impl Policy {
+    fn clock(&self) -> Option<SessionClock> {
+        #[cfg(test)]
+        {
+            self.session_clock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
+    }
+    pub(super) fn prepare_session(&self, ssl: *mut c_void) -> i32 {
+        unsafe {
+            align_tls_sessions_prepare(
+                ssl,
+                self.clock().as_ref().map_or(ptr::null(), ptr::from_ref),
+            )
+        }
+    }
+    pub(super) fn verify_session(&self, ssl: *mut c_void) -> i32 {
+        unsafe {
+            align_tls_sessions_verified(
+                ssl,
+                self.clock().as_ref().map_or(ptr::null(), ptr::from_ref),
+            )
+        }
+    }
+    pub(super) fn complete_session(&self, ssl: *mut c_void) {
+        unsafe {
+            align_tls_sessions_complete(
+                ssl,
+                self.clock().as_ref().map_or(ptr::null(), ptr::from_ref),
+            )
+        }
+    }
+
     pub(super) fn evidence_current(&self) -> bool {
         #[cfg(test)]
         let at = match self
@@ -259,7 +311,13 @@ fn create(
     chain: &[u8],
     key: &[u8],
     crls: &[u8],
+    raw_resume: i32,
 ) -> Result<Policy, i32> {
+    let resume = match raw_resume {
+        0 => false,
+        1 => true,
+        _ => return Err(AL_INVALID),
+    };
     let text = std::str::from_utf8(origin).map_err(|_| AL_INVALID)?;
     let (scheme, authority, path) = http_split_url(text).ok_or(AL_INVALID)?;
     if scheme != HttpScheme::Https || path != "/" {
@@ -267,6 +325,9 @@ fn create(
     }
     let origin = Origin::parse(authority, scheme)?;
     if chain.is_empty() != key.is_empty() || (!crls.is_empty() && trust.is_empty()) {
+        return Err(AL_INVALID);
+    }
+    if resume && (trust.is_empty() || !crls.is_empty()) {
         return Err(AL_INVALID);
     }
     let mut native = ptr::null_mut();
@@ -310,10 +371,19 @@ fn create(
             return Err(status);
         }
     }
+    if resume {
+        let status = unsafe { align_tls_sessions_enable(ctx.0) };
+        if status != 0 {
+            return Err(status);
+        }
+    }
     Ok(Policy {
         origin,
         ctx,
         revocation: !crls.is_empty(),
+        resume,
+        #[cfg(test)]
+        session_clock: Default::default(),
         #[cfg(test)]
         verification_time: Default::default(),
     })
@@ -334,6 +404,7 @@ pub unsafe extern "C" fn align_rt_http_tls_client_new(
     key_len: i64,
     crls: *const u8,
     crls_len: i64,
+    resume: i32,
     out: *mut *mut HttpClient,
 ) -> i32 {
     if out.is_null() || !out.is_aligned() {
@@ -347,6 +418,7 @@ pub unsafe extern "C" fn align_rt_http_tls_client_new(
             view(chain, chain_len, MAX_PEM)?,
             view(key, key_len, MAX_PEM)?,
             view(crls, crls_len, MAX_PEM)?,
+            resume,
         )?;
         let raw = std::alloc::alloc(std::alloc::Layout::new::<HttpClient>()).cast::<HttpClient>();
         if raw.is_null() {

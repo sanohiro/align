@@ -1,6 +1,6 @@
 # Align Design Notes
 
-An HTTPS client with explicit credentials binds the parsed trust roots, optional client identity and the connection pool to one origin. This lets two clients use different roots in the same process. Offline CRLs require a fresh connection so an idle TLS session cannot extend a past verification decision. [HTTPS client contract](impl/269-private-http-client-tls.md)
+An HTTPS client with explicit credentials binds the parsed trust roots, optional client identity and the connection pool to one origin. This lets two clients use different roots in the same process. Offline CRLs require a fresh connection so an idle TLS session cannot extend a past verification decision. A client that selects session resumption consumes each issuance once and carries the original certificate bounds through successive tickets. [HTTPS client contract](impl/269-private-http-client-tls.md), [session resumption](impl/270-http-session-resumption.md)
 
 A datagram carries its sender as an ordinary Move record. Owning the numeric host lets callers keep a peer after another receive or after closing the socket. Looking up the bound port on the same handle removes the race between probing a free port and opening the listener.
 

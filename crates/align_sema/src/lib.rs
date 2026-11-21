@@ -58027,12 +58027,12 @@ impl<'a, 't> Checker<'a, 't> {
             // `request` methods dispatch on the receiver type below. Impure (network).
             if module == "http" && method == "tls_client" {
                 self.require_import("std.http", "http.tls_client", span);
-                if args.len() != 5 {
-                    self.diags.error("http.tls_client expects an origin, trust roots, client chain, private key and CRLs", span);
+                if !(5..=6).contains(&args.len()) {
+                    self.diags.error("http.tls_client expects an origin, trust roots, client chain, private key, CRLs and an optional session resumption flag", span);
                     return err;
                 }
-                let mut checked = Vec::with_capacity(args.len());
-                for (index, field) in args.iter().enumerate() {
+                let mut checked = Vec::with_capacity(6);
+                for (index, field) in args.iter().take(5).enumerate() {
                     let expected = (index == 0 && matches!(field.kind, ast::ExprKind::ElseUnwrap { .. })).then_some(Ty::Str);
                     let value = self.check_expr(field, expected);
                     if hir_expr_diverges(&value) {
@@ -58043,6 +58043,14 @@ impl<'a, 't> Checker<'a, 't> {
                         checked.push(view);
                     }
                 }
+                let resume = if let Some(flag) = args.get(5) {
+                    let flag = self.check_expr(flag, None);
+                    if !hir_expr_diverges(&flag) { self.constrain(flag.ty, Some(Ty::Bool), flag.span); }
+                    flag
+                } else {
+                    Expr { kind: ExprKind::Bool(false), ty: Ty::Bool, span }
+                };
+                checked.push(resume);
                 return Expr { kind: ExprKind::HttpTlsClient { args: checked },
                     ty: Ty::Result(Scalar::HttpClient, Scalar::Enum(self.error_enum_id)), span };
             }

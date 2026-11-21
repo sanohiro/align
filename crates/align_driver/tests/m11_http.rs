@@ -746,6 +746,8 @@ fn scoped_tls_client_across_module_and_cache_boundaries() {
 import std.http
 pub fn configured<T>(origin: str, trust: str, unused: T) -> Result<http_client, Error> =
     http.tls_client(origin, trust, "", "", "")
+pub fn explicit<T>(origin: str, enabled: bool, unused: T) -> Result<http_client, Error> =
+    http.tls_client(origin, "", "", "", "", enabled)
 pub fn forward(origin: str) -> Result<http_client, Error> {
     client := configured(origin, "", 0)?
     return Ok(client)
@@ -754,8 +756,13 @@ pub fn forward(origin: str) -> Result<http_client, Error> {
 import std.http
 fn denied(e: Error) -> bool = match e { Denied => true, _ => false }
 fn mark(i: i32) -> str { print(i); return "" }
+fn flag() -> bool { print(6); return true }
 fn stop() -> i32 {
     result := http.tls_client("https://localhost", mark(1), mark(2), {return 7}, mark(4))
+    return 0
+}
+fn stop_flag() -> i32 {
+    ignored := http.tls_client("https://localhost", mark(1), mark(2), mark(3), mark(4), {return 8})
     return 0
 }
 fn main() -> Result<(), Error> {
@@ -765,18 +772,24 @@ fn main() -> Result<(), Error> {
         Err(e) => { if !denied(e) {return Err(Error.Invalid)} }, Ok(_) => {return Err(Error.Invalid)}
     }
     print(stop())
+    print(stop_flag())
+    no_resume := policy.explicit("https://localhost", false, 0)?
+    match policy.explicit("https://localhost", flag(), 0) {
+        Err(e) => { match e { Invalid => {}, _ => {return Err(e)} } },
+        Ok(_) => { return Err(Error.Invalid) }
+    }
     return Ok(())
 }"#;
         let files = [("main.align", main), ("policy.align", policy)];
         let whole = build_and_run_multi("scoped-client-whole", &files, "main.align");
         assert!(whole.status.success(), "{whole:?}");
-        assert_eq!(whole.stdout, b"1\n2\n7\n");
+        assert_eq!(whole.stdout, b"1\n2\n7\n1\n2\n3\n4\n8\n6\n");
         let project = Proj::new("scoped-client-units", &files, "main.align");
         let cache = project.cache();
         for warm in [false, true] {
             let built = thin_build(&project, &cache, 1);
             assert!(if warm { built.all_hit() } else { built.all_miss() });
-            assert_eq!(built.run(&project), "1\n2\n7\n");
+            assert_eq!(built.run(&project), "1\n2\n7\n1\n2\n3\n4\n8\n6\n");
         }
     });
 }
@@ -793,6 +806,10 @@ fn main() -> Result<(), Error> {
     cl := http.tls_client("https://localhost", saved, "", "", grow(other))?
     return Ok(())
 }"#;
+    let flag = source.replace("fn main()", "fn update(borrow mut owner: buffer) -> bool { owner.append(\"flag\"); return false }\nfn main()")
+        .replace("grow(other))?", "grow(other), update(input))?");
+    assert!(check_errs("scoped-flag-invalidates-earlier-view", &flag));
+    assert!(check_errs("scoped-flag-type", &source.replace("grow(other))?", "grow(other), 7)?")));
     assert!(!check_errs("scoped-independent", source));
     assert!(check_errs("scoped-stale-view", &source.replace("grow(other)", "grow(input)")));
     assert!(check_errs("scoped-wrong-arity", &source.replace(", grow(other)", "")));
@@ -834,6 +851,11 @@ fn main(args: array<str>) -> Result<(), Error> {
     request := http.request("GET", url)
     explicit := complete.request(request)?
     print(explicit.status())
+    resume := http.tls_client(url, args[3], "", "", "", true)?
+    first_full := resume.get(url)?
+    print(first_full.status())
+    second_socket := resume.get(url)?
+    print(second_socket.status())
     return Ok(())
 }"#;
         let built = build_exe("scoped-client-private-store", program);
@@ -848,13 +870,14 @@ with socket.socket() as listener:
     listener.listen()
     listener.settimeout(15)
     print(listener.getsockname()[1], flush=True)
-    for index in range(5):
+    for index in range(7):
         raw, _ = listener.accept()
         with raw:
             raw.settimeout(5)
             try:
                 with ctx.wrap_socket(raw, server_side=True) as sock:
                     if index >= 3: assert not sock.getpeercert()
+                    if index >= 5: assert sock.session_reused == (index == 6)
                     with sock.makefile('rb') as f:
                         method = f.readline().split()[0]
                         length = 0
@@ -881,7 +904,7 @@ with socket.socket() as listener:
             .output().unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(peer.wait().unwrap().success());
-        assert_eq!(output.stdout, b"200\n200\n200\n");
+        assert_eq!(output.stdout, b"200\n200\n200\n200\n200\n");
     });
 }
 

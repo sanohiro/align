@@ -22465,7 +22465,7 @@ fn scoped_tls_constructor_requires_five_dominating_views_and_client_output() -> 
     let whole = lower_program_checked(&original, false, None).map_err(|e| format!("{e:?}"))?;
     let selected = whole.fns.iter().filter(|f| f.name.as_str() == "make").map(|f| f.name.clone()).collect();
     assert!(crate::producer::validate_partition_resource_rvalues(&whole, &selected).is_ok());
-    for mode in 0..8 {
+    for mode in 0..9 {
         let mut h = original.clone();
         let expr = body_first_let_init_mut(&mut h, "make");
         let hir::ExprKind::HttpTlsClient { args } = &mut expr.kind else { return Err("expected TLS constructor".into()) };
@@ -22473,15 +22473,16 @@ fn scoped_tls_constructor_requires_five_dominating_views_and_client_output() -> 
             0 => { args.pop(); }
             1 => { args.push(args[0].clone()); }
             2..=6 => { args[mode - 2].ty = Ty::Bool; }
+            7 => args[5].ty = Ty::Str,
             _ => expr.ty = Ty::HttpClient,
         }
         assert!(lower_program_checked(&h, false, None).is_err(), "unused HIR {mode}");
     }
-    for mode in 0..11 {
+    for mode in 0..13 {
         let mut m = whole.clone();
         let f = m.fns.iter_mut().find(|f| f.name.as_str() == "make").ok_or("make")?;
-        let (result, views, out) = f.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
-            Stmt::Let(id, Rvalue::HttpTlsClient { views, out }) => Some((*id, views, out)), _ => None,
+        let (result, views, resume, out) = f.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
+            Stmt::Let(id, Rvalue::HttpTlsClient { views, resume, out }) => Some((*id, views, resume, out)), _ => None,
         }).ok_or("TLS operation")?;
         match mode {
             0 => { views.pop(); }
@@ -22490,6 +22491,8 @@ fn scoped_tls_constructor_requires_five_dominating_views_and_client_output() -> 
             7 => views[1] = Operand::Arg(1),
             8 => views[1] = Operand::Value(result),
             9 => *out = u32::MAX,
+            10 => *resume = Operand::Arg(1),
+            11 => *resume = Operand::Const(Const::Int(1, Ty::Bool)),
             _ => f.slots[*out as usize] = Ty::HttpRequest,
         }
         assert!(crate::producer::validate_mir_producers(&m).is_err(), "whole MIR {mode}");

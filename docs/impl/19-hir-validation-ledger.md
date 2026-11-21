@@ -1488,7 +1488,7 @@ merely because its `Ty` matches.
 | `HttpRespHeader` | `env[]; child[resp,name]`; `HttpResponse,Str; result Option<Str>; view inherits resp provenance; Pure`. |
 | `HttpRespBody` | `env[]; child[resp]`; `HttpResponse; result bytes; view inherits resp provenance; Pure`. |
 | `HttpClient` | `env[]; child[]; result HttpClient; new owned handle; Pure construction`. |
-| `HttpTlsClient` | Five ordered borrowed inputs, origin `Str` and four byte views. Impure, returns `ERR(HttpClient)` with fresh client state. |
+| `HttpTlsClient` | Five ordered borrowed inputs, origin `Str` and four byte views, followed by the `Bool` resumption flag (omission synthesizes false). Impure, returns `ERR(HttpClient)` with fresh client state. |
 | `HttpClientTimeout` | `env[]; child[client,ns]`; `LocalHandle(HttpClient,client),i64; result Unit; client native state mutated without source mut; Pure`. |
 | `HttpClientGet` | `env[]; child[client,url]`; `HttpClient,Str; result ERR(HttpResponse); borrowed client/url, fresh owned response; Impure`. |
 | `HttpClientPost` | `env[]; child[client,url,body]`; `HttpClient,Str,byte-view; result ERR(HttpResponse); operands borrowed, fresh owned response; Impure`. |
