@@ -406,6 +406,7 @@ fn install_static_descriptor_data(
             return_region: none_region.clone(),
             return_cleanup: no_cleanup,
             drop_state_effects,
+            mutable_view_effect: None,
             producer_certified: true,
         });
     };

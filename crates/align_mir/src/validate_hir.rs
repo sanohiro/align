@@ -1614,7 +1614,7 @@ impl<'a> PlacementValidator<'a> {
             Ty::Float(float) => valid_float(float.bits),
             Ty::Raw | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Rng => true,
             Ty::CodecBatch | Ty::CodecI64Column | Ty::CodecF64Column
-            | Ty::CodecBoolColumn | Ty::CodecStrColumn => true,
+            | Ty::Bitset | Ty::CodecBoolColumn | Ty::CodecStrColumn => true,
             Ty::Tuple(id) => self.program.tuples.get(id as usize).is_some_and(|tuple|
                 tuple.elems.len() >= 2 && tuple.elems.iter().all(|&element|
                     self.tuple_element_ok(element) && self.field_scalar_ok(element, allow_param))),
@@ -1876,6 +1876,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
+            | Scalar::Bitset
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
@@ -1950,6 +1951,7 @@ impl<'a> PlacementValidator<'a> {
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
+            | Scalar::Bitset
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
@@ -2076,6 +2078,7 @@ impl<'a> PlacementValidator<'a> {
             | Ty::CodecI64Column
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
+            | Ty::Bitset
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
             | Ty::FsDirectory
@@ -2212,7 +2215,7 @@ impl<'a> PlacementValidator<'a> {
             return false;
         }
         match payload {
-            Scalar::Raw | Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Str => false,
+            Scalar::Raw | Scalar::Struct(_) | Scalar::Tuple(_) | Scalar::Enum(_) | Scalar::Str | Scalar::Bitset => false,
             Scalar::Tagged(id) => !align_sema::drop_plan(
                 Ty::Tagged(id),
                 &self.program.structs, &self.program.tuples,
@@ -2578,6 +2581,7 @@ impl<'a> Validator<'a> {
             | Ty::CodecI64Column
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
+            | Ty::Bitset
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
             | Ty::FsDirectory
@@ -2655,6 +2659,7 @@ impl<'a> Validator<'a> {
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
+            | Scalar::Bitset
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
@@ -3678,6 +3683,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CodecI64Column
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
+            | Ty::Bitset
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
             | Ty::FsDirectory
@@ -4003,6 +4009,7 @@ impl<'a> BodyValidator<'a> {
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
             | Scalar::CodecBoolColumn
+            | Scalar::Bitset
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
             | Scalar::FsDirectory
@@ -4082,7 +4089,7 @@ impl<'a> BodyValidator<'a> {
             owned if align_sema::fixed_owned_header_scalar(owned).is_some() => true,
             Ty::Struct(id) => self.program.structs.get(id as usize).is_some(),
             Ty::Fn(id) => self.program.fn_types.get(id as usize).is_some(),
-            Ty::Raw | Ty::Slice(_) => false,
+            Ty::Raw | Ty::Bitset | Ty::Slice(_) => false,
             Ty::Enum(id) => {
                 self.program.enums.get(id as usize).is_some()
                     && !align_sema::enum_is_move(
@@ -4108,7 +4115,7 @@ impl<'a> BodyValidator<'a> {
         let mut structs = HashSet::new();
         while let Some(ty) = work.pop() {
             match ty {
-                Ty::Slice(_) => return true,
+                Ty::Slice(_) | Ty::Bitset => return true,
                 Ty::Option(payload) => work.push(align_sema::scalar_to_ty(payload)),
                 Ty::Result(ok, err) => {
                     work.push(align_sema::scalar_to_ty(err));
@@ -4818,6 +4825,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::BuilderBytes { .. }
             | hir::ExprKind::StrBytes { .. }
             | hir::ExprKind::BytesView { .. }
+            | hir::ExprKind::BitsetReduce { .. }
             | hir::ExprKind::SliceAsBytes { .. }
             | hir::ExprKind::BufferLen { .. } | hir::ExprKind::BufferCapacity { .. } | hir::ExprKind::BuilderLen { .. } | hir::ExprKind::ArrayBuilderLen { .. }
             | hir::ExprKind::BytesRead { .. }
@@ -5146,6 +5154,7 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::EncodingDecode { kind, .. } => !matches!(kind, hir::EncodingKind::Utf8Lossy | hir::EncodingKind::Html | hir::EncodingKind::PercentPath),
             hir::ExprKind::BytesRead { .. }
             | hir::ExprKind::BytesView { .. }
+            | hir::ExprKind::BitsetReduce { .. }
             | hir::ExprKind::SliceAsBytes { .. }
             | hir::ExprKind::BytesSet { .. }
             | hir::ExprKind::BytesFill { .. }
@@ -7258,7 +7267,7 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::BorrowedIndex { index, .. } => {
                 push_expr!(index, context.clone());
             }
-            hir::ExprKind::SliceRange { recv, start, end } => {
+            hir::ExprKind::SliceRange { recv, start, end, .. } => {
                 if let Some(end) = end {
                     push_expr!(end, context.clone());
                 }
@@ -9544,6 +9553,9 @@ impl<'a> BodyValidator<'a> {
                 }
                 strict(Ty::Option(Scalar::Slice(primitive)), &[bytes])
             }
+            hir::ExprKind::BitsetReduce { view, op } => {
+                (view.ty == Ty::Bitset).then(|| strict(if *op == hir::BitsetReduction::Count { i64 } else { Ty::Bool }, &[view]))?
+            }
             hir::ExprKind::SliceAsBytes { slice, elem } => {
                 if !align_sema::checked_byte_view_element(*elem) {
                     return None;
@@ -10628,6 +10640,7 @@ impl<'a> BodyValidator<'a> {
             | Ty::CodecI64Column
             | Ty::CodecF64Column
             | Ty::CodecBoolColumn
+            | Ty::Bitset
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
             | Ty::FsDirectory
@@ -11353,6 +11366,7 @@ impl<'a> BodyValidator<'a> {
                         | Ty::StructArray(..)
                         | Ty::Str
                         | Ty::String
+                        | Ty::Bitset
                         | Ty::Slice(_)
                         | Ty::DynArray(_)
                         | Ty::DynVecArray(..)
@@ -11379,6 +11393,7 @@ impl<'a> BodyValidator<'a> {
                 // Exactly one ordinary index changes its logical type: an owned string-array
                 // element is viewed as `str` while the array retains ownership of the `string`.
                 let physical_result = match receiver.ty {
+                    Ty::Bitset => Ty::Bool,
                     ty if ty.is_array_builder() => {
                         if !matches!(recv.kind, hir::ExprKind::Local(_)) {
                             return None;
@@ -11466,7 +11481,7 @@ impl<'a> BodyValidator<'a> {
                 let (falls, breaks) = strict_flow(&[index_flow]);
                 Some((element_ty, falls, breaks))
             }
-            hir::ExprKind::SliceRange { recv, start, end } => {
+            hir::ExprKind::SliceRange { kind, recv, start, end } => {
                 let receiver = self.expr_flow(recv)?;
                 let start_flow = match start.as_deref() {
                     Some(expr) => Some(self.expr_flow(expr)?),
@@ -11494,6 +11509,11 @@ impl<'a> BodyValidator<'a> {
                     _ => None,
                 };
                 let result = match receiver.ty {
+                    _ if *kind == hir::RangeKind::PackedBits => {
+                        if start.is_some() || end.is_none() || receiver.ty != Ty::Slice(Scalar::Int(align_sema::IntTy { bits: 8, signed: false })) { return None; }
+                        Ty::Bitset
+                    }
+                    Ty::Bitset => Ty::Bitset,
                     Ty::Str | Ty::String => Ty::Str,
                     _ => {
                         let scalar = sliced_element?;
@@ -14786,6 +14806,7 @@ fn is_argv_ty(ty: Ty) -> bool {
 
 fn index_element_ty(ty: Ty) -> Option<Ty> {
     match ty {
+        Ty::Bitset => Some(Ty::Bool),
         Ty::Array(element, _) | Ty::DynArray(element) | Ty::Slice(element) => {
             Some(align_sema::scalar_to_ty(element))
         }

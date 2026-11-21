@@ -11588,6 +11588,7 @@ fn hir_body_validator_pipeline_array_views() {
         "array_view_range",
         body_test_expr(
             hir::ExprKind::SliceRange {
+                kind: hir::RangeKind::Window,
                 recv: Box::new(body_test_expr(hir::ExprKind::Local(0), dyn_int)),
                 start: Some(Box::new(body_test_expr(hir::ExprKind::Int(0), integer))),
                 end: Some(Box::new(body_test_expr(hir::ExprKind::Int(1), integer))),
@@ -13117,8 +13118,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // HttpCtxView adds headerless Copy request observation with exact owner provenance.
         // CompressStream authenticates two handle places, a numeric operand and optional dictionary.
         // SocketLocalAddr reads one bound socket and returns an owned qualified record.
+        // BitsetReduce carries one borrowed view and an explicit cardinality operation.
         variants,
-        369,
+        370,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -17605,6 +17607,7 @@ const fn delegation_scalar_sweep_tripwire(scalar: &Scalar) {
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
         | Scalar::CodecBoolColumn
+        | Scalar::Bitset
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
@@ -22518,4 +22521,24 @@ fn scoped_tls_constructor_requires_five_dominating_views_and_client_output() -> 
         assert!(crate::producer::validate_partition_resource_rvalues(&malformed, &selected).is_err());
     }
     Ok(())
+}
+
+#[test]
+fn bitset_constructor_checks_its_source_bounds_and_result_independently() {
+    let good = checked_source_program("import core.bitset\nfn form(data:slice<u8>)->bitset = bitset.view(data,8)\nfn main(){}\n");
+    for mutation in 0..5 {
+        let mut bad = good.clone();
+        let expression = body_value_expression_mut(&mut bad, "form");
+        let hir::ExprKind::SliceRange { kind, recv, start, end } = &mut expression.kind else {
+            panic!("expected a checked view")
+        };
+        match mutation {
+            0 => *kind = hir::RangeKind::Window,
+            1 => *start = end.clone(),
+            2 => *end = None,
+            3 => recv.ty = Ty::Bitset,
+            _ => expression.ty = Ty::Bool,
+        }
+        assert_body_entrypoints_empty("malformed packed-bit constructor", &bad);
+    }
 }

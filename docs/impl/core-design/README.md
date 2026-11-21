@@ -22,6 +22,7 @@ implementation change does not require restating that contract.
 - [soa-groupby.md](soa-groupby.md) — `soa<T>`, column ops, `group_by` aggregates, `.agg(...)`, `dict_encode`
 - [vec-mask.md](vec-mask.md) — `vecN<T>` / `maskN<T>`, lane ops, `load`/`store`, `select`/`dot`/`fma`/`sum_where`, `align(N)`
 - [arena-heap.md](arena-heap.md) — `arena {}` and `heap.new` / `box`: regions, escape, drop
+- [bitset.md](bitset.md) — borrowed packed bits, indexing, windows, and cardinality
 - [hash.md](hash.md) — `core.hash` (`hash64`/`hash128`): status and design
 - [test.md](test.md) — implemented `core.test` declarations, assertions, isolated runner protocol, and terse-output policy
 - [codec.md](codec.md) — implemented `core.codec` canonical columnar batch envelope, zero-copy views, and encoder

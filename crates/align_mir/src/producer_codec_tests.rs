@@ -215,6 +215,7 @@ fn imported(mut program: Program) -> Result<Program, Box<dyn std::error::Error>>
             .get(&function.name)
             .cloned()
             .ok_or("drop state")?,
+        mutable_view_effect: None,
         producer_certified: true,
     });
     Ok(program)

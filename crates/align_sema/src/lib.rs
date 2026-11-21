@@ -200,6 +200,8 @@ pub enum Scalar {
     /// `slice<numeric>` is not `tracks_region` (numeric slices stay freely returnable), so the
     /// arena binding of a `bytes` view is enforced through `region_of` + `region_bearing`.
     Slice(PrimScalar),
+    /// Borrowed packed-bit descriptor, carried in aggregates without ownership.
+    Bitset,
     /// A sum-type payload (the enum's id) — a Copy tagged struct, like [`Scalar::Struct`]. Lets
     /// `Option`/`Result` carry an enum, notably `Result<T, MyError>` (4b). Non-recursive (just the
     /// id), so `Scalar` stays `Copy`.
@@ -585,6 +587,8 @@ pub enum Ty {
     DynStructArray(u32, Layout),
     /// `slice<T>` — a borrowed view `{ T* ptr, i64 len }` of scalar elements. Copy. M4.
     Slice(Scalar),
+    /// Borrowed LSB-first bits with an arbitrary logical head and length.
+    Bitset,
     /// `soa<Struct>` — a struct-of-arrays **view**: one contiguous column per field, all in a
     /// single column-major buffer addressed as `{ ptr, i64 len }` (same ABI as a slice). Copy and
     /// borrowed (M6 first cut — primitive-scalar fields only, no ownership/drop). A field
@@ -978,6 +982,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Ty::CodecBatch
         | Ty::CodecI64Column
         | Ty::CodecF64Column
+        | Ty::Bitset
         | Ty::CodecBoolColumn
         | Ty::CodecStrColumn
         | Ty::CryptoDigest
@@ -1057,6 +1062,7 @@ const fn variant_sweep_tripwire(ty: &Ty, scalar: &Scalar) {
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
+        | Scalar::Bitset
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
@@ -1131,6 +1137,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
         Ty::CodecBatch => Some(Scalar::CodecBatch),
         Ty::CodecI64Column => Some(Scalar::CodecI64Column),
         Ty::CodecF64Column => Some(Scalar::CodecF64Column),
+        Ty::Bitset => Some(Scalar::Bitset),
         Ty::CodecBoolColumn => Some(Scalar::CodecBoolColumn),
         Ty::CodecStrColumn => Some(Scalar::CodecStrColumn),
         Ty::CodecEncoder => Some(Scalar::CodecEncoder),
@@ -1209,7 +1216,7 @@ pub fn ty_to_scalar(ty: Ty) -> Option<Scalar> {
 /// aggregate-return ABI is admitted by accident.
 pub fn fn_value_ret_ok(ty: Ty) -> bool {
     ty != Ty::RunBytes
-        && (fn_sig_scalar(ty).is_some_and(|scalar| !matches!(scalar, Scalar::Slice(_)))
+        && (fn_sig_scalar(ty).is_some_and(|scalar| !matches!(scalar, Scalar::Slice(_) | Scalar::Bitset))
             || matches!(ty, Ty::Result(..)))
 }
 
@@ -1286,6 +1293,7 @@ pub fn scalar_to_ty(s: Scalar) -> Ty {
         Scalar::CodecBatch => Ty::CodecBatch,
         Scalar::CodecI64Column => Ty::CodecI64Column,
         Scalar::CodecF64Column => Ty::CodecF64Column,
+        Scalar::Bitset => Ty::Bitset,
         Scalar::CodecBoolColumn => Ty::CodecBoolColumn,
         Scalar::CodecStrColumn => Ty::CodecStrColumn,
         Scalar::CodecEncoder => Ty::CodecEncoder,
@@ -1640,6 +1648,9 @@ fn indexed_backing_compatible(
         _ => {
             let destination = expand_tagged_ty(destination, tagged_types);
             let source = expand_tagged_ty(source, tagged_types);
+            if destination == Ty::Bitset {
+                return source == Ty::Bitset || contiguous_indexed_element(source, tagged_types).is_some_and(|s| checked_byte_view_element(s) || s == Scalar::Int(IntTy { bits: 8, signed: false }));
+            }
             matches!(
                 (destination, source),
                 (Ty::Soa(left), Ty::Soa(right)) if left == right
@@ -1664,6 +1675,7 @@ fn mutable_replacement_backing_compatible(
     let destination = expand_tagged_ty(destination, tagged_types);
     let source = expand_tagged_ty(source, tagged_types);
     match destination {
+        Ty::Bitset => indexed_backing_compatible(destination, source, tagged_types),
         Ty::Slice(element) => contiguous_indexed_element(source, tagged_types) == Some(element),
         Ty::DynArray(element) => matches!(source, Ty::DynArray(other) if other == element),
         Ty::DynStructArray(id, layout) => {
@@ -1739,7 +1751,7 @@ pub fn borrowed_sum_payload_is_admissible(
     ) -> bool {
         match ty {
             Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit | Ty::Str | Ty::String
-            | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember
+            | Ty::Bitset | Ty::Slice(_) | Ty::Raw | Ty::Rng | Ty::Buffer | Ty::Writer | Ty::ProcessMember
             | Ty::ProcessUserNamespace | Ty::FsDirectory | Ty::FsDirCursor | Ty::Command => true,
             // `resource_ref<R>` is a Copy view tied to the owner generation, admitted like `str`:
             // a read through the projection copies the reference while its provenance stays on
@@ -1926,7 +1938,7 @@ fn par_map_kernel_input_value(
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
 ) -> bool {
-    par_map_kernel_value(ty, structs, tuples, enums, tagged_types) || matches!(ty, Ty::Slice(_))
+    par_map_kernel_value(ty, structs, tuples, enums, tagged_types) || matches!(ty, Ty::Bitset | Ty::Slice(_))
 }
 
 pub fn par_map_staged_parallelizable(
@@ -2906,7 +2918,7 @@ fn ty_mentions_slice(
     let mut visited_tagged = HashSet::new();
     while let Some(ty) = work.pop() {
         match ty {
-            Ty::Slice(_) => return true,
+            Ty::Slice(_) | Ty::Bitset => return true,
             Ty::Tagged(id) if visited_tagged.insert(id) => {
                 if let Some(tagged) = tagged_types.get(id as usize) {
                     match *tagged {
@@ -3265,6 +3277,7 @@ pub fn ty_contains_leaf(
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
@@ -3341,6 +3354,7 @@ pub fn ty_may_borrow(
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::Soa(_)
@@ -3649,6 +3663,7 @@ fn ty_contains_http_upgrade(
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
@@ -3772,6 +3787,7 @@ fn ty_contains_http_receive_stream(
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
+            | Scalar::Bitset
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
@@ -3913,6 +3929,7 @@ fn ty_contains_http_receive_stream(
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
@@ -4002,6 +4019,7 @@ pub fn http_stream_carrier_class(
             | Scalar::CodecBatch
             | Scalar::CodecI64Column
             | Scalar::CodecF64Column
+            | Scalar::Bitset
             | Scalar::CodecBoolColumn
             | Scalar::CodecStrColumn
             | Scalar::CryptoDigest
@@ -4142,6 +4160,7 @@ pub fn http_stream_carrier_class(
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
@@ -5351,6 +5370,7 @@ pub const BUILTIN_SPELLING_TYS: &[(&str, Ty)] = &[
     ("region", Ty::ArenaHandle),
     ("rng", Ty::Rng),
     ("str", Ty::Str),
+    ("bitset", Ty::Bitset),
     ("string", Ty::String),
     ("builder", Ty::Builder),
     ("json.doc", Ty::JsonDoc),
@@ -9495,11 +9515,9 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                 ast::Item::Fn(_) | ast::Item::Test(_)
                 | ast::Item::Const(_) | ast::Item::Extern(_) => continue,
             };
-            if m.is_entry && builtin_nominal_alias_by_bare(bare).is_some() {
+            if bare == "bitset" || (m.is_entry && builtin_nominal_alias_by_bare(bare).is_some()) {
                 diags.error(
-                    format!(
-                        "'{bare}' collides with a compiler-provided builtin type in the unmangled entry namespace"
-                    ),
+                    if bare == "bitset" { "'bitset' is a reserved builtin type".to_owned() } else { format!("'{bare}' collides with a compiler-provided builtin type in the unmangled entry namespace") },
                     span,
                 );
             }
@@ -10364,6 +10382,7 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
                     Ty::CodecBatch => payload.push(Scalar::CodecBatch),
                     Ty::CodecI64Column => payload.push(Scalar::CodecI64Column),
                     Ty::CodecF64Column => payload.push(Scalar::CodecF64Column),
+                    Ty::Bitset => payload.push(Scalar::Bitset),
                     Ty::CodecBoolColumn => payload.push(Scalar::CodecBoolColumn),
                     Ty::CodecStrColumn => payload.push(Scalar::CodecStrColumn),
                     Ty::CodecEncoder => payload.push(Scalar::CodecEncoder),
@@ -16207,7 +16226,7 @@ impl EffectScan<'_> {
         if self
             .locals
             .get(local as usize)
-            .is_some_and(|local| matches!(local.ty, Ty::Slice(_) | Ty::Soa(_)))
+            .is_some_and(|local| matches!(local.ty, Ty::Bitset | Ty::Slice(_) | Ty::Soa(_)))
         {
             self.impure_direct = true;
         }
@@ -17686,6 +17705,7 @@ impl EffectScan<'_> {
             // a field read.
             ExprKind::StrBytes { inner } => walk!(inner),
             ExprKind::BytesView { bytes, .. } => walk!(bytes),
+            ExprKind::BitsetReduce { view, .. } => walk!(view),
             ExprKind::SliceAsBytes { slice, .. } => walk!(slice),
             ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => walk!(buffer),
             // Binary decode/encode (A2) are pure in-memory reads/growth (no I/O — a buffer `put`
@@ -18631,7 +18651,7 @@ impl EffectScan<'_> {
                 walk!(index);
             }
             ExprKind::BorrowedIndex { index, .. } => walk!(index),
-            ExprKind::SliceRange { recv, start, end } => {
+            ExprKind::SliceRange { recv, start, end, .. } => {
                 walk!(recv);
                 if let Some(s) = start { walk!(s); }
                 if let Some(e) = end { walk!(e); }
@@ -20853,6 +20873,7 @@ impl<'a> EscapeCheck<'a> {
                 | Ty::StructArray(..)
                 | Ty::DynArray(..)
                 | Ty::DynStructArray(..)
+                | Ty::Bitset
                 | Ty::Slice(..)
                 | Ty::Soa(..)
                 | Ty::SoaParam(..)
@@ -20869,7 +20890,7 @@ impl<'a> EscapeCheck<'a> {
             return false;
         }
         result == source
-            || (matches!(result, Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
+            || (matches!(result, Ty::Bitset | Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
                 && indexed_backing_compatible(result, source, self.tagged_types))
     }
 
@@ -20911,7 +20932,7 @@ impl<'a> EscapeCheck<'a> {
             .unwrap_or(ast::ParamMode::ByValue);
         let caller_storage = matches!(
             expand_tagged_ty(ty, self.tagged_types),
-            Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+            Ty::Bitset | Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
         )
             || matches!(
                 mode,
@@ -20949,7 +20970,7 @@ impl<'a> EscapeCheck<'a> {
             };
             let caller_backed = matches!(
                 expand_tagged_ty(ty, self.tagged_types),
-                Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+                Ty::Bitset | Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
             ) || matches!(
                 mode,
                 ast::ParamMode::Borrow | ast::ParamMode::BorrowMut | ast::ParamMode::Out
@@ -21930,6 +21951,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
@@ -24041,6 +24063,7 @@ impl<'a> EscapeCheck<'a> {
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn => return true,
             // A `http_headers` view borrows the request context's parsed buffer, so it is
@@ -26348,6 +26371,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::RawNull
+            | ExprKind::BitsetReduce { .. }
             | ExprKind::SqliteCallbackDescriptor { .. } => values.push(Region::Static),
                     }
                 }
@@ -26600,6 +26624,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::StrBorrow(..)
             | ExprKind::StrBytes { .. }
             | ExprKind::BytesView { .. }
+            | ExprKind::BitsetReduce { .. }
             | ExprKind::SliceAsBytes { .. }
             | ExprKind::BuilderNew { .. }
             | ExprKind::BuilderWrite { .. }
@@ -27767,7 +27792,7 @@ impl<'a> EscapeCheck<'a> {
 
         let expanded = expand_tagged_ty(ty, self.tagged_types);
         let backing = match expanded {
-            Ty::Slice(..) => self.backing_storage_of_expr(value, depth),
+            Ty::Bitset | Ty::Slice(..) => self.backing_storage_of_expr(value, depth),
             Ty::Array(..) | Ty::StructArray(..) => {
                 EscapeBackingStorage::known(self.mutable_root_storage_region(local, depth))
                     .rooted(local)
@@ -30052,7 +30077,7 @@ impl<'a> EscapeCheck<'a> {
             ExprKind::OptionSome(i) | ExprKind::ResultOk(i) | ExprKind::ResultErr(i)
             | ExprKind::HeapNew(i) | ExprKind::RawAlloc(i) | ExprKind::RawTryAlloc(i) | ExprKind::RawFree(i)
             | ExprKind::RawIsNull(i) | ExprKind::BoxGet(i)
-            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BytesView { bytes: i, .. } | ExprKind::SliceAsBytes { slice: i, .. } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
+            | ExprKind::BoxClone(i) | ExprKind::StrClone(i) | ExprKind::StrBorrow(i) | ExprKind::StrBytes { inner: i } | ExprKind::BytesView { bytes: i, .. } | ExprKind::BitsetReduce { view: i, .. } | ExprKind::SliceAsBytes { slice: i, .. } | ExprKind::BuilderToString(i) | ExprKind::ArrayToSoa { source: i, .. } | ExprKind::ArrayToSlice(i)
             | ExprKind::Len(i) => self.walk(i, depth),
             ExprKind::CloneIn { value, region } => {
                 self.walk(value, depth);
@@ -30123,7 +30148,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(offset, depth);
                 self.walk(value, depth);
             }
-            ExprKind::SliceRange { recv, start, end } => {
+            ExprKind::SliceRange { recv, start, end, .. } => {
                 self.walk(recv, depth);
                 if let Some(s) = start { self.walk(s, depth); }
                 if let Some(e) = end { self.walk(e, depth); }
@@ -32518,7 +32543,7 @@ fn storage_type_paths(root: Ty, context: StorageTypeContext<'_>) -> StorageTypeP
                     Ty::DynArray(_) | Ty::DynStructArray(_, Layout::Aos) => {
                         Some(StorageHeaderKind::OwnedDynamic)
                     }
-                    Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_) => Some(StorageHeaderKind::View),
+                    Ty::Bitset | Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_) => Some(StorageHeaderKind::View),
                     Ty::XmlReader => Some(StorageHeaderKind::OwnedOpaque),
                     _ => None,
                 };
@@ -33170,7 +33195,8 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CodecColumnAt { .. }
         | ExprKind::StrBytes { .. }
         | ExprKind::BytesView { .. }
-        | ExprKind::SliceAsBytes { .. }
+        | ExprKind::BitsetReduce { .. }
+            | ExprKind::SliceAsBytes { .. }
         | ExprKind::RunBytesStdout { .. }
         | ExprKind::RunBytesStderr { .. }
         | ExprKind::HttpRespBody { .. }
@@ -37011,6 +37037,7 @@ impl<'a> MoveCheck<'a> {
                 | Ty::StructArray(..)
                 | Ty::DynArray(..)
                 | Ty::DynStructArray(..)
+                | Ty::Bitset
                 | Ty::Slice(..)
                 | Ty::Soa(..)
                 | Ty::SoaParam(..)
@@ -37061,6 +37088,7 @@ impl<'a> MoveCheck<'a> {
                 | Ty::StructArray(..)
                 | Ty::DynArray(..)
                 | Ty::DynStructArray(..)
+                | Ty::Bitset
                 | Ty::Slice(..)
                 | Ty::Soa(..)
                 | Ty::SoaParam(..) => true,
@@ -37231,14 +37259,14 @@ impl<'a> MoveCheck<'a> {
     fn mutable_view_ty(&self, ty: Ty) -> bool {
         matches!(
             expand_tagged_ty(ty, self.tagged_types),
-            Ty::Slice(..)
+            Ty::Bitset | Ty::Slice(..)
         )
     }
 
     fn caller_backed_view_ty(&self, ty: Ty) -> bool {
         matches!(
             expand_tagged_ty(ty, self.tagged_types),
-            Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+            Ty::Bitset | Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
         )
     }
 
@@ -37625,7 +37653,7 @@ impl<'a> MoveCheck<'a> {
             };
             if matches!(
                 expand_tagged_ty(result, self.tagged_types),
-                Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
+                Ty::Bitset | Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..)
             ) && indexed_backing_compatible(result, argument.ty, self.tagged_types)
             {
                 roots.extend(completion.backing.roots.iter().cloned());
@@ -37647,7 +37675,7 @@ impl<'a> MoveCheck<'a> {
             return false;
         }
         result == source
-            || (matches!(result, Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
+            || (matches!(result, Ty::Bitset | Ty::Slice(..) | Ty::Soa(..) | Ty::SoaParam(..))
                 && indexed_backing_compatible(result, source, self.tagged_types))
     }
 
@@ -38328,7 +38356,7 @@ impl<'a> MoveCheck<'a> {
                 && args.get(*index).is_some_and(|argument| {
                     matches!(
                         expand_tagged_ty(argument.ty, self.tagged_types),
-                        Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
+                        Ty::Bitset | Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
                     )
                 });
             if proved_view_change {
@@ -38788,7 +38816,7 @@ impl<'a> MoveCheck<'a> {
         }
         if !matches!(
             expand_tagged_ty(ty, self.tagged_types),
-            Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
+            Ty::Bitset | Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
         ) {
             return false;
         }
@@ -38941,7 +38969,7 @@ impl<'a> MoveCheck<'a> {
     ) -> Option<MutablePlaceSnapshot> {
         if !matches!(
             expand_tagged_ty(base.array_ty, self.tagged_types),
-            Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
+            Ty::Bitset | Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_)
         ) {
             return None;
         }
@@ -40031,7 +40059,7 @@ impl<'a> MoveCheck<'a> {
         {
             // A byte/string view observes the selected allocation, not view origins retained
             // in its element contents. Owned copies and numeric SoA columns stay writable.
-            let readonly = matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_))
+            let readonly = matches!(expand_tagged_ty(e.ty, self.tagged_types), Ty::Bitset | Ty::Slice(_) | Ty::Soa(_) | Ty::SoaParam(_))
                 && self.readonly_view_backing(e.ty, &self.completed_headers(e), &self.borrow_fact(e));
             roots.remove(&BorrowRoot::ReadOnly);
             if readonly {
@@ -43824,6 +43852,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::RegexCaptures { .. } | ExprKind::RegexGroupCount { .. }
             | ExprKind::RegexGroupIndex { .. } | ExprKind::CapturesGroup { .. }
             | ExprKind::RawNull
+            | ExprKind::BitsetReduce { .. }
             | ExprKind::SqliteCallbackDescriptor { .. } => {
                 debug_assert!(
                     !ty_may_borrow(e.ty, self.structs, self.tuples, self.enums, self.tagged_types),
@@ -50489,6 +50518,7 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::StrBytes { inner } => move_expr!(self, inner, moved, false, false),
             ExprKind::BytesView { bytes, .. } => move_expr!(self, bytes, moved, false, false),
+            ExprKind::BitsetReduce { view, .. } => move_expr!(self, view, moved, false, false),
             ExprKind::SliceAsBytes { slice, .. } => move_expr!(self, slice, moved, false, false),
             ExprKind::BufferBytes { buffer } | ExprKind::BuilderBytes { builder: buffer } | ExprKind::BufferLen { buffer } | ExprKind::BufferCapacity { buffer } | ExprKind::BuilderLen { builder: buffer } | ExprKind::ArrayBuilderLen { builder: buffer } => move_expr!(self, buffer, moved, false, false),
             // Binary decode/encode (A2): every operand is borrowed (a read, or a buffer grown in
@@ -50755,7 +50785,7 @@ impl<'a> MoveCheck<'a> {
                 self.borrows.finish_value_source(reservation);
             }
             // A range slice borrows the receiver (a view, never consumed) and reads the bounds.
-            ExprKind::SliceRange { recv, start, end } => {
+            ExprKind::SliceRange { recv, start, end, .. } => {
                 move_expr!(self, recv, moved, false, false);
                 if let Some(s) = start { move_expr!(self, s, moved, false, false); }
                 if let Some(e) = end { move_expr!(self, e, moved, false, false); }
@@ -52976,7 +53006,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                     // Record slice provenance (`s: slice<T> := a` → `s` borrows `a`'s buffer) so
                     // the `out` no-alias check can see through slice variables.
-                    if matches!(local_ty, Ty::Slice(_))
+                    if matches!(local_ty, Ty::Bitset | Ty::Slice(_))
                         && let Some(root) = self.expr_root_local(&init) {
                             self.slice_bases.insert(local, root);
                         }
@@ -53726,6 +53756,7 @@ impl<'a, 't> Checker<'a, 't> {
                 return Place::Elem { base: id, index: i, struct_id: sid, soa };
             }
             let elem = match local_ty {
+                Ty::Bitset => Ty::Bool,
                 Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => scalar_to_ty(s),
                 Ty::Error => return Place::Err,
                 other => {
@@ -54858,7 +54889,7 @@ impl<'a, 't> Checker<'a, 't> {
     /// emission must be re-gated (its callers would no longer be provably checked).
     fn slice_root_is_known(&self, root: LocalId) -> bool {
         let l = &self.locals[root as usize];
-        l.is_param || !matches!(self.resolve(l.ty), Ty::Slice(_))
+        l.is_param || !matches!(self.resolve(l.ty), Ty::Bitset | Ty::Slice(_))
     }
 
     /// The root buffer local an HIR expression borrows, if it resolves to one (a local or an
@@ -56612,7 +56643,7 @@ impl<'a, 't> Checker<'a, 't> {
                     continue;
                 }
                 // Only a slice-typed parameter can share storage with the `out` buffer.
-                if !matches!(param_tys.get(j).map(|t| self.resolve(*t)), Some(Ty::Slice(_))) {
+                if !matches!(param_tys.get(j).map(|t| self.resolve(*t)), Some(Ty::Bitset | Ty::Slice(_))) {
                     continue;
                 }
                 // A fresh array literal is disjoint stack storage.
@@ -57786,6 +57817,20 @@ impl<'a, 't> Checker<'a, 't> {
                 self.require_import("std.xml", "xml.parse", span);
                 return self.check_xml_parse(args, span);
             }
+            if module == "bitset" && method == "view" {
+                self.require_import("core.bitset", "bitset.view", span);
+                let [storage, count] = args else {
+                    self.diags.error("bitset.view requires a byte slice and a logical bit count", span);
+                    return err;
+                };
+                let bytes = Scalar::Int(IntTy { bits: 8, signed: false });
+                let recv = self.check_slice_init(storage, bytes);
+                let end = self.check_expr(count, Some(Ty::Int(IntTy { bits: 64, signed: true })));
+                return Expr {
+                    kind: ExprKind::SliceRange { kind: hir::RangeKind::PackedBits, recv: Box::new(recv), start: None, end: Some(Box::new(end)) },
+                    ty: Ty::Bitset, span,
+                };
+            }
             if module == "codec" && matches!(method, "open" | "encoder") {
                 self.require_import("core.codec", &format!("codec.{method}"), span);
                 return self.check_codec_constructor(method, args, span);
@@ -58275,6 +58320,15 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if method == "count" {
             return self.check_array_count(recv, args, span);
+        }
+        if (method == "any" || method == "all") && args.is_empty() {
+            let view = self.check_expr(recv, None);
+            if view.ty != Ty::Bitset {
+                self.diags.error(format!("'{method}' requires a predicate on an array or a bitset receiver"), span);
+                return err;
+            }
+            let op = if method == "any" { hir::BitsetReduction::Any } else { hir::BitsetReduction::All };
+            return Expr { kind: ExprKind::BitsetReduce { view: Box::new(view), op }, ty: Ty::Bool, span };
         }
         if method == "any" || method == "all" {
             return self.check_array_any_all(recv, args, method == "all", span);
@@ -62735,11 +62789,15 @@ impl<'a, 't> Checker<'a, 't> {
     /// checked source, its stages, and the final element type. `elem_expected_no_stages`
     /// is the element type to push into an inline literal when there are no stages.
     fn check_pipeline(&mut self, recv: &ast::Expr, elem_expected_no_stages: Option<Ty>, span: Span) -> Option<(Expr, Vec<Stage>, Ty)> {
+        self.check_pipeline_source(recv, elem_expected_no_stages, span, false)
+    }
+
+    fn check_pipeline_source(&mut self, recv: &ast::Expr, elem_expected_no_stages: Option<Ty>, span: Span, count_bits: bool) -> Option<(Expr, Vec<Stage>, Ty)> {
         // A field whose value is itself a fixed array is the pipeline source place, not a
         // projection stage over the containing record. Resolve that stable place before the
         // syntax-only collector interprets `.field` as an element projection.
         let fixed_field_source = self.resolve_place(recv).filter(|(_, path, ty)| {
-            !path.is_empty() && matches!(ty, Ty::Array(..) | Ty::StructArray(..))
+            !path.is_empty() && (matches!(ty, Ty::Array(..) | Ty::StructArray(..)) || (count_bits && *ty == Ty::Bitset))
         });
         let (source_ast, raw_stages) = if fixed_field_source.is_some() {
             (recv, Vec::new())
@@ -62775,6 +62833,9 @@ impl<'a, 't> Checker<'a, 't> {
                 _ => self.check_expr(source_ast, None),
             }
         };
+        if count_bits && source.ty == Ty::Bitset && raw_stages.is_empty() {
+            return Some((source, Vec::new(), Ty::Bool));
+        }
         let mut elem = match source.ty {
             Ty::Tuple(_) if matches!(source.kind, ExprKind::ArrayZip { .. }) => source.ty,
             Ty::Array(s, _) | Ty::Slice(s) | Ty::DynArray(s) => scalar_to_ty(s),
@@ -63494,7 +63555,7 @@ impl<'a, 't> Checker<'a, 't> {
         // `count` is a streaming reducer — it may fold a `json.scanner<Row>` source (J5).
         let prev_scan = self.scan_terminal;
         self.scan_terminal = true;
-        let piped = self.check_pipeline(recv, None, span);
+        let piped = self.check_pipeline_source(recv, None, span, true);
         self.scan_terminal = prev_scan;
         let Some((source, stages, _elem)) = piped else {
             return err;
@@ -63502,6 +63563,9 @@ impl<'a, 't> Checker<'a, 't> {
         // A `json.scanner<Row>` count is `Result<i64, Error>` — a malformed row surfaces as `Err`
         // (streaming; unwrap with `?`), unlike an in-memory array's bare `i64`.
         let count_ty = Ty::Int(IntTy { bits: 64, signed: true });
+        if source.ty == Ty::Bitset {
+            return Expr { kind: ExprKind::BitsetReduce { view: Box::new(source), op: hir::BitsetReduction::Count }, ty: count_ty, span };
+        }
         if matches!(source.ty, Ty::JsonScanner(_)) {
             return Expr {
                 kind: ExprKind::ArrayCount { source: Box::new(source), stages },
@@ -63555,7 +63619,7 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
             _ => {
-                let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_) | Scalar::Raw)) else {
+                let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_) | Scalar::Raw | Scalar::Bitset)) else {
                     self.diags.error(
                         format!("'to_array' needs a scalar or Copy struct element, got {}", ty_name(elem)),
                         span,
@@ -63652,7 +63716,7 @@ impl<'a, 't> Checker<'a, 't> {
             );
             return err;
         }
-        let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_) | Scalar::Raw)) else {
+        let Some(scalar) = ty_to_scalar(elem).filter(|s| !matches!(s, Scalar::Tuple(_) | Scalar::Raw | Scalar::Bitset)) else {
             self.diags.error(
                 format!("'map_into' needs a scalar element, got {} (project a field first)", ty_name(elem)),
                 span,
@@ -65153,6 +65217,7 @@ impl<'a, 't> Checker<'a, 't> {
             // A `slice` view is a borrow (`{ptr,len}`) — not boxable, exactly like `str`. (Now that a
             // slice is a payload scalar for `Result<slice<u8>, Error>`, it must be rejected here too,
             // or `scalar_bytes` would size a non-existent box payload.)
+            Scalar::Bitset => Some("a `bitset` view is not boxable".to_string()),
             Scalar::Slice(_) => Some("a `slice` view is not boxable".to_string()),
             _ => None,
         };
@@ -66719,7 +66784,7 @@ impl<'a, 't> Checker<'a, 't> {
         match r.ty {
             // `str`/`slice`/`soa` carry a runtime length in their `{ ptr, len }` view (a `soa`'s
             // length is its row count).
-            Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_)
+            Ty::Bitset | Ty::Str | Ty::String | Ty::Slice(_) | Ty::DynArray(_)
             | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
             | Ty::DynFixedStructArray(..)
             | Ty::DynStructArray(..) | Ty::DynSliceArray(_) | Ty::DynResponseArray |Ty::Soa(_) => Expr { kind: ExprKind::Len(Box::new(r)), ty: i64_ty, span },
@@ -66826,6 +66891,7 @@ impl<'a, 't> Checker<'a, 't> {
             return elems[v as usize].clone();
         }
         let elem = match r.ty {
+            Ty::Bitset => Ty::Bool,
             // The array remains the sole owner of the selected string. `string` and `str` share
             // the same `{ptr,len}` representation, but the logical result carries no Drop and its
             // region/storage roots are inherited from the receiver below.
@@ -66986,6 +67052,7 @@ impl<'a, 't> Checker<'a, 't> {
                 }
                 (r, Ty::Slice(element))
             }
+            Ty::Bitset => (r, Ty::Bitset),
             Ty::Slice(s) | Ty::Array(s, _) | Ty::DynArray(s) => {
                 // Viewability is independent of whole-element value readability.
                 let elem = scalar_to_ty(s);
@@ -67036,7 +67103,7 @@ impl<'a, 't> Checker<'a, 't> {
         let Some(start_h) = check_bound(self, start) else { return err };
         let Some(end_h) = check_bound(self, end) else { return err };
         Expr {
-            kind: ExprKind::SliceRange { recv: Box::new(recv_expr), start: start_h, end: end_h },
+            kind: ExprKind::SliceRange { kind: hir::RangeKind::Window, recv: Box::new(recv_expr), start: start_h, end: end_h },
             ty: result_ty,
             span,
         }
@@ -74053,7 +74120,7 @@ impl<'a, 't> Checker<'a, 't> {
             }
             ExprKind::OptionSome(inner) | ExprKind::ResultOk(inner) | ExprKind::ResultErr(inner)
             | ExprKind::Try(inner) | ExprKind::HeapNew(inner)
-            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BytesView { bytes: inner, .. } | ExprKind::SliceAsBytes { slice: inner, .. } | ExprKind::BuilderToString(inner) | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayToSlice(inner)
+            | ExprKind::BoxClone(inner) | ExprKind::StrClone(inner) | ExprKind::StrBorrow(inner) | ExprKind::StrBytes { inner } | ExprKind::BytesView { bytes: inner, .. } | ExprKind::BitsetReduce { view: inner, .. } | ExprKind::SliceAsBytes { slice: inner, .. } | ExprKind::BuilderToString(inner) | ExprKind::ArrayToSoa { source: inner, .. } | ExprKind::ArrayToSlice(inner)
             | ExprKind::Len(inner) => {
                 self.finalize_expr(inner)
             }
@@ -74104,7 +74171,7 @@ impl<'a, 't> Checker<'a, 't> {
                 base.element_ty = self.finalize(base.element_ty);
                 self.finalize_expr(index);
             }
-            ExprKind::SliceRange { recv, start, end } => {
+            ExprKind::SliceRange { recv, start, end, .. } => {
                 self.finalize_expr(recv);
                 if let Some(s) = start { self.finalize_expr(s); }
                 if let Some(e) = end { self.finalize_expr(e); }
@@ -75418,7 +75485,7 @@ const BUILTIN_MODULES: &[&str] = &[
     "core.option", "core.result", "core.array", "core.slice", "core.chunks", "core.vec",
     "core.mask", "core.bitset", "core.map", "core.reduce", "core.scan", "core.partition",
     "core.sort", "core.str", "core.string", "core.bytes", "core.buffer", "core.builder",
-    "core.arena", "core.json", "core.codec", "core.template", "core.hash", "core.math",
+    "core.arena", "core.bitset", "core.json", "core.codec", "core.template", "core.hash", "core.math",
     "core.test",
     // std — the OS boundary
     "std.io", "std.fs", "std.path", "std.os", "std.process", "std.env", "std.time", "std.net",
@@ -75768,6 +75835,7 @@ fn ty_name(ty: Ty) -> String {
         Ty::CodecBatch => "codec.batch".to_string(),
         Ty::CodecI64Column => "codec.i64_column".to_string(),
         Ty::CodecF64Column => "codec.f64_column".to_string(),
+        Ty::Bitset => "bitset".to_string(),
         Ty::CodecBoolColumn => "codec.bool_column".to_string(),
         Ty::CodecStrColumn => "codec.str_column".to_string(),
         Ty::CodecEncoder => "codec.encoder".to_string(),
@@ -76187,6 +76255,7 @@ fn resolved_type_source_spelling(
             Ty::CodecBatch => "codec.batch".to_string(),
             Ty::CodecI64Column => "codec.i64_column".to_string(),
             Ty::CodecF64Column => "codec.f64_column".to_string(),
+            Ty::Bitset => "bitset".to_string(),
             Ty::CodecBoolColumn => "codec.bool_column".to_string(),
             Ty::CodecStrColumn => "codec.str_column".to_string(),
             Ty::CodecEncoder => "codec.encoder".to_string(),
@@ -77364,6 +77433,10 @@ fn scalar_arg(
     // header list + body buffer). A `http_server` / `http_request_ctx` may ride a `Result` Ok payload (`http.serve`
     // / `srv.accept`) — the `allow_param` positions — but never an array/slice/box element (a copied
     // handle would double-`close` its fd), exactly like `tcp_listener` / `http response`.
+    if ty == Ty::Bitset && !allow_param {
+        diags.error(format!("{what} cannot contain a packed bit view"), span);
+        return None;
+    }
     if matches!(ty, Ty::SignatureKey(_)) && !allow_param {
         diags.error(
             format!("{what} cannot be `{}` — a restricted native handle is a single owner, not a collection element", ty_name(ty)),
@@ -77466,6 +77539,7 @@ fn collection_scalar_type(ty: Ty) -> Option<Scalar> {
             | Ty::CodecBatch
             | Ty::CodecI64Column
             | Ty::CodecF64Column
+            | Ty::Bitset
             | Ty::CodecBoolColumn
             | Ty::CodecStrColumn
             | Ty::CryptoDigest
@@ -78210,6 +78284,11 @@ fn resolve_type(
     match name {
         "bool" => Ty::Bool,
         "char" => Ty::Char,
+        "bitset" if args.is_empty() => Ty::Bitset,
+        "bitset" => {
+            diags.error("bitset takes no type arguments", span);
+            Ty::Error
+        }
         "str" => Ty::Str,
         "string" => Ty::String,
         // `raw` — an opaque raw byte pointer (`raw.alloc` yields one). Nameable so it can be a `let`
@@ -79128,6 +79207,7 @@ fn is_field_ok(ty: Ty, tuples: &[hir::TupleDef], tagged_types: &[hir::TaggedType
         | Ty::CodecBatch
         | Ty::CodecI64Column
         | Ty::CodecF64Column
+        | Ty::Bitset
         | Ty::CodecBoolColumn
         | Ty::CodecStrColumn
         | Ty::Rng => {}
@@ -79487,6 +79567,7 @@ fn enum_payload_ok(
         | Scalar::CodecBatch
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
+        | Scalar::Bitset
         | Scalar::CodecBoolColumn
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
@@ -83174,7 +83255,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // CompressStream borrows both I/O handles and returns a Copy count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 369,
+            variants, 370,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

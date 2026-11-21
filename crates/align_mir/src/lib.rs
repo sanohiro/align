@@ -336,6 +336,8 @@ pub struct ImportedFn {
     pub return_region: hir::ReturnRegionSummary,
     pub return_cleanup: hir::ReturnCleanupAbi,
     pub drop_state_effects: Vec<hir::DropStateEffect>,
+    /// Checked interface effects for a borrowed descriptor passed to another unit.
+    pub mutable_view_effect: hir::MutableViewEffectSummary,
     /// The format-9 dependency record was emitted only after producer validation.
     pub producer_certified: bool,
 }
@@ -975,6 +977,26 @@ pub enum FsTreeOutput {
     Bool(Slot),
     I64(Slot),
     CursorNext { entry: Slot, present: Slot },
+}
+
+/// Each packed-bit operation includes its signed bounds checks. No unchecked payload
+/// pointer or individual descriptor lane is exposed as a MIR value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitsetOp { View, Window, Len, Read, Write, Count, Any, All }
+
+impl BitsetOp {
+    pub fn signature(self) -> (&'static [Ty], Ty) {
+        const INDEX: Ty = Ty::Int(IntTy { bits: 64, signed: true });
+        const BYTES: Ty = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
+        match self {
+            Self::View => (&[BYTES, INDEX], Ty::Bitset),
+            Self::Window => (&[Ty::Bitset, INDEX, INDEX], Ty::Bitset),
+            Self::Len | Self::Count => (&[Ty::Bitset], INDEX),
+            Self::Read => (&[Ty::Bitset, INDEX], Ty::Bool),
+            Self::Write => (&[Ty::Bitset, INDEX, Ty::Bool], Ty::Unit),
+            Self::Any | Self::All => (&[Ty::Bitset], Ty::Bool),
+        }
+    }
 }
 
 mir_inputs_enum! {
@@ -2128,6 +2150,7 @@ pub enum Rvalue {
         bytes: Operand,
         elem: Ty,
     },
+    Bitset { op: BitsetOp, operands: Vec<Operand> },
     /// Total descriptor-only inverse of [`Rvalue::BytesView`].
     SliceAsBytes {
         slice: Operand,
@@ -4054,6 +4077,7 @@ fn lower_program_unchecked_with_plans(
                     return_region: import.return_region.clone(),
                     return_cleanup: import.return_cleanup,
                     drop_state_effects: import.drop_state_effects.clone(),
+                    mutable_view_effect: import.mutable_view_effect.clone(),
                     producer_certified: import.producer_certified,
                 })
                 .collect()
@@ -7465,6 +7489,12 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
                 field_ty_at(b, *base, path)
             };
             match base_ty {
+                Ty::Bitset => {
+                    let view = b.fresh_value(Ty::Bitset);
+                    let place = if path.is_empty() { Rvalue::Load(*base) } else { Rvalue::Field(*base, path.clone()) };
+                    b.push(Stmt::Let(view, place));
+                    lower_bitset_op(b, BitsetOp::Write, vec![Operand::Value(view), idx, val]);
+                }
                 Ty::Slice(s) | Ty::DynArray(s) => {
                     let sv = b.fresh_value(base_ty);
                     let header = if path.is_empty() {
@@ -11572,6 +11602,10 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 b.push(Stmt::Let(v, fixed_slice_rvalue(slot, path, n)));
                 Operand::Value(v)
             }
+            hir::ExprKind::Len(inner) if inner.ty == Ty::Bitset => {
+                let view = lower_required!(b, lower_expr(b, inner), Operand::Const(Const::Unit));
+                lower_bitset_op(b, BitsetOp::Len, vec![view])
+            }
             hir::ExprKind::Len(inner) => {
                 if matches!(inner.kind, hir::ExprKind::ElemField { .. })
                     && align_sema::indexed_array_field_has_length(inner.ty)
@@ -11627,7 +11661,34 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 Operand::Value(v)
             }
             hir::ExprKind::Index { recv, index } => lower_index(b, recv, index, e.ty),
-            hir::ExprKind::SliceRange { recv, start, end } => {
+            hir::ExprKind::BitsetReduce { view, op } => {
+                let value = lower_required!(b, lower_expr(b, view), Operand::Const(Const::Unit));
+                let op = match op {
+                    hir::BitsetReduction::Count => BitsetOp::Count,
+                    hir::BitsetReduction::Any => BitsetOp::Any,
+                    hir::BitsetReduction::All => BitsetOp::All,
+                };
+                lower_bitset_op(b, op, vec![value])
+            }
+            hir::ExprKind::SliceRange { kind, recv, start, end } if e.ty == Ty::Bitset => {
+                let base = lower_required!(b, lower_expr(b, recv), Operand::Const(Const::Unit));
+                if *kind == hir::RangeKind::PackedBits {
+                    let Some(count) = end else { return Operand::Const(Const::Unit); };
+                    let count = lower_required!(b, lower_expr(b, count), Operand::Const(Const::Unit));
+                    lower_bitset_op(b, BitsetOp::View, vec![base, count])
+                } else {
+                    let lo = match start {
+                        Some(expr) => lower_required!(b, lower_expr(b, expr), Operand::Const(Const::Unit)),
+                        None => Operand::Const(Const::Int(0, i64_ty())),
+                    };
+                    let hi = match end {
+                        Some(expr) => lower_required!(b, lower_expr(b, expr), Operand::Const(Const::Unit)),
+                        None => lower_bitset_op(b, BitsetOp::Len, vec![base.clone()]),
+                    };
+                    lower_bitset_op(b, BitsetOp::Window, vec![base, lo, hi])
+                }
+            }
+            hir::ExprKind::SliceRange { recv, start, end, .. } => {
                 lower_slice_range(b, recv, start.as_deref(), end.as_deref(), e.ty)
             }
             hir::ExprKind::ElemField {
@@ -13882,7 +13943,22 @@ fn lower_chunks_count(b: &mut Builder, src_len: Operand, n: Operand) -> Operand 
 /// `recv[index]` → a bounds-checked scalar element load. A scalar `array<T>` / `slice` loads
 /// through its `{ptr,len}` value (`SliceIndex`); a fixed stack `array` loads through its slot
 /// (`Index`).
+fn lower_bitset_op(b: &mut Builder, op: BitsetOp, operands: Vec<Operand>) -> Operand {
+    let (_, ty) = op.signature();
+    let value = b.fresh_value(ty);
+    if ty == Ty::Bitset {
+        inherit_borrow_owners(b, value, operands.first());
+    }
+    b.push(Stmt::Let(value, Rvalue::Bitset { op, operands }));
+    if ty == Ty::Unit { Operand::Const(Const::Unit) } else { Operand::Value(value) }
+}
+
 fn lower_index(b: &mut Builder, recv: &hir::Expr, index: &hir::Expr, elem_ty: Ty) -> Operand {
+    if recv.ty == Ty::Bitset {
+        let view = lower_required!(b, lower_expr(b, recv), Operand::Const(Const::Unit));
+        let index = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
+        return lower_bitset_op(b, BitsetOp::Read, vec![view, index]);
+    }
     if recv.ty.is_array_builder() {
         let owner = lower_required!(b, lower_borrowed_owned(b, recv), Operand::Const(Const::Unit));
         let index = lower_required!(b, lower_expr(b, index), Operand::Const(Const::Unit));
@@ -14572,6 +14648,7 @@ fn proven_vec_load_align(b: &Builder, src: &hir::Expr, index: &hir::Expr, elem: 
             recv,
             start,
             end: _,
+            kind: hir::RangeKind::Window,
         } => {
             let s = match start {
                 None => 0,
@@ -18453,6 +18530,7 @@ fn sort_key_order(s: &align_sema::Scalar) -> KeyOrder {
         | Scalar::CodecI64Column
         | Scalar::CodecF64Column
         | Scalar::CodecBoolColumn
+        | Scalar::Bitset
         | Scalar::CodecStrColumn
         | Scalar::CryptoDigest
         | Scalar::FsDirectory
@@ -25306,6 +25384,7 @@ pub fn ty_name(ty: Ty) -> String {
         Ty::CodecI64Column => "codec.i64_column".to_string(),
         Ty::CodecF64Column => "codec.f64_column".to_string(),
         Ty::CodecBoolColumn => "codec.bool_column".to_string(),
+        Ty::Bitset => "bitset".to_string(),
         Ty::CodecStrColumn => "codec.str_column".to_string(),
         Ty::CodecEncoder => "codec.encoder".to_string(),
         Ty::CryptoDigest => "crypto.digest".to_string(),

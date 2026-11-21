@@ -2624,3 +2624,7 @@ separate contracts.
 ## External writable windows
 
 An unsafe producer may retain an initialized external range under an existing mutable resource borrow. This avoids an extra owned Buffer copy without introducing permission types or writable ordinary returns. Scalar writes preserve the lifetime but retire overlapping UTF-8 validation. The synchronous File writer consumes that same authority; transfer completion and GPU ownership remain wrapper obligations. Plan244 owns the exact source and native contract.
+
+### Dense bit storage
+
+A borrowed byte pointer, bit offset and logical length let a four-word expert mask and a partially filled final byte share the same indexing contract. Writing one bit preserves the rest of its byte; the borrow checker therefore treats that byte as shared physical storage. An empty window retains its parent lifetime without advancing the pointer. The independent bandwidth decision for SoA boolean columns stays with that layout's producers. [Plan271](impl/271-borrowed-bitsets.md)

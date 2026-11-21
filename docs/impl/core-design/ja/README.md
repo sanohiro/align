@@ -20,6 +20,7 @@
 - [soa-groupby.md](soa-groupby.md) — `soa<T>`、列操作、`group_by` の集約、`.agg(...)`、`dict_encode`
 - [vec-mask.md](vec-mask.md) — `vecN<T>` / `maskN<T>`、レーン操作、`load`/`store`、`select`/`dot`/`fma`/`sum_where`、`align(N)`
 - [arena-heap.md](arena-heap.md) — `arena {}` と `heap.new` / `box`: region、escape、drop
+- [bitset.md](bitset.md) — ビット集合の借用、添字、範囲、集計
 - [hash.md](hash.md) — `core.hash`(`hash64`/`hash128`): 状態と設計
 - [test.md](test.md) — 実装済み `core.test` declaration/assertion、isolated runner protocol、terse-output policy
 - [codec.md](codec.md) — 実装済み `core.codec` canonical columnar batch envelope、zero-copy view、encoder

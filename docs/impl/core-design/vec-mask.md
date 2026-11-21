@@ -101,10 +101,10 @@ residual).
 None — Copy values. `load` borrows the slice momentarily; `store` requires a writable (`mut`/
 `out`) slice. The only region interaction is via the slices at the boundary.
 
+Borrowed packed memory is available through [core.bitset](bitset.md).
+
 ## Spec'd but not implemented
 
-- **`bitset`** (§18.1 catalog) — no implementation, no tests. Design open: relationship to
-  packed-bool soa columns (post-M6 backlog) should be settled together.
 - Aligned-load propagation across function boundaries (cross-function provably-aligned slices) —
   deferred; only locally provable alignment upgrades the load today (#320).
 

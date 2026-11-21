@@ -1280,7 +1280,8 @@ Record: `draft.md` §5, `docs/language-spec.md`, `examples/bitwise.align`, `test
 ### `core.hash` + `core.bitset` (roadmap #6) — design SETTLED (2026-06-29)
 The roadmap pairs these two as "#6", but they split cleanly by their prerequisites:
 
-- **`core.bitset` stays deferred to M6** (no new decision — this re-confirms the Bitwise-operators
+- **Borrowed bit sets (Plan271).** The four-word expert mask in `align-llm/src/native_cuda_moe.align` supplies the consumer. The dense view borrows low-bit-first bytes at arbitrary bit offsets, exposing checked element reads, writes, windows and cardinality. A change to the physical layout of SoA boolean columns still requires a density-sensitive consumer. [Plan271](impl/271-borrowed-bitsets.md)
+- **Historical decision, before the SIMD layout shipped. `core.bitset` stays deferred to M6** (no new decision — this re-confirms the Bitwise-operators
   ruling above). The `bitset` type is "large, SIMD-friendly", so its layout *is* the M6 `vec`/`mask`/
   SoA/`align(N)` model. Designing it before that model exists is exactly the premature design that
   ruling parked. → not built in #6; it rides M6 (roadmap #7). Nothing to do now but record the split.

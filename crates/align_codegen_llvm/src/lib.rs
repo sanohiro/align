@@ -35,6 +35,7 @@ use align_mir::producer::{
 /// three summary-based entry points, plus the preserve-set / opt-level helpers.
 pub mod thinlto;
 
+mod bitset;
 mod drop_codegen;
 mod ffi_aarch64;
 #[cfg(test)]
@@ -7293,6 +7294,7 @@ fn scalar_type<'c>(
         | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
         | Ty::DynFixedStructArray(..) | Ty::CodecBatch | Ty::CodecI64Column
         | Ty::CodecF64Column | Ty::CodecBoolColumn => slice_struct_type(ctx).into(),
+        Ty::Bitset => bitset_type(ctx).into(),
         Ty::CodecStrColumn => codec_str_column_type(ctx).into(),
         // An AoS struct array is a `{ptr,len}` view too; an SoA one would be a different
         // representation (column buffers), so match the layout — `Layout::Soa` (M6) makes this
@@ -7629,6 +7631,7 @@ fn tagged_child(payload: Scalar) -> Option<u32> {
         | Scalar::DynResponseArray
         | Scalar::Str
         | Scalar::Slice(_)
+        | Scalar::Bitset
         | Scalar::Enum(_)
         | Scalar::Soa(_)
         | Scalar::SoaParam(_)
@@ -7933,6 +7936,11 @@ fn slice_struct_type<'c>(ctx: &'c Context) -> StructType<'c> {
     ctx.struct_type(&[ctx.ptr_type(AddressSpace::default()).into(), ctx.i64_type().into()], false)
 }
 
+fn bitset_type<'c>(ctx: &'c Context) -> StructType<'c> {
+    let i64 = ctx.i64_type();
+    ctx.struct_type(&[ctx.ptr_type(AddressSpace::default()).into(), i64.into(), i64.into()], false)
+}
+
 /// The validated string-column view `{ offsets_ptr, data_ptr, row_len }`. Both pointers remain
 /// byte pointers because an envelope may begin at any alignment.
 fn codec_str_column_type<'c>(ctx: &'c Context) -> StructType<'c> {
@@ -8012,6 +8020,7 @@ fn abi_type<'c>(
         | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
         | Ty::DynFixedStructArray(..) | Ty::CodecBatch | Ty::CodecI64Column
         | Ty::CodecF64Column | Ty::CodecBoolColumn => slice_struct_type(ctx).into(),
+        Ty::Bitset => bitset_type(ctx).into(),
         Ty::CodecStrColumn => codec_str_column_type(ctx).into(),
         // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
         Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => {
@@ -8400,6 +8409,7 @@ fn scalar_bytes(s: Scalar) -> u64 {
         // (it only rides an `Option`/`Result`, e.g. `read_bytes_view`), but sizing it correctly (vs.
         // `unreachable!`) keeps this total should a slice element ever be sized here.
         Scalar::Slice(_) => 16,
+        Scalar::Bitset => 24,
         // A `json.doc` handle is a `{tape,node}` = `{ptr,i64}`, 16 bytes (like `Str`/`Slice`). Never a
         // box/array payload today (it only rides an `Option`/`Result`), but sized correctly for totality.
         Scalar::JsonDoc => 16,
@@ -11126,7 +11136,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
     /// loaded from the owned `array<slice<T>>` header produced by `chunks`; it is safe to copy into
     /// a worker call, but it must not silently widen the output side of a staged map.
     fn validate_par_map_input_type(&self, ty: Ty) -> Result<(), CodegenError> {
-        if matches!(ty, Ty::Slice(_)) {
+        if matches!(ty, Ty::Bitset | Ty::Slice(_)) {
             self.validate_par_map_type(ty)
         } else {
             self.validate_par_map_kernel_type(ty)
@@ -11163,6 +11173,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 | Ty::Tuple(_)
                 | Ty::Array(_, _)
                 | Ty::StructArray(_, _)
+                | Ty::Bitset
                 | Ty::Slice(_)
                 | Ty::Soa(_)
                 | Ty::Str
@@ -17313,6 +17324,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .ok_or_else(|| self.err("buffer_capacity returned no basic value"))?
             }
+            Rvalue::Bitset { op, operands } => return self.gen_bitset(*op, operands),
             Rvalue::BytesView { bytes, elem } => {
                 let (pointer, length) = self.split_str(bytes)?;
                 let pointer = pointer.into_pointer_value();
@@ -20476,6 +20488,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Ty::DynVecArray(..) | Ty::DynMaskArray(..) | Ty::DynFixedArray(..)
             | Ty::DynFixedStructArray(..) | Ty::CodecBatch | Ty::CodecI64Column
             | Ty::CodecF64Column | Ty::CodecBoolColumn => slice_struct_type(self.ctx).into(),
+            Ty::Bitset => bitset_type(self.ctx).into(),
             Ty::CodecStrColumn => codec_str_column_type(self.ctx).into(),
             // AoS struct array = `{ptr,len}`; SoA (M6) differs → match the layout (forces revisit).
             Ty::DynStructArray(_, Layout::Aos) | Ty::DynSliceArray(_) | Ty::DynResponseArray => slice_struct_type(self.ctx).into(),
@@ -29267,6 +29280,7 @@ fn main() -> i32 = 0
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             drop_state_effects: vec![hir::DropStateEffect::Invariant],
+            mutable_view_effect: None,
             producer_certified: true,
         });
         let imported = emit_llvm_ir(
@@ -29606,6 +29620,7 @@ fn main() -> i32 = 0
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             drop_state_effects: vec![hir::DropStateEffect::NotApplicable],
+            mutable_view_effect: None,
             producer_certified: true,
         });
         let per_unit = emit_llvm_ir(&per_unit, &BuildTarget::Baseline, Profile::Release, false, &[], None).unwrap();
@@ -30245,6 +30260,7 @@ fn main() -> i32 = 0
             return_region: view.return_region,
             return_cleanup: view.return_cleanup,
             drop_state_effects: vec![hir::DropStateEffect::NotApplicable; view.params.len()],
+            mutable_view_effect: None,
             producer_certified: true,
         });
         let ctx = Context::create();
@@ -31295,6 +31311,7 @@ fn main() -> i32 = 0
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             drop_state_effects: vec![hir::DropStateEffect::MayChange, hir::DropStateEffect::NotApplicable],
+            mutable_view_effect: None,
             producer_certified: true,
         });
         assert!(validate_resource_rvalues(&imported).is_ok());
@@ -33080,6 +33097,7 @@ fn main() -> i32 = 0
                             return_region: sink.return_region,
                             return_cleanup: sink.return_cleanup,
                             drop_state_effects,
+                            mutable_view_effect: None,
                             producer_certified: true,
                         });
                         "forward"
@@ -33443,6 +33461,7 @@ fn main() -> i32 = 0
                         param_modes: function.param_modes, ret: function.ret,
                         return_borrow: function.return_borrow, return_region: function.return_region,
                         return_cleanup: function.return_cleanup, drop_state_effects: effects,
+                        mutable_view_effect: None,
                         producer_certified: true,
                     });
                 }
@@ -35992,6 +36011,7 @@ fn main() -> i32 = 0
             return_region: make_function.return_region,
             return_cleanup: make_function.return_cleanup,
             drop_state_effects: Vec::new(),
+            mutable_view_effect: None,
             producer_certified: true,
         });
         assert!(
@@ -36111,6 +36131,7 @@ fn main() -> i32 = 0
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             drop_state_effects: vec![hir::DropStateEffect::NotApplicable],
+            mutable_view_effect: None,
             producer_certified: true,
         });
 
@@ -37029,6 +37050,7 @@ fn main() -> i32 = 0
                         return_region: hir::ReturnRegionSummary::None,
                         return_cleanup: hir::ReturnCleanupAbi::None,
                         drop_state_effects: vec![hir::DropStateEffect::NotApplicable; 2],
+                        mutable_view_effect: None,
                         producer_certified: true,
                     }];
             program.structs = vec![row.clone(), other.clone()];
@@ -41656,6 +41678,7 @@ fn main() -> i32 = 0
             return_region: hir::ReturnRegionSummary::None,
             return_cleanup: hir::ReturnCleanupAbi::None,
             drop_state_effects: vec![hir::DropStateEffect::NotApplicable],
+            mutable_view_effect: None,
             producer_certified: true,
         });
         let imported = emit_llvm_ir(

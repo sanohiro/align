@@ -85,6 +85,7 @@ metadata!(
     hir::AeadCipher,
     hir::AeadDir,
     hir::CliFlagKind,
+    BitsetOp,
     hir::CodecPutKind,
     hir::CompressKind,
     hir::EncodingKind,

@@ -81,7 +81,7 @@ slice<T>
 
 vecN<T>
 maskN<T>
-bitset        // designed, not built yet (its layout is the SIMD vec/mask model)
+bitset        // borrowed packed bits
 ```
 
 `()` is unit and `(e)` is grouping, so a **tuple has arity ≥ 2**. Its ownership derives from its
@@ -1900,7 +1900,7 @@ admission, layout, ownership or cleanup change is selected for this batch.
 
 `core.hash`: one canonical non-crypto mixer (`wyhash`) over a byte view — `hash64(str|slice<u8>) ->
 u64`, `hash128(...) -> (u64, u64)`. No `Hash` trait; deterministic within a build; not crypto/DoS-
-resistant (crypto → `std.crypto`). `core.bitset` is the M6 SIMD layer (`vec`/`mask`), not built yet.
+resistant (crypto → `std.crypto`). `core.bitset` borrows low-bit-first byte storage with `bitset.view(bytes, count)`. Index, indexed assignment, range, `len`, `count`, `any` and `all` operate on logical bits. Windows share the backing and its write authority. [Packed bit reference](impl/core-design/bitset.md)
 
 `core.codec` is the implemented canonical columnar data-batch format, not RPC. V1 uses the fixed
 `ALNCOL01` envelope and at most 1024 ordered unique names over exactly `i64`, `f64`, `bool`, and `str` columns.

@@ -847,7 +847,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             base: base.clone(),
             index: boxed!(index),
         },
-        ExprKind::SliceRange { recv, start, end } => ExprKind::SliceRange {
+        ExprKind::BitsetReduce { view, op } => ExprKind::BitsetReduce { view: boxed!(view), op: *op },
+        ExprKind::SliceRange { kind, recv, start, end } => ExprKind::SliceRange {
+            kind: *kind,
             recv: boxed!(recv),
             start: take_optional_boxed_expr(clones, start.is_some())?,
             end: take_optional_boxed_expr(clones, end.is_some())?,
@@ -2874,6 +2876,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::BuilderBytes { builder: recv }
         | ExprKind::StrBytes { inner: recv }
         | ExprKind::BytesView { bytes: recv, .. }
+        | ExprKind::BitsetReduce { view: recv, .. }
         | ExprKind::SliceAsBytes { slice: recv, .. }
         | ExprKind::BufferLen { buffer: recv } | ExprKind::BufferCapacity { buffer: recv } | ExprKind::BuilderLen { builder: recv } | ExprKind::ArrayBuilderLen { builder: recv }
         | ExprKind::FsExists { path: recv }
@@ -2948,7 +2951,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         ExprKind::ArrayBuilderNew { region, capacity, .. } => { optional!(region); one!(capacity); }
         ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => { one!(capacity); optional!(fill); one!(alignment); one!(pages); }
         ExprKind::BuilderNew { capacity } => optional!(capacity),
-        ExprKind::SliceRange { recv, start, end } => {
+        ExprKind::SliceRange { recv, start, end, .. } => {
             one!(recv);
             optional!(start);
             optional!(end);

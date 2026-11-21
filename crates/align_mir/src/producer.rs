@@ -3,6 +3,9 @@
 //! Publication and native emission share the same typed producer and founded
 //! initialization proof. Native lowering retains its separate target/ABI checks.
 
+#[path = "packed_backing.rs"]
+mod packed_backing;
+
 use align_ast::{BinOp, UnOp};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use crate::{Block, BlockId, QueryMetaTypes, CanonicalTy, Const, ConstElem, DirectCall, Function,
@@ -416,6 +419,7 @@ enum XmlAccessNode {
     CaptureSlot(Slot, Vec<XmlAccessPathSegment>),
     BufferValue(ValueId, Vec<XmlAccessPathSegment>),
     BufferSlot(Slot, Vec<XmlAccessPathSegment>),
+    PackedSlotAt(Slot, Vec<XmlAccessPathSegment>, ValueId, bool),
 }
 
 #[derive(Clone, Debug)]
@@ -1343,8 +1347,8 @@ fn xml_access_paths(
             };
             if is_owner { leaves.push((ty, path.clone())); }
             // A Copy view never owns its pointees, even inside an owning record.
-            if matches!(ty, Ty::Slice(_) | Ty::Soa(_)) { continue; }
-        } else if matches!(ty, Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)
+            if matches!(ty, Ty::Bitset | Ty::Slice(_) | Ty::Soa(_)) { continue; }
+        } else if matches!(ty, Ty::Bitset | Ty::Str | Ty::String | Ty::XmlReader | Ty::Fn(_)
             | Ty::HttpHeaders | Ty::HttpRequestView) || http_client_owner_leaf(ty) {
             leaves.push((ty, path));
             continue;
@@ -2384,6 +2388,8 @@ struct XmlAccessCache {
 }
 
 struct XmlAccessAnalyzer<'a> {
+    packed_backing: bool,
+    checks_packed_headers: bool,
     graph: &'a ValidatedProducerGraph<'a>,
     equations: HashMap<XmlAccessNode, XmlAccessEquation>,
     scheduled: HashSet<XmlAccessNode>,
@@ -2394,6 +2400,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
     fn new(graph: &'a ValidatedProducerGraph<'a>) -> Self {
         Self {
             graph,
+            packed_backing: false,
+            checks_packed_headers: graph.function.value_tys.contains(&Ty::Bitset) || graph.function.slots.contains(&Ty::Bitset),
             equations: HashMap::new(),
             scheduled: HashSet::new(),
             pending: VecDeque::new(),
@@ -2457,7 +2465,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             _ => return XmlAccessSource::Invalid,
         };
         match root.and_then(|root| xml_selected_ty(self.graph.program, *root, path)) {
-            Some(Ty::Slice(_)) => match node {
+            Some(Ty::Bitset | Ty::Slice(_)) => match node {
                 XmlAccessNode::Value(value, path) => self.queue(XmlAccessNode::BufferValue(value, path)),
                 XmlAccessNode::Slot(slot, path) => self.queue(XmlAccessNode::BufferSlot(slot, path)),
                 _ => XmlAccessSource::Invalid,
@@ -2489,11 +2497,13 @@ impl<'a> XmlAccessAnalyzer<'a> {
         else { return XmlAccessSource::Invalid; };
         match operand {
             Operand::Value(value) => self.buffer_node(XmlAccessNode::Value(*value, path)),
-            Operand::Arg(index) if matches!(selected, Ty::Slice(_)) => {
+            Operand::Arg(index) if matches!(selected, Ty::Bitset | Ty::Slice(_)) => {
                 // BorrowMut of a Copy slice authenticates its header, not its backing allocation.
                 let out = path.is_empty()
                     && self.graph.function.param_modes.get(*index as usize) == Some(&align_ast::ParamMode::Out);
-                XmlAccessSource::Seed(if out {
+                let packed = self.packed_backing && path.is_empty() && (selected == Ty::Bitset || matches!(selected, Ty::Slice(Scalar::Int(_) | Scalar::Float(_))))
+                    && self.graph.function.param_modes.get(*index as usize) == Some(&align_ast::ParamMode::BorrowMut);
+                XmlAccessSource::Seed(if out || packed {
                     xml_argument_access(self.graph.function, *index)
                 } else { XmlAccessProvenance::Shared })
             }
@@ -2573,6 +2583,14 @@ impl<'a> XmlAccessAnalyzer<'a> {
             Rvalue::MakeFieldSlice(_, _, _) => {
                 equation.invalid = true;
             }
+            Rvalue::Bitset { op: crate::BitsetOp::View | crate::BitsetOp::Window, operands } => {
+                let Some(source) = operands.first() else { equation.invalid = true; return equation; };
+                equation.seed = None;
+                equation.dependencies.clear();
+                equation.read_dependencies.clear();
+                let source = self.buffer_source(source, path);
+                Self::add_source(&mut equation, source);
+            }
             Rvalue::Use(operand)
             | Rvalue::SubSlice { base: operand, .. }
             | Rvalue::BytesView { bytes: operand, .. }
@@ -2591,6 +2609,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     let source = self.buffer_source(operand, path.clone());
                     Self::add_source(&mut equation, source);
                 }
+            }
+            Rvalue::Load(slot) | Rvalue::Field(slot, _) if self.packed_backing => {
+                let mut selected = match definition {
+                    Rvalue::Field(_, fields) => fields.iter().copied().map(XmlAccessPathSegment::StructField).collect(),
+                    _ => Vec::new(),
+                };
+                selected.extend(path);
+                return self.packed_slot_at(slot, selected, value, true);
+            }
+            Rvalue::ResourceViewFromRaw { .. } if self.packed_backing => {}
+            Rvalue::BufferBytes(ref owner) | Rvalue::BuilderBytes(ref owner) if self.packed_backing => {
+                if let Some(ty @ (Ty::Buffer | Ty::Builder)) = xml_operand_base_ty(self.graph.function, owner) {
+                    let source = self.source(owner, ty, Vec::new());
+                    equation.seed = None;
+                    Self::add_source(&mut equation, source);
+                } else { equation.invalid = true; }
             }
             Rvalue::Load(_) | Rvalue::Field(..) | Rvalue::TupleIndex { .. }
             | Rvalue::MakeTuple { .. } | Rvalue::MakeEnum { .. } | Rvalue::EnumPayload { .. }
@@ -2620,7 +2654,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         }
         let mut equation = XmlAccessEquation::default();
-        let Some(ty @ Ty::Slice(_)) = self.graph.function.slots.get(slot as usize).copied() else {
+        let Some(ty @ (Ty::Bitset | Ty::Slice(_))) = self.graph.function.slots.get(slot as usize).copied() else {
             equation.invalid = true;
             return equation;
         };
@@ -3269,7 +3303,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 (selected, None, self.slot_equation(*slot, path.clone()))
             }
             XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..)
-                | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) => {
+                | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) | XmlAccessNode::PackedSlotAt(..) => {
                 return XmlAccessEquation { invalid: true, ..XmlAccessEquation::default() };
             }
         };
@@ -3316,7 +3350,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     self.queue(XmlAccessNode::CaptureSlot(slot, path))
                 }
                 XmlAccessNode::CaptureValue(..) | XmlAccessNode::CaptureSlot(..)
-                | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) => {
+                | XmlAccessNode::BufferValue(..) | XmlAccessNode::BufferSlot(..) | XmlAccessNode::PackedSlotAt(..) => {
                     XmlAccessSource::Invalid
                 }
             };
@@ -3337,7 +3371,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 XmlAccessNode::CaptureValue(..)
                 | XmlAccessNode::CaptureSlot(..)
                 | XmlAccessNode::BufferValue(..)
-                | XmlAccessNode::BufferSlot(..) => XmlAccessSource::Invalid,
+                | XmlAccessNode::BufferSlot(..) | XmlAccessNode::PackedSlotAt(..) => XmlAccessSource::Invalid,
             };
             Self::add_source(&mut equation, source);
         }
@@ -3899,7 +3933,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                let needs_value = matches!(source_ty, Ty::Vec(..) | Ty::Mask(..) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Slice(_))
+                let needs_value = matches!(source_ty, Ty::Bitset | Ty::Vec(..) | Ty::Mask(..) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Slice(_))
                     || xml_numeric_scalar_ty(source_ty);
                 let compatible = xml_value_flow_matches(self.graph.program, source_ty, result_ty)
                     || xml_ty_is_view_retype(source_ty, result_ty);
@@ -4075,6 +4109,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !self.graph.function.slots.get(slot as usize)
                     .is_some_and(|actual| xml_flow_matches(self.graph.program, *actual, result_ty)) {
                     equation.invalid = true;
+                } else if selected_ty == Ty::Bitset || (self.checks_packed_headers && path.is_empty() && packed_backing::read_type(selected_ty)) {
+                    return self.packed_slot_at(slot, path, value, false);
                 } else if path.is_empty()
                     && let Some((element, length, _)) = xml_fixed_construction_shape(self.graph.program, result_ty)
                 {
@@ -5002,7 +5038,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                 } else {
+                    let direct = path.is_empty();
                     selected_path.extend(path);
+                    if selected_ty == Ty::Bitset || (self.checks_packed_headers && direct && packed_backing::read_type(selected_ty)) {
+                        return self.packed_slot_at(slot, selected_path, value, false);
+                    }
                     Self::add_source(
                         &mut equation,
                         self.queue(XmlAccessNode::Slot(slot, selected_path)),
@@ -6001,6 +6041,31 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         self.graph.program,
                     ),
                 });
+            }
+            Rvalue::Bitset { op, operands } => {
+                let (inputs, result) = op.signature();
+                if result != result_ty || !path.is_empty() || inputs.len() != operands.len() {
+                    equation.invalid = true;
+                    return equation;
+                }
+                for (operand, ty) in operands.iter().zip(inputs) {
+                    if !packed_backing::native_value(self.graph.function, operand, *ty) { equation.invalid = true; }
+                    if let Operand::BorrowedPlace(place) = operand {
+                        let Some((_, selected)) = self.graph.function.slots.get(place.slot as usize)
+                            .and_then(|root| xml_borrowed_path(self.graph.program, *root, &place.path)) else {
+                            equation.invalid = true;
+                            return equation;
+                        };
+                        let proof = self.queue(XmlAccessNode::PackedSlotAt(place.slot, selected, value, false));
+                        Self::add_required_source(&mut equation, proof, OperandRequirement::READ);
+                    }
+                    self.check_operand(&mut equation, operand, *ty);
+                }
+                if result == Ty::Bitset {
+                    self.add_operand(&mut equation, &operands[0], inputs[0], Vec::new());
+                } else {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
             }
             Rvalue::BytesView { bytes, elem } => {
                 let bytes_ty = Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false }));
@@ -8258,6 +8323,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 XmlAccessNode::BufferValue(value, path) => self.buffer_value_equation(*value, path.clone()),
                 XmlAccessNode::BufferSlot(slot, path) => self.buffer_slot_equation(*slot, path.clone()),
+                XmlAccessNode::PackedSlotAt(slot, path, at, writable) => self.packed_slot_at(*slot, path.clone(), *at, *writable),
             };
             equation.requires_inputs = matches!(node,
                 XmlAccessNode::Value(..) | XmlAccessNode::CaptureValue(..) | XmlAccessNode::BufferValue(..));
@@ -8701,7 +8767,23 @@ fn xml_place_call_access_valid(
         requirement.callable = matches!(selected, Ty::Fn(_));
         requirement.is_satisfied_by(selected_access(*selected, path, false))
     }) { return false; }
+    for (leaf, tail) in leaves {
+        if *leaf == Ty::Bitset {
+            let mut selected = prefix.clone();
+            selected.extend_from_slice(tail);
+            let mut analyzer = XmlAccessAnalyzer::new(graph);
+            let proof = analyzer.queue(XmlAccessNode::PackedSlotAt(place.slot, selected, call, false));
+            if !OperandRequirement::READ.is_satisfied_by(analyzer.build(proof, Some(&graph.access_cache))) { return false; }
+        }
+    }
     if mode != align_ast::ParamMode::BorrowMut { return true; }
+    if packed_backing::parameter_type(expected) {
+        let mut analyzer = XmlAccessAnalyzer::new(graph);
+        analyzer.packed_backing = true;
+        let proof = analyzer.queue(XmlAccessNode::PackedSlotAt(place.slot, prefix.clone(), call, true));
+        let required = OperandRequirement { read: true, ..exclusive };
+        if !required.is_satisfied_by(analyzer.build(proof, None)) { return false; }
+    }
     let Some(owners) = xml_access_paths(graph.program, expected, true) else { return false; };
     owners.iter().all(|(selected, path)| {
         OperandRequirement { read: true, ..exclusive }
@@ -9012,6 +9094,12 @@ pub fn validate_checked_byte_views(program: &Program) -> Result<(), ProducerErro
                         && primitive.is_some_and(|primitive| {
                             result_ty == Some(Ty::Option(Scalar::Slice(primitive)))
                         })
+                }
+                Rvalue::Bitset { op, operands } => {
+                    let (inputs, result) = op.signature();
+                    result_ty == Some(result) && inputs.len() == operands.len() && inputs.iter().zip(operands)
+                        .all(|(ty, operand)| xml_operand_base_ty(function, operand) == Some(*ty)
+                            && packed_backing::native_value(function, operand, *ty))
                 }
                 Rvalue::SliceAsBytes { slice, elem } => {
                     checked_byte_view_element(*elem)
@@ -10000,11 +10088,11 @@ fn validate_resource_rvalues_component(
         };
         // Copy HTTP views still carry native pointer authority. Memoize type-graph
         // membership so every producer is checked, including unused aggregate values.
-        let mut http_view_types = HashMap::new();
-        let mut has_http_view = |ty| {
-            *http_view_types.entry(ty).or_insert_with(|| {
+        let mut checked_view_types = HashMap::new();
+        let mut has_checked_view = |ty| {
+            *checked_view_types.entry(ty).or_insert_with(|| {
                 xml_owned_leaf_paths(program, ty).is_none_or(|leaves| {
-                    leaves.iter().any(|(leaf, _)| matches!(leaf, Ty::HttpHeaders | Ty::HttpRequestView))
+                    leaves.iter().any(|(leaf, _)| matches!(leaf, Ty::Bitset | Ty::HttpHeaders | Ty::HttpRequestView))
                 })
             })
         };
@@ -10193,6 +10281,15 @@ fn validate_resource_rvalues_component(
                             let Some(leaves) = xml_owned_leaf_paths(program, *expected) else {
                                 return false;
                             };
+                            if *mode == align_ast::ParamMode::Out && packed_backing::parameter_type(*expected) {
+                                if !matches!(expected, Ty::Slice(_)) || !xml_operand_base_ty(function, operand)
+                                    .is_some_and(|ty| xml_source_ty_matches(program, ty, *expected)) { return false; }
+                                let mut analyzer = XmlAccessAnalyzer::new(&access_graph);
+                                analyzer.packed_backing = true;
+                                let source = analyzer.buffer_source(operand, Vec::new());
+                                return OperandRequirement { read: true, write: true, exclusive: true, ..Default::default() }
+                                    .is_satisfied_by(analyzer.build(source, None));
+                            }
                             if *mode == align_ast::ParamMode::Out && !leaves.is_empty() {
                                 if !matches!(expected, Ty::Slice(_))
                                     || !xml_operand_base_ty(function, operand).is_some_and(
@@ -10324,14 +10421,29 @@ fn validate_resource_rvalues_component(
                     .get(*value as usize)
                     .copied()
                     .ok_or_else(|| fail(function, "result value id is absent"))?;
-                let produces_http_view = has_http_view(result);
-                let retypes_http_view = if let Rvalue::Use(source) = rvalue {
-                    xml_operand_base_ty(function, source).is_some_and(&mut has_http_view)
+                let produces_checked_view = has_checked_view(result);
+                let retypes_checked_view = if let Rvalue::Use(source) = rvalue {
+                    xml_operand_base_ty(function, source).is_some_and(&mut has_checked_view)
                 } else { false };
-                if (produces_http_view || retypes_http_view)
+                if (produces_checked_view || retypes_checked_view)
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
-                    return Err(fail(function, "HTTP view producer or retype contract mismatch"));
+                    return Err(fail(function, "view producer or retype contract mismatch"));
+                }
+                if let Rvalue::Bitset { op, operands } = rvalue {
+                    if !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result)) {
+                        return Err(fail(function, "invalid packed bit operation producer"));
+                    }
+                    if *op == crate::BitsetOp::Write {
+                        let Some(view) = operands.first() else { return Err(fail(function, "missing packed bit destination")); };
+                        let mut analyzer = XmlAccessAnalyzer::new(&access_graph);
+                        analyzer.packed_backing = true;
+                        let source = analyzer.buffer_source(view, Vec::new());
+                        let required = OperandRequirement { read: true, write: true, exclusive: true, ..OperandRequirement::default() };
+                        if !required.is_satisfied_by(analyzer.build(source, None)) {
+                            return Err(fail(function, "packed bit write lacks writable backing"));
+                        }
+                    }
                 }
                 // Builder construction certifies its allocation, not arbitrary bytes later
                 // pushed into it. Authenticate every transferred owner at the writer boundary,
@@ -11569,6 +11681,7 @@ fn validate_tagged_program_inner(
                 | Scalar::CodecI64Column
                 | Scalar::CodecF64Column
                 | Scalar::CodecBoolColumn
+                | Scalar::Bitset
                 | Scalar::CodecStrColumn
                 | Scalar::CryptoDigest
                 | Scalar::FsDirectory
@@ -11729,6 +11842,7 @@ fn validate_tagged_program_inner(
                         | Ty::CodecI64Column
                         | Ty::CodecF64Column
                         | Ty::CodecBoolColumn
+                        | Ty::Bitset
                         | Ty::CodecStrColumn
                         | Ty::CryptoDigest
                         | Ty::FsDirectory
@@ -12839,9 +12953,17 @@ pub fn validate_str_match_terminators(program: &Program) -> Result<(), ProducerE
 fn validate_operand_availability(function: &Function) -> Result<(), ProducerError> {
     use crate::operand_inputs::OperandInputs;
 
+    // A packed descriptor can reach a load through a slot, a selected field, or a
+    // branch predecessor. Check store inputs as well as the immediate SSA expression.
+    let has_packed = function.blocks.iter().any(|block| block.stmts.iter()
+        .any(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::Bitset { .. }))));
     let mut pending = Vec::new();
     for block in &function.blocks {
         for (index, stmt) in block.stmts.iter().enumerate() {
+            if has_packed {
+                pending.push((block.id, index));
+                continue;
+            }
             if let Stmt::Let(id, rv) = stmt
                 && (matches!(rv, Rvalue::MakeVec { .. } | Rvalue::SocketObserve { .. } | Rvalue::HttpTlsClient { .. })
                     || matches!(rv, Rvalue::Select { cond, .. }

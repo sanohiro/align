@@ -3325,11 +3325,14 @@ zip
 ```text
 vecN<T>      // vec2/vec4/vec8/vec16 (the width is in the name)
 maskN<T>     // a comparison mask over a vecN<T>
-bitset
 dot
 sum_where
 select
 ```
+
+### core.bitset
+
+`bitset.view(storage: slice<u8>, count: i64) -> bitset` borrows packed bytes in low-bit-first order. A negative count or insufficient storage aborts. Indexing reads a `bool`; indexed assignment changes a single bit in writable storage. `bits[lo..hi]` retains the borrow even for unaligned or empty windows. `len()` and `count()` return the logical length and population count. `any()` and `all()` return false and true on empty input. Unused tail bits are ignored. The Copy descriptor holds a byte pointer, a bit offset and an i64 logical length. [Library reference](docs/impl/core-design/bitset.md)
 
 ### core.string
 

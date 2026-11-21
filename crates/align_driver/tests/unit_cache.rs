@@ -1717,3 +1717,28 @@ fn named_time_generic_templates_survive_cache_change_and_restore() {
         assert_eq!(&align_mir::print::program_to_string(restored.materialize(i).expect("restored time MIR")), expected);
     }
 }
+
+#[test]
+fn bitset_return_root_change_invalidates_a_warm_consumer() {
+    let _serial = serial();
+    let lib = "module lib\nimport core.bitset\npub fn picked(left: slice<u8>, right: slice<u8>) -> bitset = bitset.view(left, 8)\n";
+    let main = r#"import lib
+fn main() {
+  mut a := [0 as u8].to_array()
+  mut b := [0 as u8].to_array()
+  bits := lib.picked(a,b)
+  b = [1 as u8].to_array()
+  print(bits[0])
+}
+"#;
+    let project = Proj::new("packed-bits-cache", &[("lib.align", lib), ("main.align", main)]);
+    let cold = project.build(UnitReuse::Allowed);
+    assert!(!hit(&cold, "main"));
+    assert!(hit(&project.build(UnitReuse::Allowed), "main"));
+    project.write("lib.align", &lib.replace("bitset.view(left", "bitset.view(right"));
+    let (updated, diagnostics) = project.build_dirty(UnitReuse::Allowed);
+    assert!(updated.diags.has_errors(), "{diagnostics}");
+    assert!(diagnostics.contains("invalidated borrow"), "{diagnostics}");
+    project.write("lib.align", lib);
+    assert!(hit(&project.build(UnitReuse::Allowed), "main"));
+}
