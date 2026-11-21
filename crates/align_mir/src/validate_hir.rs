@@ -25,7 +25,7 @@ pub(crate) fn global_type_metadata_is_valid(program: &hir::Program) -> bool {
     && program.structs.iter().all(|definition| {
         !(definition.name == "os.host_info" || definition.source_name == "os.host_info")
             || align_sema::host_info_schema_valid(definition)
-    }) && align_sema::fs_tree_schemas_valid(&program.structs, &program.enums) && align_sema::process_live::schemas_valid(&program.structs, &program.enums)
+    }) && align_sema::net::schemas_valid(&program.structs) && align_sema::fs_tree_schemas_valid(&program.structs, &program.enums) && align_sema::process_live::schemas_valid(&program.structs, &program.enums)
     && Validator::new(program).validate()
 }
 
@@ -4845,7 +4845,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TcpReadTimeout { .. }
             | hir::ExprKind::TcpWriteTimeout { .. }
             | hir::ExprKind::TcpListen { .. }
-            | hir::ExprKind::TcpAccept { .. }
+            | hir::ExprKind::SocketLocalAddr { .. } | hir::ExprKind::TcpAccept { .. }
             | hir::ExprKind::UdpBind { .. }
             | hir::ExprKind::UdpSendTo { .. }
             | hir::ExprKind::UdpRecvFrom { .. }
@@ -5243,7 +5243,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::TcpReadTimeout { .. }
             | hir::ExprKind::TcpWriteTimeout { .. }
             | hir::ExprKind::TcpListen { .. }
-            | hir::ExprKind::TcpAccept { .. }
+            | hir::ExprKind::SocketLocalAddr { .. } | hir::ExprKind::TcpAccept { .. }
             | hir::ExprKind::UdpBind { .. }
             | hir::ExprKind::UdpSendTo { .. }
             | hir::ExprKind::UdpRecvFrom { .. }
@@ -9794,6 +9794,11 @@ impl<'a> BodyValidator<'a> {
                 (local(conn, Ty::TcpConn) && conn.ty == Ty::TcpConn && ns.ty == i64)
                     .then(|| strict(Ty::Unit, &[conn, ns]))?
             }
+            hir::ExprKind::SocketLocalAddr { socket } => {
+                let id = align_sema::net::record_id(&self.program.structs, align_sema::net::ENDPOINT)?;
+                (align_sema::net::socket_handle(socket.ty) && local(socket, socket.ty))
+                    .then(|| result(Ty::Struct(id), &[socket]))?
+            }
             hir::ExprKind::TcpAccept { listener } => {
                 (local(listener, Ty::TcpListener) && listener.ty == Ty::TcpListener)
                     .then(|| result(Ty::TcpConn, &[listener]))?
@@ -9822,7 +9827,8 @@ impl<'a> BodyValidator<'a> {
                 {
                     return None;
                 }
-                result(Ty::Int(align_sema::IntTy { bits: 64, signed: true }), &[sock, buffer])
+                let id = align_sema::net::record_id(&self.program.structs, align_sema::net::DATAGRAM)?;
+                result(Ty::Struct(id), &[sock, buffer])
             }
             hir::ExprKind::FsReadFileView { path } => {
                 (context.arena_depth > 0 && path.ty == Ty::Str)

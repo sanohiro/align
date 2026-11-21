@@ -13,6 +13,8 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+**Socket endpoints (Plan268).** UDP receive returns the sender and stored byte count. Numeric local and peer endpoints own their host strings. A TCP listener or UDP socket may request a kernel-assigned port and read it through `local_addr()`.
+
 ### Literal text splitting
 
 `str.split(separator)` preserves empty fields and returns `array<str>` borrowing only the receiver. An empty separator matches every Unicode scalar boundary. Plan261 records ownership and cleanup.

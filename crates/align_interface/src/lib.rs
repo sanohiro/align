@@ -1652,6 +1652,8 @@ const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("crypto.digest", 0, BuiltinCapability::Opaque),
     ("fs.directory", 0, BuiltinCapability::Opaque),
     ("fs.dir_cursor", 0, BuiltinCapability::Opaque),
+    ("net.endpoint", 0, BuiltinCapability::Opaque),
+    ("net.datagram", 0, BuiltinCapability::Opaque),
     ("fs.dir_entry", 0, BuiltinCapability::Opaque),
     ("fs.metadata", 0, BuiltinCapability::Opaque),
     ("fs.entry_kind", 0, BuiltinCapability::Opaque),
@@ -3167,6 +3169,7 @@ pub fn summary_to_source(
                             builtin_type_imports.insert("std.crypto".to_string());
                         }
                         "json.encode_options" => { builtin_type_imports.insert("core.json".to_string()); }
+                        "net.endpoint" | "net.datagram" => { builtin_type_imports.insert("std.net".to_string()); }
                         "fs.memory_writer" | "fs.sealed_file" | "fs.memory_kind" | "fs.directory" | "fs.dir_cursor" | "fs.dir_entry" | "fs.metadata" | "fs.access_mode" | "fs.entry_kind" => { builtin_type_imports.insert("std.fs".to_string()); }
                         "process.child_scope" | "process.member" | "process.member_info" | "process.reaped" | "process.image" | "process.user_namespace" | "process.signal_subscription" => { builtin_type_imports.insert("std.process".to_string()); }
                         "os.host_info" | "os.identity_info" => { builtin_type_imports.insert("std.os".to_string()); }
@@ -3554,6 +3557,8 @@ mod builtin_spelling_tests {
             ("process.child_scope", true),
             ("process.member", true),
             ("process.member_info", true),
+            ("net.endpoint", true),
+            ("net.datagram", true),
             ("process.reaped", false),
         ] {
             assert_eq!(align_sema::builtin_spelling_is_move(spelling), Some(owned), "{spelling}");

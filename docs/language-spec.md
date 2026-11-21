@@ -1940,6 +1940,12 @@ std.crypto
 std.http
 ```
 
+Under `std.net`, a TCP connection, listener or UDP socket returns its numeric address from
+`local_addr() -> Result<net.endpoint, Error>`. Port zero requests an assigned port on bind or
+listen. UDP `recv_from(buf)` returns a `net.datagram` with the stored byte count `n` and the
+sender `peer`. Each endpoint owns its host string and port. A positive-capacity buffer can
+receive an empty datagram, and a zero-capacity buffer returns `Error.Invalid` before receiving.
+
 `std.io`: concrete builtin **Move** types `reader` / `writer` / `file` (each owns an fd, `Drop`
 closes it) — one type, many constructors (`fs.open`, `io.stdin`, `io.stdout.buffered()`), not a
 trait; `stream` is named but its surface is not yet specified. `io.stdout`/

@@ -1736,13 +1736,9 @@ and http last (needs net + TLS).
     (accept retries; connect fails that address and moves on).
   - Slice 4 `udp_socket` (#374): third twin; `udp.bind` (SOCK_DGRAM, wildcard on empty host),
     `u.send_to(data: bytes, host, port)` (non-consuming byte-view arg, EINTR-retried atomic
-    sendto, per-call resolve = documented v1 cost), `u.recv_from(buf) -> Result<i64, Error>` —
-    the `reader.read(buf)` cap/len shape reused verbatim. **Datagram peer deferred**: Result Ok
-    payloads are single Scalars (no `Scalar::Tuple`), and an owned peer would make net.md's
-    "small Copy struct" a Move aggregate — count-only is the ideal v1; peer waits for
-    first-class builtin-struct returns (recorded in net.md EN+ja).
-  - **Deferred with record (not blockers):** port 0 / kernel-assigned bind (needs a
-    `local_addr()`-style accessor), datagram peer (above), intra-frame borrow invalidation
+    sendto, per-call resolve). Plan268 adds the owned `net.datagram` receive result, local
+    endpoint observation on all three handles, and kernel-assigned bind/listen ports.
+  - **Deferred with record (not blockers):** intra-frame borrow invalidation
     (reader outliving a reassigned/moved conn — the `buffer.bytes()`/`cli.get_str` class,
     sharpened note in open-questions), send_to destination cache, non-blocking/epoll/io_uring
     backends (later Linux backend behind the same signatures), BSD-family port surface.

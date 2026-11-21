@@ -1851,6 +1851,19 @@ pub fn native_owner_mir_contract<'a>(
             contract.operands.push((child, Ty::Child, write));
             contract.outputs.push((*out, function.slots.get(*out as usize).copied().unwrap_or(Ty::Error)));
         }
+        Rvalue::SocketObserve { socket, buffer, out } => {
+            contract.result = i32_ty;
+            let handle = xml_operand_base_ty(function, socket)
+                .filter(|ty| align_sema::net::socket_handle(*ty) && (buffer.is_none() || *ty == Ty::UdpSocket))
+                .unwrap_or(Ty::Error);
+            contract.operands.push((socket, handle, read));
+            let name = if let Some(buf) = buffer {
+                contract.operands.push((buf, Ty::Buffer, write));
+                align_sema::net::DATAGRAM
+            } else { align_sema::net::ENDPOINT };
+            let record = align_sema::net::record_id(&program.structs, name).map(Ty::Struct).unwrap_or(Ty::Error);
+            contract.outputs.push((*out, record));
+        }
         Rvalue::FsTree { kind, args, output } => {
             contract.result = i32_ty;
             for (input, operand) in kind.inputs().iter().zip(args) {
@@ -2002,7 +2015,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
     let owned = |slot| vec![(slot, Owned)];
     match rvalue {
         Rvalue::ProcessLive { out, .. } => out.iter().map(|slot|(*slot,Owned)).collect(),
-        Rvalue::ChildWait { out, .. } | Rvalue::HttpCtxPeerEof { out, .. } => vec![(*out, Owned)],
+        Rvalue::SocketObserve { out, .. } | Rvalue::ChildWait { out, .. } | Rvalue::HttpCtxPeerEof { out, .. } => vec![(*out, Owned)],
         Rvalue::FsTree { output, .. } => fs_tree_output_slots(*output).into_iter().map(|slot| (slot, Owned)).collect(),
         Rvalue::JsonDecode { out, .. }
         | Rvalue::JsonDecodeStructArray { out, .. }
@@ -7097,7 +7110,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::TcpAccept { .. }
             | Rvalue::UdpBind { .. }
             | Rvalue::UdpSendTo { .. }
-            | Rvalue::UdpRecvFrom { .. }
+            | Rvalue::SocketObserve { .. }
             | Rvalue::ProcessSpawn { .. }
             | Rvalue::ChildWait { .. }
             | Rvalue::ChildKill { .. }
@@ -9087,6 +9100,9 @@ fn validate_host_mir(program: &Program) -> Result<(), ProducerError> {
         }
     }
 
+    if !align_sema::net::schemas_valid(&program.structs) {
+        return Err(ProducerError::Lowering("malformed standard socket record".into()));
+    }
     if !align_sema::fs_tree_schemas_valid(&program.structs, &program.enums) {
         return Err(ProducerError::Lowering("malformed retained filesystem schema".to_string()));
     }
@@ -9307,7 +9323,8 @@ fn validate_resource_rvalues_inner(
     for function in &program.fns {
         if defined.is_none_or(|emitted| emitted.contains(&function.name)) {
             crate::group_source::validate(program, function)?;
-            validate_vector_operand_availability(function)?;
+            crate::socket_observation::validate(function)?;
+            validate_operand_availability(function)?;
         }
     }
     validate_template_html_mir_signatures(program)?;
@@ -12797,16 +12814,16 @@ pub fn validate_str_match_terminators(program: &Program) -> Result<(), ProducerE
     Ok(())
 }
 
-/// Check the explicit SSA dependencies of each vector construction and blend at their
+/// Check the SSA dependencies of vector constructions, blends and socket observations at their
 /// statement positions. Cache dominance per pair of blocks and visit shared producers once.
-fn validate_vector_operand_availability(function: &Function) -> Result<(), ProducerError> {
+fn validate_operand_availability(function: &Function) -> Result<(), ProducerError> {
     use crate::operand_inputs::OperandInputs;
 
     let mut pending = Vec::new();
     for block in &function.blocks {
         for (index, stmt) in block.stmts.iter().enumerate() {
             if let Stmt::Let(id, rv) = stmt
-                && (matches!(rv, Rvalue::MakeVec { .. })
+                && (matches!(rv, Rvalue::MakeVec { .. } | Rvalue::SocketObserve { .. })
                     || matches!(rv, Rvalue::Select { cond, .. }
                         if matches!(function.value_tys.get(*id as usize), Some(Ty::Vec(..)))
                         || matches!(xml_operand_base_ty(function, cond), Some(Ty::Mask(..)))))
@@ -12819,7 +12836,7 @@ fn validate_vector_operand_availability(function: &Function) -> Result<(), Produ
         return Ok(());
     }
     let fail = || ProducerError::Lowering(format!(
-        "vector operand has no dominating definition in '{}'", function.name
+        "operand has no dominating definition in '{}'", function.name
     ));
     let mut definitions = vec![None; function.value_tys.len()];
     for block in &function.blocks {

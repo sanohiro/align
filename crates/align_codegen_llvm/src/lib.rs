@@ -18016,15 +18016,45 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("udp_send_to returns i64")
             }
-            // u.recv_from — block for one datagram into the buffer; return i64 (bytes received, or
-            // -(status)).
-            Rvalue::UdpRecvFrom { sock, buffer } => {
-                let sp = self.operand(sock)?.into();
-                let bp = self.operand(buffer)?.into();
-                self.builder
-                    .build_call(self.runtime(RuntimeKey::UdpRecvFrom), &[sp, bp], "urecv")
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("udp_recv_from returns i64")
+            Rvalue::SocketObserve { socket, buffer, out } => {
+                let key = match (self.f.operand_ty(socket), buffer.is_some()) {
+                    (Ty::TcpConn, false) => RuntimeKey::TcpConnLocalAddr,
+                    (Ty::TcpListener, false) => RuntimeKey::TcpListenerLocalAddr,
+                    (Ty::UdpSocket, false) => RuntimeKey::UdpLocalAddr,
+                    (Ty::UdpSocket, true) => RuntimeKey::UdpRecvFrom,
+                    _ => return Err(self.err("invalid socket observation")),
+                };
+                let i64_ty = self.ctx.i64_type();
+                let endpoint = self.ctx.struct_type(&[slice_struct_type(self.ctx).into(), i64_ty.into()], false);
+                let native = if buffer.is_some() {
+                    self.ctx.struct_type(&[i64_ty.into(), endpoint.into()], false)
+                } else { endpoint };
+                let scratch = self.alloca_at_entry(native.into(), "socket.observation")?;
+                let mut args = vec![self.operand(socket)?.into()];
+                if let Some(buf) = buffer { args.push(self.operand(buf)?.into()); }
+                args.push(scratch.into());
+                let status = self.builder.build_call(self.runtime(key), &args, "socket.status")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("socket observation must return a status"))?;
+                let observation = self.builder.build_load(native, scratch, "socket.native")
+                    .map_err(|e| self.err(e))?.into_struct_value();
+                // Runtime zero-initializes all fields on failure. Translate the fixed C record
+                // to the actual Align field layout before MIR interprets the status.
+                let (host_path, port_path): (&[u32], &[u32]) = if buffer.is_some() {
+                    (&[1, 0], &[1, 1])
+                } else { (&[0], &[1]) };
+                let endpoint_value = if buffer.is_some() {
+                    let count = self.builder.build_extract_value(observation, 0, "socket.bytes").map_err(|e| self.err(e))?;
+                    let (dst, _) = self.checked_field_path_ptr_and_ty(*out, &[0])?;
+                    self.builder.build_store(dst, count).map_err(|e| self.err(e))?;
+                    self.builder.build_extract_value(observation, 1, "socket.peer").map_err(|e| self.err(e))?.into_struct_value()
+                } else { observation };
+                for (field, path) in [(0, host_path), (1, port_path)] {
+                    let value = self.builder.build_extract_value(endpoint_value, field, "socket.field").map_err(|e| self.err(e))?;
+                    let (dst, _) = self.checked_field_path_ptr_and_ty(*out, path)?;
+                    self.builder.build_store(dst, value).map_err(|e| self.err(e))?;
+                }
+                status
             }
             // process.spawn — fork+execvp; write the owned child handle into `out`, return i32 status.
             // `cmd` is a {ptr,len} str view (the lookup path); `args` is a {ptr,len} of str views (the

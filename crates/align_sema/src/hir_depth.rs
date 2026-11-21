@@ -947,6 +947,7 @@ fn walk_body_records<'a>(
                 | ExprKind::DnsResolve { host: recv }
                 | ExprKind::ConnReader { conn: recv }
                 | ExprKind::ConnWriter { conn: recv }
+                | ExprKind::SocketLocalAddr { socket: recv }
                 | ExprKind::TcpAccept { listener: recv }
                 | ExprKind::FsReadFileView { path: recv }
                 | ExprKind::FsReadBytesView { path: recv }

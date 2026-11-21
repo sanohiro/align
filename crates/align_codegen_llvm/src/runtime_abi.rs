@@ -804,7 +804,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::StrTrim) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::StrTrimEnd) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::StrTrimStart) => RuntimeEffects { class: EffectClass::PureArgRead, argmem: ArgMem::Read, params: &[ParamEffect { ordinal: 0, mode: ParamMode::Read }], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::TcpAccept) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::TcpConnLocalAddr | RuntimeKey::TcpListenerLocalAddr | RuntimeKey::UdpLocalAddr | RuntimeKey::TcpAccept) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TcpConnFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TcpConnReader) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TcpConnWriter) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
@@ -829,7 +829,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::TimeParse) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::TimeSleep) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::UdpBind) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 3], releases: Release::None, returns_fresh: false, diverges: false },
-        RuntimeAbiId::Keyed(RuntimeKey::UdpRecvFrom) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::UdpRecvFrom) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 2], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::UdpSendTo) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1, 3], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::UdpSocketFree) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::HandleOnly, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::Utf8BoundaryFail) => RuntimeEffects { class: EffectClass::FailNoReturn, argmem: ArgMem::None, params: &[], escapes: &[], releases: Release::None, returns_fresh: false, diverges: true },
@@ -3006,6 +3006,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_tcp_accept",
             shape: RuntimeAbiShape::A19,
         },
+        RuntimeKey::TcpConnLocalAddr => RuntimeAbi { key, symbol: "align_rt_tcp_conn_local_addr", shape: RuntimeAbiShape::A19 },
         RuntimeKey::TcpConnFree => RuntimeAbi {
             key,
             symbol: "align_rt_tcp_conn_free",
@@ -3031,6 +3032,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_tcp_listen",
             shape: RuntimeAbiShape::A07,
         },
+        RuntimeKey::TcpListenerLocalAddr => RuntimeAbi { key, symbol: "align_rt_tcp_listener_local_addr", shape: RuntimeAbiShape::A19 },
         RuntimeKey::TcpListenerFree => RuntimeAbi {
             key,
             symbol: "align_rt_tcp_listener_free",
@@ -3127,6 +3129,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_time_sleep",
             shape: RuntimeAbiShape::A58,
         },
+        RuntimeKey::UdpLocalAddr => RuntimeAbi { key, symbol: "align_rt_udp_local_addr", shape: RuntimeAbiShape::A19 },
         RuntimeKey::UdpBind => RuntimeAbi {
             key,
             symbol: "align_rt_udp_bind",
@@ -3134,8 +3137,8 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
         },
         RuntimeKey::UdpRecvFrom => RuntimeAbi {
             key,
-            symbol: "align_rt_udp_recv_from",
-            shape: RuntimeAbiShape::A36,
+            symbol: "align_rt_udp_recv_datagram",
+            shape: RuntimeAbiShape::A24,
         },
         RuntimeKey::UdpSendTo => RuntimeAbi {
             key,
@@ -3279,15 +3282,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 499 || keyed_runtime_abis().len() != 499 {
+    if RuntimeKey::ALL.len() != 502 || keyed_runtime_abis().len() != 502 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 517 {
+    if runtime_abis().count() != 520 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(517);
+    let mut symbols = HashSet::with_capacity(520);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -4640,17 +4643,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 517);
+        assert_eq!(rows.len(), 520);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            517
+            520
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            517
+            520
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4700,7 +4703,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 517);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 520);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4827,7 +4830,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 517);
+        assert_eq!(rows.len(), 520);
 
         for row in rows {
             let symbol = row.symbol;

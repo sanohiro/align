@@ -16,6 +16,7 @@ use align_span::Span;
 mod callback_access;
 pub mod hir;
 pub mod fs_tree;
+pub mod net;
 pub mod process_live;
 pub use hir::*;
 mod hir_depth;
@@ -774,8 +775,7 @@ pub enum Ty {
     /// A `udp_socket` (`std.net`) — a bound `SOCK_DGRAM` (UDP) socket, the `Ok` payload of
     /// `udp.bind`'s `Result<udp_socket, Error>`. An owned **Move** handle owning one socket fd (like
     /// `tcp_conn`/`tcp_listener`), `Drop`-freed (the fd is `close`d). Its `u.send_to(...)` /
-    /// `u.recv_from(...)` datagram ops each return a `Result<i64, Error>` (a byte count) — connectionless,
-    /// so there is no borrowed reader/writer and no region binding. Impure. Opaque pointer.
+    /// `u.recv_from(...)` return a byte count and an owned datagram respectively. Impure. Opaque pointer.
     UdpSocket,
     /// A `child` (`std.process`) — a spawned child process, the `Ok` payload of `process.spawn`'s
     /// `Result<child, Error>`. An owned **Move** handle owning the child's pid (plus a reaped flag),
@@ -5447,6 +5447,10 @@ pub fn builtin_spelling_needs_return_cleanup(head: &str) -> Option<bool> {
         return Some(needs_drop_flag(Ty::Struct(0), &[process_live::member_info_definition()], &[], &[], &[]));
     }
     if process_live::COPY_NAMES.contains(&head) { return Some(false); }
+    if matches!(head, net::ENDPOINT | net::DATAGRAM) {
+        let records = net::definitions(0);
+        return Some(needs_drop_flag(Ty::Struct(u32::from(head == net::DATAGRAM)), &records, &[], &[], &[]));
+    }
     if head == "fs.dir_entry" { return Some(needs_drop_flag(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
@@ -5470,6 +5474,10 @@ pub fn builtin_spelling_is_move(head: &str) -> Option<bool> {
         return Some(ty_is_move(Ty::Struct(0), &[process_live::member_info_definition()], &[], &[], &[]));
     }
     if process_live::COPY_NAMES.contains(&head) { return Some(false); }
+    if matches!(head, net::ENDPOINT | net::DATAGRAM) {
+        let records = net::definitions(0);
+        return Some(ty_is_move(Ty::Struct(u32::from(head == net::DATAGRAM)), &records, &[], &[], &[]));
+    }
     if head == "fs.dir_entry" { return Some(ty_is_move(Ty::Struct(0), &[fs_dir_entry_definition()], &[], &[], &[])); }
     if matches!(head, "fs.metadata" | "fs.entry_kind") {
         let ty = if head == "fs.metadata" { Ty::Struct(0) } else { Ty::Enum(0) };
@@ -7199,6 +7207,8 @@ struct BuiltinNominalAlias {
 
 const BUILTIN_NOMINAL_ALIASES: &[BuiltinNominalAlias] = &[
     BuiltinNominalAlias { bare: "json.encode_options", explicit: "json.encode_options", canonical: "json.encode_options", required_import: Some("core.json") },
+    BuiltinNominalAlias { bare: net::ENDPOINT, explicit: net::ENDPOINT, canonical: net::ENDPOINT, required_import: Some("std.net") },
+    BuiltinNominalAlias { bare: net::DATAGRAM, explicit: net::DATAGRAM, canonical: net::DATAGRAM, required_import: Some("std.net") },
     BuiltinNominalAlias { bare: "fs.dir_entry", explicit: "fs.dir_entry", canonical: "fs.dir_entry", required_import: Some("std.fs") },
     BuiltinNominalAlias { bare: "process.signal_subscription", explicit: "process.signal_subscription", canonical: "process.signal_subscription", required_import: Some("std.process") },
     BuiltinNominalAlias { bare: "process.child_scope", explicit: "process.child_scope", canonical: "process.child_scope", required_import: Some("std.process") },
@@ -9976,6 +9986,15 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         });
     }
 
+    if let Ok(endpoint) = u32::try_from(structs.len())
+        && let Some(datagram) = endpoint.checked_add(1) {
+        struct_ids.insert(net::ENDPOINT.into(), endpoint);
+        struct_ids.insert(net::DATAGRAM.into(), datagram);
+        structs.extend(net::definitions(endpoint));
+    } else {
+        diags.error("socket record capacity exceeded".to_string(), Span::new(0, 0, 0));
+    }
+
     // Keep public source identity in a producer-owned side table. HIR stores only nominal ids and
     // backend names; diagnostics for a later generic specialization must still be able to render
     // `geom.Row<Owned>` without consulting those internal identities.
@@ -10537,11 +10556,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
         if m.interface_only {
             continue;
         }
-        let mut refs = std::collections::HashSet::new();
+        let mut refs = ModuleReferences::default();
         collect_refs(&m.file.items, &mut refs);
         // Used iff some collected prefix equals `needle` or is `needle.` + more (allocation-free).
         let used = |needle: &str| {
-            refs.iter().any(|r| r == needle || (r.starts_with(needle) && r.as_bytes().get(needle.len()) == Some(&b'.')))
+            refs.prefixes.iter().any(|r| r == needle || (r.starts_with(needle) && r.as_bytes().get(needle.len()) == Some(&b'.')))
         };
         let mut seen = std::collections::HashSet::new();
         for imp in &m.file.imports {
@@ -10549,12 +10568,11 @@ pub fn check_program_with_all_interface_facts_and_static_descriptors(
             if !seen.insert(p.clone()) {
                 continue; // a duplicate import already errored above
             }
-            // `std.net` is reached through its sub-namespaces (`dns`/`tcp`/`udp`/`socket`), not a
-            // bare `net.*`, so it is "used" if any of those is referenced. Only the namespaces
-            // that have actually shipped are listed — a user local named `tcp` must not suppress
-            // the unused-import warning. Extend this list as net slices 2-4 land.
+            // Standard sockets have three operation namespaces and a qualified record namespace.
             let is_used = if p == "std.net" {
-                ["dns", "tcp", "udp"].iter().any(|ns| used(ns))
+                ["dns", "tcp", "udp", "net"].iter().any(|ns| used(ns))
+                    || refs.socket_receivers.iter().any(|name| name != &m.path
+                        && !mod_table.get(&m.path).is_some_and(|info| info.user_imports.contains(name)))
             } else {
                 let namespace: &str = if BUILTIN_MODULES.contains(&p.as_str()) {
                     // The accessed namespace is the prefix after the last `.` (`core.json` → `json`).
@@ -17762,7 +17780,7 @@ impl EffectScan<'_> {
                 self.impure_direct = true;
             }
             // `l.accept()` is impure (a blocking accept syscall) — excluded from `par_map`.
-            ExprKind::TcpAccept { listener } => {
+            ExprKind::TcpAccept { listener } | ExprKind::SocketLocalAddr { socket: listener } => {
                 walk!(listener);
                 self.impure_direct = true;
             }
@@ -26208,7 +26226,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::DnsResolve { .. }
             | ExprKind::TcpConnect { .. }
             | ExprKind::TcpListen { .. }
-            | ExprKind::TcpAccept { .. }
+            | ExprKind::SocketLocalAddr { .. } | ExprKind::TcpAccept { .. }
             | ExprKind::UdpBind { .. }
             | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. }
@@ -26704,7 +26722,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ConnReader { .. }
             | ExprKind::ConnWriter { .. }
             | ExprKind::TcpListen { .. }
-            | ExprKind::TcpAccept { .. }
+            | ExprKind::SocketLocalAddr { .. } | ExprKind::TcpAccept { .. }
             | ExprKind::UdpBind { .. }
             | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. }
@@ -30269,7 +30287,7 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(host, depth);
                 self.walk(port, depth);
             }
-            ExprKind::TcpAccept { listener } => self.walk(listener, depth),
+            ExprKind::TcpAccept { listener } | ExprKind::SocketLocalAddr { socket: listener } => self.walk(listener, depth),
             ExprKind::UdpBind { host, port } => {
                 self.walk(host, depth);
                 self.walk(port, depth);
@@ -33353,7 +33371,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::TcpReadTimeout { .. }
         | ExprKind::TcpWriteTimeout { .. }
         | ExprKind::TcpListen { .. }
-        | ExprKind::TcpAccept { .. }
+        | ExprKind::SocketLocalAddr { .. } | ExprKind::TcpAccept { .. }
         | ExprKind::UdpBind { .. }
         | ExprKind::UdpSendTo { .. }
         | ExprKind::UdpRecvFrom { .. }
@@ -43741,7 +43759,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::FsCreateDir { .. } | ExprKind::FsIsDir { .. } | ExprKind::FsRemoveEmptyDir { .. } | ExprKind::FsReadDir { .. }
             | ExprKind::RenameNoReplace { .. }
             | ExprKind::DnsResolve { .. } | ExprKind::TcpConnect { .. } | ExprKind::TcpListen { .. }
-            | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
+            | ExprKind::SocketLocalAddr { .. } | ExprKind::TcpAccept { .. } | ExprKind::UdpBind { .. } | ExprKind::UdpSendTo { .. }
             | ExprKind::UdpRecvFrom { .. } | ExprKind::PathJoin { .. } | ExprKind::PathNormalize { .. }
             | ExprKind::EnvGet { .. } | ExprKind::EnvSet { .. } | ExprKind::TimeNow | ExprKind::TimeInstant
             | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::OsMemory { .. } | ExprKind::ProcessCpuCount | ExprKind::TimeSleep { .. } | ExprKind::ProcessExit { .. }
@@ -51194,7 +51212,7 @@ impl<'a> MoveCheck<'a> {
             }
             // `l.accept()` borrows the `tcp_listener` (the listening fd stays owned by `l`); the
             // returned `tcp_conn` is freshly owned, never consumes the listener.
-            ExprKind::TcpAccept { listener } => move_expr!(self, listener, moved, false, false),
+            ExprKind::TcpAccept { listener } | ExprKind::SocketLocalAddr { socket: listener } => move_expr!(self, listener, moved, false, false),
             // `udp.bind` borrows `host` (str, never consumed); `port` is a Copy i64. `u.send_to` /
             // `u.recv_from` borrow the `udp_socket` (the fd stays owned by `u`) plus their byte
             // view / buffer — none consumed.
@@ -58609,6 +58627,20 @@ impl<'a, 't> Checker<'a, 't> {
         // `std.net` — `l.accept()` on a `tcp_listener` blocks for an inbound connection and returns a
         // new owned `tcp_conn` (`Result<tcp_conn, Error>`). Dispatched on the receiver type so the
         // name stays free on other values.
+        if method == "local_addr" {
+            let socket = self.check_expr(recv, None);
+            self.require_import("std.net", "local_addr", span);
+            if !net::socket_handle(socket.ty) || !matches!(socket.kind, ExprKind::Local(_)) || !args.is_empty() {
+                self.diags.error("local_addr() requires a bound socket and takes no arguments".to_string(), span);
+                return err;
+            }
+            let Some(id) = net::record_id(self.structs, net::ENDPOINT) else {
+                self.diags.error("missing net.endpoint schema".to_string(), span);
+                return err;
+            };
+            return Expr { kind: ExprKind::SocketLocalAddr { socket: Box::new(socket) },
+                ty: Ty::Result(Scalar::Struct(id), Scalar::Enum(self.error_enum_id)), span };
+        }
         if method == "accept" {
             let recv_expr = self.check_expr(recv, None);
             if recv_expr.ty == Ty::TcpListener {
@@ -58661,7 +58693,7 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         // `std.net` — `u.send_to(data, host, port)` / `u.recv_from(buf)` on a `udp_socket`. Datagram
-        // ops, each returning `Result<i64, Error>` (a byte count). Dispatched on the receiver type so
+        // ops returning a sent byte count or a received datagram. Dispatched on the receiver type so
         // the names stay free on other values.
         if matches!(method, "send_to" | "recv_from") {
             let recv_expr = self.check_expr(recv, None);
@@ -67439,8 +67471,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// `tcp.listen(host, port)` (`std.net`) -> `Result<tcp_listener, Error>` — bind a listening TCP
     /// socket to `port` (`SO_REUSEADDR` before `bind`, then `listen`). `host` is a borrowed `str`
     /// (never consumed); an empty host binds the wildcard address (`AI_PASSIVE`). `port` is an `i64`
-    /// validated to `1..=65535` at runtime → `Error.Invalid` on a bad port, never an abort. Port `0`
-    /// (kernel-assigned) is rejected in v1 — there is no way to read the bound port back yet. The Ok
+    /// validated to `0..=65535` at runtime. With port `0` the kernel assigns a port, which the
+    /// caller can read through `local_addr()`. An invalid port yields `Error.Invalid`. The Ok
     /// payload is an owned `tcp_listener` Move handle (`Drop` closes its fd). Impure. Builtin.
     fn check_tcp_listen(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -67471,9 +67503,8 @@ impl<'a, 't> Checker<'a, 't> {
 
     /// `udp.bind(host, port)` (`std.net`) -> `Result<udp_socket, Error>` — open a `SOCK_DGRAM` (UDP)
     /// socket bound to `port`. `host` is a borrowed `str` (never consumed); an empty host binds the
-    /// wildcard address (`AI_PASSIVE`). `port` is an `i64` validated to `1..=65535` at runtime →
-    /// `Error.Invalid` on a bad port, never an abort. Port `0` (kernel-assigned) is rejected in v1 —
-    /// there is no way to read the bound port back yet (the `tcp.listen` deferral). The Ok payload is
+    /// wildcard address (`AI_PASSIVE`). The port range is `0..=65535`; zero selects a kernel-assigned
+    /// port readable through `local_addr()`. An invalid port yields `Error.Invalid`. The Ok payload is
     /// an owned `udp_socket` Move handle (`Drop` closes its fd). Impure. Builtin.
     fn check_udp_bind(&mut self, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
@@ -67502,23 +67533,8 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `u.send_to(data, host, port)` / `u.recv_from(buf)` on a `udp_socket` ([`Ty::UdpSocket`]), the
-    /// receiver already evaluated. Both are datagram ops returning `Result<i64, Error>` (a byte
-    /// count). The receiver must be a **bound local** (the `check_conn_stream` / `accept` v1 rule — an
-    /// unbound owned-socket temporary is not `Drop`ped yet, so its fd would leak).
-    ///
-    /// `send_to` resolves `host`/`port` per call (`SOCK_DGRAM`) and sends the byte view `data`
-    /// (`str` / owned `string` auto-borrowed / `slice<u8>` — `encoding.base64_encode`'s accepted
-    /// forms) as one datagram; the count is the bytes sent. `recv_from` blocks for one datagram and
-    /// fills `buf` (a `mut buffer`) up to its capacity (overwriting its length, like `reader.read`);
-    /// the count is the bytes received. A datagram larger than the buffer is truncated.
-    ///
-    /// v1 shape note: `recv_from` returns the received **count** only. `net.md` sketches a
-    /// `datagram {n, peer}` return, but the peer address is an owned `string` and a `Result` `Ok`
-    /// payload must be a single [`Scalar`] (there is no `Scalar::Tuple`, and synthesizing a builtin
-    /// Move struct-with-owned-field aggregate would be a magic special-case) — so the ideal `{n, peer}`
-    /// shape is **deferred** until first-class builtin-struct returns land, and v1 mirrors
-    /// `reader.read`'s clean `Result<i64, Error>` (fill-buffer-return-count) exactly.
+    /// A bound UDP socket borrows its data or writable receive buffer for one datagram.
+    /// Sending returns the byte count. Receiving returns that count and the owned sender address.
     fn check_udp_socket_method(&mut self, recv_expr: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // v1 bound-receiver gate (mirrors `check_conn_stream` / `check_listener_accept`): the socket
@@ -67535,6 +67551,7 @@ impl<'a, 't> Checker<'a, 't> {
         }
         let i64_result = Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id));
         if method == "recv_from" {
+            self.require_import("std.net", "recv_from", span);
             if args.len() != 1 {
                 self.diags.error(format!("'.recv_from()' takes 1 argument (a mut buffer), got {}", args.len()), span);
                 return err;
@@ -67550,9 +67567,13 @@ impl<'a, 't> Checker<'a, 't> {
             if !self.require_mut_buffer_local(&args[0], ".recv_from()") {
                 return err;
             }
+            let Some(id) = net::record_id(self.structs, net::DATAGRAM) else {
+                self.diags.error("missing net.datagram schema".to_string(), span);
+                return err;
+            };
             return Expr {
                 kind: ExprKind::UdpRecvFrom { sock: Box::new(recv_expr), buffer: Box::new(buffer) },
-                ty: i64_result,
+                ty: Ty::Result(Scalar::Struct(id), Scalar::Enum(self.error_enum_id)),
                 span,
             };
         }
@@ -74213,7 +74234,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(host);
                 self.finalize_expr(port);
             }
-            ExprKind::TcpAccept { listener } => self.finalize_expr(listener),
+            ExprKind::TcpAccept { listener } | ExprKind::SocketLocalAddr { socket: listener } => self.finalize_expr(listener),
             ExprKind::UdpBind { host, port } => {
                 self.finalize_expr(host);
                 self.finalize_expr(port);
@@ -75122,7 +75143,13 @@ fn path_module_prefix(p: &ast::Path) -> Option<String> {
     Some(p.segments[..p.segments.len() - 1].iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join("."))
 }
 
-fn collect_refs(items: &[ast::Item], out: &mut std::collections::HashSet<String>) {
+#[derive(Default)]
+struct ModuleReferences {
+    prefixes: HashSet<String>,
+    socket_receivers: HashSet<String>,
+}
+
+fn collect_refs(items: &[ast::Item], out: &mut ModuleReferences) {
     for item in items {
         match item {
             ast::Item::Fn(f) => {
@@ -75152,7 +75179,7 @@ fn collect_refs(items: &[ast::Item], out: &mut std::collections::HashSet<String>
             }
             ast::Item::Resource(resource) => {
                 if let Some(prefix) = path_module_prefix(&resource.drop_hook) {
-                    out.insert(prefix);
+                    out.prefixes.insert(prefix);
                 }
             }
             ast::Item::Const(c) => {
@@ -75175,11 +75202,11 @@ fn collect_refs(items: &[ast::Item], out: &mut std::collections::HashSet<String>
     }
 }
 
-fn walk_type(t: &ast::Type, out: &mut std::collections::HashSet<String>) {
+fn walk_type(t: &ast::Type, out: &mut ModuleReferences) {
     match t {
         ast::Type::Named { path, args, .. } => {
             if let Some(prefix) = path_module_prefix(path) {
-                out.insert(prefix);
+                out.prefixes.insert(prefix);
             }
             for a in args {
                 walk_type(a, out);
@@ -75194,7 +75221,7 @@ fn walk_type(t: &ast::Type, out: &mut std::collections::HashSet<String>) {
     }
 }
 
-fn walk_block(b: &ast::Block, out: &mut std::collections::HashSet<String>) {
+fn walk_block(b: &ast::Block, out: &mut ModuleReferences) {
     for s in &b.stmts {
         match s {
             ast::Stmt::Let { ty, init, .. } => {
@@ -75217,13 +75244,13 @@ fn walk_block(b: &ast::Block, out: &mut std::collections::HashSet<String>) {
     }
 }
 
-fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
+fn walk_expr(e: &ast::Expr, out: &mut ModuleReferences) {
     use ast::ExprKind as K;
     match &e.kind {
         K::Unit | K::Int(_) | K::Float(_) | K::Char(_) | K::Str(_) | K::Bool(_) | K::FieldShorthand(_) => {}
         K::Path(p) => {
             if let Some(prefix) = path_module_prefix(p) {
-                out.insert(prefix);
+                out.prefixes.insert(prefix);
             }
         }
         K::Unary { expr, .. } | K::Try(expr) | K::TupleIndex { recv: expr, .. } => walk_expr(expr, out),
@@ -75236,13 +75263,18 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
             walk_expr(rhs, out);
         }
         K::Call { callee, args } => {
+            if let K::FieldAccess { recv, field } = &callee.kind
+                && matches!(field.name.as_str(), "local_addr" | "recv_from")
+                && let Some(receiver) = flatten_module_path(recv) {
+                out.socket_receivers.insert(receiver);
+            }
             walk_expr(callee, out);
             args.iter().for_each(|a| walk_expr(a, out));
         }
         K::FieldAccess { recv, .. } => {
             // The whole dotted receiver (`geom`, `util.math`, `geom.Color`) is the qualified prefix.
             if let Some(prefix) = flatten_module_path(recv) {
-                out.insert(prefix);
+                out.prefixes.insert(prefix);
             } else {
                 walk_expr(recv, out);
             }
@@ -75263,7 +75295,7 @@ fn walk_expr(e: &ast::Expr, out: &mut std::collections::HashSet<String>) {
         | K::Loop(b) => walk_block(b, out),
         K::StructLit { name, fields } => {
             if let Some(prefix) = path_module_prefix(name) {
-                out.insert(prefix);
+                out.prefixes.insert(prefix);
             }
             fields.iter().for_each(|f| walk_expr(&f.value, out));
         }
@@ -83109,7 +83141,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // CompressStream borrows both I/O handles and returns a Copy count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 367,
+            variants, 368,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 
@@ -89789,6 +89821,23 @@ fn main() {}
             .collect::<Vec<_>>();
         let checked = check_program_with_static_descriptors(&modules, &mut diagnostics);
         (checked, diagnostics)
+    }
+
+    #[test]
+    fn socket_methods_and_user_module_functions_have_distinct_imports() {
+        for (body, unused) in [
+            ("fn call() = helpers.local_addr()", true),
+            ("fn call(borrow s: udp_socket) { r := s.local_addr() }", false),
+            ("fn call(d: net.datagram) -> net.endpoint = d.peer", false),
+        ] {
+            let source = format!("module app\nimport helpers\nimport std.net\n{body}\n");
+            let (_, diagnostics) = check_modules(&[
+                ("app", &source, true),
+                ("helpers", "module helpers\npub fn local_addr() {}\n", false),
+            ]);
+            assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+            assert_eq!(diagnostics.iter().any(|d| d.message == "unused import `std.net`"), unused);
+        }
     }
 
     #[test]

@@ -459,11 +459,13 @@ key|StrTrimEnd|str_trim_end|PureArgRead|declare { ptr, i64 } @align_rt_str_trim_
 key|StrTrimStart|str_trim_start|PureArgRead|declare { ptr, i64 } @align_rt_str_trim_start(ptr readonly, i64) #6
 key|TcpAccept|tcp_accept|HostState|declare i32 @align_rt_tcp_accept(ptr, ptr) #2
 key|TcpConnFree|tcp_conn_free|HostState|declare void @align_rt_tcp_conn_free(ptr) #2
+key|TcpConnLocalAddr|tcp_conn_local_addr|HostState|declare i32 @align_rt_tcp_conn_local_addr(ptr, ptr) #2
 key|TcpConnReader|tcp_conn_reader|HostState|declare ptr @align_rt_tcp_conn_reader(ptr) #2
 key|TcpConnWriter|tcp_conn_writer|HostState|declare ptr @align_rt_tcp_conn_writer(ptr) #2
 key|TcpConnect|tcp_connect|HostState|declare i32 @align_rt_tcp_connect(ptr, i64, i64, i64, ptr) #2
 key|TcpListen|tcp_listen|HostState|declare i32 @align_rt_tcp_listen(ptr, i64, i64, ptr) #2
 key|TcpListenerFree|tcp_listener_free|HostState|declare void @align_rt_tcp_listener_free(ptr) #2
+key|TcpListenerLocalAddr|tcp_listener_local_addr|HostState|declare i32 @align_rt_tcp_listener_local_addr(ptr, ptr) #2
 key|TcpReadTimeout|tcp_read_timeout|HostState|declare void @align_rt_tcp_read_timeout(ptr, i64) #2
 key|TcpWriteTimeout|tcp_write_timeout|HostState|declare void @align_rt_tcp_write_timeout(ptr, i64) #2
 key|TemplateHtmlFree|template_html_free|IndirectStorage|declare void @align_rt_template_html_free_v1(ptr) #2
@@ -482,7 +484,8 @@ key|TimeNow|time_now|HostState|declare i64 @align_rt_time_now() #2
 key|TimeParse|time_parse|HostState|declare i32 @align_rt_time_parse(ptr, ptr, i64, i32) #2
 key|TimeSleep|time_sleep|HostState|declare void @align_rt_time_sleep(i64) #2
 key|UdpBind|udp_bind|HostState|declare i32 @align_rt_udp_bind(ptr, i64, i64, ptr) #2
-key|UdpRecvFrom|udp_recv_from|HostState|declare i64 @align_rt_udp_recv_from(ptr, ptr) #2
+key|UdpLocalAddr|udp_local_addr|HostState|declare i32 @align_rt_udp_local_addr(ptr, ptr) #2
+key|UdpRecvFrom|udp_recv_datagram|HostState|declare i32 @align_rt_udp_recv_datagram(ptr, ptr, ptr) #2
 key|UdpSendTo|udp_send_to|HostState|declare i64 @align_rt_udp_send_to(ptr, ptr, i64, ptr, i64, i64) #2
 key|UdpSocketFree|udp_socket_free|HostState|declare void @align_rt_udp_socket_free(ptr) #2
 key|UnicodeNfc|unicode_nfc|IndirectStorage|declare i32 @align_rt_unicode_nfc(ptr captures(none), ptr readonly captures(none), i64) #2

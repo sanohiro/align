@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 499] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 502] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -484,11 +484,13 @@ runtime_keys! {
     StrTrimStart => "str_trim_start",
     TcpAccept => "tcp_accept",
     TcpConnFree => "tcp_conn_free",
+    TcpConnLocalAddr => "tcp_conn_local_addr",
     TcpConnReader => "tcp_conn_reader",
     TcpConnWriter => "tcp_conn_writer",
     TcpConnect => "tcp_connect",
     TcpListen => "tcp_listen",
     TcpListenerFree => "tcp_listener_free",
+    TcpListenerLocalAddr => "tcp_listener_local_addr",
     TcpReadTimeout => "tcp_read_timeout",
     TcpWriteTimeout => "tcp_write_timeout",
     TemplateHtmlFree => "template_html_free",
@@ -507,7 +509,8 @@ runtime_keys! {
     TimeParse => "time_parse",
     TimeSleep => "time_sleep",
     UdpBind => "udp_bind",
-    UdpRecvFrom => "udp_recv_from",
+    UdpLocalAddr => "udp_local_addr",
+    UdpRecvFrom => "udp_recv_datagram",
     UdpSendTo => "udp_send_to",
     UdpSocketFree => "udp_socket_free",
     UnicodeNfc => "unicode_nfc",
@@ -524,7 +527,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 499] = [(); RuntimeKey::ALL.len()];
+const _: [(); 502] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -533,7 +536,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 499);
+        assert_eq!(RuntimeKey::ALL.len(), 502);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

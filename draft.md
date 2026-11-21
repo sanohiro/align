@@ -4472,7 +4472,12 @@ The exact bounded grammar, endpoint, ABI and ownership contract is in `docs/impl
 
 ### std.net
 
-Low-level focused.
+A bound TCP connection, listener or UDP socket provides `local_addr() -> Result<net.endpoint, Error>`.
+`net.endpoint { host: string, port: i64 }` owns its numeric host, including any IPv6 scope.
+Port zero requests a kernel-assigned port from `tcp.listen` or `udp.bind`.
+`u.recv_from(buf: mut buffer) -> Result<net.datagram, Error>` returns
+`net.datagram { n: i64, peer: net.endpoint }`. The count is the number of bytes that fit.
+A zero-capacity destination fails before receiving. An empty datagram carries its sender.
 
 ```text
 tcp

@@ -38,6 +38,8 @@ mod http_peer_eof_tests;
 mod file_read_at_tests;
 #[cfg(test)]
 mod http_accept_budget_tests;
+mod net_endpoint;
+pub use net_endpoint::*;
 #[cfg(test)]
 mod net_service_tests;
 #[cfg(test)]
@@ -1357,18 +1359,22 @@ struct NumericService {
     start: usize,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PortPolicy { AssignedAllowed, Positive }
+
 impl NumericService {
-    fn new(port: i64) -> Option<Self> {
+    fn new(port: i64, policy: PortPolicy) -> Option<Self> {
         let mut value = u16::try_from(port).ok()?;
-        if value == 0 {
+        if value == 0 && policy == PortPolicy::Positive {
             return None;
         }
         let mut service = Self { bytes: [0; 6], start: 5 };
-        // A positive u16 has at most five digits, so the initialized final NUL stays untouched.
-        while value != 0 {
+        // Write at least one digit, including for a kernel-assigned port.
+        loop {
             service.start -= 1;
             service.bytes[service.start] = b"0123456789"[usize::from(value % 10)];
             value /= 10;
+            if value == 0 { break; }
         }
         Some(service)
     }
@@ -1396,7 +1402,7 @@ unsafe fn tcp_connect_validated_fd_with<O: TcpConnectOps>(
         return Err(AL_INVALID);
     }
     unsafe { *out = core::ptr::null_mut() };
-    let Some(c_service) = NumericService::new(port) else {
+    let Some(c_service) = NumericService::new(port, PortPolicy::Positive) else {
         return Err(AL_INVALID);
     };
     let Some(c_host) = (unsafe { abi_c_string(host, host_len) }) else {
@@ -1701,21 +1707,19 @@ pub struct TcpListener {
 /// `host` passes a null node so `getaddrinfo` yields the wildcard address (`INADDR_ANY` / `in6addr_any`
 /// — bind on all interfaces). On success writes the owned `tcp_listener` handle to `out`. Returns `0`
 /// on success, else a status the shared table maps: `AL_INVALID` for a bad `port` (outside
-/// `1..=65535`), a non-UTF-8 / interior-NUL host, or `EAI_NONAME`/`EAI_NODATA`; `AL_CODE + |eai|` for
+/// `0..=65535`), a non-UTF-8 / interior-NUL host, or `EAI_NONAME`/`EAI_NODATA`; `AL_CODE + |eai|` for
 /// another resolver failure; or the last `bind`/`listen`/`socket` errno (via [`io_error_to_status`])
 /// when every candidate address failed (e.g. `EADDRINUSE`). Leaves `*out = null` on failure.
 /// `freeaddrinfo` runs on every path (no leak).
 ///
-/// v1 rejects `port = 0` (a kernel-assigned ephemeral port) — there is no way to read the bound port
-/// back out of the handle yet, so a caller could never discover the assigned port. Deferred until a
-/// `local_addr()`-style accessor lands.
+/// Port zero requests a kernel-assigned port, reported by `local_addr()`.
 ///
 /// # Safety
 /// `host` must describe a valid byte range for `host_len`; `out` must point to a writable
 /// `*mut TcpListener` slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_tcp_listen(host: *const u8, host_len: i64, port: i64, out: *mut *mut TcpListener) -> i32 {
-    unsafe { tcp_listen_impl(host, host_len, port, out, false) }
+    unsafe { tcp_listen_impl(host, host_len, port, out, false, PortPolicy::AssignedAllowed) }
 }
 
 /// The shared body of [`align_rt_tcp_listen`] and the prefork listener behind
@@ -1724,15 +1728,12 @@ pub unsafe extern "C" fn align_rt_tcp_listen(host: *const u8, host_len: i64, por
 ///
 /// # Safety
 /// Same contract as [`align_rt_tcp_listen`].
-unsafe fn tcp_listen_impl(host: *const u8, host_len: i64, port: i64, out: *mut *mut TcpListener, reuseport: bool) -> i32 {
+unsafe fn tcp_listen_impl(host: *const u8, host_len: i64, port: i64, out: *mut *mut TcpListener, reuseport: bool, policy: PortPolicy) -> i32 {
     if out.is_null() {
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    // A TCP port is 1..=65535 — reject out-of-range (0, negative, > 65535). Port 0 (kernel-assigned)
-    // is deliberately rejected in v1 (see the doc comment) rather than silently binding a port the
-    // caller cannot read back.
-    let Some(c_service) = NumericService::new(port) else {
+    let Some(c_service) = NumericService::new(port, policy) else {
         return AL_INVALID;
     };
     // Borrow just long enough to distinguish the allocation-free wildcard case. A non-empty host
@@ -1940,13 +1941,12 @@ pub struct UdpSocket {
 /// `socket`, `bind` — until one succeeds. An empty `host` passes a null node so `getaddrinfo` yields
 /// the wildcard address (`INADDR_ANY` / `in6addr_any`). On success writes the owned `udp_socket`
 /// handle to `out`. Returns `0` on success, else a status the shared table maps: `AL_INVALID` for a
-/// bad `port` (outside `1..=65535`), a non-UTF-8 / interior-NUL host, or `EAI_NONAME`/`EAI_NODATA`;
+/// bad `port` (outside `0..=65535`), a non-UTF-8 / interior-NUL host, or `EAI_NONAME`/`EAI_NODATA`;
 /// `AL_CODE + |eai|` for another resolver failure; or the last `bind`/`socket` errno (via
 /// [`io_error_to_status`]) when every candidate address failed (e.g. `EADDRINUSE`). Leaves
 /// `*out = null` on failure. `freeaddrinfo` runs on every path (no leak).
 ///
-/// v1 rejects `port = 0` (a kernel-assigned ephemeral port) — there is no way to read the bound port
-/// back out of the handle yet, the same deferral as `tcp.listen`.
+/// Port zero requests a kernel-assigned port, reported by `local_addr()`.
 ///
 /// # Safety
 /// `host` must describe a valid byte range for `host_len`; `out` must point to a writable
@@ -1957,9 +1957,7 @@ pub unsafe extern "C" fn align_rt_udp_bind(host: *const u8, host_len: i64, port:
         return AL_INVALID;
     }
     unsafe { *out = core::ptr::null_mut() };
-    // A UDP port is 1..=65535 — reject out-of-range (0, negative, > 65535). Port 0 (kernel-assigned)
-    // is deliberately rejected in v1 (see the doc comment), the `tcp.listen` deferral.
-    let Some(c_service) = NumericService::new(port) else {
+    let Some(c_service) = NumericService::new(port, PortPolicy::AssignedAllowed) else {
         return AL_INVALID;
     };
     // Borrow just long enough to distinguish the allocation-free wildcard case. A non-empty host
@@ -2052,7 +2050,7 @@ pub unsafe extern "C" fn align_rt_udp_send_to(sock: *mut UdpSocket, data: *const
     if sock.is_null() {
         return -(AL_INVALID as i64);
     }
-    let Some(c_service) = NumericService::new(port) else {
+    let Some(c_service) = NumericService::new(port, PortPolicy::Positive) else {
         return -(AL_INVALID as i64);
     };
     let fd = unsafe { (*sock).fd };
@@ -2106,48 +2104,6 @@ pub unsafe extern "C" fn align_rt_udp_send_to(sock: *mut UdpSocket, data: *const
     }
     unsafe { freeaddrinfo(res) };
     -(last_status as i64)
-}
-
-/// `u.recv_from(buf)` — block for one inbound datagram on the socket's fd, filling `buf` up to its
-/// capacity (overwriting its length) and returning the number of bytes received (`>= 0`) on success,
-/// else `-(status)` (the [`align_rt_io_reader_read`] sign convention). Retries `EINTR` (a blocking
-/// wait, the `accept` rationale). The peer address is not captured in v1 (a null `src_addr`).
-///
-/// A datagram larger than `buf`'s capacity is **truncated**: `recvfrom` fills `cap` bytes and the
-/// kernel discards the remainder (standard datagram-socket behavior); the returned count is what fit
-/// (`cap`), and the lost tail is not recoverable. Size the buffer to the largest expected datagram.
-///
-/// # Safety
-/// `sock` must be null or a valid `UdpSocket` pointer; `buf` must be null or a valid `Buffer`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_udp_recv_from(sock: *mut UdpSocket, buf: *mut Buffer) -> i64 {
-    if sock.is_null() || buf.is_null() {
-        return -(AL_INVALID as i64);
-    }
-    let fd = unsafe { (*sock).fd };
-    let b = unsafe { &mut *buf };
-    if b.cap == 0 {
-        b.len = 0;
-        return 0;
-    }
-    let Some(dst) = b.prepare_uninit_window() else { return -(AL_INVALID as i64) };
-    loop {
-        let n = unsafe { recvfrom(fd, dst as *mut core::ffi::c_void, b.cap, 0, core::ptr::null_mut(), core::ptr::null_mut()) };
-        if n >= 0 {
-            // `recvfrom` initialized exactly the returned prefix (possibly truncated to `cap`).
-            let n = n as usize;
-            assert!(n <= b.cap, "recvfrom returned more bytes than its destination length");
-            b.data.with_mut(|data| unsafe { data.set_len(n) });
-            b.len = n;
-            return n as i64;
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            continue; // EINTR: a signal interrupted the blocking wait — retry (no datagram consumed).
-        }
-        b.len = 0;
-        return -(io_error_to_status(&e) as i64);
-    }
 }
 
 /// Read the already-open file into a fresh **arena** allocation, writing a `{ptr,len}` view to
@@ -18275,12 +18231,8 @@ unsafe extern "C" {
     fn listen(sockfd: i32, backlog: i32) -> i32;
     #[cfg(not(target_os = "linux"))]
     fn accept(sockfd: i32, addr: *mut u8, addrlen: *mut u32) -> i32;
-    // `sendto`/`recvfrom` — the connectionless (UDP) datagram calls (identical prototypes on Linux
-    // and macOS/BSD). A null `dest_addr`/`src_addr` means "unspecified"; `recvfrom` with a null
-    // `src_addr`/`addrlen` discards the peer address. Both return the byte count (`isize`), `-1` on
-    // error.
+    // Datagram destination uses the native address supplied by getaddrinfo.
     fn sendto(sockfd: i32, buf: *const core::ffi::c_void, len: usize, flags: i32, dest_addr: *const u8, addrlen: u32) -> isize;
-    fn recvfrom(sockfd: i32, buf: *mut core::ffi::c_void, len: usize, flags: i32, src_addr: *mut u8, addrlen: *mut u32) -> isize;
     // `poll(2)` — the server's keep-alive `accept` waits on TWO fds at once (the parked connection and
     // the listener) instead of blocking in `accept` alone (http.md item 9 ②). Identical prototype and
     // `POLLIN`/`POLLHUP`/`POLLERR` values on Linux and macOS/BSD; `timeout < 0` blocks forever.
@@ -26652,7 +26604,7 @@ unsafe fn http_serve_impl(host_ptr: *const u8, host_len: i64, port: i64, out: *m
     }
     unsafe { *out = core::ptr::null_mut() };
     let mut listener: *mut TcpListener = core::ptr::null_mut();
-    let rc = unsafe { tcp_listen_impl(host_ptr, host_len, port, &mut listener, reuseport) };
+    let rc = unsafe { tcp_listen_impl(host_ptr, host_len, port, &mut listener, reuseport, PortPolicy::Positive) };
     if rc != 0 {
         return rc; // *out already null; nothing to free (listen left `listener` null on failure)
     }
@@ -42279,7 +42231,7 @@ mod tests {
         let (hp, hl) = view_of("127.0.0.1");
         // A null `out` slot is rejected as Error.Invalid, never a crash.
         assert_eq!(unsafe { align_rt_tcp_connect(hp, hl, 80, 0, std::ptr::null_mut()) }, AL_INVALID);
-        // Out-of-range ports (0, negative, > 65535) are Error.Invalid, never an abort and never a
+        // Out-of-range ports (negative or greater than 65535) are Error.Invalid, never an abort and never a
         // wrap into a valid port; `out` is left null.
         for bad in [0i64, -1, 65536, 70000] {
             let mut conn: *mut TcpConn = std::ptr::null_mut();
@@ -42477,21 +42429,23 @@ mod tests {
         server.join().expect("timeout server");
     }
 
+    fn test_bound_port(observe: impl FnOnce(&mut NetEndpoint) -> i32) -> i64 {
+        let mut address = net_endpoint::EMPTY;
+        assert_eq!(observe(&mut address), 0);
+        assert!(address.port > 0);
+        unsafe { align_rt_free(address.host.ptr.cast_mut()) };
+        address.port
+    }
+
     #[test]
     fn tcp_listen_accept_connect_loopback_roundtrip() {
         use std::io::{Read, Write};
-        // A free loopback port: bind a probe listener on :0, read its port, drop it, then have the
-        // runtime bind that port. (Port 0 is rejected by `align_rt_tcp_listen`, so a real port is
-        // needed — the standard probe pattern.) The window between drop and re-bind is small; a
-        // failure here would surface as EADDRINUSE (a clean Err), never a hang.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        let port = probe.local_addr().unwrap().port() as i64;
-        drop(probe);
 
         let (hp, hl) = view_of("127.0.0.1");
         let mut listener: *mut TcpListener = std::ptr::null_mut();
-        let rc = unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) };
-        assert_eq!(rc, 0, "listen on the probed loopback port succeeds");
+        let rc = unsafe { align_rt_tcp_listen(hp, hl, 0, &mut listener) };
+        assert_eq!(rc, 0, "listen on an assigned loopback port succeeds");
+        let port = test_bound_port(|out| unsafe { align_rt_tcp_listener_local_addr(listener, out) });
         assert!(!listener.is_null(), "a successful listen writes a non-null handle");
 
         // A client connects (via the runtime `connect`) once the listener is up, sends a byte string,
@@ -42536,14 +42490,12 @@ mod tests {
     fn tcp_listen_empty_host_binds_wildcard() {
         // An empty host passes a null node to `getaddrinfo` (AI_PASSIVE) — the wildcard bind.
         // Prove the path end-to-end: a loopback client can reach the wildcard listener.
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-        let port = probe.local_addr().unwrap().port() as i64;
-        drop(probe);
 
         let (hp, hl) = view_of("");
         let mut listener: *mut TcpListener = std::ptr::null_mut();
-        let rc = unsafe { align_rt_tcp_listen(hp, hl, port, &mut listener) };
-        assert_eq!(rc, 0, "wildcard listen on the probed port succeeds");
+        let rc = unsafe { align_rt_tcp_listen(hp, hl, 0, &mut listener) };
+        assert_eq!(rc, 0, "wildcard listen on an assigned port succeeds");
+        let port = test_bound_port(|out| unsafe { align_rt_tcp_listener_local_addr(listener, out) });
         assert!(!listener.is_null(), "a successful wildcard listen writes a non-null handle");
 
         let client = std::thread::spawn(move || {
@@ -42579,9 +42531,9 @@ mod tests {
         let (hp, hl) = view_of("127.0.0.1");
         // A null `out` slot is rejected as Error.Invalid, never a crash.
         assert_eq!(unsafe { align_rt_tcp_listen(hp, hl, 8080, std::ptr::null_mut()) }, AL_INVALID);
-        // Out-of-range ports (0 = kernel-assigned but unreadable in v1, negative, > 65535) are all
+        // Out-of-range ports (negative or greater than 65535) are all
         // Error.Invalid, never an abort; `out` is left null.
-        for bad in [0i64, -1, 65536, 70000] {
+        for bad in [-1i64, 65536, 70000] {
             let mut listener: *mut TcpListener = std::ptr::null_mut();
             assert_eq!(unsafe { align_rt_tcp_listen(hp, hl, bad, &mut listener) }, AL_INVALID, "port {bad} is invalid");
             assert!(listener.is_null(), "a rejected port leaves out null");
@@ -42607,17 +42559,12 @@ mod tests {
 
     #[test]
     fn udp_bind_send_to_recv_from_loopback_roundtrip() {
-        // Bind an Align UDP socket on an ephemeral loopback port (probe :0 for a free port — port 0
-        // is rejected by `align_rt_udp_bind`, so a real port is needed). A Rust peer binds its own
-        // socket, then the two exchange one datagram each way.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-        let srv_port = probe.local_addr().unwrap().port() as i64;
-        drop(probe);
 
         let (hp, hl) = view_of("127.0.0.1");
         let mut sock: *mut UdpSocket = std::ptr::null_mut();
-        let rc = unsafe { align_rt_udp_bind(hp, hl, srv_port, &mut sock) };
-        assert_eq!(rc, 0, "udp bind on the probed loopback port succeeds");
+        let rc = unsafe { align_rt_udp_bind(hp, hl, 0, &mut sock) };
+        assert_eq!(rc, 0, "udp bind on an assigned loopback port succeeds");
+        let srv_port = test_bound_port(|out| unsafe { align_rt_udp_local_addr(sock, out) });
         assert!(!sock.is_null(), "a successful bind writes a non-null handle");
 
         // The Rust peer binds its own loopback socket and sends a datagram to the Align socket.
@@ -42627,7 +42574,10 @@ mod tests {
 
         // The Align socket receives the datagram (recv_from fills the buffer, returns the count).
         let b = align_rt_buffer_new(16, 1, 0);
-        let n = unsafe { align_rt_udp_recv_from(sock, b) };
+        let mut message = NetDatagram { n: -1, peer: net_endpoint::EMPTY };
+        assert_eq!(unsafe { align_rt_udp_recv_datagram(sock, b, &mut message) }, 0);
+        let n = message.n;
+        unsafe { align_rt_free(message.peer.host.ptr.cast_mut()) };
         assert_eq!(n, 4, "recv_from returns the datagram's 4 bytes");
         let got = unsafe { &*b };
         assert_eq!(&got.data[..got.len], b"ping", "the datagram round-trips byte-exact");
@@ -42648,20 +42598,21 @@ mod tests {
     fn udp_bind_empty_host_binds_wildcard() {
         // An empty host passes a null node to `getaddrinfo` (AI_PASSIVE) — the wildcard bind. Prove
         // the path end-to-end: a loopback peer can reach the wildcard-bound socket.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-        let port = probe.local_addr().unwrap().port() as i64;
-        drop(probe);
 
         let (hp, hl) = view_of("");
         let mut sock: *mut UdpSocket = std::ptr::null_mut();
-        let rc = unsafe { align_rt_udp_bind(hp, hl, port, &mut sock) };
-        assert_eq!(rc, 0, "wildcard udp bind on the probed port succeeds");
+        let rc = unsafe { align_rt_udp_bind(hp, hl, 0, &mut sock) };
+        assert_eq!(rc, 0, "wildcard udp bind on an assigned port succeeds");
+        let port = test_bound_port(|out| unsafe { align_rt_udp_local_addr(sock, out) });
         assert!(!sock.is_null());
 
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer bind");
         peer.send_to(b"hi", ("127.0.0.1", port as u16)).expect("peer sends to wildcard socket");
         let b = align_rt_buffer_new(8, 1, 0);
-        let n = unsafe { align_rt_udp_recv_from(sock, b) };
+        let mut message = NetDatagram { n: -1, peer: net_endpoint::EMPTY };
+        assert_eq!(unsafe { align_rt_udp_recv_datagram(sock, b, &mut message) }, 0);
+        let n = message.n;
+        unsafe { align_rt_free(message.peer.host.ptr.cast_mut()) };
         assert_eq!(n, 2, "the wildcard socket receives the loopback datagram");
 
         unsafe { align_rt_udp_socket_free(sock) };
@@ -42672,17 +42623,18 @@ mod tests {
     fn udp_recv_from_into_small_buffer_truncates() {
         // A datagram larger than the buffer's capacity is truncated (recvfrom fills `cap`, discards
         // the rest); the count is what fit. Pin this documented behavior.
-        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-        let port = probe.local_addr().unwrap().port() as i64;
-        drop(probe);
         let (hp, hl) = view_of("127.0.0.1");
         let mut sock: *mut UdpSocket = std::ptr::null_mut();
-        assert_eq!(unsafe { align_rt_udp_bind(hp, hl, port, &mut sock) }, 0);
+        assert_eq!(unsafe { align_rt_udp_bind(hp, hl, 0, &mut sock) }, 0);
 
+        let port = test_bound_port(|out| unsafe { align_rt_udp_local_addr(sock, out) });
         let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer bind");
         peer.send_to(b"0123456789", ("127.0.0.1", port as u16)).expect("peer sends a 10-byte datagram");
         let b = align_rt_buffer_new(4, 1, 0); // smaller than the datagram
-        let n = unsafe { align_rt_udp_recv_from(sock, b) };
+        let mut message = NetDatagram { n: -1, peer: net_endpoint::EMPTY };
+        assert_eq!(unsafe { align_rt_udp_recv_datagram(sock, b, &mut message) }, 0);
+        let n = message.n;
+        unsafe { align_rt_free(message.peer.host.ptr.cast_mut()) };
         assert_eq!(n, 4, "recv_from into a too-small buffer returns the capacity (truncated)");
         let got = unsafe { &*b };
         assert_eq!(got.data.len(), 4, "recvfrom publishes exactly the initialized truncated prefix");
@@ -42697,8 +42649,8 @@ mod tests {
         let (hp, hl) = view_of("127.0.0.1");
         // A null `out` slot is rejected as Error.Invalid, never a crash.
         assert_eq!(unsafe { align_rt_udp_bind(hp, hl, 8080, std::ptr::null_mut()) }, AL_INVALID);
-        // Out-of-range ports (0, negative, > 65535) are all Error.Invalid; `out` is left null.
-        for bad in [0i64, -1, 65536, 70000] {
+        // Out-of-range ports (negative or greater than 65535) are all Error.Invalid; `out` is left null.
+        for bad in [-1i64, 65536, 70000] {
             let mut sock: *mut UdpSocket = std::ptr::null_mut();
             assert_eq!(unsafe { align_rt_udp_bind(hp, hl, bad, &mut sock) }, AL_INVALID, "port {bad} is invalid");
             assert!(sock.is_null(), "a rejected port leaves out null");
@@ -42708,7 +42660,10 @@ mod tests {
     #[test]
     fn udp_send_to_and_recv_from_bad_args() {
         // A null socket / null buffer / bad port is a negative (Err) status, never a crash.
-        assert_eq!(unsafe { align_rt_udp_recv_from(std::ptr::null_mut(), std::ptr::null_mut()) }, -(AL_INVALID as i64));
+        let mut result = NetDatagram { n: -1, peer: net_endpoint::EMPTY };
+        assert_eq!(unsafe { align_rt_udp_recv_datagram(std::ptr::null(), std::ptr::null_mut(), &mut result) }, AL_INVALID);
+        assert_eq!(result.n, 0);
+        assert!(result.peer.host.ptr.is_null());
         let (hp, hl) = view_of("127.0.0.1");
         assert_eq!(unsafe { align_rt_udp_send_to(std::ptr::null_mut(), b"x".as_ptr(), 1, hp, hl, 80) }, -(AL_INVALID as i64));
         // A real socket, but a bad destination port / empty host is Err.
@@ -42721,7 +42676,7 @@ mod tests {
         let (eh, el) = view_of("");
         assert_eq!(unsafe { align_rt_udp_send_to(sock, b"x".as_ptr(), 1, eh, el, port) }, -(AL_INVALID as i64), "an empty host is not a valid destination");
         // recv_from into a null buffer on a real socket is Err (not a crash).
-        assert_eq!(unsafe { align_rt_udp_recv_from(sock, std::ptr::null_mut()) }, -(AL_INVALID as i64));
+        assert_eq!(unsafe { align_rt_udp_recv_datagram(sock, std::ptr::null_mut(), &mut result) }, AL_INVALID);
         unsafe { align_rt_udp_socket_free(sock) };
     }
 

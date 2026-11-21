@@ -1,5 +1,7 @@
 # Align Design Notes
 
+A datagram carries its sender as an ordinary Move record. Owning the numeric host lets callers keep a peer after another receive or after closing the socket. Looking up the bound port on the same handle removes the race between probing a free port and opening the listener.
+
 Literal text splitting materializes an independently owned array of borrowed views. Keeping the field headers separate from the input buffer allows fields to survive array replacement while retaining the input's UTF-8 validation and lifetime. An empty separator splits on Unicode scalar boundaries so every field is valid text.
 
 A nonblocking HTTP peer EOF probe reports the narrow TCP receive observation.

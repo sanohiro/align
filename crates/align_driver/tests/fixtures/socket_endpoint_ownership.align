@@ -1,0 +1,18 @@
+module packets
+import std.net
+
+pub fn unchanged(e: Error) -> Error = e
+
+pub fn receive<T>(drop_early: bool, tag: T) -> Result<net.datagram, Error> {
+    server := udp.bind("127.0.0.1", 0)?
+    client := udp.bind("127.0.0.1", 0)?
+    dest := server.local_addr()?
+    sent := client.send_to("one", dest.host, dest.port)?
+    mut b := buffer(3)
+    first := server.recv_from(b)?
+    if drop_early { return Err(Error.Invalid) }
+    client.send_to("two", dest.host, dest.port)?
+    second := server.recv_from(b)?
+    if first.n != sent || second.peer.port != first.peer.port || b.bytes()[0] != 116 { return Err(Error.Invalid) }
+    return Ok(first)
+}

@@ -29,7 +29,12 @@ l.accept() -> Result<tcp_conn, Error>
 // UDP
 udp.bind(host: str, port: i64) -> Result<udp_socket, Error>
 u.send_to(data: bytes, host: str, port: i64) -> Result<i64, Error>
-u.recv_from(buf: mut buffer) -> Result<i64, Error>        // fills caller buffer, returns byte count (v1)
+u.recv_from(buf: mut buffer) -> Result<net.datagram, Error>
+c.local_addr() -> Result<net.endpoint, Error>     // tcp_conn
+l.local_addr() -> Result<net.endpoint, Error>     // tcp_listener
+u.local_addr() -> Result<net.endpoint, Error>     // udp_socket
+net.endpoint { host: string, port: i64 }
+net.datagram { n: i64, peer: net.endpoint }
 // DNS
 dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
 ```
@@ -46,16 +51,10 @@ dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
   (`owns_fd: false` — fd の所有と close は引き続き conn 側が担う)。したがって reader/writer のリージョン
   は conn `c` に束縛され、`c` の Drop を越えて使うことは拒否される(`region_of(TcpReader) = region_of(c)`)。
   これは #297 のトラップを意識した分岐である。
-- `dns.resolve` は所有権付きの `array<string>` を返す(`read_dir` #339 と同じ deep-drop)。
-  `datagram`/`response` は小さな構造体(Copy)で、カウントと、必要に応じて所有権付きの peer/body を運ぶ。
-  - **Slice 4 v1 の形(実装済み):** `recv_from` は受信**バイト数**のみを返す(`Result<i64, Error>`)。
-    `reader.read` とまったく同じ形(呼び出し側のバッファを埋め、バイト数を返す)。理想形である
-    `datagram {n, peer}` は**先送り**する:`Result` の `Ok` ペイロードは単一の `Scalar` であり
-    (`Scalar::Tuple` は存在しない)、peer アドレスは所有権付きの `string` なので、`{n, peer}` は
-    所有フィールドを持つ組み込み Move 構造体という集約型を新たに合成する必要がある — これは
-    「あるべき姿、さもなくば先送り」が禁じる、ライブラリ固有のコンパイラ処理にあたる。第一級の組み込み構造体戻り値が
-    入るまで待つ。ソケット自体は syscall(`recvfrom`)で peer を受け取っているが、v1 では単に破棄する
-    (`src_addr` は null)。
+- `dns.resolve` は所有する `array<string>` を返す。
+- ポート `0` を指定して `tcp.listen` または `udp.bind` を呼ぶと、カーネルがポートを選ぶ。束縛したハンドルの `local_addr()` で実際のアドレスとポートを取得する。接続と送信の宛先ポートは 1〜65535。
+- `net.endpoint` と `net.datagram` は通常の Move 構造体。ホスト名は数値表記の IPv4 または IPv6 を保持する所有文字列で、IPv6 のスコープ ID が非ゼロなら `%数値` が付く。受信後にソケットを閉じたりバッファを再利用したりしても、送信元を利用できる。
+- `u.recv_from(buf)` は受信したバイト数と送信元を返す。長いデータグラムは容量まで読み、残りを破棄する。容量が正なら空のデータグラムも送信元と `n == 0` を返す。容量ゼロのバッファは受信前に `Error.Invalid` となる。受信エラー時のバッファ長はゼロ。
 
 ## Effect classification
 

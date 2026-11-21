@@ -34,6 +34,7 @@ mod json_encode;
 pub use json_encode::json_encode_sequence_is_valid;
 pub mod print;
 pub mod producer;
+mod socket_observation;
 mod query_meta_layout;
 pub use query_meta_layout::QueryMetaTypes;
 mod runtime_key;
@@ -2334,13 +2335,9 @@ pub enum Rvalue {
         host: Operand,
         port: Operand,
     },
-    /// `u.recv_from(buf)` — block for one inbound datagram on the `udp_socket` operand, filling the
-    /// `buffer` operand up to its capacity (overwriting its length). Yields an `i64`: the bytes
-    /// received (`>= 0`, `Ok`) or `-(status)` on error (the [`Rvalue::ReaderRead`] sign convention).
-    UdpRecvFrom {
-        sock: Operand,
-        buffer: Operand,
-    },
+    /// Read a local endpoint or receive a UDP datagram into the supplied buffer. The native
+    /// boundary initializes the ordinary Move record in out and returns an i32 status.
+    SocketObserve { socket: Operand, buffer: Option<Operand>, out: Slot },
     /// `process.spawn(cmd, args)` — `fork` + `execvp(cmd, argv)`. `cmd` is a `str` view (the lookup
     /// path); `args` is a str-view collection `{ptr,len}` (the child's full argv, incl. argv[0]). On
     /// success writes the owned `child` handle (a bare pointer) into `out`. Yields an `i32` status (0 =
@@ -9589,6 +9586,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             hir::ExprKind::TcpListen { host, port } => lower_tcp_listen(b, host, port, e.ty),
             hir::ExprKind::TcpAccept { listener } => lower_tcp_accept(b, listener, e.ty),
+            hir::ExprKind::SocketLocalAddr { socket } => lower_socket_observation(b, socket, None, e.ty),
             hir::ExprKind::UdpBind { host, port } => lower_udp_bind(b, host, port, e.ty),
             hir::ExprKind::UdpSendTo {
                 sock,
@@ -9597,7 +9595,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 port,
             } => lower_udp_send_to(b, sock, data, host, port, e.ty),
             hir::ExprKind::UdpRecvFrom { sock, buffer } => {
-                lower_udp_recv_from(b, sock, buffer, e.ty)
+                lower_socket_observation(b, sock, Some(buffer), e.ty)
             }
             hir::ExprKind::ProcessSpawn { cmd, args } => lower_process_spawn(b, cmd, args, e.ty),
             hir::ExprKind::ChildWait { child } => lower_child_wait(b, child, e.ty),
@@ -20705,26 +20703,20 @@ fn lower_udp_send_to(
     lower_count_or_status_result(b, n, result_ty)
 }
 
-/// `u.recv_from(buf)` → the runtime blocks for one datagram, filling `buf` and returning the bytes
-/// received (`>= 0`) or `-(status)`; wrap into `Result<i64, Error>` via the shared count/status
-/// helper (the `reader.read` sign convention).
-fn lower_udp_recv_from(
-    b: &mut Builder,
-    sock: &hir::Expr,
-    buffer: &hir::Expr,
-    result_ty: Ty,
-) -> Operand {
-    let s = lower_required!(b, lower_expr(b, sock), Operand::Const(Const::Unit));
-    let buf = lower_required!(b, lower_expr(b, buffer), Operand::Const(Const::Unit));
-    let n = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(
-        n,
-        Rvalue::UdpRecvFrom {
-            sock: s,
-            buffer: buf,
-        },
-    ));
-    lower_count_or_status_result(b, n, result_ty)
+fn lower_socket_observation(b: &mut Builder, socket: &hir::Expr, buffer: Option<&hir::Expr>, result_ty: Ty) -> Operand {
+    let socket = lower_required!(b, lower_expr(b, socket), Operand::Const(Const::Unit));
+    let buffer = if let Some(expr) = buffer {
+        Some(lower_required!(b, lower_expr(b, expr), Operand::Const(Const::Unit)))
+    } else { None };
+    let Ty::Result(Scalar::Struct(id), _) = result_ty else {
+        b.terminate(Term::Unreachable);
+        return Operand::Const(Const::Unit);
+    };
+    let record = Ty::Struct(id);
+    let out = b.new_slot(record);
+    let code = b.fresh_value(status_ty());
+    b.push(Stmt::Let(code, Rvalue::SocketObserve { socket, buffer, out }));
+    emit_open_handle_result(b, code, out, record, result_ty)
 }
 
 /// `process.spawn(cmd, args)` → the runtime `fork`s + `execvp`s, writing the owned `child` handle into

@@ -315,7 +315,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::TcpConnect { .. } | Rvalue::ConnReader { .. } | Rvalue::ConnWriter { .. } |
         Rvalue::TcpReadTimeout { .. } | Rvalue::TcpWriteTimeout { .. } | Rvalue::TcpListen { .. } |
         Rvalue::TcpAccept { .. } | Rvalue::UdpBind { .. } | Rvalue::UdpSendTo { .. } |
-        Rvalue::UdpRecvFrom { .. } | Rvalue::ProcessSpawn { .. } | Rvalue::ChildWait { .. } |
+        Rvalue::SocketObserve { .. } | Rvalue::ProcessSpawn { .. } | Rvalue::ChildWait { .. } |
         Rvalue::ChildKill { .. } | Rvalue::ProcessExec { .. } | Rvalue::FsReadFileView { .. } |
         Rvalue::FsReadBytesView { .. } | Rvalue::PathJoin { .. } | Rvalue::PathComponent { .. } |
         Rvalue::PathNormalize { .. } | Rvalue::EnvGet { .. } | Rvalue::EnvSet { .. } |

@@ -3014,7 +3014,7 @@ str_contains str_ends_with str_eq str_eq_ignore_case str_find str_finder_find st
 str_finder_new str_rfind str_starts_with str_trim str_trim_end str_trim_start tcp_accept
 tcp_conn_free tcp_conn_reader tcp_conn_writer tcp_connect tcp_listen tcp_listener_free
 tcp_read_timeout tcp_write_timeout tg_alloc tg_begin tg_end tg_register tg_wait time_instant
-time_now time_sleep udp_bind udp_recv_from udp_send_to udp_socket_free utf8_boundary_fail
+tcp_conn_local_addr tcp_listener_local_addr time_now time_sleep udp_bind udp_local_addr udp_recv_datagram udp_send_to udp_socket_free utf8_boundary_fail
 utf8_valid
 ```
 
@@ -3286,7 +3286,7 @@ ReaderBuffered ReaderReadLine BytesAsStr WriterWrite WriterFlush IoCopy FileCrea
 FilePread FilePwrite FileLen BufferNew BufferBytes StrBytes BufferLen BytesRead BufferPut
 BufferAppend ArrayBuilderNew ArrayBuilderPush ArrayBuilderAppend ArrayBuilderBuild FsWriteFile
 FsExists FsRemove FsReadDir DnsResolve TcpConnect ConnReader ConnWriter TcpReadTimeout
-TcpWriteTimeout TcpListen TcpAccept UdpBind UdpSendTo UdpRecvFrom FsReadFileView
+TcpWriteTimeout TcpListen TcpAccept SocketLocalAddr UdpBind UdpSendTo UdpRecvFrom FsReadFileView
 FsReadBytesView PathJoin PathComponent PathNormalize EnvGet EnvSet TimeNow TimeInstant
 ProcessCpuCount TimeSleep ProcessExit ProcessAbort ProcessSpawn ChildWait ChildKill ProcessExec
 ProcessCommand CommandCwd CommandTimeout CommandEnv CommandEnvClear CommandRun RunOutputCode
