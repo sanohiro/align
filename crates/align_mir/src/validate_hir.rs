@@ -10294,9 +10294,10 @@ impl<'a> BodyValidator<'a> {
                     .then(|| result(Ty::Tagged(option_id), &[stream, buffer]))?
             }
             hir::ExprKind::HttpTlsClient { args } => {
-                if args.len() != 5 { return None; }
+                if args.len() != 6 { return None; }
                 for (index, arg) in args.iter().enumerate() {
-                    if self.expr_flow(arg)?.falls && !(if index == 0 { arg.ty == Ty::Str } else { byte_view(arg.ty) }) {
+                    let valid = match index { 0 => arg.ty == Ty::Str, 5 => arg.ty == Ty::Bool, _ => byte_view(arg.ty) };
+                    if self.expr_flow(arg)?.falls && !valid {
                         return None;
                     }
                 }

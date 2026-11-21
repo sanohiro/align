@@ -17,7 +17,8 @@ fn main() {
         assert!(prefix.status.success(), "install openssl@3 or set OPENSSL_INCLUDE_DIR");
         tls.include(PathBuf::from(std::str::from_utf8(&prefix.stdout).expect("OpenSSL prefix").trim()).join("include"));
     }
-    tls.file("src/http_tls_policy.c").std("c11").compile("align_http_tls_policy");
+    println!("cargo:rerun-if-changed=src/http_tls_sessions.c");
+    tls.file("src/http_tls_policy.c").file("src/http_tls_sessions.c").std("c11").compile("align_http_tls_policy");
     println!("cargo:rerun-if-changed=src/crypto_blake3.c");
     println!("cargo:rerun-if-env-changed=BLAKE3_INCLUDE_DIR");
     for name in ["PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"] {

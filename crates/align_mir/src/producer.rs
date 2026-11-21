@@ -1067,8 +1067,8 @@ fn xml_numeric_scalar_ty(ty: Ty) -> bool {
 }
 
 // A raw borrow-mode argument is a native address. Its entry store binds a slot, and a
-// BorrowedPlace reads the value from that slot. It cannot itself be a numeric operand.
-fn numeric_value_form(function: &Function, operand: &Operand) -> bool {
+// BorrowedPlace reads the value from that slot. It cannot itself be used as a scalar or byte-view value.
+fn direct_value_form(function: &Function, operand: &Operand) -> bool {
     match operand {
         Operand::Arg(index) => function.param_modes.get(*index as usize)
             == Some(&align_ast::ParamMode::ByValue),
@@ -1987,13 +1987,19 @@ pub fn native_owner_mir_contract<'a>(
                 (req, Ty::HttpRequest, consume),
             ];
         }
-        Rvalue::HttpTlsClient { views, out } => {
+        Rvalue::HttpTlsClient { views, resume, out } => {
             let valid = views.len() == 5 && views.iter().all(|v| match v {
                 Operand::Arg(i) => function.param_modes.get(*i as usize) == Some(&align_ast::ParamMode::ByValue),
                 Operand::Value(_) | Operand::BorrowedPlace(_) => true,
                 _ => false,
             });
-            contract.result = if valid { i32_ty } else { Ty::Error };
+            let flag_valid = match resume {
+                Operand::Const(Const::Bool(_)) | Operand::Value(_) | Operand::BorrowedPlace(_) => true,
+                Operand::Arg(i) => function.param_modes.get(*i as usize) == Some(&align_ast::ParamMode::ByValue),
+                _ => false,
+            };
+            contract.result = if valid && flag_valid { i32_ty } else { Ty::Error };
+            contract.operands.push((resume, Ty::Bool, read));
             contract.outputs.push((*out, Ty::HttpClient));
             for (index, view) in views.iter().enumerate() {
                 contract.operands.push((view, if index == 0 { Ty::Str } else { byte_view(view) }, read));
@@ -2297,7 +2303,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         Rvalue::HttpReadStreamHeader { stream, name, .. } => vec![stream, name],
         Rvalue::HttpReadStreamRead { stream, buffer, .. }
         | Rvalue::HttpSseStreamNext { stream, buffer, .. } => vec![stream, buffer],
-        Rvalue::HttpTlsClient { views, .. } => views.iter().collect(),
+        Rvalue::HttpTlsClient { views, resume, .. } => views.iter().chain(std::iter::once(resume)).collect(),
         Rvalue::HttpGetMany {
             client,
             urls,
@@ -3893,10 +3899,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                let numeric = matches!(source_ty, Ty::Vec(..) | Ty::Mask(..)) || xml_numeric_scalar_ty(source_ty);
+                let needs_value = matches!(source_ty, Ty::Vec(..) | Ty::Mask(..) | Ty::Bool | Ty::Char | Ty::Str | Ty::String | Ty::Slice(_))
+                    || xml_numeric_scalar_ty(source_ty);
                 let compatible = xml_value_flow_matches(self.graph.program, source_ty, result_ty)
                     || xml_ty_is_view_retype(source_ty, result_ty);
-                if !compatible || (numeric && !numeric_value_form(self.graph.function, &operand)) {
+                if !compatible || (needs_value && !direct_value_form(self.graph.function, &operand)) {
                     equation.invalid = true;
                 } else if path.is_empty() {
                     self.add_operand(&mut equation, &operand, source_ty, Vec::new());
@@ -5008,7 +5015,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                         scalar_to_ty(element) == elem && lanes == n && elems.len() == n as usize
                     })
                     || elems.iter().any(|lane| {
-                        !numeric_value_form(self.graph.function, lane)
+                        !direct_value_form(self.graph.function, lane)
                             || xml_operand_base_ty(self.graph.function, lane) != Some(elem)
                     })
                 {
@@ -5033,7 +5040,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     });
                 if !condition_matches
                     || (matches!(result_ty, Ty::Vec(..)) && [&cond, &a, &b].into_iter()
-                        .any(|op| !numeric_value_form(self.graph.function, op)))
+                        .any(|op| !direct_value_form(self.graph.function, op)))
                     || !xml_operand_base_ty(self.graph.function, &a)
                         .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, result_ty))
                     || !xml_operand_base_ty(self.graph.function, &b)
@@ -6950,7 +6957,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 };
                 if !path.is_empty() || result_ty != elem || scalar_to_ty(element) != elem
-                    || lanes != n || !numeric_value_form(function, vec) || mode.has_unknown()
+                    || lanes != n || !direct_value_form(function, vec) || mode.has_unknown()
                     || (!matches!(elem, Ty::Float(_)) && !mode.is_empty())
                 {
                     equation.invalid = true;
@@ -6958,10 +6965,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 self.check_operand(&mut equation, vec, vec_ty);
                 match &definition {
-                    Rvalue::VecDot { b, .. } if numeric_value_form(function, b) => {
+                    Rvalue::VecDot { b, .. } if direct_value_form(function, b) => {
                         self.check_operand(&mut equation, b, vec_ty);
                     }
-                    Rvalue::VecSumWhere { mask, .. } if numeric_value_form(function, mask) => {
+                    Rvalue::VecSumWhere { mask, .. } if direct_value_form(function, mask) => {
                         let mask_ty = xml_operand_base_ty(function, mask);
                         if let Some(ty) = mask_ty.filter(|t| align_sema::mask_gates_vector(*t, element, n)) {
                             self.check_operand(&mut equation, mask, ty);

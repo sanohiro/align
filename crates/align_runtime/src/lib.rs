@@ -23912,6 +23912,11 @@ unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64, policy: Optio
     // (alert/protocol) via `ssl_error_status`, which checks `SSL_get_verify_result` first. With a
     // deadline armed, a `WANT_*`/`SYSCALL` whose errno is `EAGAIN`/`EWOULDBLOCK` is that deadline
     // firing → `AL_TIMEOUT` (not a generic transport error).
+    let sessions = policy.filter(|p| p.resume);
+    if let Some(policy) = sessions {
+        let status = policy.prepare_session(ssl);
+        if status != 0 { return fail(status); }
+    }
     crypto_asymmetric::clear_errors();
     let rc = unsafe { SSL_connect(ssl) };
     if rc != 1 {
@@ -23923,6 +23928,10 @@ unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64, policy: Optio
             && e.kind() == std::io::ErrorKind::WouldBlock;
         let status = if timed_out { AL_TIMEOUT } else { unsafe { ssl_error_status(ssl, err, &e) } };
         return fail(status);
+    }
+    if let Some(policy) = sessions {
+        let status = policy.verify_session(ssl);
+        if status != 0 { return fail(status); }
     }
     Ok(Conn::Tls { ssl, fd })
 }
@@ -25063,6 +25072,9 @@ impl HttpReadStream {
             && !conn.has_pending();
         let client = unsafe { self.client.as_ref() };
         let (fd, ssl) = conn.into_parts();
+        if allow_pool && let Some(policy) = client.and_then(|c| c.policy.as_ref()).filter(|p| p.resume) {
+            policy.complete_session(ssl);
+        }
         if reusable && let Some(client) = client {
             client.put_idle(self.scheme, &self.host, self.port, fd, ssl);
             return;
@@ -26068,6 +26080,9 @@ unsafe fn http_client_perform(
                 // receive buffer into `response`. Decide the conn's fate only after that successful
                 // parse: a protocol failure returns `Failed` above and is never pooled.
                 let (fd, ssl) = conn.into_parts();
+                if let Some(policy) = client_ref.and_then(|c| c.policy.as_ref()).filter(|p| p.resume) {
+                    policy.complete_session(ssl);
+                }
                 if reusable && let Some(c) = client_ref {
                     c.put_idle(scheme, host, port, fd, ssl);
                 } else {

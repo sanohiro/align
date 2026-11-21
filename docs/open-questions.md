@@ -17,7 +17,7 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ### Origin-scoped client TLS
 
-`http.tls_client` supports explicit trust, mutual TLS and offline CRLs. Its immutable origin limits all request paths before socket acquisition, and its existing Move owner releases credentials and pooled connections together. [HTTPS client contract](impl/269-private-http-client-tls.md)
+`http.tls_client` supports explicit trust, mutual TLS and offline CRLs. Its immutable origin limits all request paths before socket acquisition, and its existing Move owner releases credentials and pooled connections together. An optional final boolean permits a single-use TLS issuance for an explicitly trusted origin with empty CRLs. The original verification interval and 90-second age limit persist across successor tickets. [HTTPS client contract](impl/269-private-http-client-tls.md)
 
 ### Literal text splitting
 

@@ -14,20 +14,22 @@ TLS はクライアント優先で先送り。HTTP/3、ルーティング、ミ�
 **モジュール状態: v1 COMPLETE**(スライス 1–6 出荷済み。クライアント側 TLS はスライス 5)。最初の
 post-`pkg.db` convergence item である client streaming receive は **2026-08-30 実装済み**で、dependent raw
 `http_read_stream` boundary と consuming `http_sse_stream` transition の両方が出荷済みである。
-接続先を限定したクライアントは、独自の信頼ルート、相互 TLS、オフライン CRL による失効確認に対応する。サーバ側 TLS とセッション再開は別のバックログ項目である。
+接続先を限定したクライアントは、独自の信頼ルート、相互 TLS、オフライン CRL による失効確認に対応する。明示した信頼ルートのクライアントではセッション再開も選べる。サーバ側 TLS は保留中である。
 
 ## 接続先を限定した HTTPS
 
 ```text
 http.tls_client(origin: str, trust_pem: bytes, certificate_chain_pem: bytes,
-                private_key_pem: bytes, crls_pem: bytes) -> Result<http_client, Error>
+                private_key_pem: bytes, crls_pem: bytes, resume_sessions: bool = false) -> Result<http_client, Error>
 ```
 
-5 個の引数は構築中だけ借用する。`origin` には HTTPS のオリジンを渡し、ポートと末尾のスラッシュを省略できる。ストリームとバッチ内の各リクエストを含め、通信前に正規化した DNS 名または IP アドレスとポートを照合する。不正な URL や呼び出し側が指定した Host、Content-Length、Transfer-Encoding は `Error.Invalid`、有効な別オリジンは `Error.Denied` となる。
+5 個の文字列・バイト列は構築中だけ借用する。`origin` には HTTPS のオリジンを渡し、ポートと末尾のスラッシュを省略できる。ストリームとバッチ内の各リクエストを含め、通信前に正規化した DNS 名または IP アドレスとポートを照合する。不正な URL や呼び出し側が指定した Host、Content-Length、Transfer-Encoding は `Error.Invalid`、有効な別オリジンは `Error.Denied` となる。
 
 信頼ルートを空にするとシステムの信頼ストアを使う。自己署名 CA 証明書を指定すると、このクライアントの信頼ストアを置き換える。相互 TLS ではクライアントのリーフ証明書から順に中間証明書までを並べ、対応する暗号化されていない PKCS#8 秘密鍵を渡す。両方を空にするとクライアント証明書を省略する。チェーンにルートは含めない。不正な PEM、末尾に余分なバイナリがある入力、上限を超えた入力は構築時に拒否する。各フィールドは 4 MiB、証明書と CRL は各リスト 64 件、復号後の秘密鍵は 64 KiB が上限である。
 
 CRL を指定する場合は信頼ルートも明示する。リクエストごとに新しい接続を確立し、署名済みの有効な失効情報で相手の証明書チェーンと接続先を検証する。対象の CRL の欠落、証明書の失効、有効期間外の CRL は `Error.Denied` となる。構築したクライアントが解析済みの資格情報と接続プールを所有する。[詳細仕様](../../269-private-http-client-tls.md)
+
+`resume_sessions` を有効にするには、信頼ルートを明示し、CRL を空にする。新しい TCP 接続では、同じ接続先への完了済みリクエストで発行された TLS 1.2 セッションまたは TLS 1.3 チケットを 1 回だけ提示できる。元の証明書の有効期間、セッションの有効期間、最初の認証から単調時計で 90 秒のうち、最も早い期限が適用される。サーバーが新しいハンドシェイクを選んだ場合も、HTTP データの送信前に相手の証明書チェーンと設定済みのすべてのクライアント証明書の有効期間を再確認する。相手が提示を要求しなかったクライアント証明書も対象になる。[セッション再開の仕様](../../270-http-session-resumption.md)
 
 ## Signatures
 

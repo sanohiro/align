@@ -48,13 +48,20 @@ impl Drop for Client {
     }
 }
 fn native(parts: [(*const u8, i64); 5], out: *mut *mut HttpClient) -> i32 {
+    native_mode(parts, 0, out)
+}
+fn native_mode(parts: [(*const u8, i64); 5], resume: i32, out: *mut *mut HttpClient) -> i32 {
     let [(a, al), (b, bl), (c, cl), (d, dl), (e, el)] = parts;
-    unsafe { align_rt_http_tls_client_new(a, al, b, bl, c, cl, d, dl, e, el, out) }
+    unsafe { align_rt_http_tls_client_new(a, al, b, bl, c, cl, d, dl, e, el, resume, out) }
 }
 fn client(fields: [&str; 5]) -> Result<Client, i32> {
+    client_mode(fields, 0)
+}
+fn client_mode(fields: [&str; 5], resume: i32) -> Result<Client, i32> {
     let mut ptr = ptr::dangling_mut();
-    let status = native(
+    let status = native_mode(
         fields.map(|s| (s.as_ptr(), i64::try_from(s.len()).unwrap())),
+        resume,
         &mut ptr,
     );
     if status != 0 {
@@ -580,3 +587,6 @@ fn scoped_destination_precedes_pool_checkout_and_reconnect() {
         vec![Some(vec![]), Some(vec![])]
     );
 }
+
+#[path = "http_tls_session_tests.rs"]
+mod session_tests;

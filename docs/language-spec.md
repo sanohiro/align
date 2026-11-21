@@ -2194,7 +2194,7 @@ Send timeout poisons; consuming finish/reject still closes once. Empty send and
 committed raw HTTP/1.0 finish remain clock-free. The budget does not cover content
 generation. The full platform/mode contract is in `docs/impl/std-design/http.md`.
 
-`http.tls_client(origin, trust_pem, certificate_chain_pem, private_key_pem, crls_pem)` returns `Result<http_client, Error>`. Its verified HTTPS origin, optional private trust store, optional mutual TLS identity and offline CRL policy remain fixed through ownership transfer and borrowed package calls. A CRL-enabled client verifies a fresh connection per request. [HTTPS client contract](impl/269-private-http-client-tls.md)
+`http.tls_client(origin: str, trust_pem: bytes, certificate_chain_pem: bytes, private_key_pem: bytes, crls_pem: bytes, resume_sessions: bool = false)` returns `Result<http_client, Error>`. With explicit roots and empty CRLs, the optional final boolean enables single-use session resumption for up to 90 seconds after full authentication, within certificate and session validity. Its verified HTTPS origin, optional private trust store, optional mutual TLS identity and offline CRL policy remain fixed through ownership transfer and borrowed package calls. A CRL-enabled client verifies a fresh connection per request. [HTTPS client contract](impl/269-private-http-client-tls.md)
 
 `std.http` whole-body clients expose
 `cl.max_response_body_bytes(limit: i64)` and the request-local
