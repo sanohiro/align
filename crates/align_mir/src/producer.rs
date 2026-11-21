@@ -1040,7 +1040,9 @@ struct XmlCallResult<'a> {
 
 pub fn xml_operand_base_ty(function: &crate::Function, operand: &Operand) -> Option<Ty> {
     Some(match operand {
-        Operand::Const(Const::Int(_, ty)) | Operand::Const(Const::Float(_, ty)) => *ty,
+        Operand::Const(Const::Int(_, ty @ Ty::Int(_)) | Const::Float(_, ty @ Ty::Float(_)))
+            if xml_numeric_scalar_ty(*ty) => *ty,
+        Operand::Const(Const::Int(..) | Const::Float(..)) => return None,
         Operand::Const(Const::Char(_)) => Ty::Char,
         Operand::Const(Const::Bool(_)) => Ty::Bool,
         Operand::Const(Const::Unit) => Ty::Unit,
@@ -1062,6 +1064,17 @@ fn xml_numeric_scalar_ty(ty: Ty) -> bool {
         Ty::Int(IntTy { bits: 8 | 16 | 32 | 64, .. })
             | Ty::Float(FloatTy { bits: 32 | 64 })
     )
+}
+
+// A raw borrow-mode argument is a native address. Its entry store binds a slot, and a
+// BorrowedPlace reads the value from that slot. It cannot itself be a numeric operand.
+fn numeric_value_form(function: &Function, operand: &Operand) -> bool {
+    match operand {
+        Operand::Arg(index) => function.param_modes.get(*index as usize)
+            == Some(&align_ast::ParamMode::ByValue),
+        Operand::Const(_) | Operand::Value(_) | Operand::BorrowedPlace(_) => true,
+        _ => false,
+    }
 }
 
 fn xml_numeric_vector_shape(ty: Ty) -> Option<(Scalar, u32)> {
@@ -3854,9 +3867,10 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     equation.invalid = true;
                     return equation;
                 };
-                if !xml_value_flow_matches(self.graph.program, source_ty, result_ty)
-                    && !xml_ty_is_view_retype(source_ty, result_ty)
-                {
+                let numeric = matches!(source_ty, Ty::Vec(..) | Ty::Mask(..)) || xml_numeric_scalar_ty(source_ty);
+                let compatible = xml_value_flow_matches(self.graph.program, source_ty, result_ty)
+                    || xml_ty_is_view_retype(source_ty, result_ty);
+                if !compatible || (numeric && !numeric_value_form(self.graph.function, &operand)) {
                     equation.invalid = true;
                 } else if path.is_empty() {
                     self.add_operand(&mut equation, &operand, source_ty, Vec::new());
@@ -4962,6 +4976,24 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     );
                 }
             }
+            Rvalue::MakeVec { elems, elem, n } => {
+                if !path.is_empty()
+                    || !xml_numeric_vector_shape(result_ty).is_some_and(|(element, lanes)| {
+                        scalar_to_ty(element) == elem && lanes == n && elems.len() == n as usize
+                    })
+                    || elems.iter().any(|lane| {
+                        !numeric_value_form(self.graph.function, lane)
+                            || xml_operand_base_ty(self.graph.function, lane) != Some(elem)
+                    })
+                {
+                    equation.invalid = true;
+                } else {
+                    for lane in &elems {
+                        self.check_operand(&mut equation, lane, elem);
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
             Rvalue::Select { cond, a, b } => {
                 let condition_ty = xml_operand_base_ty(self.graph.function, &cond);
                 let condition_matches = condition_ty == Some(Ty::Bool)
@@ -4974,6 +5006,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                             })
                     });
                 if !condition_matches
+                    || (matches!(result_ty, Ty::Vec(..)) && [&cond, &a, &b].into_iter()
+                        .any(|op| !numeric_value_form(self.graph.function, op)))
                     || !xml_operand_base_ty(self.graph.function, &a)
                         .is_some_and(|actual| xml_flow_matches(self.graph.program, actual, result_ty))
                     || !xml_operand_base_ty(self.graph.function, &b)
@@ -6877,14 +6911,42 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     }
                 }
             }
-            Rvalue::VecSumWhere { elem, mode, .. }
-            | Rvalue::VecDot { elem, mode, .. }
-            | Rvalue::VecSum { elem, mode, .. } => {
-                if mode.has_unknown()
+            Rvalue::VecSumWhere { ref vec, elem, n, mode, .. }
+            | Rvalue::VecDot { a: ref vec, elem, n, mode, .. }
+            | Rvalue::VecSum { ref vec, elem, n, mode } => {
+                let function = self.graph.function;
+                let Some(vec_ty) = xml_operand_base_ty(function, vec) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                let Some((element, lanes)) = xml_numeric_vector_shape(vec_ty) else {
+                    equation.invalid = true;
+                    return equation;
+                };
+                if !path.is_empty() || result_ty != elem || scalar_to_ty(element) != elem
+                    || lanes != n || !numeric_value_form(function, vec) || mode.has_unknown()
                     || (!matches!(elem, Ty::Float(_)) && !mode.is_empty())
                 {
                     equation.invalid = true;
+                    return equation;
                 }
+                self.check_operand(&mut equation, vec, vec_ty);
+                match &definition {
+                    Rvalue::VecDot { b, .. } if numeric_value_form(function, b) => {
+                        self.check_operand(&mut equation, b, vec_ty);
+                    }
+                    Rvalue::VecSumWhere { mask, .. } if numeric_value_form(function, mask) => {
+                        let mask_ty = xml_operand_base_ty(function, mask);
+                        if let Some(ty) = mask_ty.filter(|t| align_sema::mask_gates_vector(*t, element, n)) {
+                            self.check_operand(&mut equation, mask, ty);
+                        } else {
+                            equation.invalid = true;
+                        }
+                    }
+                    Rvalue::VecSum { .. } => {}
+                    _ => equation.invalid = true,
+                }
+                equation.seed = Some(XmlAccessProvenance::Owned);
             }
             Rvalue::TaskTake(task) => {
                 let program = self.graph.program;
@@ -6923,7 +6985,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::ResourceIntoRaw { .. }
             | Rvalue::BoxGet(..)
             | Rvalue::BoxClone(..)
-            | Rvalue::MakeVec { .. }
             | Rvalue::VecExtract { .. }
             | Rvalue::VecInsert { .. }
             | Rvalue::VecMinMax { .. }
@@ -9246,6 +9307,7 @@ fn validate_resource_rvalues_inner(
     for function in &program.fns {
         if defined.is_none_or(|emitted| emitted.contains(&function.name)) {
             crate::group_source::validate(program, function)?;
+            validate_vector_operand_availability(function)?;
         }
     }
     validate_template_html_mir_signatures(program)?;
@@ -10258,6 +10320,15 @@ fn validate_resource_rvalues_component(
                             })
                         });
                     if !valid { return Err(fail(function, "array builder owner transfer provenance mismatch")); }
+                }
+                let vector_producer = match rvalue {
+                    Rvalue::MakeVec { .. } => true,
+                    Rvalue::Select { cond, .. } => matches!(result, Ty::Vec(..))
+                        || matches!(xml_operand_base_ty(function, cond), Some(Ty::Mask(..))),
+                    _ => false,
+                };
+                if vector_producer && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result)) {
+                    return Err(fail(function, "vector construction or selection has an invalid type or operand producer"));
                 }
                 if native_owner_mir_contract(program, function, rvalue).is_some()
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
@@ -12721,6 +12792,73 @@ pub fn validate_str_match_terminators(program: &Program) -> Result<(), ProducerE
                     )));
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Check the explicit SSA dependencies of each vector construction and blend at their
+/// statement positions. Cache dominance per pair of blocks and visit shared producers once.
+fn validate_vector_operand_availability(function: &Function) -> Result<(), ProducerError> {
+    use crate::operand_inputs::OperandInputs;
+
+    let mut pending = Vec::new();
+    for block in &function.blocks {
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            if let Stmt::Let(id, rv) = stmt
+                && (matches!(rv, Rvalue::MakeVec { .. })
+                    || matches!(rv, Rvalue::Select { cond, .. }
+                        if matches!(function.value_tys.get(*id as usize), Some(Ty::Vec(..)))
+                        || matches!(xml_operand_base_ty(function, cond), Some(Ty::Mask(..)))))
+            {
+                pending.push((block.id, index));
+            }
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let fail = || ProducerError::Lowering(format!(
+        "vector operand has no dominating definition in '{}'", function.name
+    ));
+    let mut definitions = vec![None; function.value_tys.len()];
+    for block in &function.blocks {
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            if let Stmt::Let(value, rv) = stmt {
+                for id in std::iter::once(*value).chain(rv.auxiliary_result()) {
+                    let definition = definitions.get_mut(id as usize).ok_or_else(&fail)?;
+                    if definition.replace((block.id, index)).is_some() {
+                        return Err(fail());
+                    }
+                }
+            }
+        }
+    }
+    let mut visited = HashSet::new();
+    let mut dominance = HashMap::new();
+    while let Some((block, index)) = pending.pop() {
+        if !visited.insert((block, index)) {
+            continue;
+        }
+        let stmt = function.blocks.get(block as usize).filter(|b| b.id == block)
+            .and_then(|b| b.stmts.get(index)).ok_or_else(&fail)?;
+        if !stmt.operands_satisfy(&mut |operand| {
+            let Operand::Value(value) = operand else { return true };
+            let Some(&Some((source, position))) = definitions.get(*value as usize) else { return false };
+            let available = if source == block {
+                position < index
+            } else {
+                *dominance.entry((source, block)).or_insert_with(|| {
+                    mir_block_reachable_avoiding(function, block, None) == Some(true)
+                        && mir_block_reachable_avoiding(function, block, Some(source)) == Some(false)
+                })
+            };
+            if available {
+                pending.push((source, position));
+            }
+            available
+        }) {
+            return Err(fail());
         }
     }
     Ok(())

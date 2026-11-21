@@ -23,7 +23,7 @@ v.expm1()/log1p()                             // 各レーンの幅に一致す�
 v.sin()/cos(), y.atan2(x)                      // 各レーンをラジアンで計算; atan2 の両辺は同じ型
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
-select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
+select(m, a, b)                  -> vecN<T>      // lane blend; one operand may be its vector peer's scalar element type
                                                   // m: レーン数とレーン幅が一致する任意の mask
 v.sum_where(m)                   -> T            // masked reduction; 同じ構造的 mask 規則
 
@@ -37,6 +37,8 @@ align(N) Struct { ... }                           // over-align struct; stride p
 ## Type & ownership classification
 
 `vecN<T>` と `maskN<T>` は **Copy 可能なスカラークラスの値**（レジスタサイズの集約データ）である。自由に渡し、返し、格納することができる。move / drop / escape の経路には決して乗らない。`maskN<T>` は型として名前を指定できる（アノテーション、引数、戻り値など）。mask の要素型は名前を付けるためのものであり、機械表現は `<N x i1>` である。`select` と `sum_where` は対象ベクタとレーン数・レーンのビット幅が一致する mask を受け取る。この判定は `align_sema::mask_gates_vector` に集約され、sema、checked-HIR record validator、MIR producer validator が共有する。
+
+`select(m, v, 0)` と `select(m, 0, v)` では、ベクタの要素と同じ型のスカラーを全レーンに複製する。すべてのレーンが片側を選ぶ場合も、3つの式を左から一度ずつ評価する。選んだ値のビット表現をそのまま保つ。
 
 `align(N)` は型ではなく属性であり、`layout(C)` と組み合わせる場合どちらの順序でも合成可能である。
 
@@ -86,7 +88,6 @@ abort や割り当ては発生せず、ベクトルでは各レーンに独立�
 ## 仕様先行(未実装)
 
 - **`bitset`**（§18.1 カタログ） — 実装もテストもない。設計は未定であり、packed-bool な soa カラム（M6 以降のバックログ）との関係性を考慮して一緒に決定すべきである。
-- **`select`** のオペランドへのスカラーのブロードキャスト（broadcast）。算術のブロードキャストは完成している — リテラル（`v * 2`、`10 + v`）も、型の付いたスカラー束縛（`s: f64 := 2.0; v * s` / `s * v`）も正しく lowering される。`select` はこれに参加しない。blend する2つのオペランドはどちらも `vecN<T>` でなければならず（`select(m, w, 0)` は「'select' vectors must have the same type, got vec4<i32> and int(undetermined)」となる）、splat 機能が実装されるまで定数側は明示的なベクタとして記述すること。
 - 関数境界を越える aligned-load の伝播（関数をまたいでもアライメントが証明可能なスライスの引き渡し） — 保留中。現在はローカルで証明可能なアライメントのみが load 操作を最適化（格上げ）する（#320）。
 
 ## Pitfalls

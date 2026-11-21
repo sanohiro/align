@@ -2063,6 +2063,14 @@ pub fn mask_gates_vector(mask: Ty, elem: Scalar, lanes: u32) -> bool {
     mask_lanes == lanes && mask_width == elem_width
 }
 
+/// The data operands of a lane-wise select establish one concrete numeric vector.
+pub fn select_data_type(a: Ty, b: Ty) -> Option<Ty> {
+    let (element, lanes) = independent_copy_vector(a).or_else(|| independent_copy_vector(b))?;
+    let vector = Ty::Vec(element, lanes);
+    let scalar = scalar_to_ty(element);
+    ((a == vector || a == scalar) && (b == vector || b == scalar)).then_some(vector)
+}
+
 /// Which direction a JSON schema is being validated for. The field-descriptor table
 /// (`emit_desc_table`) is shared by decode and encode, so [`Checker::json_struct_fields_ok`] is one
 /// walk — but the two domains are not identical (an `Option<enum>` field encodes and does not
@@ -56457,7 +56465,7 @@ impl<'a, 't> Checker<'a, 't> {
             return self.check_buffer_new(args, span);
         }
         if name == "select" {
-            return self.check_select(args, span);
+            return self.check_select(args, expected, numeric, span);
         }
         if name == "dot" {
             return self.check_vec_dot(args, span);
@@ -61723,10 +61731,6 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
-    /// `select(mask, a, b)` — lane-wise blend of two `vecN<T>` by a `mask` (M6 slice 2). The mask
-    /// gates the vectors structurally: same lane count, same lane bit width (see
-    /// [`mask_gates_vector`]), whatever element type the producing comparison had. The result is
-    /// the vectors' type.
     /// `fma(a, b, c)` — fused multiply-add `a*b + c` with a single rounding. A free builtin (like
     /// `dot`/`select`). Float-only (scalar `f32`/`f64` or `vecN<f32>`/`vecN<f64>`); the three
     /// operands share the type. Lowers to one `llvm.fma` (a `vfmadd`/`fmla` instruction).
@@ -61762,29 +61766,32 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::MathOp { fn_: hir::MathFn::Fma, operands: vec![ac, bc, cc] }, ty, span }
     }
 
-    fn check_select(&mut self, args: &[ast::Expr], span: Span) -> Expr {
+    /// Blend numeric lanes under a structural mask. One scalar may broadcast in either data position.
+    fn check_select(&mut self, args: &[ast::Expr], expected: Option<Ty>, numeric: NumericOperandContext, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let [m, a, b] = args else {
-            self.diags.error(format!("'select' takes 3 arguments (a mask and two vectors), got {}", args.len()), span);
+            self.diags.error(format!("'select' takes 3 arguments (a mask and two data values), got {}", args.len()), span);
             return err;
         };
         let mc = self.check_expr(m, None);
-        let ac = self.check_expr(a, None);
-        let bc = self.check_expr(b, Some(ac.ty));
-        if mc.ty == Ty::Error || ac.ty == Ty::Error || bc.ty == Ty::Error {
-            return err;
+        let context = expected.map(|ty| self.resolve(ty)).filter(|ty| matches!(ty, Ty::Vec(..)))
+            .map(NumericOperandContext::from_type).unwrap_or(numeric);
+        let ac = self.check_expr_context(a, None, context);
+        let a_ty = self.resolve(ac.ty);
+        let bc = self.check_expr_context(b, None, context.after_left(a_ty));
+        let b_ty = self.resolve(bc.ty);
+        if mc.ty == Ty::Error || a_ty == Ty::Error || b_ty == Ty::Error { return err; }
+        // A leading unconstrained numeric literal learns its type from a later vector witness.
+        for (value, witness) in [(a_ty, b_ty), (b_ty, a_ty)] {
+            if matches!(value, Ty::IntVar(_) | Ty::FloatVar(_)) && let Ty::Vec(element, _) = witness {
+                self.unify(value, scalar_to_ty(element), span);
+            }
         }
-        let Ty::Vec(s, n) = self.resolve(ac.ty) else {
-            self.diags.error(format!("'select' picks between two vectors, got {}", ty_name(ac.ty)), a.span);
+        let (a_ty, b_ty) = (self.resolve(ac.ty), self.resolve(bc.ty));
+        let Some(Ty::Vec(s, n)) = select_data_type(a_ty, b_ty) else {
+            self.diags.error(format!("'select' needs a vector and either the same vector type or its scalar element, got {} and {}", ty_name(a_ty), ty_name(b_ty)), span);
             return err;
         };
-        if self.resolve(bc.ty) != Ty::Vec(s, n) {
-            self.diags.error(
-                format!("'select' vectors must have the same type, got {} and {}", ty_name(ac.ty), ty_name(bc.ty)),
-                b.span,
-            );
-            return err;
-        }
         let mc_ty = self.resolve(mc.ty);
         match mc_ty {
             Ty::Mask(..) if mask_gates_vector(mc_ty, s, n) => {}

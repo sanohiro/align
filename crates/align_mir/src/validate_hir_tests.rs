@@ -21917,6 +21917,158 @@ fn json_doc_encode_checked_source_and_piece_matrix() -> Result<(), &'static str>
 }
 
 #[test]
+fn select_broadcast_checked_hir_and_make_vec_producers() -> Result<(), String> {
+    let hir = checked_source_program("fn probe(m:mask2<i32>,v:vec2<i32>,x:i32) { ignored:=select(m,x,v) }\nfn main() {}\n");
+    assert!(body_core_metadata_is_valid(&hir));
+    for mutation in 0..4 {
+        let mut bad = hir.clone();
+        let expr = body_first_let_init_mut(&mut bad, "probe");
+        let hir::ExprKind::Select { mask, a, b } = &mut expr.kind else {
+            return Err("expected select".into());
+        };
+        match mutation {
+            0 => *b = a.clone(),
+            1 => a.ty = int(64),
+            2 => mask.ty = Ty::Mask(scalar_int(32), 4),
+            _ => expr.ty = int(32),
+        }
+        assert!(!body_core_metadata_is_valid(&bad), "HIR {mutation}");
+    }
+    let base = lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
+    let local = base.fns.iter().map(|f| f.name.clone()).collect();
+    let unit = base.fns.iter().filter(|f| f.name.as_str() == "probe").map(|f| f.name.clone()).collect();
+    let shapes = |p: &Program| crate::producer::validate_mir_producers(p).is_ok();
+    assert!(shapes(&base));
+    let probe = base.fns.iter().find(|f| f.name.as_str() == "probe").ok_or("missing probe")?;
+    let broadcast = probe.blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
+        Stmt::Let(id, Rvalue::MakeVec { .. }) => Some(*id),
+        _ => None,
+    }).ok_or("missing scalar broadcast")?;
+    let mut bad_select = base.clone();
+    let arm = bad_select.fns.iter_mut().find(|f| f.name.as_str() == "probe").into_iter()
+        .flat_map(|f| &mut f.blocks).flat_map(|b| &mut b.stmts).find_map(|s| match s {
+            Stmt::Let(_, Rvalue::Select { a, .. }) => Some(a),
+            _ => None,
+        }).ok_or("missing MIR select")?;
+    assert!(matches!(arm, Operand::Value(id) if *id == broadcast));
+    *arm = Operand::Const(Const::Int(0, int(32)));
+    assert!(!shapes(&bad_select));
+    assert!(crate::producer::validate_partition_resource_rvalues(&bad_select, &unit).is_err());
+    for mutation in 0..8 {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name.as_str() == "probe").ok_or("missing probe")?;
+        let (result, elems, elem, n) = function.blocks.iter_mut().flat_map(|b| &mut b.stmts)
+            .find_map(|s| match s {
+                Stmt::Let(id, Rvalue::MakeVec { elems, elem, n }) => Some((*id, elems, elem, n)),
+                _ => None,
+            }).ok_or("missing scalar broadcast")?;
+        assert_eq!(elems.len(), 2);
+        assert!(matches!((&elems[0], &elems[1]),
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b));
+        match mutation {
+            0 => { elems.pop(); }
+            1 => elems.push(elems[0].clone()),
+            2 => elems[0] = Operand::Const(Const::Bool(true)),
+            3 => *elem = int(64),
+            4 => *n = 8,
+            5 => elems[0] = Operand::Value(u32::MAX),
+            6 => elems[0] = Operand::Const(Const::Float(0.0, int(32))),
+            _ => {
+                *n = 3;
+                elems.push(elems[0].clone());
+                function.value_tys[result as usize] = Ty::Vec(scalar_int(32), 3);
+            }
+        }
+        assert!(!shapes(&bad), "whole MIR {mutation}");
+        for definitions in [&local, &unit] {
+            assert!(crate::producer::validate_partition_resource_rvalues(&bad, definitions).is_err(), "partition MIR {mutation}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn vector_operand_forms_and_dominating_definitions() -> Result<(), String> {
+    let hir = checked_source_program("fn probe(m:mask2<i32>,v:vec2<i32>,x:i32,borrow bm:mask2<i32>,borrow bv:vec2<i32>,borrow bx:i32) { ignored:=select(m,x,v) }\nfn main() {}\n");
+    let base = lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
+    let unit = base.fns.iter().filter(|f| f.name.as_str() == "probe").map(|f| f.name.clone()).collect();
+    let probe_index = base.fns.iter().position(|f| f.name.as_str() == "probe").ok_or("probe")?;
+    let check = |p: &Program, valid: bool, label: &str| {
+        assert_eq!(crate::producer::validate_mir_producers(p).is_ok(), valid, "whole {label}");
+        assert_eq!(crate::producer::validate_partition_resource_rvalues(p, &unit).is_ok(), valid, "unit {label}");
+    };
+    check(&base, true, "valid probe");
+    let mask = Ty::Mask(scalar_int(32), 2);
+    let vector = Ty::Vec(scalar_int(32), 2);
+    for (ty, invalid) in [
+        (mask, Operand::Const(Const::Int(1, mask))),
+        (vector, Operand::Const(Const::Float(0.0, vector))),
+        (int(32), Operand::Const(Const::Float(0.0, int(32)))),
+        (mask, Operand::Arg(3)),
+        (vector, Operand::Arg(4)),
+        (int(32), Operand::Arg(5)),
+    ] {
+        for forward in [false, true] {
+            let mut bad = base.clone();
+            let f = &mut bad.fns[probe_index];
+            let id = f.value_tys.len() as ValueId;
+            let input = if forward { Operand::Value(id) } else { invalid.clone() };
+            let (block, index) = f.blocks.iter_mut().find_map(|block| {
+                let index = block.stmts.iter_mut().position(|stmt| match stmt {
+                    Stmt::Let(_, Rvalue::Select { cond, .. }) if ty == mask => { *cond = input.clone(); true }
+                    Stmt::Let(_, Rvalue::Select { b, .. }) if ty == vector => { *b = input.clone(); true }
+                    Stmt::Let(_, Rvalue::MakeVec { elems, .. }) if ty == int(32) => { elems[0] = input.clone(); true }
+                    _ => false,
+                })?;
+                Some((block, index))
+            }).ok_or("vector use")?;
+            if forward {
+                f.value_tys.push(ty);
+                block.stmts.insert(index, Stmt::Let(id, Rvalue::Use(invalid.clone())));
+            }
+            check(&bad, false, &format!("{invalid:?} forwarded={forward}"));
+        }
+    }
+
+    // A forwarded scalar's definition must precede the forwarding instruction, even when
+    // the final MakeVec is dominated by both instructions. The same rule spans a diamond.
+    for (diamond, dominates) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut p = base.clone();
+        let f = &mut p.fns[probe_index];
+        let source = f.value_tys.len() as ValueId;
+        let forwarded = source + 1;
+        f.value_tys.extend([int(32), int(32)]);
+        let block_count = f.blocks.len() as BlockId;
+        let block = f.blocks.iter_mut().find(|b| b.stmts.iter().any(|s| matches!(s, Stmt::Let(_, Rvalue::MakeVec { .. })))).ok_or("broadcast block")?;
+        let index = block.stmts.iter_mut().position(|stmt| match stmt {
+            Stmt::Let(_, Rvalue::MakeVec { elems, .. }) => { elems[0] = Operand::Value(forwarded); true }
+            _ => false,
+        }).ok_or("broadcast")?;
+        let define = Stmt::Let(source, Rvalue::Use(Operand::Const(Const::Int(3, int(32)))));
+        let alias = Stmt::Let(forwarded, Rvalue::Use(Operand::Value(source)));
+        if diamond {
+            let join = block_count + 2;
+            let mut body = block.stmts.split_off(index);
+            body.insert(0, alias);
+            let previous = std::mem::replace(&mut block.term,
+                Term::Branch(Operand::Const(Const::Bool(true)), block_count, block_count + 1));
+            let mut then_stmts = vec![];
+            if dominates { block.stmts.push(define); } else { then_stmts.push(define); }
+            f.blocks.extend([
+                Block { id: block_count, stmts: then_stmts, stmt_lines: vec![], term: Term::Goto(join) },
+                Block { id: block_count + 1, stmts: vec![], stmt_lines: vec![], term: Term::Goto(join) },
+                Block { id: join, stmts: body, stmt_lines: vec![], term: previous },
+            ]);
+        } else {
+            let pair = if dominates { [define, alias] } else { [alias, define] };
+            block.stmts.splice(index..index, pair);
+        }
+        check(&p, dominates, &format!("diamond={diamond} dominates={dominates}"));
+    }
+    Ok(())
+}
+
+#[test]
 fn stream_codec_hir_signature_matrix() -> Result<(), String> {
     let source = "import std.compress\nimport std.io\nfn f()->Result<i64,Error> { result:=compress.zstd_decompress_to(io.stdin,io.stdout,4,\"seed\"); result }\nfn main() {}\n";
     let valid = checked_source_program(source);

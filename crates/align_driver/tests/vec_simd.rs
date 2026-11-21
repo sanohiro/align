@@ -546,6 +546,51 @@ fn a_mismatched_scalar_type_broadcasting_into_a_vector_is_rejected() {
 }
 
 #[test]
+fn select_broadcast_order_bits_and_cached_import() {
+    if !backend_available() { return; }
+    let source = fixture("crates/align_driver/tests/fixtures/vec_select_broadcast.align");
+    let library = "module blend\npub fn pick<T>(m:mask2<u64>,v:vec2<u64>,value:u64,yes:T,no:T)->T {\n blended:=select(m,v,value)\n if blended[0] == v[0] && blended[1] == value { return yes }\n return no\n}\n";
+    let files = [("main.align", source), ("blend.align", library)];
+    let expected = "1\n2\n3\n1\n3\n2\n1\n4\n1\n3\n5\n1\n1\n99\n";
+    let whole = build_and_run_multi("select-broadcast-whole", &files, "main.align");
+    assert!(whole.status.success(), "{whole:?}");
+    assert_eq!(whole.stdout, expected.as_bytes());
+
+    let project = Proj::new("select-broadcast-units", &files, "main.align");
+    let cache = project.cache();
+    for warm in [false, true] {
+        let units = thin_build(&project, &cache, 1);
+        assert!(if warm { units.all_hit() } else { units.all_miss() });
+        assert_eq!(units.run(&project), expected);
+    }
+}
+
+#[test]
+fn select_broadcast_data_domains() {
+    let mut program = String::new();
+    for width in [2, 4, 8, 16] {
+        for element in ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"] {
+            program.push_str(&format!("fn blend_{width}_{element}(m:mask{width}<{element}>, v:vec{width}<{element}>, x:{element})->vec{width}<{element}> = select(m, x, select(m, v, x))\n"));
+        }
+    }
+    program.push_str("fn main() {}\n");
+    assert!(!check_errs("select-broadcast-positive", &program));
+    for (name, body) in [
+        ("two-scalars", "return select(m, 1, 2)"),
+        ("signed", "x: u32 := 1; return select(m, x, v)"),
+        ("width", "x: i16 := 1; return select(m, v, x)"),
+        ("float", "return select(m, 1.5, v)"),
+        ("bool", "return select(m, v, false)"),
+        ("left-array", "a := select(m, [1, 2], v); return a"),
+        ("lane-width", "x: vec2<i16> := [0, 0]; return select(x == 0, 1, v)"),
+        ("lane-count", "x: vec4<i32> := [0, 0, 0, 0]; return select(x == 0, v, 1)"),
+    ] {
+        let program = format!("fn bad(m:mask2<i32>,v:vec2<i32>)->vec2<i32> {{ {body} }}\nfn main() {{}}\n");
+        assert!(check_errs(&format!("select-broadcast-{name}"), &program), "{name}");
+    }
+}
+
+#[test]
 fn select_with_a_non_mask_first_arg_is_rejected() {
     // `select`'s first argument must be a mask (a vector comparison result), not a vector.
     let src = concat!(

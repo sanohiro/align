@@ -130,14 +130,13 @@ w := v * 3 + 1
 
 **Q17.** `m := w > 8`. Which lanes are true, and how do we zero the rest?
 
-**A17.** The last two lanes are true, and the false side needs a real vector:
+**A17.** The last two lanes are true. Use zero for the false lanes.
 
 ```align
-zero: vec4<i32> := [0, 0, 0, 0]
-select(m, w, zero)
+select(m, w, 0)
 ```
 
-`[0, 0, 10, 13]`. Q16's arithmetic broadcasts a scalar (`w * 3 + 1`), but `select` needs **two vectors**. `select(m, w, 0)` is a type error; give it vectors of the same type to choose between.
+`[0, 0, 10, 13]`. The scalar zero broadcasts with the element type of `w`. Each true lane keeps its value from `w`.
 
 ---
 

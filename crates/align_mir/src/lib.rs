@@ -11644,7 +11644,9 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::Select { mask, a, b: bexpr } => {
                 lower_required_binding!(b, cond = lower_expr(b, mask), Operand::Const(Const::Unit));
                 lower_required_binding!(b, av = lower_expr(b, a), Operand::Const(Const::Unit));
+                let av = broadcast_vector_operand(b, av, a.ty, e.ty);
                 lower_required_binding!(b, bv = lower_expr(b, bexpr), Operand::Const(Const::Unit));
+                let bv = broadcast_vector_operand(b, bv, bexpr.ty, e.ty);
                 let v = b.fresh_value(e.ty);
                 b.push(Stmt::Let(v, Rvalue::Select { cond, a: av, b: bv }));
                 Operand::Value(v)
@@ -13010,6 +13012,19 @@ fn lower_int_div(b: &mut Builder, op: BinOp, l: Operand, r: Operand, ty: Ty) -> 
     Operand::Value(v)
 }
 
+/// Repeat an already evaluated scalar at the lane width established by a vector operand.
+fn broadcast_vector_operand(b: &mut Builder, value: Operand, ty: Ty, vector_ty: Ty) -> Operand {
+    let Ty::Vec(element, n) = vector_ty else { return value };
+    if ty != align_sema::scalar_to_ty(element) { return value; }
+    let v = b.fresh_value(vector_ty);
+    b.push(Stmt::Let(v, Rvalue::MakeVec {
+        elems: vec![value; n as usize],
+        elem: align_sema::scalar_to_ty(element),
+        n,
+    }));
+    Operand::Value(v)
+}
+
 /// Lower a `vecN<T>` `/` or `%` with the same lane-wise divisor guards as the scalar [`lower_int_div`]
 /// — the SIMD mirror of that pass, so vector and scalar division share one semantics:
 /// - **Any zero lane aborts.** `divisor == splat(0)` is an elementwise compare → a `<N x i1>` mask;
@@ -13087,20 +13102,7 @@ fn lower_vec_div(
         return Operand::Value(v);
     }
     // Ensure the divisor is a vector (splat a broadcast scalar) so the guard is uniformly vectorized.
-    let rvec = if matches!(rhs_ty, Ty::Vec(..)) {
-        r
-    } else {
-        let v = b.fresh_value(vec_ty);
-        b.push(Stmt::Let(
-            v,
-            Rvalue::MakeVec {
-                elems: vec![r; n as usize],
-                elem,
-                n,
-            },
-        ));
-        Operand::Value(v)
-    };
+    let rvec = broadcast_vector_operand(b, r, rhs_ty, vec_ty);
     let mask_ty = Ty::Mask(s, n);
     // any(divisor == 0) → report and abort (cold edge), the vector mirror of the scalar zero guard.
     // Compare vector-vs-vector (splat the `0`) so the MIR node is well-typed — a vector `Eq` takes two

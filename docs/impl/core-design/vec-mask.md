@@ -27,7 +27,7 @@ v.expm1()/log1p()                             // per-lane, width-exact scalar li
 v.sin()/cos(), y.atan2(x)                      // per-lane radians; atan2 operands have the same type
 dot(a, b)                        -> T
 fma(a, b, c)                     -> vecN<T>      // one rounding
-select(m, a, b)                  -> vecN<T>      // lane blend; a and b are BOTH vectors (no broadcast)
+select(m, a, b)                  -> vecN<T>      // lane blend; one operand may be its vector peer's scalar element type
                                                   // m: any mask of the same lane COUNT and WIDTH
 v.sum_where(m)                   -> T            // masked reduction; same structural mask rule
 
@@ -47,6 +47,8 @@ machine level, so the operations that consume one (`select`, `sum_where`) admit 
 same lane count and lane bit width as the vectors it gates. That predicate is
 `align_sema::mask_gates_vector`, and it is called by sema, the checked-HIR record validator and the
 MIR producer validator alike, so no layer can disagree about a blend.
+
+`select(m, v, 0)` and `select(m, 0, v)` broadcast a scalar of the vector's element type. All three expressions evaluate once from left to right, including when every mask lane selects the same side. The selected values retain their exact bits.
 
 `align(N)` is an attribute, not a type — it composes with `layout(C)` in either order.
 
@@ -103,11 +105,6 @@ None — Copy values. `load` borrows the slice momentarily; `store` requires a w
 
 - **`bitset`** (§18.1 catalog) — no implementation, no tests. Design open: relationship to
   packed-bool soa columns (post-M6 backlog) should be settled together.
-- Scalar broadcast into a **`select`** operand. Arithmetic broadcast is complete — a literal
-  (`v * 2`, `10 + v`) and a typed scalar binding (`s: f64 := 2.0; v * s` / `s * v`) both lower
-  correctly. `select` does not participate: both blended operands must be `vecN<T>`
-  (`select(m, w, 0)` → "'select' vectors must have the same type, got vec4<i32> and
-  int(undetermined)"), so spell the constant side as an explicit vector until a splat form ships.
 - Aligned-load propagation across function boundaries (cross-function provably-aligned slices) —
   deferred; only locally provable alignment upgrades the load today (#320).
 
