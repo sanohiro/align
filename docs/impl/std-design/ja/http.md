@@ -23,7 +23,7 @@ http.tls_client(origin: str, trust_pem: bytes, certificate_chain_pem: bytes,
                 private_key_pem: bytes, crls_pem: bytes) -> Result<http_client, Error>
 ```
 
-5 個の引数は構築中だけ借用する。`origin` には HTTPS のオリジンを渡し、ポートと末尾のスラッシュを省略できる。ストリームとバッチ内の各リクエストを含め、通信前に正規化した DNS 名または IP アドレスとポートを照合する。不正な URL や呼び出し側が指定した Host は `Error.Invalid`、有効な別オリジンは `Error.Denied` となる。
+5 個の引数は構築中だけ借用する。`origin` には HTTPS のオリジンを渡し、ポートと末尾のスラッシュを省略できる。ストリームとバッチ内の各リクエストを含め、通信前に正規化した DNS 名または IP アドレスとポートを照合する。不正な URL や呼び出し側が指定した Host、Content-Length、Transfer-Encoding は `Error.Invalid`、有効な別オリジンは `Error.Denied` となる。
 
 信頼ルートを空にするとシステムの信頼ストアを使う。自己署名 CA 証明書を指定すると、このクライアントの信頼ストアを置き換える。相互 TLS ではクライアントのリーフ証明書から順に中間証明書までを並べ、対応する暗号化されていない PKCS#8 秘密鍵を渡す。両方を空にするとクライアント証明書を省略する。チェーンにルートは含めない。不正な PEM、末尾に余分なバイナリがある入力、上限を超えた入力は構築時に拒否する。各フィールドは 4 MiB、証明書と CRL は各リスト 64 件、復号後の秘密鍵は 64 KiB が上限である。
 

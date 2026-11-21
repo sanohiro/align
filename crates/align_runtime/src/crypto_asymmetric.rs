@@ -479,7 +479,7 @@ pub(super) fn decode_base64_digits(
     chars: usize,
     limit: usize,
 ) -> Result<SensitiveDer, c_int> {
-    if chars == 0 || chars % 4 != 0 {
+    if chars == 0 || !chars.is_multiple_of(4) {
         return Err(AL_INVALID);
     }
     let padding = digits.clone().rev().take_while(|&byte| byte == b'=').take(3).count();

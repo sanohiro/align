@@ -251,6 +251,7 @@ fn scoped_origin_and_descriptor_validation() {
     for (name, value) in [
         ("Host", "localhost"),
         ("content-length", "0"),
+        ("Transfer-Encoding", "chunked"),
         ("bad name", "x"),
         ("x", "\u{07}"),
     ] {

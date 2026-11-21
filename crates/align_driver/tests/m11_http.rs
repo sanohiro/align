@@ -814,6 +814,9 @@ fn scoped_https_transport_uses_only_its_own_roots_and_crls() {
         std::fs::write(stage.join("key.pem"), pem("server_key")).unwrap();
         std::fs::write(stage.join("ambient.pem"), combined("root", "mid_crl")).unwrap();
         std::fs::create_dir(stage.join("cert-dir")).unwrap();
+        std::fs::write(stage.join("ambient-chain.pem"), combined("client", "intermediate")).unwrap();
+        std::fs::write(stage.join("ambient-key.pem"), pem("client_key")).unwrap();
+        std::fs::write(stage.join("openssl.cnf"), "openssl_conf=init\n[init]\nssl_conf=ssl\n[ssl]\nsystem_default=policy\n[policy]\nVerifyCAFile=ambient.pem\nCertificate=ambient-chain.pem\nPrivateKey=ambient-key.pem\n").unwrap();
         let program = r#"import std.http
 fn denied(e: Error) -> bool = match e { Denied => true, _ => false }
 fn main(args: array<str>) -> Result<(), Error> {
@@ -838,6 +841,8 @@ fn main(args: array<str>) -> Result<(), Error> {
 import socket, ssl
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain('chain.pem', 'key.pem')
+ctx.load_verify_locations('ambient.pem')
+ctx.verify_mode = ssl.CERT_OPTIONAL
 with socket.socket() as listener:
     listener.bind(('127.0.0.1', 0))
     listener.listen()
@@ -849,6 +854,7 @@ with socket.socket() as listener:
             raw.settimeout(5)
             try:
                 with ctx.wrap_socket(raw, server_side=True) as sock:
+                    if index >= 3: assert not sock.getpeercert()
                     with sock.makefile('rb') as f:
                         method = f.readline().split()[0]
                         length = 0
@@ -869,11 +875,73 @@ with socket.socket() as listener:
         let port = port.trim().parse::<u16>().unwrap();
         let url = format!("https://127.0.0.1:{port}/");
         let output = Command::new(&built.exe).current_dir(stage)
+            .env("OPENSSL_CONF", stage.join("openssl.cnf"))
             .env("SSL_CERT_FILE", stage.join("ambient.pem")).env("SSL_CERT_DIR", stage.join("cert-dir"))
             .args([url.as_str(), pem("other_root"), pem("root"), pem("root_crl"), &combined("root_crl", "mid_crl")])
             .output().unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(peer.wait().unwrap().success());
         assert_eq!(output.stdout, b"200\n200\n200\n");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scoped_tls_releases_inputs_and_failed_native_connections() {
+    use align_driver::{BuildTarget, CDriver, Profile};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    if !backend_available() { return; }
+    owned_fixture::run("scoped_tls_releases_inputs_and_failed_native_connections", |stage| {
+        let main = r#"import std.http
+extern "C" fn tls_stage(n: i32)
+extern "C" fn tls_balance() -> i32
+fn code(e: Error) -> bool = match e { Code(n) => n == 0, _ => false }
+fn observe(borrow mut cl: http_client, url: str, n: i32) -> bool {
+    unsafe { tls_stage(n) }
+    match cl.get(url) { Err(e) => { if !code(e) {return false} }, Ok(_) => {return false} }
+    return unsafe { tls_balance() } == 1
+}
+fn verify(ip_url: str, dns_url: str) -> i32 {
+    unsafe { tls_stage(0) }
+    discarded := http.tls_client(ip_url.clone(), "trust".clone(), "chain".clone(), "key".clone(), "crls".clone())
+    if unsafe { tls_balance() } != 1 {return 1}
+    mut ip := http.tls_client(ip_url, "", "", "", "") else {return 2}
+    mut name := http.tls_client(dns_url, "", "", "", "") else {return 3}
+    if !observe(ip, ip_url, 1) {return 4}
+    if !observe(ip, ip_url, 2) {return 5}
+    if !observe(ip, ip_url, 3) {return 6}
+    if !observe(name, dns_url, 4) {return 7}
+    return 0
+}
+fn main(args: array<str>) -> Result<(), Error> {
+    print(verify(args[1], args[2]))
+    return Ok(())
+}"#;
+        let mut sources = SourceMap::new();
+        let checked = align_driver::check(&mut sources, "main.align", main);
+        assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &checked.diags));
+        let mir = align_driver::lower_to_mir(&checked.hir);
+        let object = stage.join("main.o");
+        align_driver::emit_object_file(&mir, &object, BuildTarget::Baseline, Profile::Release, &[], false).unwrap();
+        let c = stage.join("observer.c");
+        std::fs::write(&c, include_str!("fixtures/scoped_tls_cleanup.c")).unwrap();
+        let observer = stage.join("observer.o");
+        assert!(Command::new("cc").arg("-c").arg(c).arg("-o").arg(&observer).status().unwrap().success());
+        let symbols = ["align_rt_str_clone", "align_rt_free", "SSL_new", "SSL_free", "SSL_set_fd",
+            "SSL_set1_host", "X509_VERIFY_PARAM_set1_ip_asc"];
+        let wraps = symbols.map(|symbol| format!("-Wl,--wrap={symbol}")).join(" ");
+        let wrapper = stage.join("link");
+        std::fs::write(&wrapper, format!("#!/bin/sh\nexec cc {wraps} \"$@\"\n")).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = stage.join("program");
+        align_driver::link_objects(&CDriver::explicit(wrapper).unwrap(), &[&object, &observer], &output,
+            &mir.link_libs, Profile::Release).unwrap();
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let run = Command::new(output).args([format!("https://127.0.0.1:{port}/"), format!("https://localhost:{port}/")])
+            .output().unwrap();
+        assert!(run.status.success(), "{run:?}");
+        assert_eq!(run.stdout, b"0\n", "temporary ownership or native setup stage");
     });
 }

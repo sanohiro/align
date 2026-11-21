@@ -23,7 +23,7 @@ http.tls_client(origin: str, trust_pem: bytes, certificate_chain_pem: bytes,
                 private_key_pem: bytes, crls_pem: bytes) -> Result<http_client, Error>
 ```
 
-All five inputs are borrowed during construction. Use an HTTPS origin with an optional port and trailing slash. The client checks every request, including streaming and batch entries, against the normalized DNS name or IP address and port before network I/O. A malformed URL or caller-supplied Host yields `Error.Invalid`. Another well-formed origin yields `Error.Denied`.
+All five inputs are borrowed during construction. Use an HTTPS origin with an optional port and trailing slash. The client checks every request, including streaming and batch entries, against the normalized DNS name or IP address and port before network I/O. A malformed URL or caller-supplied Host, Content-Length or Transfer-Encoding field yields `Error.Invalid`. Another well-formed origin yields `Error.Denied`.
 
 Empty trust uses the system store. Explicit trust accepts self-signed CA certificates and replaces that store for this client. Supply an ordered leaf-first client chain and its matching unencrypted PKCS#8 key together for mutual TLS. Two empty fields omit the identity. The chain ends before the root. The constructor rejects malformed PEM, trailing binary data and oversized inputs. Each field accepts up to 4 MiB, each certificate or CRL list up to 64 objects, and a decoded private key up to 64 KiB.
 

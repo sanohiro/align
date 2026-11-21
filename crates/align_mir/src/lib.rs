@@ -22464,7 +22464,8 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
             }
             let out = b.new_slot(Ty::HttpClient);
             let code = b.fresh_value(status_ty());
-            b.push(Stmt::Let(code, Rvalue::HttpTlsClient { views, out }));
+            b.push(Stmt::Let(code, Rvalue::HttpTlsClient { views: views.clone(), out }));
+            for view in views.iter().rev() { drop_borrow_owners(b, view); }
             emit_open_handle_result(b, code, out, Ty::HttpClient, e.ty)
         }
         hir::ExprKind::HttpClient => {

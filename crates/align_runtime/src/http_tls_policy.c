@@ -60,7 +60,13 @@ int align_tls_policy_init(int system_trust, SSL_CTX **out) {
     if (!(SSL_CTX_set_mode(ctx, SSL_MODE_NO_AUTO_CHAIN) & SSL_MODE_NO_AUTO_CHAIN)) goto finish;
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
     if (!(SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET) & SSL_OP_NO_TICKET)) goto finish;
-    if (!SSL_CTX_get_cert_store(ctx) || (system_trust && !SSL_CTX_set_default_verify_paths(ctx))) goto finish;
+    /* Bind all effective verification paths to this client's store. The context owns
+     * the first reference and both per-certificate store slots acquire one. */
+    X509_STORE *store = X509_STORE_new();
+    if (!store) goto finish;
+    SSL_CTX_set_cert_store(ctx, store);
+    if (!SSL_CTX_set1_verify_cert_store(ctx, store) || !SSL_CTX_set1_chain_cert_store(ctx, store)) goto finish;
+    if (system_trust && !SSL_CTX_set_default_verify_paths(ctx)) goto finish;
     *out = ctx;
     return 0;
 finish:

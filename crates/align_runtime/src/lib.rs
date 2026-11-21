@@ -23855,21 +23855,24 @@ unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64, policy: Optio
     if policy.is_some_and(|p| !p.evidence_current()) { return Err(AL_DENIED); }
     let ctx = policy.map_or_else(tls_client_ctx, |p| p.ctx.0);
     if ctx.is_null() {
-        return Err(AL_INVALID); // engine init failed (OOM-class)
+        return Err(AL_CODE); // engine initialization failure
     }
     let fd = unsafe { http_connect_fd(host, port, timeout_ns) }?; // TCP first; connect errno → Error.Code
+    crypto_asymmetric::clear_errors();
     let ssl = unsafe { SSL_new(ctx) };
     if ssl.is_null() {
+        crypto_asymmetric::clear_errors();
         unsafe { close(fd) };
-        return Err(AL_INVALID);
+        return Err(AL_CODE);
     }
     // From here EVERY error path frees ssl AND fd via `close_tls`.
     let fail = |status: i32| -> Result<Conn, i32> {
         unsafe { close_tls(ssl, fd) };
+        crypto_asymmetric::clear_errors();
         Err(status)
     };
     if unsafe { SSL_set_fd(ssl, fd) } != 1 {
-        return fail(AL_INVALID);
+        return fail(AL_CODE);
     }
     unsafe { SSL_set_verify(ssl, SSL_VERIFY_PEER, core::ptr::null()) }; // mandatory peer verify
     let Ok(host_c) = std::ffi::CString::new(host) else {
@@ -23881,11 +23884,11 @@ unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64, policy: Optio
     if host.parse::<std::net::IpAddr>().is_ok() {
         let param = unsafe { SSL_get0_param(ssl) };
         if param.is_null() || unsafe { X509_VERIFY_PARAM_set1_ip_asc(param, host_c.as_ptr()) } != 1 {
-            return fail(AL_INVALID);
+            return fail(AL_CODE);
         }
     } else {
         if unsafe { SSL_set1_host(ssl, host_c.as_ptr()) } != 1 {
-            return fail(AL_INVALID);
+            return fail(AL_CODE);
         }
         unsafe { SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS) };
         // SNI (DNS names only). `SSL_set_tlsext_host_name` is a macro over `SSL_ctrl`; OpenSSL

@@ -117,6 +117,7 @@ pub(super) fn destination<'a>(
                 !http_is_token(name.as_bytes())
                     || name.eq_ignore_ascii_case("host")
                     || name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
                     || !http_upgrade_header_value_valid(value.as_bytes())
             })
         {
