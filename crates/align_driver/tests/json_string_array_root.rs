@@ -238,6 +238,14 @@ fn escaped()->Result<(),Error> {
   return Ok(())
 }
 fn main()->i32 {
+  owner:=[(91 as u8),(34 as u8),(120 as u8),(34 as u8),(93 as u8)].to_array()
+  mut alias:slice<u8>:=owner
+  text:=alias.as_str() else {return 7}
+  mut decoded:=model.decode(text) else {return 8}
+  saved:=decoded[0]
+  decoded=model.decode("[]") else {return 9}
+  if saved!="x" || decoded.len()!=0 {return 10}
+  alias[0]=255
   a:=unsafe {align_rt_alloc_count()}
   f:=unsafe {align_rt_free_count()}
   clean() else {return 1}
@@ -262,7 +270,7 @@ fn json_string_array_root_rejects_invalid_source_and_view_escape() {
             ).unwrap();
             let cases = [
                 (
-                    "import borrowed\nfn bad() {owner:=[(91 as u8),(93 as u8)].to_array();mut alias:slice<u8>:=owner;text:=alias.as_str() else {return};mut values:=borrowed.decode(text) else {return};field:=values[0];values=borrowed.decode(\"[]\") else {return};alias[0]=255;print(field)}",
+                    "import borrowed\nfn bad() {owner:=[(91 as u8),(34 as u8),(120 as u8),(34 as u8),(93 as u8)].to_array();mut alias:slice<u8>:=owner;text:=alias.as_str() else {return};mut values:=borrowed.decode(text) else {return};field:=values[0];values=borrowed.decode(\"[]\") else {return};alias[0]=255;print(field)}",
                     Some("validated bytes were modified"),
                 ),
                 (
