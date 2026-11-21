@@ -96,6 +96,21 @@ instructions and smaller code with preserved behavior. Compact sources, commands
 CSV samples and IR extracts are retained in the local qualification evidence.
 R109's original global count threshold remains unqualified.
 
+### Cost of the remaining guard in pack verification
+
+On 2026-11-21 the release compiler at `3d8ae634` built the product revision
+used in the October M1 census for baseline x86_64. In a full `--pack-verify`
+on Linux/WSL2, `bytes_equal_at` compared 733 names totaling 17,824 bytes.
+Across five warm-cache runs, timing the entire name-validation loop once per
+run gave a median of 13.24 µs out of 2.93 s (0.00045%). Timing each comparison
+separately confirmed the call count. All three modes, including the unmodified
+verifier, produced identical reports apart from elapsed time. Changing the
+first name byte made all three reject member zero with `R4_PACK_NAME_MISMATCH`.
+
+Keep the existing guard for this workload. Reconsider elimination when a
+measured consumer spends material time on this access pattern. The ARM64
+whole-product sign-test target remains open.
+
 ## Other request dispositions
 
 R97's remaining dynamic prefix call is LLVM's ordinary inline-cost decision
