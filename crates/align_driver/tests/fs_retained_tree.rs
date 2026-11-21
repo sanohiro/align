@@ -100,7 +100,7 @@ fn main() -> Result<(), Error> {
             !built
                 .link_libs_union()
                 .iter()
-                .any(|library| library == "crypto")
+                .any(|library| library.name() == "crypto")
         );
         let unit = built.link_and_run();
         assert_eq!(

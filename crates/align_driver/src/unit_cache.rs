@@ -61,7 +61,7 @@ pub const UNIT_KEY_FORMAT_VERSION: u32 = 1;
 
 /// The unit manifest wire-format version. Bump on ANY change to the encoded byte layout; an old
 /// manifest then fails closed on decode (a clean miss, its bytes unreferenced).
-const UNIT_MANIFEST_FORMAT_VERSION: u32 = 1;
+const UNIT_MANIFEST_FORMAT_VERSION: u32 = 2;
 
 /// The manifest phase discriminator, disjoint from `cache.rs`'s `PHASE_TAG_PRELINK` (1) and
 /// `PHASE_TAG_BACKEND` (2), so a unit manifest can never be mis-decoded as a ThinLTO one even under
@@ -263,7 +263,7 @@ pub struct UnitEntry {
     /// capability-derived ones. Only the second half corresponds to `capabilities`, so a unit that
     /// declares an FFI library and uses no gated builtin has a non-empty `link_libs` and an empty
     /// `capabilities`. Re-deriving would silently drop that unit's `-l` flag.
-    pub link_libs: Vec<String>,
+    pub link_libs: Vec<crate::NativeLibrary>,
 }
 
 /// Every diagnostic in replayable form, or `None` when this unit must not be retained.
@@ -397,7 +397,13 @@ fn write_value(w: &mut Writer, entry: &UnitEntry) {
     }
     w.u32(cache::u32_len(entry.link_libs.len()));
     for lib in &entry.link_libs {
-        w.str(lib);
+        match lib {
+            crate::NativeLibrary::System(name) => {
+                w.u8(0);
+                w.str(name);
+            }
+            crate::NativeLibrary::Blake3Provider => w.u8(1),
+        }
     }
 }
 
@@ -411,7 +417,11 @@ fn read_value(r: &mut Reader<'_>) -> Result<UnitEntry, CacheDecodeError> {
         };
         Ok(CachedDiagnostic { severity, message: r.str()?, lo: r.u32()?, hi: r.u32()? })
     })?;
-    let link_libs = r.seq(|r| r.str())?;
+    let link_libs = r.seq(|r| match r.u8()? {
+        0 => Ok(crate::NativeLibrary::System(r.str()?)),
+        1 => Ok(crate::NativeLibrary::Blake3Provider),
+        tag => Err(CacheDecodeError::BadTag { what: "native library", tag }),
+    })?;
     Ok(UnitEntry { summary_bytes, diagnostics, link_libs })
 }
 
@@ -837,7 +847,7 @@ mod tests {
                 lo: 7,
                 hi: 11,
             }],
-            link_libs: vec!["sqlite3".to_string()],
+            link_libs: vec![crate::NativeLibrary::from("sqlite3"), crate::NativeLibrary::Blake3Provider],
         }
     }
 
@@ -874,7 +884,7 @@ mod tests {
     /// together. The 16-byte trailer is by definition `Hash128` OF the preceding value region, so it
     /// is checked as that rule rather than as a magic constant.
     const GOLDEN_PREFIX_HEX: &str = concat!(
-        "01000000",                         // manifest_format_version = 1 (u32 LE)
+        "02000000",                         // manifest_format_version = 2 (u32 LE)
         "03",                               // phase_tag = 3
         // -- key region --
         "01000000",                         // key_format_version = 1
@@ -901,7 +911,7 @@ mod tests {
         "01",                               // severity = 1 (Warning)
         "100000006c6f73737920636f6e76657273696f6e",                   // "lossy conversion"
         "07000000", "0b000000",             // lo = 7, hi = 11
-        "01000000", "0700000073716c69746533",                         // link_libs = ["sqlite3"]
+        "02000000", "00", "0700000073716c69746533", "01",              // System("sqlite3"), Blake3Provider
     );
 
     fn golden_key() -> UnitKey {
@@ -942,7 +952,7 @@ mod tests {
                 lo: 7,
                 hi: 11,
             }],
-            link_libs: vec!["sqlite3".to_string()],
+            link_libs: vec![crate::NativeLibrary::from("sqlite3"), crate::NativeLibrary::Blake3Provider],
         }
     }
 
@@ -1024,9 +1034,20 @@ mod tests {
         assert_eq!(entry.diagnostics[0].message, "lossy conversion");
         assert_eq!(entry.diagnostics[0].lo, 7);
         assert_eq!(entry.diagnostics[0].hi, 11);
-        assert_eq!(entry.link_libs, vec!["sqlite3".to_string()]);
+        assert_eq!(entry.link_libs, vec![crate::NativeLibrary::from("sqlite3"), crate::NativeLibrary::Blake3Provider]);
         // And it is the same value the round-trip test builds.
         assert_eq!((key, entry), (golden_key(), golden_entry()));
+    }
+
+    #[test]
+    fn malformed_library_origins_are_rejected() {
+        // Empty summary, empty diagnostics, exactly one link item.
+        let mut value = from_hex("000000000000000001000000");
+        value.push(2);
+        assert!(matches!(read_value(&mut Reader::new(&value)),
+            Err(CacheDecodeError::BadTag { what: "native library", tag: 2 })));
+        *value.last_mut().unwrap() = 0;
+        assert!(read_value(&mut Reader::new(&value)).is_err(), "missing system name");
     }
 
     #[test]

@@ -155,7 +155,7 @@ fn build_from_path(
     }
     // First-seen union across units, matching the driver's deterministic order. A v1 session is a
     // one-unit package, so this reduces to that unit's list.
-    let mut link_libs: Vec<String> = Vec::new();
+    let mut link_libs: Vec<align_driver::NativeLibrary> = Vec::new();
     for unit in &build.units {
         for lib in &unit.link_libs {
             if !link_libs.iter().any(|l| l == lib) {

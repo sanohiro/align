@@ -271,6 +271,10 @@ jobs:
           path: ${{ steps.apt-llvm.outputs.path }}
           key: ${{ steps.apt-llvm.outputs.key }}
 
+      - name: Install the BLAKE3 C provider
+        shell: bash
+        run: scripts/install-blake3.sh "$RUNNER_TEMP/blake3" shared --github-env
+
       - name: Build compiler and runtime
         shell: bash
         run: >
@@ -459,14 +463,20 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          brew install llvm@22 openssl@3 libpq zstd
+          brew install llvm@22 openssl@3 libpq zstd blake3
+          echo "BLAKE3_INCLUDE_DIR=$(brew --prefix blake3)/include" >> "$GITHUB_ENV"
           LLVM_PREFIX="$(brew --prefix llvm@22)"
           LIBPQ_PREFIX="$(brew --prefix libpq)"
           echo "LLVM_SYS_221_PREFIX=$LLVM_PREFIX" >> "$GITHUB_ENV"
           echo "LLVM_CONFIG=$LLVM_PREFIX/bin/llvm-config" >> "$GITHUB_ENV"
           echo "$LLVM_PREFIX/bin" >> "$GITHUB_PATH"
           echo "$LIBPQ_PREFIX/bin" >> "$GITHUB_PATH"
-          echo "LIBRARY_PATH=$LIBPQ_PREFIX/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$LIBPQ_PREFIX/lib:$(brew --prefix openssl@3)/lib:$(brew --prefix zstd)/lib:$(brew --prefix blake3)/lib" >> "$GITHUB_ENV"
+
+      - name: Install the BLAKE3 C provider
+        if: runner.os == 'Linux'
+        shell: bash
+        run: scripts/install-blake3.sh "$RUNNER_TEMP/blake3" shared --github-env
 
       - name: Verify toolchain
         shell: bash
@@ -630,6 +640,16 @@ jobs:
           # break from being discovered at release time.
           ./target/release/align-repl --version
           printf '40 + 2\n:quit\n' | ./target/release/align-repl | grep -x 42
+
+      - name: Verify the distributable BLAKE3 archive
+        if: matrix.scope != 'light'
+        shell: bash
+        run: |
+          scripts/cargo.sh build --locked -p align_driver -p align_runtime
+          scripts/cargo.sh test --locked -p align_driver --test m11_crypto blake3_official
+          scripts/test-blake3-package.sh --shared target/debug/alignc
+          scripts/install-blake3.sh "$RUNNER_TEMP/blake3-static" static
+          scripts/test-blake3-package.sh target/debug "$RUNNER_TEMP/blake3-static/lib/libblake3.a"
 
       # The saved cache names the tree it was built from so the next run's
       # "Restore source mtimes from Git" can invalidate exactly what changed.

@@ -2686,6 +2686,7 @@ fn pkg_kv_timeout_ownership_link_child() {
                 panic!("read timeout ownership link-child library {index}: {error}")
             })
         })
+        .map(decode_link_child_library)
         .collect::<Vec<_>>();
     let executable = PathBuf::from(
         std::env::var_os(LINK_EXE_ENV).expect("missing timeout ownership link-child executable"),
@@ -2694,7 +2695,7 @@ fn pkg_kv_timeout_ownership_link_child() {
         .expect("link timeout ownership executable");
 }
 
-fn link_objects_bounded(objects: &[PathBuf], executable: &Path, libraries: &[String]) {
+fn link_objects_bounded(objects: &[PathBuf], executable: &Path, libraries: &[align_driver::NativeLibrary]) {
     let mut command =
         Command::new(std::env::current_exe().expect("resolve timeout ownership test executable"));
     command
@@ -2711,7 +2712,7 @@ fn link_objects_bounded(objects: &[PathBuf], executable: &Path, libraries: &[Str
         command.env(format!("{LINK_CHILD_ENV}_OBJECT_{index}"), object);
     }
     for (index, library) in libraries.iter().enumerate() {
-        command.env(format!("{LINK_CHILD_ENV}_LIBRARY_{index}"), library);
+        command.env(format!("{LINK_CHILD_ENV}_LIBRARY_{index}"), encode_link_child_library(library));
     }
     let linked = run_command_bounded(
         &mut command,

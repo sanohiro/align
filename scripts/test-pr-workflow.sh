@@ -3035,7 +3035,7 @@ grep -Fq 'skip_clean "libexec/alignc"' "$formula_template" || {
   echo "the Homebrew formula may rewrite the compiler after its cache is keyed" >&2
   exit 1
 }
-grep -Fq 'libexec.install "alignc", "align-repl", "libalign_runtime.a", "share"' \
+grep -Fq 'libexec.install "alignc", "align-repl", "libalign_runtime.a", "libblake3.a", "share"' \
   "$formula_template" || {
   echo "the Homebrew formula no longer installs the adjacent cache tree" >&2
   exit 1

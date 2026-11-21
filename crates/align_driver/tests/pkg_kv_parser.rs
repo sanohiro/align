@@ -2710,6 +2710,7 @@ fn pkg_kv_parser_link_child() {
             std::env::var(format!("{LINK_CHILD_ENV}_LIBRARY_{index}"))
                 .unwrap_or_else(|error| panic!("read parser link-child library {index}: {error}"))
         })
+        .map(decode_link_child_library)
         .collect::<Vec<_>>();
     let executable = PathBuf::from(
         std::env::var_os(LINK_EXE_ENV).expect("missing parser link-child executable"),
@@ -2718,7 +2719,7 @@ fn pkg_kv_parser_link_child() {
         .expect("link pkg.kv parser executable");
 }
 
-fn link_objects_bounded(objects: &[PathBuf], exe: &Path, libraries: &[String]) {
+fn link_objects_bounded(objects: &[PathBuf], exe: &Path, libraries: &[align_driver::NativeLibrary]) {
     let mut command =
         Command::new(std::env::current_exe().expect("resolve pkg.kv parser test executable"));
     command
@@ -2731,7 +2732,7 @@ fn link_objects_bounded(objects: &[PathBuf], exe: &Path, libraries: &[String]) {
         command.env(format!("{LINK_CHILD_ENV}_OBJECT_{index}"), object);
     }
     for (index, library) in libraries.iter().enumerate() {
-        command.env(format!("{LINK_CHILD_ENV}_LIBRARY_{index}"), library);
+        command.env(format!("{LINK_CHILD_ENV}_LIBRARY_{index}"), encode_link_child_library(library));
     }
     let output = run_command_bounded(
         &mut command,

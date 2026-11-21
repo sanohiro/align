@@ -1823,7 +1823,7 @@ and http last (needs net + TLS).
 - **`std.crypto` — DONE (2026-07-07, PRs #384–#388, one slice per PR + the #383 engine-decision
   docs PR).** Engine: **OpenSSL libcrypto (EVP), floor ≥ 3.2, `-lcrypto` always-linked** — settled
   pre-implementation via two independent design reviews (security + dependency lens, #383);
-  **blake3 deferred with record** (no system engine; no BLAKE2b aliasing). The module's hard
+  BLAKE3 now uses the official C engine ([plan 264](264-std-crypto-blake3.md)). The module's hard
   requirement — constant-time as *verified*, not specified — was met literally: every slice
   passed an independent adversarial gate review, and the CT/security-critical properties were
   checked against **compiled machine code**, not source.
@@ -1872,7 +1872,7 @@ and http last (needs net + TLS).
     Implementation self-caught two real bugs pre-review: a wrong `OSSL_PARAM_UNSIGNED_INTEGER`
     constant (2, not 6) and an `Rvalue` enum-size growth re-triggering the expr-depth ceiling —
     fixed by boxing the payload (`Argon2Args`).
-  - **Deferred with record (not blockers):** blake3 (#383); zeroize-on-drop key buffers (P6 —
+  - **Deferred with record (not blockers):** zeroize-on-drop key buffers (P6 —
     buffer Drop just frees; callers holding key material should overwrite first; a zeroizing
     buffer variant is the recorded candidate); a nonce-generating seal convenience (P3);
     `OSSL_set_max_threads` for parallel argon2 lanes; fixed-size `array<u8; N>` digest returns

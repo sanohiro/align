@@ -373,7 +373,7 @@ fn main() -> Result<(), Error> {
             .mir
             .link_libs
             .iter()
-            .any(|library| library == "crypto"),
+            .any(|library| library.name() == "crypto"),
         "session-only pkg.auth unit must retain module-wide libcrypto: {:?}",
         per_unit.unit("pkg.auth").mir.link_libs,
     );

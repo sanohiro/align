@@ -368,9 +368,9 @@ fn gate_d_capability_union_is_libz_only() {
     }
     let per = build_per_unit_multi("gd", &[("zip.align", ZIP_D), ("plain.align", PLAIN_D), ("main.align", MAIN_D)], "main.align");
     let libs = per.link_libs_union();
-    assert!(libs.contains(&"z".to_string()), "the compress unit must contribute libz: {libs:?}");
+    assert!(libs.contains(&"z".into()), "the compress unit must contribute libz: {libs:?}");
     for absent in ["zstd", "crypto", "ssl"] {
-        assert!(!libs.contains(&absent.to_string()), "no unit uses {absent}: {libs:?}");
+        assert!(!libs.contains(&align_driver::NativeLibrary::from(absent)), "no unit uses {absent}: {libs:?}");
     }
 
     // End-to-end: the linked binary records exactly the libz dependency among gated libraries.

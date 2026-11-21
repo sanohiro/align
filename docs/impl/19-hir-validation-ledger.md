@@ -1512,7 +1512,7 @@ merely because its `Ty` matches.
 | `CryptoDigestNew` | `env[]; child[]; result CryptoDigest`; fresh opaque Move owner; Impure. |
 | `CryptoDigestUpdate` | `env[]; child[digest,data]`; bound live `CryptoDigest` local or exclusive borrowed parameter, byte-view data, Unit result; no retained input; receiver survives eager data evaluation; Impure. |
 | `CryptoDigestFinish` | `env[]; child[digest]`; bound owned `CryptoDigest` local or by-value parameter; consumes and nulls source; fresh individually owned `DynArray(u8)` result; Impure. |
-| `CryptoHash` | `env[algo]`; `child[data]`; `byte-view; result DynArray(u8); fresh owned output, exact runtime length 32/64 by algo; Impure`. |
+| `CryptoHash` | `env[algo]`; `child[data]`; `byte-view; result DynArray(u8); fresh owned output, exact runtime length 20/32/64 by algo (BLAKE3: 32); Impure`. |
 | `CryptoHmac` | `env[]; child[key,data]`; `byte-view,byte-view; result DynArray(u8) with exact length 32; fresh owned output; Impure`. |
 | `CryptoHkdf` | `env[]; child[salt,ikm,info,len]`; `byte-view,byte-view,byte-view,i64; result ERR(Buffer); all borrowed, fresh owned output; Impure`. |
 | `CryptoAead` | `env[cipher,dir]`; `child[key,nonce,input,aad]`; all byte-view; `result ERR(Buffer); all borrowed; cipher fixes 32-byte key/12-byte nonce/16-byte tag contract; dir selects seal/open and all-or-nothing open; fresh owned success output; Impure`. |

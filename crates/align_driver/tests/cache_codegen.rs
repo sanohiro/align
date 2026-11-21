@@ -95,7 +95,7 @@ impl Drop for Project {
 struct Emitted {
     outcomes: Vec<CacheOutcome>,
     objs: Vec<PathBuf>,
-    link_libs: Vec<String>,
+    link_libs: Vec<align_driver::NativeLibrary>,
 }
 
 fn emit_all(
@@ -113,7 +113,7 @@ fn emit_all(
     assert!(!walk.diags.has_errors(), "unexpected build errors");
     let mut outcomes = Vec::new();
     let mut objs = Vec::new();
-    let mut link_libs: Vec<String> = Vec::new();
+    let mut link_libs: Vec<align_driver::NativeLibrary> = Vec::new();
     for unit in &walk.units {
         let obj = proj.dir.join(format!("{}-{}.o", unit.unit.replace('.', "_"), nonce()));
         let unit_exports: &[String] = if unit.is_entry { exports } else { &[] };

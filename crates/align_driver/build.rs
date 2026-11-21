@@ -22,7 +22,7 @@ use std::process::Command;
 /// constant in sync with `RUNTIME_SRC_DIGEST_SEED` in `src/lib.rs`.
 const RUNTIME_SRC_DIGEST_SEED: u64 = 0x616C_6967_6E5F_7274; // "align_rt"
 
-/// A deterministic, mtime-independent content digest of every `*.rs` file under `dir` (recursive):
+/// A deterministic, mtime-independent content digest of every Rust and C source file under `dir` (recursive):
 /// relative paths sorted, then for each `(rel_path, len, bytes)` folded into one buffer and hashed.
 /// `None` if the tree is absent/unreadable. Mirrors `align_driver::runtime_src_digest`.
 fn runtime_src_digest(dir: &Path) -> Option<String> {
@@ -38,7 +38,7 @@ fn runtime_src_digest(dir: &Path) -> Option<String> {
             let path = entry.path();
             if ft.is_dir() {
                 stack.push(path);
-            } else if ft.is_file() && path.extension().is_some_and(|x| x == "rs") {
+            } else if ft.is_file() && path.extension().is_some_and(|x| x == "rs" || x == "c") {
                 let rel = path.strip_prefix(dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
                 files.push((rel, path));
             }

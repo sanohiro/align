@@ -58014,6 +58014,7 @@ impl<'a, 't> Checker<'a, 't> {
                     method,
                     "constant_time_equal"
                         | "random"
+                        | "blake3"
                         | "sha1"
                         | "sha256"
                         | "sha256_stream"
@@ -68377,7 +68378,7 @@ impl<'a, 't> Checker<'a, 't> {
 
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // `sha256`/`sha512` (Slice 2) — the EVP digests; delegate to the shared hash builder.
-        if matches!(method, "sha1" | "sha256" | "sha512") {
+        if matches!(method, "sha1" | "sha256" | "sha512" | "blake3") {
             return self.check_crypto_hash(method, args, span);
         }
         // `hmac_sha256`/`hkdf_sha256` (Slice 3) — delegate to their builders.
@@ -68582,6 +68583,7 @@ impl<'a, 't> Checker<'a, 't> {
     fn check_crypto_hash(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         let algo = match method {
+            "blake3" => hir::HashAlgo::Blake3,
             "sha1" => hir::HashAlgo::Sha1, "sha256" => hir::HashAlgo::Sha256, "sha512" => hir::HashAlgo::Sha512,
             _ => { self.diags.error(format!("unknown hash operation: {method}"),span); return err; }
         };

@@ -245,6 +245,102 @@ fn crypto_wrong_shape_rejected() {
 // `slice<u8>` (u8 is not a Move element), which `encoding.hex_encode` renders for comparison against
 // the NIST/RFC known-answer vectors. Impure (a C-engine call), so `par_map` rejects a hashing closure.
 
+/// The upstream 1.8.7 unkeyed corpus fills byte i with i % 251. Boundaries
+/// exercise both sides of a block or chunk and the tree merge after three chunks.
+#[test]
+fn blake3_official_vectors_and_owned_results() {
+    if !backend_available() { return; }
+    let program = r#"
+import std.crypto
+import std.encoding
+fn digest(n: i64) -> array<u8> {
+  mut input := buffer(n)
+  mut i := 0
+  loop {
+    if i >= n { break }
+    input.put_u8((i % 251) as u8)
+    i = i + 1
+  }
+  return crypto.blake3(input.bytes())
+}
+fn main() {
+  mut retained := digest(0)
+  print(retained.len())
+  print(encoding.hex_encode(retained[0..32]))
+  retained = digest(64)
+  print(encoding.hex_encode(retained[0..32]))
+  retained = digest(1024)
+  print(encoding.hex_encode(retained[0..32]))
+  retained = digest(1025)
+  print(encoding.hex_encode(retained[0..32]))
+  retained = digest(3073)
+  print(encoding.hex_encode(retained[0..32]))
+  retained = crypto.blake3("abc")
+  print(encoding.hex_encode(retained[0..32]))
+}
+"#;
+    let result = build_and_run("m11-crypto-blake3-vectors", program);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(String::from_utf8_lossy(&result.stdout).lines().collect::<Vec<_>>(), [
+        "32",
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "4eed7141ea4a5cd4b788606bd23f46e212af9cacebacdc7d1f4c6dc7f2511b98",
+        "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7",
+        "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444",
+        "7124b49501012f81cc7f11ca069ec9226cecb8a2c850cfe644e327d22d3e1cd3",
+        "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+    ]);
+}
+
+#[test]
+fn blake3_allocates_one_owned_result_in_or_out_of_an_arena() {
+    if !backend_available() { return; }
+    let program = r#"
+import std.crypto
+extern "C" fn align_rt_alloc_count() -> i64
+extern "C" fn align_rt_free_count() -> i64
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes() -> i64
+fn compare(a: slice<u8>) -> i64 {
+  arena {
+    b := crypto.blake3("abc")
+    if unsafe { align_rt_requested_live_bytes() } != 64 { return 1 }
+    if !crypto.constant_time_equal(a, b[0..32]) { return 2 }
+  }
+  return 0
+}
+fn check() -> i64 {
+  a := crypto.blake3("abc")
+  status := compare(a[0..32])
+  if unsafe { align_rt_requested_live_bytes() } != 32 || a.len() != 32 { return 3 }
+  return status
+}
+fn main() {
+  unsafe { align_rt_requested_live_reset() }
+  allocated := unsafe { align_rt_alloc_count() }
+  freed := unsafe { align_rt_free_count() }
+  print(check())
+  print(unsafe { align_rt_alloc_count() } - allocated)
+  print(unsafe { align_rt_free_count() } - freed)
+  print(unsafe { align_rt_requested_live_bytes() })
+}
+"#;
+    let result = build_and_run("m11-crypto-blake3-drop", program);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(result.stdout, b"0\n2\n2\n0\n");
+}
+
+#[test]
+fn blake3_requires_import_and_one_byte_view() {
+    for (label, source) in [
+        ("no-import", "fn main() { h := crypto.blake3(\"x\"); print(h.len()) }"),
+        ("missing-data", "import std.crypto\nfn main() { h := crypto.blake3(); print(h.len()) }"),
+        ("wrong-type", "import std.crypto\nfn main() { h := crypto.blake3(42); print(h.len()) }"),
+    ] {
+        assert!(check_errs(label, source), "expected {label} to be rejected");
+    }
+}
+
 /// `sha256` matches the NIST known-answer vectors for the empty string and `"abc"`, and the digest
 /// is 32 bytes.
 #[test]
@@ -380,6 +476,7 @@ pub fn main() -> i32 {
   return 0
 }
 ";
+    assert!(check_errs("m11cr-blake3-parmap-impure", &src.replace("sha256", "blake3")));
     assert!(check_errs("m11cr-sha-parmap-impure", src), "an impure sha256 closure must be rejected by par_map");
 }
 

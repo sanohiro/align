@@ -339,6 +339,27 @@ pub struct ImportedFn {
     pub producer_certified: bool,
 }
 
+/// A source or capability library. The BLAKE3 builtin may use the packaged
+/// archive; explicit extern declarations always use the named system library.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NativeLibrary {
+    System(String),
+    Blake3Provider,
+}
+
+impl NativeLibrary {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::System(name) => name,
+            Self::Blake3Provider => "blake3",
+        }
+    }
+}
+
+impl From<&str> for NativeLibrary {
+    fn from(name: &str) -> Self { Self::System(name.to_owned()) }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub fns: Vec<Function>,
@@ -374,8 +395,8 @@ pub struct Program {
     /// time. **Empty in the whole-program path** (byte-identity), populated only by per-unit
     /// lowering.
     pub imported_fns: Vec<ImportedFn>,
-    /// External libraries to link (`-l<name>`), passed through from HIR; consumed by the driver.
-    pub link_libs: Vec<String>,
+    /// User-declared system libraries and compiler-selected capability libraries.
+    pub link_libs: Vec<NativeLibrary>,
     /// Struct layouts, indexed by the id in [`Ty::Struct`]; codegen builds LLVM struct
     /// types from these.
     pub structs: Vec<hir::StructDef>,
@@ -3338,6 +3359,8 @@ pub enum Term {
 /// would require splitting the runtime crate by feature area — recorded as a follow-up, not done here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Capability {
+    /// The official BLAKE3 C provider, isolated in a dedicated runtime archive member.
+    Blake3,
     /// gzip compression/decompression — `libz`.
     Zlib,
     /// zstd compression/decompression — `libzstd`.
@@ -3351,9 +3374,10 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// The `-l<name>` libraries this capability requires (a superset — see the type doc).
+    /// Libraries required by this capability. BLAKE3 can resolve to a packaged archive.
     pub fn link_libs(self) -> &'static [&'static str] {
         match self {
+            Capability::Blake3 => &["blake3"],
             Capability::Zlib => &["z"],
             Capability::Zstd => &["zstd"],
             Capability::Crypto => &["crypto", "z", "zstd"],
@@ -3382,6 +3406,7 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
                 hir::CompressKind::Zstd => Capability::Zstd,
             })
         }
+        Rvalue::CryptoHash { algo: hir::HashAlgo::Blake3, .. } => Some(Capability::Blake3),
         Rvalue::CryptoDigestNew | Rvalue::CryptoDigestUpdate { .. } | Rvalue::CryptoDigestFinish(_)
         | Rvalue::CryptoHash { .. }
         | Rvalue::CryptoHmac { .. }
@@ -3476,7 +3501,7 @@ fn collect_capability_libs(
     tuples: &[hir::TupleDef],
     enums: &[hir::EnumDef],
     tagged_types: &[hir::TaggedType],
-) -> Vec<String> {
+) -> Vec<NativeLibrary> {
     let mut caps: Vec<Capability> = Vec::new();
     for f in fns {
         for cap in function_capabilities(f, structs, tuples, enums, tagged_types) {
@@ -3491,10 +3516,13 @@ fn collect_capability_libs(
     // empirically: a crypto-before-http program links fine either way), but a fixed
     // order keeps the link line deterministic across code motion and stays correct
     // if these libs are ever linked as static archives.
-    let mut libs: Vec<String> = Vec::new();
+    let mut libs = Vec::new();
+    if caps.contains(&Capability::Blake3) {
+        libs.push(NativeLibrary::Blake3Provider);
+    }
     for l in ["ssl", "crypto", "zstd", "z"] {
         if caps.iter().any(|cap| cap.link_libs().contains(&l)) {
-            libs.push(l.to_string());
+            libs.push(NativeLibrary::from(l));
         }
     }
     libs
@@ -3963,8 +3991,8 @@ fn lower_program_unchecked_with_plans(
     }
     annotate_par_map_work(&mut fns);
     // User-declared `extern "C" link("name")` libraries come first (validated in sema); then the
-    // libraries the used builtins require. Both feed the driver's single `-l<name>` loop.
-    let mut link_libs = program.link_libs.clone();
+    // libraries the lowered builtins require. Keep the two BLAKE3 origins distinct.
+    let mut link_libs: Vec<_> = program.link_libs.iter().cloned().map(NativeLibrary::System).collect();
     for l in collect_capability_libs(
         &fns,
         &program.structs,

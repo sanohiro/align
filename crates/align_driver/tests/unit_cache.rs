@@ -348,7 +348,7 @@ fn a_reused_build_equals_a_cold_build() {
     // existed.
     let reference = proj.build(UnitReuse::Forbidden);
     assert!(reference.units.iter().all(|u| u.frontend.is_none()), "a forbidden walk declines the stage");
-    let ref_shape: Vec<(String, Vec<u8>, Vec<String>, bool)> = reference
+    let ref_shape: Vec<(String, Vec<u8>, Vec<align_driver::NativeLibrary>, bool)> = reference
         .units
         .iter()
         .map(|u| {
@@ -365,7 +365,7 @@ fn a_reused_build_equals_a_cold_build() {
     proj.build(UnitReuse::Allowed);
     let warm = proj.build(UnitReuse::Allowed);
     assert!(warm.units.iter().all(|u| u.is_reused()), "every unit should now come from disk");
-    let warm_shape: Vec<(String, Vec<u8>, Vec<String>, bool)> = warm
+    let warm_shape: Vec<(String, Vec<u8>, Vec<align_driver::NativeLibrary>, bool)> = warm
         .units
         .iter()
         .map(|u| {
@@ -585,7 +585,7 @@ fn copied_compiler_reads_adjacent_packaged_frontend_and_codegen_cache() {
             if key.unit != "lib" {
                 return None;
             }
-            entry.link_libs.push("definitely-not-a-real-library".to_string());
+            entry.link_libs.push("definitely-not-a-real-library".into());
             std::fs::write(&path, unit_cache::serialize_manifest(&key, &entry)).expect("tamper packaged lib");
             Some((path, bytes, key))
         })
@@ -865,7 +865,7 @@ fn rehydration_rejects_a_tampered_summary() {
 fn rehydration_rejects_tampered_link_libs() {
     let _serial = serial();
     tamper_and_expect_rejection("tamper-links", |entry| {
-        entry.link_libs.push("nonexistent".to_string());
+        entry.link_libs.push("nonexistent".into());
     });
 }
 
@@ -961,6 +961,29 @@ fn a_foreign_compiler_fingerprint_never_hits() {
 // ---- P17 / P34: link libraries ----------------------------------------------------------------
 
 #[test]
+fn blake3_provider_and_explicit_library_survive_warm_reuse() {
+    use align_driver::NativeLibrary;
+    let _serial = serial();
+    let project = Proj::new("blake3-origins", &[("main.align", "fn main() {}\n")]);
+    let uncalled = "fn unused() -> i64 { digest := crypto.blake3(\"a\"); return digest.len() }\n";
+    let external = "extern \"C\" link(\"blake3\") { fn blake3_version() -> raw }\n";
+    for (source, expected) in [
+        (external.to_owned(), vec![NativeLibrary::from("blake3")]),
+        (format!("import std.crypto\n{uncalled}"), vec![NativeLibrary::Blake3Provider]),
+        (format!("import std.crypto\n{external}{uncalled}"),
+            vec![NativeLibrary::from("blake3"), NativeLibrary::Blake3Provider]),
+    ] {
+        project.write("main.align", &format!("{source}fn main() {{}}\n"));
+        let fresh = project.build(UnitReuse::Allowed);
+        assert!(!fresh.units.is_empty());
+        for unit in &fresh.units { assert_eq!(unit.link_libs, expected); }
+        let warm = project.build(UnitReuse::Allowed);
+        assert!(warm.units.iter().all(|unit| unit.is_reused()));
+        for unit in &warm.units { assert_eq!(unit.link_libs, expected); }
+    }
+}
+
+#[test]
 fn ffi_declared_link_libraries_survive_reuse() {
     let _serial = serial();
     // The load-bearing case for persisting `link_libs` at all: a `link("m")` library is NOT a
@@ -976,10 +999,10 @@ fn ffi_declared_link_libraries_survive_reuse() {
         ],
     );
     let cold = proj.build(UnitReuse::Forbidden);
-    let cold_libs: Vec<(String, Vec<String>)> =
+    let cold_libs: Vec<(String, Vec<align_driver::NativeLibrary>)> =
         cold.units.iter().map(|u| (u.unit.clone(), u.link_libs.clone())).collect();
     assert!(
-        cold_libs.iter().any(|(_, libs)| libs.iter().any(|l| l == "m")),
+        cold_libs.iter().any(|(_, libs)| libs.iter().any(|l| l.name() == "m")),
         "the fixture must actually declare an FFI library: {cold_libs:?}"
     );
     let num = cold.units.iter().find(|u| u.unit == "num").expect("num unit");
@@ -991,7 +1014,7 @@ fn ffi_declared_link_libraries_survive_reuse() {
     proj.build(UnitReuse::Allowed);
     let warm = proj.build(UnitReuse::Allowed);
     assert!(warm.units.iter().all(|u| u.is_reused()));
-    let warm_libs: Vec<(String, Vec<String>)> =
+    let warm_libs: Vec<(String, Vec<align_driver::NativeLibrary>)> =
         warm.units.iter().map(|u| (u.unit.clone(), u.link_libs.clone())).collect();
     assert_eq!(cold_libs, warm_libs, "a reused unit must carry the same link line");
 }
@@ -1199,7 +1222,7 @@ fn a_synthetic_key_round_trips_through_the_store() {
     let entry = UnitEntry {
         summary_bytes: vec![9, 9, 9],
         diagnostics: Vec::new(),
-        link_libs: vec!["z".to_string()],
+        link_libs: vec!["z".into()],
     };
     std::fs::create_dir_all(&proj.cache).expect("create cache root");
     unit_cache::publish(&proj.cache, &key, &entry);
@@ -1524,7 +1547,7 @@ fn a_stale_entry_makes_the_cli_retry_once_and_succeed() {
         if key.unit != "lib" {
             continue;
         }
-        entry.link_libs.push("definitely-not-a-real-library".to_string());
+        entry.link_libs.push("definitely-not-a-real-library".into());
         std::fs::write(&path, unit_cache::serialize_manifest(&key, &entry)).expect("rewrite");
         tampered = true;
     }

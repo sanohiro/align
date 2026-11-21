@@ -261,7 +261,7 @@ pub fn link_objects_with_output(
     cc: &crate::CDriver,
     objs: &[&Path],
     exe: &Path,
-    link_libs: &[String],
+    link_libs: &[crate::NativeLibrary],
     profile: Profile,
     sink: &mut dyn LinkOutputSink,
 ) -> Result<(), String> {
@@ -272,7 +272,7 @@ pub fn link_objects_instrumented_with_output(
     cc: &crate::CDriver,
     objs: &[&Path],
     exe: &Path,
-    link_libs: &[String],
+    link_libs: &[crate::NativeLibrary],
     profile: Profile,
     profile_rt: &Path,
     sink: &mut dyn LinkOutputSink,
@@ -284,7 +284,7 @@ fn link_captured(
     cc: &crate::CDriver,
     objs: &[&Path],
     exe: &Path,
-    link_libs: &[String],
+    link_libs: &[crate::NativeLibrary],
     profile: Profile,
     profile_rt: Option<&Path>,
     sink: &mut dyn LinkOutputSink,
@@ -293,6 +293,7 @@ fn link_captured(
     let format = crate::target_object_format()?;
     let runtime = crate::runtime_archive()?;
     let ordered_link_libs = crate::order_link_libs(link_libs);
+    let blake3 = crate::blake3_companion(&runtime, link_libs);
     let linker = crate::select_linker(format)?;
     let parent = exe
         .parent()
@@ -307,6 +308,7 @@ fn link_captured(
         exe: tool.path(),
         runtime: &runtime,
         ordered_link_libs: &ordered_link_libs,
+        blake3_archive: blake3.as_deref(),
         format,
         profile,
         profile_rt,

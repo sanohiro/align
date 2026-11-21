@@ -18182,6 +18182,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::CryptoHash { algo, data } => {
                 let (dp, dl) = self.split_str(data)?;
                 let f = match algo {
+                    align_sema::hir::HashAlgo::Blake3 => self.runtime(RuntimeKey::CryptoBlake3),
                     align_sema::hir::HashAlgo::Sha1 => self.runtime(RuntimeKey::CryptoSha1),
                     align_sema::hir::HashAlgo::Sha256 => self.runtime(RuntimeKey::CryptoSha256),
                     align_sema::hir::HashAlgo::Sha512 => self.runtime(RuntimeKey::CryptoSha512),
