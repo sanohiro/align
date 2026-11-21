@@ -1162,6 +1162,7 @@ already lives in `docs/open-questions.md`.
 - **`soa_slice<T>`** (multi-column `s[a..b]` sub-view over every column): needs a
   `{ptr, total_len, start, count}` view repr since column stride depends on the original row count.
   See `docs/open-questions.md` → "Multi-column `soa_slice<T>`".
+- Fused SoA grouping on `i64` and `str` keys ships in Plan263. A single scan updates all requested `sum`, `min`, `max`, and `count` columns.
 - **Packed-bool columns** (`bitset`-backed `bool` fields in a `soa<T>`, instead of one byte/lane).
 - **Dynamic over-aligned arrays**: a heap-allocated `array<align(N)Struct>` (element stride is already
   correct; only the heap buffer's own alignment is missing) and arena/heap-buffer over-alignment in

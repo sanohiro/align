@@ -554,9 +554,77 @@ fn group_by_agg_non_i64_value_is_rejected() {
 }
 
 #[test]
-fn group_by_agg_soa_source_is_rejected() {
-    // First cut is the AoS str key; a soa i64-key multi-aggregate is a deferred follow-up.
-    assert!(!ok("P { k: i64, v: i64 }\nfn main() -> i32 { arena { s := [P{k:1,v:2}].to_soa()\n g := s.group_by(.k).agg(sum(.v))\n return 0 } }\n"));
+fn soa_fused_aggregates_execute_in_whole_and_per_unit_code() {
+    if !backend_available() { return; }
+    let model = r#"module groups
+pub Row { flag:bool, text:str, k:i64, v:i64, more:i64 }
+pub fn group<T>(tag:T, rows:soa<Row>)->i64 {
+  words:=rows.group_by(.text).agg(sum(.v),min(.more),max(.more),count(),sum(.v))
+  numbers:=rows.group_by(.k).agg(sum(.v),count(),max(.k))
+  if words.0.len()!=2 || words.0[0]!="界" || words.0[1]!="" {return 1}
+  if words.1[0]!=-6 || words.2[0]!=-5 || words.3[0]!=10 || words.4[0]!=2 || words.5[0]!=-6 {return 2}
+  if words.1[1]!=3 || words.2[1]!=5 || words.3[1]!=5 || words.4[1]!=1 {return 3}
+  if numbers.0.len()!=2 || numbers.2.sum()!=3 {return 4}
+  mut i:=0
+  loop {
+    if i==numbers.0.len() {break}
+    if numbers.0[i]==-7 {
+      if numbers.1[i]!=-6 || numbers.2[i]!=2 || numbers.3[i]!=-7 {return 5}
+    } else {
+      if numbers.0[i]!=5 || numbers.1[i]!=3 || numbers.2[i]!=1 || numbers.3[i]!=5 {return 6}
+    }
+    i=i+1
+  }
+  return 0
+}
+"#;
+    let main = r#"import groups
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+fn run()->i64 {
+  arena {
+    rows:=[groups.Row{flag:true,text:"界",k:-7,v:-4,more:10},groups.Row{flag:false,text:"",k:5,v:3,more:5},groups.Row{flag:true,text:"界",k:-7,v:-2,more:-5}].to_soa()
+    return groups.group(3,rows)
+  }
+}
+fn main() {
+  a:=unsafe {align_rt_alloc_count()}
+  f:=unsafe {align_rt_free_count()}
+  print(run())
+  print(unsafe {align_rt_alloc_count()}-a == unsafe {align_rt_free_count()}-f)
+}
+"#;
+    let files = [("groups.align", model), ("main.align", main)];
+    let mir = whole_mir_multi("soa-fused-descriptor", &files, "main.align");
+    assert_eq!(mir.matches("group_multi_cols(").count(), 2, "{mir}");
+    for result in [build_and_run_multi("soa-fused-whole", &files, "main.align"),
+        build_per_unit_multi("soa-fused-units", &files, "main.align").link_and_run()] {
+        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "0\ntrue\n");
+    }
+}
+
+#[test]
+fn soa_fused_aggregate_projection_lifetimes() {
+    let prefix = "Row {text:str,v:i64}\n";
+    for (body, errors) in [
+        ("fn f()->array<i64> {arena {s:=[Row{text:\"x\",v:2}].to_soa();g:=s.group_by(.text).agg(sum(.v));return g.1}}", false),
+        ("fn f()->(array<i64>,array<i64>) {arena {s:=[Row{text:\"x\",v:2}].to_soa();return s.group_by(.v).agg(count())}}", false),
+        ("fn f()->str {arena a {x:=\"x\".clone_in(a);s:=[Row{text:x,v:2}].to_soa();g:=s.group_by(.text).agg(count());return g.0[0]}}", true),
+        ("fn f(s:soa<Row>)->i64 = s.group_by(.v).agg(sum(.text)).1.len()", true),
+        ("fn f(s:soa<Row>)->i64 = s.group_by(.text).agg(count(.v)).1.len()", true),
+    ] {
+        let src = format!("{prefix}{body}\nfn main() {{}}\n");
+        let result = diff_check_multi("soa-fused-projection", &[("main.align",&src)], "main.align");
+        assert_eq!(result.whole_errors, errors, "{src}\n{}",result.whole_diags);
+        assert_eq!(result.per_unit_errors, errors, "{src}\n{}",result.per_unit_diags);
+    }
+    for (actions, errors) in [("alias[0]=255; print(kept)",true),("print(kept); alias[0]=255",false)] {
+        let src = format!("{prefix}fn main() {{owner:=[(65 as u8)].to_array();mut alias:slice<u8>:=owner;text:=alias.as_str() else {{return}};arena {{s:=[Row{{text:text,v:7}}].to_soa();g:=s.group_by(.text).agg(count());kept:=g.0[0];{actions}}}}}\n");
+        let r = diff_check_multi("soa-fused-key-view", &[("main.align",&src)], "main.align");
+        assert_eq!(r.whole_errors, errors, "{src}\n{}",r.whole_diags);
+        assert_eq!(r.per_unit_errors, errors, "{src}\n{}",r.per_unit_diags);
+    }
 }
 
 #[test]

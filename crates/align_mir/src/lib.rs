@@ -1436,6 +1436,16 @@ pub enum Rvalue {
         out_keys: Operand,
         out_vals: Vec<Operand>,
     },
+    /// Fuse the selected columns from one captured SoA descriptor into independent outputs.
+    /// The descriptor also sizes every allocation; a native failure terminates before publication.
+    GroupAggMultiCols {
+        source: Operand,
+        struct_id: u32,
+        key_field: u32,
+        aggs: Vec<(hir::GroupOp, Option<u32>)>,
+        out_keys: Operand,
+        out_vals: Vec<Operand>,
+    },
     /// `s.dict_encode(.key)` — intern the `str` `key_field` column of the AoS array-of-`struct_id` in
     /// slot `base` (codegen derives the per-row stride + key byte offset) into the caller `out_ids`
     /// (dense i64 ids, one per row) + `out_dict` (the `str` dictionary), via `align_rt_dict_encode_str`.
@@ -11316,15 +11326,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     Ty::Tuple(id) => id,
                     _ => unreachable!("group_by multi-aggregate result is a tuple"),
                 };
-                match source {
-                    hir::GroupSource::AosStr => lower_array_group_multi_str(
-                        b, *base, *struct_id, *key_field, aggs, tuple_id,
-                    ),
-                    // sema restricts the fused multi-aggregate to the AoS str key (first cut).
-                    other => {
-                        unreachable!("multi-aggregate group_by source {other:?} is sema-rejected")
-                    }
-                }
+                lower_array_group_multi(b, *base, *struct_id, *key_field, aggs, tuple_id, *source)
             }
             hir::ExprKind::ArrayDictEncode {
                 base,
@@ -17688,29 +17690,39 @@ fn lower_array_group_str(
 /// single-pass [`Rvalue::GroupAggMultiStr`] (intern key once, fold K accumulators), and builds the
 /// result tuple `(array<str>, array<i64> × K)`. The key buffer's `str` elements borrow `base`, so the
 /// tuple is region-tied to the source (sema).
-fn lower_array_group_multi_str(
+fn lower_array_group_multi(
     b: &mut Builder,
     base: u32,
     struct_id: u32,
     key_field: u32,
     aggs: &[hir::GroupAgg1],
     tuple_id: u32,
+    source: hir::GroupSource,
 ) -> Operand {
-    let strs = scalar_of(Ty::Str);
+    let (base_ty, key_ty) = match source {
+        hir::GroupSource::AosStr => (Ty::DynStructArray(struct_id, Layout::Aos), Ty::Str),
+        hir::GroupSource::SoaStr => (Ty::Soa(struct_id), Ty::Str),
+        hir::GroupSource::SoaI64 => (Ty::Soa(struct_id), i64_ty()),
+        hir::GroupSource::Encoded => {
+            b.terminate(Term::Unreachable);
+            return terminated_operand();
+        }
+    };
+    let key_scalar = scalar_of(key_ty);
     let i64s = scalar_of(i64_ty());
-    // Load the AoS array to get its length (an upper bound on the group count).
-    let arr = b.fresh_value(Ty::DynStructArray(struct_id, Layout::Aos));
+    // Capture the descriptor once for both output capacity and column access.
+    let arr = b.fresh_value(base_ty);
     b.push(Stmt::Let(arr, Rvalue::Load(base)));
     let len = b.fresh_value(i64_ty());
     b.push(Stmt::Let(len, Rvalue::SliceLen(Operand::Value(arr))));
     // Owned `str`-view key buffer + one owned i64 output column per aggregate, each sized at the row
     // count (the upper bound on the group count).
-    let out_keys = b.fresh_value(Ty::Box(strs));
+    let out_keys = b.fresh_value(Ty::Box(key_scalar));
     b.push(Stmt::Let(
         out_keys,
         Rvalue::HeapAllocBuf {
             count: Operand::Value(len),
-            elem: Ty::Str,
+            elem: key_ty,
         },
     ));
     let out_vals: Vec<ValueId> = aggs
@@ -17729,19 +17741,35 @@ fn lower_array_group_multi_str(
         .collect();
     // Fused one-pass aggregate → group count.
     let count = b.fresh_value(i64_ty());
-    b.push(Stmt::Let(
-        count,
+    let specs = aggs.iter().map(|a| (a.op, a.value_field)).collect();
+    let key_output = Operand::Value(out_keys);
+    let values = out_vals.iter().copied().map(Operand::Value).collect();
+    let operation = if source == hir::GroupSource::AosStr {
         Rvalue::GroupAggMultiStr {
-            base,
-            struct_id,
-            key_field,
-            aggs: aggs.iter().map(|a| (a.op, a.value_field)).collect(),
-            out_keys: Operand::Value(out_keys),
-            out_vals: out_vals.iter().map(|v| Operand::Value(*v)).collect(),
-        },
-    ));
+            base, struct_id, key_field, aggs: specs, out_keys: key_output, out_vals: values,
+        }
+    } else {
+        Rvalue::GroupAggMultiCols {
+            source: Operand::Value(arr), struct_id, key_field, aggs: specs,
+            out_keys: key_output, out_vals: values,
+        }
+    };
+    b.push(Stmt::Let(count, operation));
+    if source != hir::GroupSource::AosStr {
+        let valid = b.fresh_value(Ty::Bool);
+        b.push(Stmt::Let(valid, Rvalue::Bin(BinOp::Ge, Operand::Value(count),
+            Operand::Const(Const::Int(0, i64_ty())))));
+        let publish = b.new_block();
+        let fail = b.new_block();
+        b.terminate(Term::Branch(Operand::Value(valid), publish, fail));
+        b.cur = fail;
+        let abort = b.fresh_value(Ty::Unit);
+        b.push(Stmt::Let(abort, Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), vec![])));
+        b.terminate(Term::Unreachable);
+        b.cur = publish;
+    }
     // Build the result tuple: distinct keys + one owned array per aggregate column.
-    let karr = b.fresh_value(Ty::DynArray(strs));
+    let karr = b.fresh_value(Ty::DynArray(key_scalar));
     b.push(Stmt::Let(
         karr,
         Rvalue::MakeDynArray {

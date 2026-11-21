@@ -25870,7 +25870,7 @@ impl<'a> EscapeCheck<'a> {
             // default `Static`.) `dict_encode` itself likewise borrows its source AoS (its `dict`/
             // `source` slices view it), so the encoded value inherits the source's region.
             ExprKind::ArrayGroupAgg { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded | hir::GroupSource::SoaStr, .. }
-            | ExprKind::ArrayGroupAggMulti { base, source: hir::GroupSource::AosStr | hir::GroupSource::Encoded, .. }
+            | ExprKind::ArrayGroupAggMulti { base, source: hir::GroupSource::AosStr | hir::GroupSource::SoaStr, .. }
             | ExprKind::ArrayDictEncode { base, .. }
             // A `soa` column projection `s.field` is a `{ptr,len}` slice into the soa's buffer; for a
             // `str` column it is a `slice<str>` whose views borrow the soa's buffer/input, so it
@@ -33559,7 +33559,8 @@ fn classify_storage_expression(
     if matches!(
         &expression.kind,
         ExprKind::ArrayGroupAggMulti { aggs, source, .. }
-            if aggs.is_empty() || *source != hir::GroupSource::AosStr
+            if aggs.is_empty() || *source == hir::GroupSource::Encoded
+                || (*source == hir::GroupSource::SoaI64) != paths.headers.first().is_some_and(|h| h.ty == Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })))
     ) {
         paths.valid = false;
         paths.headers.clear();
@@ -63027,6 +63028,14 @@ impl<'a, 't> Checker<'a, 't> {
         }
     }
 
+    fn soa_group_source(&self, id: u32, key: &ast::Ident) -> hir::GroupSource {
+        if self.structs[id as usize].fields.iter().any(|f| f.name == key.name && f.ty == Ty::Str) {
+            hir::GroupSource::SoaStr
+        } else {
+            hir::GroupSource::SoaI64
+        }
+    }
+
     /// `s.group_by(.key).<agg>(…)` — column-oriented grouped aggregate over a `soa<Struct>` local:
     /// `sum`/`min`/`max(.value)` or `count()`. Yields `(array<i64>, array<i64>)` (distinct keys,
     /// per-key aggregate). First slice: the source must be a `soa<Struct>` local and the `key` (and
@@ -63086,15 +63095,7 @@ impl<'a, 't> Checker<'a, 't> {
             // A soa keys on an i64 column (SoaI64) or a `str` column (SoaStr) — decided by the key
             // field's declared type. A str key column is interned like the AoS str key, but read from
             // its own contiguous column (the two-column runtime path).
-            Ty::Soa(id) => {
-                let is_str_key = self.structs[id as usize]
-                    .fields
-                    .iter()
-                    .find(|f| f.name == key_field.name)
-                    .is_some_and(|f| f.ty == Ty::Str);
-                let src = if is_str_key { hir::GroupSource::SoaStr } else { hir::GroupSource::SoaI64 };
-                (id, src, None)
-            }
+            Ty::Soa(id) => (id, self.soa_group_source(id, key_field), None),
             Ty::DynStructArray(id, Layout::Aos) => (id, hir::GroupSource::AosStr, None),
             Ty::DictEncoded(id, kf) => (id, hir::GroupSource::Encoded, Some(kf)),
             Ty::Error => return err,
@@ -63230,27 +63231,24 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        // First cut: the AoS `str` key (the one-pass `HashMap<&str,[i64;K]>` shape that matches fast
-        // Rust). i64-key soa / precomputed dict_encoded multi-aggregate are deferred follow-ups.
-        let id = match self.locals[base as usize].ty {
-            Ty::DynStructArray(id, Layout::Aos) => id,
+        let (id, source, label) = match self.locals[base as usize].ty {
+            Ty::DynStructArray(id, Layout::Aos) => (id, hir::GroupSource::AosStr, "array"),
+            Ty::Soa(id) => (id, self.soa_group_source(id, key_field), "soa"),
             Ty::Error => return err,
             other => {
-                self.diags.error(
-                    format!("fused `group_by(.key).agg(...)` first cut needs an AoS `array<Struct>` with a `str` key, got {}", ty_name(other)),
-                    span,
-                );
+                self.diags.error(format!("fused `group_by(.key).agg(...)` needs a `soa<Struct>` or an AoS `array<Struct>`, got {}", ty_name(other)), span);
                 return err;
             }
         };
         let sname = self.structs[id as usize].name.clone();
         let fields = self.structs[id as usize].fields.clone();
         let i64t = Ty::Int(IntTy { bits: 64, signed: true });
-        let Some(ki) = self.resolve_group_field(&sname, &fields, "array", key_field, "key", Ty::Str) else { return err };
+        let key_ty = if source == hir::GroupSource::SoaI64 { i64t } else { Ty::Str };
+        let Some(ki) = self.resolve_group_field(&sname, &fields, label, key_field, "key", key_ty) else { return err };
         let mut aggs: Vec<hir::GroupAgg1> = Vec::with_capacity(specs.len());
         for (op, vf) in specs {
             let value_field = match vf {
-                Some(v) => match self.resolve_group_field(&sname, &fields, "array", v, "value", i64t) {
+                Some(v) => match self.resolve_group_field(&sname, &fields, label, v, "value", i64t) {
                     Some(idx) => Some(idx),
                     None => return err,
                 },
@@ -63258,14 +63256,14 @@ impl<'a, 't> Checker<'a, 't> {
             };
             aggs.push(hir::GroupAgg1 { op, value_field });
         }
-        // Result tuple: `(array<str>, array<i64> × K)` — distinct keys + one column per aggregate.
-        let karr = ty_to_scalar(Ty::DynArray(Scalar::Str)).expect("array<str> is a payload scalar");
+        // Result tuple: `(array<Key>, array<i64> × K)` — distinct keys + one column per aggregate.
+        let karr = ty_to_scalar(Ty::DynArray(ty_to_scalar(key_ty).unwrap())).expect("array<str> is a payload scalar");
         let varr = ty_to_scalar(Ty::DynArray(ty_to_scalar(i64t).unwrap())).expect("array<i64> is a payload scalar");
         let mut elems = vec![karr];
         elems.extend(std::iter::repeat_n(varr, aggs.len()));
         let tuple_id = intern_tuple(self.tuples, elems);
         Expr {
-            kind: ExprKind::ArrayGroupAggMulti { base, struct_id: id, key_field: ki, aggs, source: hir::GroupSource::AosStr },
+            kind: ExprKind::ArrayGroupAggMulti { base, struct_id: id, key_field: ki, aggs, source },
             ty: Ty::Tuple(tuple_id),
             span,
         }

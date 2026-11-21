@@ -1873,7 +1873,7 @@ implementation, two column layouts. **Region**: the str keys borrow the soa's st
 escape-checked (a str-key result can't leave the arena; an i64-key result's owned keys still can).
 `tests/soa.rs` (`soa_str_key_group_by_all_aggregates`, `…_type_checks_and_selects_by_key_column`,
 `…_result_cannot_escape_the_arena`), runtime `group_str_cols_aggregates_two_separate_columns`,
-`draft.md` §9. **Deferred:** fused multi-aggregate (`.agg(...)`) over a soa str key (still AoS-only).
+`draft.md` §9. Plan263 extends fused `.agg(...)` to SoA string and integer keys.
 
 **Scalar-accessor slice DONE — `s.len()` + `s[i].field`.** A soa now answers `s.len()` (its row
 count — the `{ptr,len}` length, via `ExprKind::Len` → `SliceLen`) and `s[i].field` (one column's
@@ -2455,8 +2455,8 @@ landed the structural win (cause 1: N passes → 1).
 **So beating smart Rust is a cross-cutting "smart" pass, deferred** (we trail smart in other benches
 too — best decided once): pick the hash strategy (`ahash` dep vs hand-rolled AES, applied to **all**
 str group paths incl. `dict_encode`), an inline-value accumulator layout (vs the dense-id `acc[id*K+j]`
-indirection), and possibly an AoS-reading (fair) smart baseline. Plus the deferred non-headline sources
-(i64-key soa / precomputed `dict_encoded` multi-aggregate), a `group_by(.key)` lambda key, and the
+indirection), and possibly an AoS-reading (fair) smart baseline. Plan263 adds i64-key and str-key SoA multi-aggregate. Remaining candidates include
+precomputed `dict_encoded` multi-aggregate, a `group_by(.key)` lambda key, and the
 `Scalar::DictEncoded` (return/wrap) follow-up. A2's honest niche stays **sequential/interactive** reuse
 (aggregates arriving over time, not fusible into one pass). Design ↓.
 **Surface positioning — DECIDED 2026-06-29 (Codex overreach review).** `dict_encode` is an **advanced

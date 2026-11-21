@@ -269,7 +269,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::ResourceViewFromRaw { .. } | Rvalue::BoxClone { .. } | Rvalue::IndexPtr { .. } |
         Rvalue::ArenaAlloc { .. } | Rvalue::HeapAllocBuf { .. } | Rvalue::SoaAlloc { .. } |
         Rvalue::MakeDynArray { .. } | Rvalue::GroupAgg { .. } | Rvalue::GroupAggStrCols { .. } |
-        Rvalue::GroupAggStr { .. } | Rvalue::GroupAggMultiStr { .. } | Rvalue::DictEncode { .. } |
+        Rvalue::GroupAggStr { .. } | Rvalue::GroupAggMultiStr { .. } | Rvalue::GroupAggMultiCols { .. } | Rvalue::DictEncode { .. } |
         Rvalue::MakeDictEncoded { .. } | Rvalue::DictField { .. } | Rvalue::GatherColumnI64 { .. } |
         Rvalue::DictLookup { .. } | Rvalue::Chunks { .. } | Rvalue::ParMapParallel { .. } |
         Rvalue::ParMapReduce { .. } | Rvalue::StaticData { .. } | Rvalue::StrClone { .. } |

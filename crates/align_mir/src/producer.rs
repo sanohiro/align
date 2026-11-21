@@ -3631,6 +3631,59 @@ impl<'a> XmlAccessAnalyzer<'a> {
         true
     }
 
+    fn add_soa_multi_writer(
+        &mut self, equation: &mut XmlAccessEquation, writer: (ValueId, &Rvalue),
+        output: (&Operand, &Operand, Ty, &[XmlAccessPathSegment]),
+    ) -> bool {
+        let (count, Rvalue::GroupAggMultiCols { source, struct_id, key_field, aggs, out_keys, out_vals }) = writer
+            else { return false };
+        let (ptr, len, selected_ty, remaining) = output;
+        let key_output = Self::same_operand(ptr, out_keys);
+        if !key_output && !out_vals.iter().any(|v| Self::same_operand(ptr, v)) { return false; }
+        let integer = Scalar::Int(IntTy { bits: 64, signed: true });
+        let numeric = scalar_to_ty(integer);
+        let row = self.graph.program.structs.get(*struct_id as usize);
+        let field = |index: u32| row.and_then(|r| r.fields.get(index as usize)).map(|f| f.ty);
+        let key = field(*key_field);
+        let source_ty = Ty::Soa(*struct_id);
+        if xml_operand_base_ty(self.graph.function, source) != Some(source_ty)
+            || !matches!(source, Operand::Value(_))
+            || !(key == Some(numeric) || key == Some(Ty::Str))
+            || self.graph.function.value_tys.get(count as usize) != Some(&numeric)
+            || !Self::same_operand(len, &Operand::Value(count)) || !remaining.is_empty()
+            || Some(selected_ty) != if key_output { key } else { Some(numeric) }
+            || aggs.is_empty() || aggs.len() != out_vals.len() || u32::try_from(aggs.len()).is_err()
+            || !aggs.iter().all(|(op, value)| match (op, value) {
+                (hir::GroupOp::Count, None) => true,
+                (hir::GroupOp::Sum | hir::GroupOp::Min | hir::GroupOp::Max, Some(value)) => field(*value) == Some(numeric),
+                _ => false,
+            }) {
+            equation.invalid = true;
+            return true;
+        }
+        self.check_operand(equation, source, source_ty);
+        for index in std::iter::once(*key_field).chain(aggs.iter().filter_map(|(_, v)| *v)) {
+            let Some(ty) = field(index) else { equation.invalid = true; return true; };
+            let column = self.read_source(equation, source, ty, vec![XmlAccessPathSegment::StructField(index)]);
+            Self::add_required_source(equation, column, OperandRequirement::READ);
+        }
+        for (index, out) in std::iter::once(out_keys).chain(out_vals).enumerate() {
+            let scalar = if index == 0 && key == Some(Ty::Str) { Scalar::Str } else { integer };
+            if !self.heap_buffer_capacity_matches_slice_len(out, source)
+                || (index > 0 && (Self::same_operand(out_keys, out) ||
+                    out_vals[..index-1].iter().any(|other| Self::same_operand(other, out)))) {
+                equation.invalid = true;
+            }
+            self.check_operand(equation, out, Ty::Box(scalar));
+        }
+        if key_output && key == Some(Ty::Str) {
+            Self::add_source(equation, XmlAccessSource::Seed(XmlAccessProvenance::Shared));
+        } else {
+            Self::add_source(equation, XmlAccessSource::Seed(XmlAccessProvenance::Owned));
+        }
+        true
+    }
+
     /// Runtime AoS writers share the source row layout and output-buffer contract. Numeric
     /// outputs own their copied values; key views retain only the selected source key field.
     fn add_aos_buffer_writer(
@@ -4760,6 +4813,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     if let Stmt::Let(count, runtime) = statement {
                         let output = (&ptr, &len, selected_ty, remaining);
                         if self.add_column_buffer_writer(&mut equation, (*count, runtime), output)
+                            || self.add_soa_multi_writer(&mut equation, (*count, runtime), output)
                             || self.add_aos_buffer_writer(&mut equation, (*count, runtime), output)
                             || self.add_dictionary_buffer_writer(&mut equation, (*count, runtime), output)
                         {
@@ -4817,6 +4871,21 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.invalid |= inputs.invalid;
                 equation.checks.extend(inputs.checks);
                 equation.checks.extend(inputs.dependencies.into_iter().map(|source| (source, OperandRequirement::READ)));
+                equation.seed = Some(XmlAccessProvenance::Owned);
+            }
+            runtime @ Rvalue::GroupAggMultiCols { .. } => {
+                let Rvalue::GroupAggMultiCols { struct_id, key_field, out_keys, .. } = &runtime else { unreachable!() };
+                let key = self.graph.program.structs.get(*struct_id as usize)
+                    .and_then(|s| s.fields.get(*key_field as usize)).map(|f| f.ty);
+                let mut inputs = XmlAccessEquation::default();
+                if !path.is_empty() || key.is_none_or(|key| !self.add_soa_multi_writer(&mut inputs,
+                    (value, &runtime), (out_keys, &Operand::Value(value), key, &[]))) {
+                    equation.invalid = true;
+                    return equation;
+                }
+                equation.invalid |= inputs.invalid;
+                equation.checks.extend(inputs.checks);
+                equation.checks.extend(inputs.dependencies.into_iter().map(|s| (s, OperandRequirement::READ)));
                 equation.seed = Some(XmlAccessProvenance::Owned);
             }
             runtime @ (Rvalue::GroupAggStr { .. } | Rvalue::GroupAggMultiStr { .. } | Rvalue::DictEncode { .. }) => {
@@ -9117,6 +9186,69 @@ fn validate_partition_scope(
     Ok(())
 }
 
+/// The outputs of a fused write are a single ordered publication. A heap allocation's type
+/// alone does not establish the producing invocation, count, success branch or aggregate ordinal.
+fn validate_fused_group_publications(function: &crate::Function) -> Result<(), ProducerError> {
+    let blocks = &function.blocks;
+    if !blocks.iter().flat_map(|b| &b.stmts).any(|s| matches!(s, Stmt::Let(_, Rvalue::GroupAggMultiCols { .. }))) {
+        return Ok(());
+    }
+    let fail = || ProducerError::Lowering(format!("invalid fused SoA group publication in '{}'", function.name));
+    let mut outputs = BTreeMap::new();
+    let mut published = BTreeSet::new();
+    for (block_index, block) in blocks.iter().enumerate() {
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            let Stmt::Let(count, Rvalue::GroupAggMultiCols { out_keys, out_vals, .. }) = stmt else { continue };
+            let [Stmt::Let(condition, Rvalue::Bin(BinOp::Ge, Operand::Value(result), Operand::Const(Const::Int(0, ty))))] =
+                &block.stmts[index + 1..] else { return Err(fail()); };
+            let Term::Branch(Operand::Value(branch), ok, bad) = block.term else { return Err(fail()); };
+            if result != count || branch != *condition || *ty != Ty::Int(IntTy { bits: 64, signed: true }) || ok == bad {
+                return Err(fail());
+            }
+            let success = blocks.get(ok as usize).ok_or_else(&fail)?;
+            let failure = blocks.get(bad as usize).ok_or_else(&fail)?;
+            if !matches!(&failure.stmts[..], [Stmt::Let(_, Rvalue::Call(DirectCall::Runtime(RuntimeKey::ProcessAbort), args))] if args.is_empty())
+                || !matches!(failure.term, Term::Unreachable)
+                || function.entry == ok
+                || blocks.iter().enumerate().any(|(other, block)| other != block_index && crate::byte_ranges::successors(&block.term).contains(&ok)) {
+                return Err(fail());
+            }
+            let mut headers = Vec::with_capacity(out_vals.len() + 1);
+            for (ordinal, output) in std::iter::once(out_keys).chain(out_vals).enumerate() {
+                let Operand::Value(allocation) = output else { return Err(fail()); };
+                let Some(Stmt::Let(header, Rvalue::MakeDynArray { ptr: Operand::Value(ptr), len: Operand::Value(len) })) =
+                    success.stmts.get(ordinal) else { return Err(fail()); };
+                if allocation != ptr || len != count || outputs.insert(*allocation, *header).is_some() {
+                    return Err(fail());
+                }
+                headers.push(*header);
+            }
+            let Some(Stmt::Let(_, Rvalue::MakeTuple { elems, .. })) = success.stmts.get(headers.len()) else { return Err(fail()); };
+            if elems.len() != headers.len() || !elems.iter().zip(headers).all(|(op, id)| matches!(op, Operand::Value(v) if *v == id)) {
+                return Err(fail());
+            }
+        }
+    }
+    for stmt in blocks.iter().flat_map(|b| &b.stmts) {
+        if let Stmt::Let(header, Rvalue::MakeDynArray { ptr: Operand::Value(ptr), .. }) = stmt
+            && let Some(expected) = outputs.get(ptr)
+            && (header != expected || !published.insert(*ptr)) {
+            return Err(fail());
+        }
+        // An existing single-output or AoS group writer may not reuse a fused writer's output.
+        let forbidden = |op: &Operand| matches!(op, Operand::Value(v) if outputs.contains_key(v));
+        let overlaps = match stmt {
+            Stmt::Let(_, Rvalue::GroupAgg { out_keys, out_vals, .. } | Rvalue::GroupAggStr { out_keys, out_vals, .. }
+                | Rvalue::GroupAggStrCols { out_keys, out_vals, .. }) => forbidden(out_keys) || forbidden(out_vals),
+            Stmt::Let(_, Rvalue::GroupAggMultiStr { out_keys, out_vals, .. }) => forbidden(out_keys) || out_vals.iter().any(forbidden),
+            Stmt::Let(_, Rvalue::DictEncode { out_ids, out_dict, .. }) => forbidden(out_ids) || forbidden(out_dict),
+            _ => false,
+        };
+        if overlaps { return Err(fail()); }
+    }
+    Ok(())
+}
+
 // Mixed decode's optional arena is exactly the active lexical arena, never a typed but
 // expired/foreign capability. Check CFG paths before producer trust, including partition peers.
 fn validate_json_decode_arenas(program: &Program) -> Result<(), ProducerError> {
@@ -9188,6 +9320,7 @@ fn validate_resource_rvalues_inner(
 ) -> Result<(), ProducerError> {
     validate_host_mir(program)?;
     validate_json_decode_arenas(program)?;
+    for function in &program.fns { validate_fused_group_publications(function)?; }
     validate_template_html_mir_signatures(program)?;
     let components = xml_local_call_components(program)?;
     // A partition peer carries its real signature in `program.fns`; seeding it grants the same
@@ -10556,6 +10689,7 @@ fn validate_resource_rvalues_component(
                     | Rvalue::GroupAggStrCols { .. }
                     | Rvalue::GroupAggStr { .. }
                     | Rvalue::GroupAggMultiStr { .. }
+                    | Rvalue::GroupAggMultiCols { .. }
                     | Rvalue::DictEncode { .. }
                     | Rvalue::GatherColumnI64 { .. }
                     | Rvalue::DictLookup { .. } => matches!(
@@ -13486,6 +13620,64 @@ mod tests {
             }
             assert!(validate_mir_producers(&malformed).is_err(), "mutation {mutation}");
             assert!(validate_partition_resource_rvalues(&malformed, &defined).is_err(), "partition mutation {mutation}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_soa_group_producer_rejects_substituted_metadata_and_outputs() -> Result<(), Box<dyn std::error::Error>> {
+        for field in ["name","k"] {
+            let source = format!("Row {{ flag:bool, name:str, k:i64, v:i64 }}\nfn group(s:soa<Row>)->i64 {{g:=s.group_by(.{field}).agg(sum(.v),count());return g.1.len()}}\nfn main() {{}}\n");
+            let mut diags = align_diag::Diagnostics::new();
+            let ast = align_parser::parse_file(align_lexer::tokenize(0, &source, &mut diags), &mut diags);
+            let hir = align_sema::check_file(&ast, &mut diags);
+            assert!(!diags.has_errors(), "{:?}", diags.iter().collect::<Vec<_>>());
+            let base = crate::lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
+            let scope = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+            validate_partition_resource_rvalues(&base, &scope)?;
+            for mutation in 0..10 {
+                let mut program = base.clone();
+                let f = program.fns.iter_mut().find(|f| f.name.as_str() == "group").ok_or("missing group")?;
+                let (bb, pos) = f.blocks.iter().enumerate().find_map(|(id, b)| b.stmts.iter().position(|s|
+                    matches!(s, Stmt::Let(_, Rvalue::GroupAggMultiCols { .. }))).map(|pos| (id,pos))).ok_or("missing fused call")?;
+                let Stmt::Let(_, Rvalue::GroupAggMultiCols { source, struct_id, key_field, aggs, out_keys, out_vals }) =
+                    &mut f.blocks[bb].stmts[pos] else { return Err("operation".into()); };
+                match mutation {
+                    0 => *struct_id = u32::MAX,
+                    1 => *key_field = 0,
+                    2 => aggs[0].1 = Some(1),
+                    3 => aggs[1].1 = Some(3),
+                    4 => out_vals[0] = out_keys.clone(),
+                    5 => out_vals.swap(0, 1),
+                    6 => {
+                        let Operand::Value(old) = source else { return Err("source SSA".into()); };
+                        let fresh = u32::try_from(f.value_tys.len())?;
+                        let original = *old;
+                        *source = Operand::Value(fresh);
+                        let slot = f.blocks[bb].stmts.iter().find_map(|s| match s {
+                            Stmt::Let(v, Rvalue::Load(slot)) if *v == original => Some(*slot), _ => None,
+                        }).ok_or("source load")?;
+                        f.value_tys.push(f.slots[slot as usize]);
+                        f.blocks[bb].stmts.insert(pos, Stmt::Let(fresh, Rvalue::Load(slot)));
+                    }
+                    7 => {
+                        let duplicate = f.blocks[bb].stmts[pos].clone();
+                        f.blocks[bb].stmts.insert(pos, duplicate);
+                    }
+                    8 => {
+                        let Term::Branch(_, ok, bad) = &mut f.blocks[bb].term else { return Err("guard".into()); };
+                        std::mem::swap(ok,bad);
+                    }
+                    _ => {
+                        let Term::Branch(_, ok, _) = f.blocks[bb].term else { return Err("guard".into()); };
+                        let Stmt::Let(_, Rvalue::MakeDynArray { len, .. }) = &mut f.blocks[ok as usize].stmts[0]
+                            else { return Err("header".into()); };
+                        *len = Operand::Const(Const::Int(-1, Ty::Int(IntTy {bits:64,signed:true})));
+                    }
+                }
+                assert!(validate_mir_producers(&program).is_err(), "{field}/{mutation} whole");
+                assert!(validate_partition_resource_rvalues(&program, &scope).is_err(), "{field}/{mutation} partition");
+            }
         }
         Ok(())
     }

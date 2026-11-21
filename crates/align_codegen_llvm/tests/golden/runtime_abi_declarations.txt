@@ -207,6 +207,7 @@ key|GroupMaxStrCols|group_max_str_cols|IndirectStorage|declare i64 @align_rt_gro
 key|GroupMinI64|group_min_i64|IndirectStorage|declare i64 @align_rt_group_min_i64(ptr, ptr, i64, ptr, ptr, i64) #2
 key|GroupMinStr|group_min_str|IndirectStorage|declare i64 @align_rt_group_min_str(ptr, i64, i64, i64, i64, ptr, ptr, i64) #2
 key|GroupMinStrCols|group_min_str_cols|IndirectStorage|declare i64 @align_rt_group_min_str_cols(ptr, ptr, i64, ptr, ptr, i64) #2
+key|GroupMultiCols|group_multi_cols|IndirectStorage|declare i64 @align_rt_group_multi_cols(ptr, ptr captures(none), i64, ptr captures(none), i64, i64) #2
 key|GroupMultiStr|group_multi_str|IndirectStorage|declare i64 @align_rt_group_multi_str(ptr, i64, i64, i64, ptr, i64, ptr, i64) #2
 key|GroupSumI64|group_sum_i64|IndirectStorage|declare i64 @align_rt_group_sum_i64(ptr, ptr, i64, ptr, ptr, i64) #2
 key|GroupSumStr|group_sum_str|IndirectStorage|declare i64 @align_rt_group_sum_str(ptr, i64, i64, i64, i64, ptr, ptr, i64) #2
