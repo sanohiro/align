@@ -13115,8 +13115,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // HttpCtxPeerEof adds a checked shared receiver and Copy bool/Error result.
         // FileReadAt adds one explicit initialized byte-view native writer.
         // HttpCtxView adds headerless Copy request observation with exact owner provenance.
+        // CompressStream authenticates two handle places, a numeric operand and optional dictionary.
         variants,
-        366,
+        367,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }

@@ -243,6 +243,54 @@ fn stream_encoders_and_dictionary_interoperate_with_independent_decoders() {
             }
             .unwrap();
             assert_eq!(decoded, value);
+            if value == message.as_slice() {
+                match format {
+                    Some(DeflateFormat::Gzip) => {}
+                    Some(DeflateFormat::Zlib) => {
+                        assert_ne!(packed[1] & 0x20, 0);
+                        assert_eq!(&packed[2..6], &0xe59918e6u32.to_be_bytes());
+                        for wrong in [&[][..], b"wrong dictionary"] {
+                            assert!(
+                                zlib_inflate_with_dictionary(
+                                    &packed,
+                                    DeflateFormat::Zlib,
+                                    value.len(),
+                                    11,
+                                    wrong
+                                )
+                                .is_err()
+                            );
+                        }
+                    }
+                    Some(DeflateFormat::Raw) => {
+                        for wrong in [&[][..], &vec![b'X'; dictionary.len()]] {
+                            assert_ne!(
+                                zlib_inflate_with_dictionary(
+                                    &packed,
+                                    DeflateFormat::Raw,
+                                    value.len(),
+                                    11,
+                                    wrong
+                                )
+                                .as_deref(),
+                                Ok(value)
+                            );
+                        }
+                    }
+                    None if dictionary == trained => {
+                        check_trained_frame(&packed, value, dictionary)
+                    }
+                    None => {
+                        for wrong in [&[][..], &vec![b'X'; dictionary.len()]] {
+                            assert_ne!(
+                                zstd_decompress_with_dictionary(&packed, value.len(), wrong)
+                                    .as_deref(),
+                                Ok(value)
+                            );
+                        }
+                    }
+                }
+            }
             let cap = i64::try_from(value.len()).unwrap();
             assert_eq!(
                 run(decode, &packed, 1, cap, dictionary, false),

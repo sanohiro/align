@@ -83099,9 +83099,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // HttpRespondTimeoutNs consumes two native owners and returns unit/Error.
         // HttpCtxPeerEof shared-borrows a context and returns Copy bool/Error.
         // FileReadAt borrows File and writes an initialized byte view, returning count/Error.
+        // CompressStream borrows both I/O handles and returns a Copy count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 366,
+            variants, 367,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

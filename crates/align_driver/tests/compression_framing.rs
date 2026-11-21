@@ -281,7 +281,7 @@ fn {codec}_check()->Result<(),Error> {{
     });
 }
 
-// ELF symbol wrapping counts the actual standard-handle shells across all three exits.
+// ELF symbol wrapping observes standard handles and provider contexts on real exit paths.
 #[cfg(target_os = "linux")]
 #[test]
 fn stream_standard_handle_cleanup() {
@@ -289,51 +289,25 @@ fn stream_standard_handle_cleanup() {
     use std::process::Command;
     owned_fixture::run("stream_standard_handle_cleanup", |stage| {
         let result = (|| -> TestResult {
-            let source = r#"import std.compress
-import std.io
-extern "C" fn observed() -> i64
-fn exercise(mode:i64)->Result<i64,Error> {
-  if mode==1 { return compress.gzip_decompress_to(io.stdin,io.stdout) }
-  return compress.gzip_compress_to(io.stdin,io.stdout,{ if mode==2 { return Ok(71) }; 6 })
-}
-fn main()->Result<(),Error> {
-  a:=exercise(2)?
-  n:=unsafe { observed() }
-  if a!=71 || n!=1 { return Err(Error.Invalid) }
-  match exercise(1) { Ok(_) => { return Err(Error.Invalid) }, Err(_) => {} }
-  m:=unsafe { observed() }
-  if m!=2 { return Err(Error.Invalid) }
-  size:=exercise(0)?
-  k:=unsafe { observed() }
-  if size<=0 || k!=3 { return Err(Error.Invalid) }
-  return Ok(())
-}
-"#;
+            let source = common::fixture("crates/align_driver/tests/fixtures/stream_codec_lifecycle.align");
             let c = stage.join("observe.c");
             let observer = stage.join("observe.o");
-            std::fs::write(&c, r#"#include <stdint.h>
-#include <stdlib.h>
-static int made_r, dropped_r, made_w, dropped_w;
-extern void *__real_align_rt_io_reader_stdin(void);
-extern void *__real_align_rt_io_writer_std(int32_t,int32_t);
-extern void __real_align_rt_io_reader_free(void *);
-extern void __real_align_rt_io_writer_free(void *);
-void *__wrap_align_rt_io_reader_stdin(void) { made_r++; return __real_align_rt_io_reader_stdin(); }
-void *__wrap_align_rt_io_writer_std(int32_t f,int32_t b) { made_w++; return __real_align_rt_io_writer_std(f,b); }
-void __wrap_align_rt_io_reader_free(void *p) { if(p)dropped_r++; __real_align_rt_io_reader_free(p); }
-void __wrap_align_rt_io_writer_free(void *p) { if(p)dropped_w++; __real_align_rt_io_writer_free(p); }
-int64_t observed(void) { return made_r==made_w && made_r==dropped_r && made_w==dropped_w ? made_r : -1; }
-"#)?;
+            std::fs::write(&c, common::fixture("crates/align_driver/tests/fixtures/stream_codec_lifecycle.c"))?;
             assert!(Command::new("cc").arg("-c").arg(c).arg("-o").arg(&observer).status()?.success());
             let wrapper = stage.join("link-observer");
-            std::fs::write(&wrapper, "#!/bin/sh\nexec cc -Wl,--wrap=align_rt_io_reader_stdin,--wrap=align_rt_io_reader_free,--wrap=align_rt_io_writer_std,--wrap=align_rt_io_writer_free \"$@\"\n")?;
+            let symbols = ["align_rt_io_reader_stdin", "align_rt_io_reader_free", "align_rt_io_writer_std",
+                "align_rt_io_writer_free", "deflateInit2_", "inflateInit2_", "deflateEnd", "inflateEnd",
+                "deflateSetDictionary", "ZSTD_createCCtx", "ZSTD_freeCCtx", "ZSTD_createDStream",
+                "ZSTD_freeDStream", "ZSTD_CCtx_loadDictionary"];
+            let flags = symbols.iter().map(|name| format!("-Wl,--wrap={name}")).collect::<Vec<_>>().join(" ");
+            std::fs::write(&wrapper, format!("#!/bin/sh\nexec cc {flags} \"$@\"\n"))?;
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
             let program = programs(stage, source, false)?.remove(0);
             let object = stage.join("exercise.o");
             align_driver::emit_object_file(&program, &object, BuildTarget::Baseline, Profile::Release, &[], false)?;
             let output = stage.join("exercise");
             align_driver::link_objects(&align_driver::CDriver::explicit(wrapper)?, &[&object, &observer], &output, &program.link_libs, Profile::Release)?;
-            let run = Command::new(output).output()?;
+            let run = Command::new(output).current_dir(stage).output()?;
             assert!(run.status.success(), "{run:?}");
             assert!(run.stdout.starts_with(&[0x1f, 0x8b]), "{run:?}");
             Ok(())
