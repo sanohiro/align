@@ -78,13 +78,13 @@ fn observe(mut syscall: impl FnMut(*mut libc::sockaddr, &mut libc::socklen_t) ->
 }
 
 unsafe fn local_addr(fd: Option<i32>, out: *mut NetEndpoint) -> i32 {
-    let Some(out) = (unsafe { out.as_mut() }) else { return AL_INVALID };
-    *out = EMPTY;
+    if out.is_null() { return AL_INVALID; }
+    unsafe { out.write(EMPTY) };
     let Some(fd) = fd else { return AL_INVALID };
     match observe(|addr, len| {
         if unsafe { libc::getsockname(fd, addr, len) } == 0 { Ok(0) } else { Err(io::Error::last_os_error()) }
     }) {
-        Ok((_, endpoint)) => { *out = endpoint; 0 }
+        Ok((_, endpoint)) => { unsafe { out.write(endpoint) }; 0 }
         Err(status) => status,
     }
 }
@@ -118,8 +118,8 @@ pub unsafe extern "C" fn align_rt_udp_local_addr(socket: *const UdpSocket, out: 
 /// Non-null arguments must be valid, with exclusive access to the buffer and output.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn align_rt_udp_recv_datagram(socket: *const UdpSocket, buffer: *mut Buffer, out: *mut NetDatagram) -> i32 {
-    let Some(out) = (unsafe { out.as_mut() }) else { return AL_INVALID };
-    *out = NetDatagram { n: 0, peer: EMPTY };
+    if out.is_null() { return AL_INVALID; }
+    unsafe { out.write(NetDatagram { n: 0, peer: EMPTY }) };
     let (Some(socket), Some(buf)) = (unsafe { socket.as_ref() }, unsafe { buffer.as_mut() }) else { return AL_INVALID };
     buf.len = 0;
     if buf.cap == 0 { return AL_INVALID; }
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn align_rt_udp_recv_datagram(socket: *const UdpSocket, bu
             // With flags zero, recvfrom returns exactly the initialized prefix, bounded by cap.
             buf.data.with_mut(|data| unsafe { data.set_len(n) });
             buf.len = n;
-            *out = NetDatagram { n: n as i64, peer };
+            unsafe { out.write(NetDatagram { n: n as i64, peer }) };
             0
         }
         Err(status) => status,

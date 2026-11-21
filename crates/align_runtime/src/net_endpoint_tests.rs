@@ -55,12 +55,15 @@ fn udp_receive_admission_errors_and_initialized_output() {
     let dest = native.local_addr().unwrap();
     let empty = align_rt_buffer_new(0, 1, 0);
     let buf = align_rt_buffer_new(6, 1, 0);
-    let mut packet = NetDatagram { n: -1, peer: EMPTY };
+    let mut raw = mem::MaybeUninit::<NetDatagram>::uninit();
     unsafe {
         (*buf).data.with_mut(|data| data.extend_from_slice(b"old"));
         (*buf).len = 3;
         sender.send_to(b"", dest).unwrap();
-        assert_eq!(align_rt_udp_recv_datagram(ptr::null(), buf, &mut packet), AL_INVALID);
+        assert_eq!(align_rt_udp_recv_datagram(ptr::null(), buf, raw.as_mut_ptr()), AL_INVALID);
+        let mut packet = raw.assume_init();
+        assert_eq!(packet.n, 0);
+        assert!(packet.peer.host.ptr.is_null());
         assert_eq!(align_rt_udp_recv_datagram(&socket, buf, ptr::null_mut()), AL_INVALID);
         { let b = &*buf; assert_eq!(&b.data[..b.len], b"old"); }
         assert_eq!(align_rt_udp_recv_datagram(&socket, empty, &mut packet), AL_INVALID);
@@ -105,8 +108,9 @@ fn ipv6_socket_observation_and_http_port_policy() {
     match std::net::UdpSocket::bind(("::1", 0)) {
         Ok(bound) => {
             let socket = UdpSocket { fd: bound.as_raw_fd() };
-            let mut address = EMPTY;
-            assert_eq!(unsafe { align_rt_udp_local_addr(&socket, &mut address) }, 0);
+            let mut raw = mem::MaybeUninit::<NetEndpoint>::uninit();
+            assert_eq!(unsafe { align_rt_udp_local_addr(&socket, raw.as_mut_ptr()) }, 0);
+            let address = unsafe { raw.assume_init() };
             assert_eq!(address.port, i64::from(bound.local_addr().unwrap().port()));
             assert_eq!(host(address), "::1");
         }

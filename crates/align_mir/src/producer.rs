@@ -3827,16 +3827,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             return equation;
         }
         let definition = (*definition).clone();
-        if let Rvalue::SocketObserve { socket, buffer, .. } = &definition {
-            // The source supplies bound locals. A raw borrow-mode argument is an address of
-            // storage, not the handle loaded from it. Match projections use BorrowedPlace.
-            let bound = |op: &Operand| matches!(op, Operand::BorrowedPlace(_))
-                || matches!(op, Operand::Value(_) if self.load_slot(op).is_some());
-            if !bound(socket) || buffer.as_ref().is_some_and(|op| !bound(op)) {
-                equation.invalid = true;
-                return equation;
-            }
-        }
         if let Some(contract) = native_owner_mir_contract(self.graph.program, self.graph.function, &definition) {
             // Independent builder copies authenticate the entire result graph at the opcode.
             // Its selected inline fields inherit that proof, never the builder's storage.
@@ -9333,6 +9323,7 @@ fn validate_resource_rvalues_inner(
     for function in &program.fns {
         if defined.is_none_or(|emitted| emitted.contains(&function.name)) {
             crate::group_source::validate(program, function)?;
+            crate::socket_observation::validate(function)?;
             validate_operand_availability(function)?;
         }
     }

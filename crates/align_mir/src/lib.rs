@@ -34,6 +34,7 @@ mod json_encode;
 pub use json_encode::json_encode_sequence_is_valid;
 pub mod print;
 pub mod producer;
+mod socket_observation;
 mod query_meta_layout;
 pub use query_meta_layout::QueryMetaTypes;
 mod runtime_key;

@@ -22047,6 +22047,49 @@ fn socket_observation_schemas_and_output_producers() -> Result<(), String> {
         assert!(crate::producer::validate_mir_producers(&m).is_err(), "MIR {mode}");
         assert!(crate::producer::validate_partition_resource_rvalues(&m, &emitted).is_err(), "unit {mode}");
     }
+    // A fresh record's ordinary integer fields cannot be assigned directly, even when
+    // the assignment is well typed. A reset input slot supplies no live handle.
+    for mode in 0..5 {
+        let mut m = whole.clone();
+        let f = m.fns.iter_mut().find(|f| f.name.as_str() == "receive").ok_or("receive")?;
+        let (block, position, out) = f.blocks.iter_mut().find_map(|block| {
+            let (index, out) = block.stmts.iter().enumerate().find_map(|(i, s)| match s {
+                Stmt::Let(_, Rvalue::SocketObserve { out, .. }) => Some((i, *out)),
+                _ => None,
+            })?;
+            Some((block, index, out))
+        }).ok_or("socket call")?;
+        if mode < 2 {
+            block.stmts.insert(position + mode, Stmt::StoreField(out, vec![0], Operand::Const(Const::Int(7, int(64)))));
+        } else {
+            let slot = f.params[usize::from(mode == 3)];
+            let at = if mode == 4 { position } else {
+                block.stmts.iter().position(|s| matches!(s, Stmt::Let(_, Rvalue::Load(target)) if *target == slot))
+                    .ok_or("bound input load")?
+            };
+            block.stmts.insert(at, Stmt::DropFlagInit(slot));
+        }
+        assert!(crate::producer::validate_mir_producers(&m).is_err(), "whole storage {mode}");
+        assert!(crate::producer::validate_partition_resource_rvalues(&m, &emitted).is_err(), "unit storage {mode}");
+    }
+    // At a control-flow join the owner must be initialized by both incoming paths.
+    let mut joined = whole.clone();
+    let f = joined.fns.iter_mut().find(|f| f.name.as_str() == "receive").ok_or("receive")?;
+    let side = u32::try_from(f.blocks.len()).map_err(|_| "blocks")?;
+    let target = side + 1;
+    let block = f.blocks.iter_mut().find(|b| b.stmts.iter().any(|s| matches!(s,
+        Stmt::Let(_, Rvalue::SocketObserve { .. })))).ok_or("call block")?;
+    let load = block.stmts.iter().position(|s| matches!(s, Stmt::Let(_, Rvalue::Load(slot))
+        if *slot == f.params[0])).ok_or("socket load")?;
+    let tail = block.stmts.split_off(load);
+    let term = std::mem::replace(&mut block.term, Term::Branch(Operand::Const(Const::Bool(true)), side, target));
+    f.blocks.push(Block { id: side, stmts: vec![], stmt_lines: vec![], term: Term::Goto(target) });
+    f.blocks.push(Block { id: target, stmts: tail, stmt_lines: vec![], term });
+    assert!(crate::producer::validate_mir_producers(&joined).is_ok(), "both predecessors live");
+    let f = joined.fns.iter_mut().find(|f| f.name.as_str() == "receive").ok_or("receive")?;
+    f.blocks[side as usize].stmts.push(Stmt::DropFlagInit(f.params[0]));
+    assert!(crate::producer::validate_mir_producers(&joined).is_err());
+    assert!(crate::producer::validate_partition_resource_rvalues(&joined, &emitted).is_err());
     Ok(())
 }
 
