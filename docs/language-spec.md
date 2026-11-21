@@ -619,7 +619,7 @@ remain outside this direct-field rule. See Plan192.
 A call returning an owning record can also transfer a complete direct owning field:
 `make().field` evaluates as `{ owner := make(); owner.field }`. For a fallible call,
 `read()?.field` propagates the error before extraction. The receiver is evaluated once.
-The extracted value retains its backing and cleanup mode, and the temporary owns its
+The same direct-field storage and cleanup rules apply. The temporary owns its
 remaining fields through ordinary local cleanup. The field must be known to need Drop
 where the expression is checked. Bind the record explicitly to read a Copy or view field.
 
