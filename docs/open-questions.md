@@ -1267,6 +1267,10 @@ so nested generic type args (`Pair<Pair<T>>`) still close; the shift is formed o
 position, where `<`/`>` are comparison-only (no turbofish). Folds in constant expressions.
 Record: `draft.md` §5, `docs/language-spec.md`, `examples/bitwise.align`, `tests/bitwise.rs`
 
+### Scalar lanes in a vector blend — settled
+
+`select(mask, a, b)` accepts a scalar on either side of a vector of the same element type. A vector operand fixes the result type and width. The three operands evaluate once in source order. [Plan267](impl/267-vector-select-broadcast.md) records the inference and representation rules.
+
 ### `core.hash` + `core.bitset` (roadmap #6) — design SETTLED (2026-06-29)
 The roadmap pairs these two as "#6", but they split cleanly by their prerequisites:
 

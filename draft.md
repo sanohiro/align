@@ -1861,12 +1861,15 @@ Loop-fused without creating temporary arrays.
 ### Mask
 
 Comparing two vectors elementwise yields a **mask** (one bool lane per vector lane), and
-`select(mask, a, b)` blends two vectors lane-wise — lane `i` is `a[i]` where the mask is set, else
-`b[i]`:
+`select(mask, a, b)` chooses from `a` where a mask lane is set and from `b` otherwise.
+At least one data operand supplies the vector. The other may have the same vector type or its
+exact scalar element type. A scalar broadcasts to every lane. All three operands evaluate
+once from left to right, preserving the selected bits including floating-point signed zero and NaN payloads.
 
 ```align
 m: mask4<i32> := a > b     // mask: one bool lane per comparison
 hi := select(m, a, b)      // elementwise max (a where a > b, else b)
+positive := select(a > 0, a, 0)
 total := scores.sum_where(m)   // masked reduction
 ```
 

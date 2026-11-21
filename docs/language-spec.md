@@ -916,7 +916,7 @@ operations, retained vector form, and scalarization at that stage. Eliminated-or
 verbose-only. A retained operation without a provider warns that instruction selection may still
 scalarize it; only emitted-object inspection establishes final machine SIMD. A
 comparison yields a `maskN<T>`, which is a **nameable** type (annotation, parameter, return) with the
-same element and width as the compared vectors; `select(m, a, b)` blends. A mask **gates
+same element and width as the compared vectors; `select(m, a, b)` blends. At least one of `a` and `b` supplies the vector. The other may have the same vector type or its exact scalar element type. All three expressions evaluate once from left to right, and a scalar broadcasts with its exact bit representation. A mask **gates
 structurally**: because a mask is one bool lane per lane and has no machine-level element type,
 `select` and `sum_where` accept any mask with the same lane count and the same lane bit width as the
 vectors it gates (`mask4<f32>` gates `vec4<i32>`/`vec4<u32>`/`vec4<f32>`; `mask2<f64>` gates the

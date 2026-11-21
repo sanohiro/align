@@ -4587,7 +4587,9 @@ impl<'a> BodyValidator<'a> {
                     .tuples
                     .get(*tuple_id as usize)
                     .is_some_and(|tuple| tuple.elems.len() == sources.len()),
-            hir::ExprKind::Select { .. } | hir::ExprKind::VecMinMax { .. } => true,
+            hir::ExprKind::Select { mask, a, b } =>
+                select_result(mask.ty, a.ty, b.ty) == Some(expression.ty),
+            hir::ExprKind::VecMinMax { .. } => true,
             hir::ExprKind::VecSumWhere { float_mode, .. }
             | hir::ExprKind::VecDot { float_mode, .. }
             | hir::ExprKind::VecSum { float_mode, .. } => {
@@ -8145,16 +8147,9 @@ impl<'a> BodyValidator<'a> {
                 let mask = self.expr_flow(mask)?;
                 let a = self.expr_flow(a)?;
                 let b = self.expr_flow(b)?;
-                let (scalar, lanes) = vector_numeric(a.ty)?;
-                // The mask is structural: same lane count and lane bit width, whatever element the
-                // producing comparison recorded (`align_sema::mask_gates_vector`, the one rule).
-                if !align_sema::mask_gates_vector(mask.ty, scalar, lanes)
-                    || b.ty != Ty::Vec(scalar, lanes)
-                {
-                    return None;
-                }
+                let result = select_result(mask.ty, a.ty, b.ty)?;
                 let (falls, breaks) = strict_flow(&[mask, a, b]);
-                Some((Ty::Vec(scalar, lanes), falls, breaks))
+                Some((result, falls, breaks))
             }
                 hir::ExprKind::VecSumWhere { vec, mask, .. } => {
                 let vector = self.expr_flow(vec)?;
@@ -14489,6 +14484,12 @@ fn vector_numeric(ty: Ty) -> Option<(Scalar, u32)> {
             if valid_vector_scalar(scalar) && valid_vector_lanes(lanes) => Some((scalar, lanes)),
         _ => None,
     }
+}
+
+fn select_result(mask: Ty, a: Ty, b: Ty) -> Option<Ty> {
+    let vector = align_sema::select_data_type(a, b)?;
+    let (element, lanes) = vector_numeric(vector)?;
+    align_sema::mask_gates_vector(mask, element, lanes).then_some(vector)
 }
 
 fn numeric_pair_result(lhs: Ty, rhs: Ty, mask: bool) -> Option<Ty> {

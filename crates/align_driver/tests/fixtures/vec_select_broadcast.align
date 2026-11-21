@@ -1,0 +1,48 @@
+import blend
+fn vector() -> vec2<i32> { print(3); return [4, 6] }
+fn scalar() -> i32 { print(2); return 9 }
+fn mask() -> mask2<f32> {
+  print(1)
+  a: vec2<f32> := [1.0, 0.0]
+  return a > 0.0
+}
+fn from_borrow(m: mask2<i32>, v: vec2<i32>, borrow value: i32) -> vec2<i32> = select(m, value, v)
+fn early(stop: bool) -> i32 {
+  choice := select(mask(), { if stop { return 71 }; scalar() }, vector())
+  return choice[0]
+}
+fn mask_early(stop: bool) -> i32 {
+  choice := select({ print(4); if stop { return 72 }; mask() }, scalar(), vector())
+  return choice[0]
+}
+fn right_early(stop: bool) -> i32 {
+  choice := select(mask(), vector(), { print(5); if stop { return 73 }; scalar() })
+  return choice[0]
+}
+fn main() -> i32 {
+  a := select(mask(), scalar(), vector())
+  b := select(mask(), vector(), scalar())
+  if a[0] != 9 || a[1] != 6 || b[0] != 4 || b[1] != 9 { return 1 }
+  if early(true) != 71 || mask_early(true) != 72 || right_early(true) != 73 { return 2 }
+  v: vec2<u64> := [3, 4]
+  high: u64 := 9223372036854775809
+  m := v < 4
+  c := select(m, high, v)
+  d := blend.pick(m, v, high, high, 0 as u64)
+  if c[0] != high || c[1] != 4 || d != high { return 3 }
+  words: [u32; 2] := [2143289413, 2147483648]
+  floats: slice<f32> := words[..].as_bytes().view_le() else { return 4 }
+  z: vec2<f32> := [0.0, 0.0]
+  n := select(z == 0.0, floats[0], z)
+  s := select(z != 0.0, z, floats[1])
+  if n[1].to_bits() != words[0] || s[0].to_bits() != words[1] { return 5 }
+  mixed: vec2<i32> := select(mask(), select(mask(), [8, 7], 9), -3)
+  inferred := select(mixed > 0, mixed, [0, 2])
+  left := select(mixed > 0, 11, mixed)
+  if mixed[0] != 8 || inferred[1] != 2 || left[1] != -3 { return 6 }
+  bound: i32 := 77
+  direct := from_borrow(mixed > 0, mixed, bound)
+  if direct[0] != 77 || direct[1] != -3 { return 7 }
+  print(99)
+  return 0
+}

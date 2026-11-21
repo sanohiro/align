@@ -4962,6 +4962,31 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     );
                 }
             }
+            Rvalue::MakeVec { elems, elem, n } => {
+                if !path.is_empty()
+                    || !xml_numeric_vector_shape(result_ty).is_some_and(|(element, lanes)| {
+                        scalar_to_ty(element) == elem && lanes == n && elems.len() == n as usize
+                    })
+                    || elems.iter().any(|lane| {
+                        let value_form = match lane {
+                            Operand::Const(Const::Int(_, _)) => matches!(elem, Ty::Int(_)),
+                            Operand::Const(Const::Float(_, _)) => matches!(elem, Ty::Float(_)),
+                            Operand::Arg(index) => self.graph.function.param_modes.get(*index as usize)
+                                == Some(&align_ast::ParamMode::ByValue),
+                            Operand::Value(_) | Operand::BorrowedPlace(_) => true,
+                            _ => false,
+                        };
+                        !value_form || xml_operand_base_ty(self.graph.function, lane) != Some(elem)
+                    })
+                {
+                    equation.invalid = true;
+                } else {
+                    for lane in &elems {
+                        self.check_operand(&mut equation, lane, elem);
+                    }
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                }
+            }
             Rvalue::Select { cond, a, b } => {
                 let condition_ty = xml_operand_base_ty(self.graph.function, &cond);
                 let condition_matches = condition_ty == Some(Ty::Bool)
@@ -6923,7 +6948,6 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::ResourceIntoRaw { .. }
             | Rvalue::BoxGet(..)
             | Rvalue::BoxClone(..)
-            | Rvalue::MakeVec { .. }
             | Rvalue::VecExtract { .. }
             | Rvalue::VecInsert { .. }
             | Rvalue::VecMinMax { .. }
@@ -10258,6 +10282,15 @@ fn validate_resource_rvalues_component(
                             })
                         });
                     if !valid { return Err(fail(function, "array builder owner transfer provenance mismatch")); }
+                }
+                let vector_producer = match rvalue {
+                    Rvalue::MakeVec { .. } => true,
+                    Rvalue::Select { cond, .. } => matches!(result, Ty::Vec(..))
+                        || matches!(xml_operand_base_ty(function, cond), Some(Ty::Mask(..))),
+                    _ => false,
+                };
+                if vector_producer && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result)) {
+                    return Err(fail(function, "vector construction or selection has an invalid type or operand producer"));
                 }
                 if native_owner_mir_contract(program, function, rvalue).is_some()
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))

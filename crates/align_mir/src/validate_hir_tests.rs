@@ -21917,6 +21917,77 @@ fn json_doc_encode_checked_source_and_piece_matrix() -> Result<(), &'static str>
 }
 
 #[test]
+fn select_broadcast_checked_hir_and_make_vec_producers() -> Result<(), String> {
+    let hir = checked_source_program("fn probe(m:mask2<i32>,v:vec2<i32>,x:i32) { ignored:=select(m,x,v) }\nfn main() {}\n");
+    assert!(body_core_metadata_is_valid(&hir));
+    for mutation in 0..4 {
+        let mut bad = hir.clone();
+        let expr = body_first_let_init_mut(&mut bad, "probe");
+        let hir::ExprKind::Select { mask, a, b } = &mut expr.kind else {
+            return Err("expected select".into());
+        };
+        match mutation {
+            0 => *b = a.clone(),
+            1 => a.ty = int(64),
+            2 => mask.ty = Ty::Mask(scalar_int(32), 4),
+            _ => expr.ty = int(32),
+        }
+        assert!(!body_core_metadata_is_valid(&bad), "HIR {mutation}");
+    }
+    let base = lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
+    let local = base.fns.iter().map(|f| f.name.clone()).collect();
+    let unit = base.fns.iter().filter(|f| f.name.as_str() == "probe").map(|f| f.name.clone()).collect();
+    let shapes = |p: &Program| crate::producer::validate_mir_producers(p).is_ok();
+    assert!(shapes(&base));
+    let probe = base.fns.iter().find(|f| f.name.as_str() == "probe").ok_or("missing probe")?;
+    let broadcast = probe.blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
+        Stmt::Let(id, Rvalue::MakeVec { .. }) => Some(*id),
+        _ => None,
+    }).ok_or("missing scalar broadcast")?;
+    let mut bad_select = base.clone();
+    let arm = bad_select.fns.iter_mut().find(|f| f.name.as_str() == "probe").into_iter()
+        .flat_map(|f| &mut f.blocks).flat_map(|b| &mut b.stmts).find_map(|s| match s {
+            Stmt::Let(_, Rvalue::Select { a, .. }) => Some(a),
+            _ => None,
+        }).ok_or("missing MIR select")?;
+    assert!(matches!(arm, Operand::Value(id) if *id == broadcast));
+    *arm = Operand::Const(Const::Int(0, int(32)));
+    assert!(!shapes(&bad_select));
+    assert!(crate::producer::validate_partition_resource_rvalues(&bad_select, &unit).is_err());
+    for mutation in 0..8 {
+        let mut bad = base.clone();
+        let function = bad.fns.iter_mut().find(|f| f.name.as_str() == "probe").ok_or("missing probe")?;
+        let (result, elems, elem, n) = function.blocks.iter_mut().flat_map(|b| &mut b.stmts)
+            .find_map(|s| match s {
+                Stmt::Let(id, Rvalue::MakeVec { elems, elem, n }) => Some((*id, elems, elem, n)),
+                _ => None,
+            }).ok_or("missing scalar broadcast")?;
+        assert_eq!(elems.len(), 2);
+        assert!(matches!((&elems[0], &elems[1]),
+            (Operand::Value(a), Operand::Value(b)) | (Operand::Arg(a), Operand::Arg(b)) if a == b));
+        match mutation {
+            0 => { elems.pop(); }
+            1 => elems.push(elems[0].clone()),
+            2 => elems[0] = Operand::Const(Const::Bool(true)),
+            3 => *elem = int(64),
+            4 => *n = 8,
+            5 => elems[0] = Operand::Value(u32::MAX),
+            6 => elems[0] = Operand::Const(Const::Float(0.0, int(32))),
+            _ => {
+                *n = 3;
+                elems.push(elems[0].clone());
+                function.value_tys[result as usize] = Ty::Vec(scalar_int(32), 3);
+            }
+        }
+        assert!(!shapes(&bad), "whole MIR {mutation}");
+        for definitions in [&local, &unit] {
+            assert!(crate::producer::validate_partition_resource_rvalues(&bad, definitions).is_err(), "partition MIR {mutation}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn stream_codec_hir_signature_matrix() -> Result<(), String> {
     let source = "import std.compress\nimport std.io\nfn f()->Result<i64,Error> { result:=compress.zstd_decompress_to(io.stdin,io.stdout,4,\"seed\"); result }\nfn main() {}\n";
     let valid = checked_source_program(source);

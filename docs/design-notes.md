@@ -930,6 +930,10 @@ an allocation, and a manual edit must retain intended types and stage boundaries
 
 ## The SIMD philosophy
 
+`select(m, v, 0)` uses the vector to establish the lane type. Broadcasting the evaluated scalar
+allows one masked expression to preserve exact integer and floating-point bits. The mask establishes
+which lanes to select and can come from a comparison of a different numeric family of the same width.
+
 Align does not try to make developers write SIMD.
 
 Align makes ordinary code naturally SIMD-friendly.
