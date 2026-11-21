@@ -29,6 +29,7 @@ pub mod loop_facts;
 mod canonical_graph;
 mod generated_id;
 mod group_source;
+mod group_backing;
 mod json_encode;
 pub use json_encode::json_encode_sequence_is_valid;
 pub mod print;

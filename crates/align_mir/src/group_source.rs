@@ -10,6 +10,7 @@ type Places = BTreeSet<(Slot, Vec<u32>)>;
 #[derive(Clone, Default)]
 struct Initialized {
     places: Places,
+    backing: crate::group_backing::Backing,
     values: BTreeSet<ValueId>,
 }
 
@@ -89,9 +90,37 @@ fn merge(previous: &mut Initialized, incoming: &Initialized) -> bool {
     changed
 }
 
-fn constant_index(index: &Operand) -> Option<u32> {
+pub(super) fn constant_index(index: &Operand) -> Option<u32> {
     match index {
         Operand::Const(Const::Int(i, _)) => u32::try_from(*i).ok(),
+        _ => None,
+    }
+}
+
+// The type of the accessed slot determines whether the native read needs an initialized
+// descriptor. Projecting a column into a slice or copying a scalar field still reads that slot.
+fn read_place(rv: &Rvalue) -> Option<(Slot, Vec<u32>)> {
+    match rv {
+        Rvalue::Load(slot)
+        | Rvalue::MakeSlice(slot, _)
+        | Rvalue::SoaColumn { base: slot, .. }
+        | Rvalue::GroupAggMultiCols { base: slot, .. }
+        | Rvalue::GroupAggStr { base: slot, .. }
+        | Rvalue::GroupAggMultiStr { base: slot, .. }
+        | Rvalue::DictEncode { base: slot, .. } => Some((*slot, vec![])),
+        Rvalue::Field(slot, path) | Rvalue::MakeFieldSlice(slot, path, _) => {
+            Some((*slot, path.clone()))
+        }
+        Rvalue::Index(slot, index) | Rvalue::IndexField(slot, index, _) => {
+            let mut path = Vec::new();
+            if let Some(i) = constant_index(index) {
+                path.push(i);
+                if let Rvalue::IndexField(_, _, fields) = rv {
+                    path.extend(fields);
+                }
+            }
+            Some((*slot, path))
+        }
         _ => None,
     }
 }
@@ -147,7 +176,10 @@ pub(super) fn validate(program: &Program, function: &Function) -> Result<(), Pro
         }
     }
     let mut entries = vec![None; function.blocks.len()];
-    *entries.get_mut(function.entry as usize).ok_or_else(&fail)? = Some(Initialized::default());
+    *entries.get_mut(function.entry as usize).ok_or_else(&fail)? = Some(Initialized {
+        backing: crate::group_backing::Backing::at_entry(function),
+        ..Initialized::default()
+    });
     let mut pending = VecDeque::from([function.entry]);
     while let Some(id) = pending.pop_front() {
         let block = function
@@ -160,6 +192,19 @@ pub(super) fn validate(program: &Program, function: &Function) -> Result<(), Pro
             if !stmt.operands_satisfy(&mut |op| input_ready(function, &carriers, &state, op)) {
                 return Err(fail());
             }
+            let place = match stmt {
+                Stmt::Let(_, rv) => read_place(rv),
+                _ => None,
+            };
+            if place.as_ref().is_some_and(|(slot, path)| {
+                carriers.contains(slot) && !covers(&state.places, *slot, path)
+            }) {
+                return Err(fail());
+            }
+            state
+                .backing
+                .step(program, function, stmt, place)
+                .ok_or_else(&fail)?;
             match stmt {
                 Stmt::Store(slot, op) if carriers.contains(slot) => {
                     if xml_operand_base_ty(function, op)
@@ -189,37 +234,8 @@ pub(super) fn validate(program: &Program, function: &Function) -> Result<(), Pro
                     state.places.retain(|(s, _)| s != slot);
                 }
                 Stmt::Let(v, rv) => {
-                    let result = function.value_tys[*v as usize];
-                    if let Rvalue::GroupAggMultiCols { base, .. } = rv {
-                        if !covers(&state.places, *base, &[]) {
-                            return Err(fail());
-                        }
+                    if matches!(rv, Rvalue::GroupAggMultiCols { .. }) {
                         uses.remove(v);
-                    }
-                    if carries_soa(result) {
-                        let location = match rv {
-                            Rvalue::Load(slot) | Rvalue::MakeSlice(slot, _) => {
-                                Some((*slot, Vec::new()))
-                            }
-                            Rvalue::Field(slot, path) | Rvalue::MakeFieldSlice(slot, path, _) => {
-                                Some((*slot, path.clone()))
-                            }
-                            Rvalue::Index(slot, index) | Rvalue::IndexField(slot, index, _) => {
-                                let mut path = Vec::new();
-                                if let Some(i) = constant_index(index) {
-                                    path.push(i);
-                                    if let Rvalue::IndexField(_, _, fields) = rv {
-                                        path.extend(fields);
-                                    }
-                                }
-                                Some((*slot, path))
-                            }
-                            _ => None,
-                        };
-                        if location.is_some_and(|(slot, path)| !covers(&state.places, slot, &path))
-                        {
-                            return Err(fail());
-                        }
                     }
                     // The JSON lowering zeroes its out slot. The CSV runtime publishes an
                     // empty descriptor before parsing its validated input.
@@ -232,16 +248,18 @@ pub(super) fn validate(program: &Program, function: &Function) -> Result<(), Pro
                 _ => {}
             }
         }
-        if !block
-            .term
-            .operands_satisfy(&mut |op| input_ready(function, &carriers, &state, op))
+        if !state.backing.valid_terminator(&block.term)
+            || !block
+                .term
+                .operands_satisfy(&mut |op| input_ready(function, &carriers, &state, op))
         {
             return Err(fail());
         }
         for next in crate::byte_ranges::successors(&block.term) {
             let entry = entries.get_mut(next as usize).ok_or_else(&fail)?;
             if let Some(previous) = entry {
-                if !merge(previous, &state) {
+                let backing_changed = previous.backing.merge(&state.backing).ok_or_else(&fail)?;
+                if !merge(previous, &state) && !backing_changed {
                     continue;
                 }
             } else {

@@ -958,6 +958,8 @@ import pkg.db.a1_test
 import pkg.db.sqlite
 import app.batch_query
 
+fn release_batch(owned: pkg.db.batch<app.batch_query.PlainRow>) -> i64 = 0
+
 fn invalid_query(
   result: Result<pkg.db.rows<app.batch_query.PlainRow>, pkg.db.Error>,
 ) -> bool {
@@ -1103,6 +1105,9 @@ fn main() -> i32 {
 
   columns := pkg.db.batch_soa(first) else { return 29 }
   if columns.id.sum() != 201 || columns[1].label != "medium-label" { return 30 }
+  unrelated := arena { [1, 2].sum() }
+  grouped := columns.group_by(.label).agg(sum(.id), count())
+  if unrelated != 3 || grouped.0.len() != 2 || grouped.1.sum() != 201 || grouped.2.sum() != 2 { return 45 }
   soa_plan := pkg.db.a1_test.install_non_soa_batch_plan(first)
   malformed_soa := pkg.db.batch_soa(first)
   pkg.db.a1_test.restore_batch_plan(first, soa_plan)
@@ -1114,6 +1119,9 @@ fn main() -> i32 {
     Ok(_) => false
   }
   if !malformed_soa_ok { return 44 }
+  amounts := grouped.1
+  consumed := release_batch(first)
+  if amounts.sum() + consumed != 201 { return 46 }
 
   rich_result := pkg.db.rows(
     pkg.db.exec_conn(connection),
@@ -2963,6 +2971,16 @@ fn post_move_row_view(borrow connection: pkg.db.conn) -> i32 {
   return row.label.len() as i32
 }
 
+fn post_move_group(borrow mut stream: pkg.db.rows<app.batch_query.PlainRow>) -> i64 {
+  values := pkg.db.next_batch(stream, 2) else { return 0 }
+  batch := values else { return 0 }
+  columns := pkg.db.batch_soa(batch) else { return 0 }
+  grouped := columns.group_by(.label).agg(sum(.id), count())
+  key := grouped.0[0]
+  ignored := consume_batch(batch)
+  return key.len()
+}
+
 fn return_soa_column_view(borrow connection: pkg.db.conn) -> str {
   mut stream := pkg.db.rows(
     pkg.db.exec_conn(connection), app.batch_query.plain(),
@@ -3044,6 +3062,7 @@ fn batch_rows_and_soa_views_cannot_escape_or_survive_move() {
         "use of invalidated borrow 'row'",
         1,
     );
+    assert_rejected_by_both("group key after consuming the batch", "use of invalidated borrow 'key'", 1);
 }
 
 #[test]
@@ -3174,7 +3193,7 @@ pkg-db-a1-postgres-streamed-one 485206604faf2733
 pkg-db-a1-postgres-streamed-timeout-drop f8c274359241b762
 pkg-db-a1-postgres-streamed-unsafe-statuses d174d9b087289404
 pkg-db-a1-postgres-value-matrix 900160246701aeff
-pkg-db-a1-sqlite-batches d257d048f2216750
+pkg-db-a1-sqlite-batches 1bbeff2eb1390de1
 pkg-db-a1-zero-column-plan 866983be583f9bc9
 ";
 

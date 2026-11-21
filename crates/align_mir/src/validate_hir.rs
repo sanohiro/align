@@ -12543,7 +12543,9 @@ impl<'a> BodyValidator<'a> {
             hir::GroupSource::Encoded => return None,
         };
         let definition = self.program.structs.get(struct_id as usize)?;
-        if self.local_type(context, base)? != base_ty || definition.fields.get(key_field as usize)?.ty != key_ty {
+        if !self.body_ty_matches(self.local_type(context, base)?, base_ty)
+            || !self.body_ty_matches(definition.fields.get(key_field as usize)?.ty, key_ty)
+        {
             return None;
         }
         for aggregate in aggregates {

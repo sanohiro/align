@@ -42669,8 +42669,17 @@ impl<'a> MoveCheck<'a> {
         let selected = if headers.leaves.is_empty() {
             self.local_borrow_fact(base).project_exact(BorrowProjection::StructField(key))
         } else {
+            // External views (including db.batch_soa) have no managed column-content
+            // entries. Their fallback roots own every field payload. Known transposes
+            // keep their exact field projection even when joined with an opaque input.
+            let mut opaque = BorrowRoots::new();
+            for leaf in headers.leaves.values() {
+                opaque.extend(leaf.fallback_roots.iter().cloned());
+                if let Some(external) = &leaf.external_backing { opaque.extend(external.iter().cloned()); }
+            }
             let content = self.generation_field_content(local.ty, headers, None, &[key], || self.local_borrow_fact(base));
-            content.non_storage.join(&self.borrows.resolve_headers(&content.headers).non_storage)
+            let selected = content.non_storage.join(&self.borrows.resolve_headers(&content.headers).non_storage);
+            selected.join(&BorrowFact::from_direct(opaque))
         };
         selected.prefixed(BorrowProjection::TupleElement(0))
     }

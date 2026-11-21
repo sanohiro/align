@@ -13534,7 +13534,7 @@ mod tests {
             let base = crate::lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
             let scope = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
             validate_partition_resource_rvalues(&base, &scope)?;
-            for mutation in 0..16 {
+            for mutation in 0..17 {
                 let mut program = base.clone();
                 let f = program.fns.iter_mut().find(|f| f.name.as_str() == "group").ok_or("missing group")?;
                 let (bb, pos) = f.blocks.iter().enumerate().find_map(|(id, b)| b.stmts.iter().position(|s|
@@ -13578,6 +13578,21 @@ mod tests {
                         f.blocks.push(crate::Block { id: join, stmts: tail, stmt_lines: vec![], term });
                     }
                     11 => { f.param_modes[0] = align_ast::ParamMode::Out; }
+                    16 => {
+                        let c = u32::try_from(f.value_tys.len())?;
+                        let row = *struct_id;
+                        let it = IntTy {bits:64,signed:true};
+                        let base_ty = f.slots[slot as usize];
+                        f.value_tys.extend([Ty::Slice(Scalar::Int(it)),Ty::Int(it),Ty::Bool,base_ty]);
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s,Stmt::Store(dst,_) if *dst == slot)).ok_or("parameter")?;
+                        f.blocks[bb].stmts.splice(store..=store, [
+                            Stmt::Let(c, Rvalue::SoaColumn {base:slot,struct_id:row,field:2}),
+                            Stmt::Let(c+1, Rvalue::SliceLen(Operand::Value(c))),
+                            Stmt::Let(c+2, Rvalue::Bin(align_ast::BinOp::Gt,Operand::Value(c+1),Operand::Const(Const::Int(0,Ty::Int(it))))),
+                            Stmt::Let(c+3, Rvalue::Select {cond: Operand::Value(c+2),a:Operand::Arg(0),b:Operand::Arg(0)}),
+                            Stmt::Store(slot,Operand::Value(c+3)),
+                        ]);
+                    }
                     15 => {
                         let Ty::Soa(row) = f.slots[slot as usize] else { return Err("source type".into()); };
                         let wrapper = Ty::Option(Scalar::Soa(row));
@@ -13624,6 +13639,42 @@ mod tests {
                 assert!(validate_mir_producers(&program).is_err(), "{field}/{mutation} whole");
                 assert!(validate_partition_resource_rvalues(&program, &scope).is_err(), "{field}/{mutation} partition");
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_soa_group_backing_lives_at_each_read() -> Result<(), Box<dyn std::error::Error>> {
+        let source = "Row { k:i64,v:i64 }\nfn group()->i64 {\n result := arena {\n  s:=[Row{k:1,v:5}].to_soa()\n  col:=s.v\n  g:=s.group_by(.k).agg(sum(.v),count())\n  x:=arena { col.sum() }\n  g.1[0]+x\n }; return result\n}\nfn main(){}\n";
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+        let base = crate::lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
+        let scope = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+        validate_mir_producers(&base)?;
+        validate_partition_resource_rvalues(&base,&scope)?;
+        for target in 0..4 {
+            let mut program = base.clone();
+            let f = program.fns.iter_mut().find(|f| f.name.as_str() == "group").ok_or("group")?;
+            let outer = f.blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
+                Stmt::Let(_, Rvalue::SoaAlloc {handle:Operand::Value(v),..}) => Some(*v), _ => None
+            }).ok_or("outer allocation")?;
+            let (last,n) = f.blocks.iter().enumerate().find_map(|(b,block)| block.stmts.iter().position(|s|
+                matches!(s, Stmt::ArenaEnd(Operand::Value(v)) if *v == outer)).map(|n|(b,n))).ok_or("cleanup")?;
+            let end = f.blocks[last].stmts.remove(n);
+            let (block,pos) = f.blocks.iter().enumerate().find_map(|(b,block)| block.stmts.iter().position(|s|
+                matches!((target,s),
+                    (0,Stmt::Let(_,Rvalue::SoaAlloc{..}))
+                    | (1,Stmt::Let(_,Rvalue::SoaColumn{..}))
+                    | (2,Stmt::Let(_,Rvalue::GroupAggMultiCols{..}))
+                    | (3,Stmt::Let(_,Rvalue::ArenaBegin))
+                ) && !(target == 3 && matches!(s, Stmt::Let(v,_) if *v == outer))
+            ).map(|n|(b,n))).ok_or("target")?;
+            f.blocks[block].stmts.insert(pos,end);
+            assert!(validate_mir_producers(&program).is_err(), "whole {target}");
+            assert!(validate_partition_resource_rvalues(&program,&scope).is_err(), "partition {target}");
         }
         Ok(())
     }
