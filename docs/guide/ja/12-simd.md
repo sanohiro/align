@@ -46,7 +46,7 @@ abort や割り当ては発生せず、ベクトルでは各レーンに独立�
 fn main() -> i32 {
     scores: vec4<i32> := [90, 45, 82, 60]
     m := scores > 80                        // mask4<i32>: [t, f, t, f]
-    picked := select(m, scores, scores * 0) // lane-wise blend, no branch
+    picked := select(m, scores, 0) // lane-wise blend, no branch
     print(picked.sum_where(m))              // 172 — masked reduction: 90 + 82
     return 0
 }
@@ -54,25 +54,23 @@ fn main() -> i32 {
 
 `select(mask, a, b)` は、マスクに応じて各レーンの値を `a` または `b` から選びます。`v.sum_where(mask)` は、マスクが `true` のレーンだけを合計します。パイプラインの `xs.where(p).sum()` でも、条件を満たさない要素を加算の単位元である 0 に置き換えることで、分岐なしの集計ができます。
 
-レーン数と1レーンのビット幅が一致すれば、マスクは異なるスカラー型にも使えます。`mask4<f32>` で `vec4<f32>` のスコアと `vec4<i32>` の添字を選択でき、どちらの `sum_where` にも渡せます。`vec4<i64>` や `vec2<f32>` には使えません。比較結果の型自体は元の `maskN<T>` のままで、`select` に渡す2つの値ベクトルは同じ型が必要です。
+レーン数と1レーンのビット幅が一致すれば、マスクは異なるスカラー型にも使えます。`mask4<f32>` で `vec4<f32>` のスコアと `vec4<i32>` の添字を選択でき、どちらの `sum_where` にも渡せます。`vec4<i64>` や `vec2<f32>` には使えません。比較結果の型は元の `maskN<T>` のままです。`select` の片側に `vecN<T>` を渡すと、もう片側には同じ型のベクトルか要素型 `T` のスカラーを渡せます。
 
-`select` がレーンを選ぶ前に、値の引数は両方とも評価されます。レーンごとの `if` ではありません。`select(d != 0, n / d, zero)` と書いても、分母がゼロのレーンで割り算が実行されます。先に演算の引数を安全な値にし、その後で必要な代替結果を選びます。
+`select` がレーンを選ぶ前に、値の引数は両方とも評価されます。レーンごとの `if` ではありません。`select(d != 0, n / d, 0)` と書いても、分母がゼロのレーンで割り算が実行されます。先に演算の引数を安全な値にし、その後で必要な代替結果を選びます。
 
 ```align
 fn main() -> i32 {
     numerators: vec4<i32> := [12, 20, 30, 40]
     denominators: vec4<i32> := [3, 0, 5, 0]
-    ones: vec4<i32> := [1, 1, 1, 1]
-    zero: vec4<i32> := [0, 0, 0, 0]
     valid := denominators != 0
-    safe := select(valid, denominators, ones)
-    quotients := select(valid, numerators / safe, zero)
+    safe := select(valid, denominators, 1)
+    quotients := select(valid, numerators / safe, 0)
     print(quotients.sum())    // 10: 4 + 0 + 6 + 0
     return 0
 }
 ```
 
-最初の選択で不正な割り算を防ぎ、2回目で「分母がゼロなら結果をゼロにする」という方針を実現しています。`select` には同じ型のベクトルを2つ渡します。算術演算と違い、スカラーの代替値を自動で全レーンに適用することはありません。
+最初の選択で不正な割り算を防ぎ、2回目で「分母がゼロなら結果をゼロにする」という方針を実現しています。スカラーの `1` と `0` はそれぞれ全レーンに展開されます。
 
 ## メモリとレジスタを橋渡しする ― `load` / `store`
 

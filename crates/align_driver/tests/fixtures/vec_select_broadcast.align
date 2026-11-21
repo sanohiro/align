@@ -27,6 +27,15 @@ fn main() -> i32 {
   v: vec2<u64> := [3, 4]
   high: u64 := 9223372036854775809
   m := v < 4
+  p := select(m, v.sum(), v)
+  q := select(m, v, v.sum())
+  t := select(m, dot(v,v), v)
+  u := select(m, v, dot(v,v))
+  h := select(m, v.sum_where(m), v)
+  j := select(m, v, v.sum_where(m))
+  lanes: vec4<u64> := [v.sum(), dot(v,v), v.sum_where(m), 4]
+  if p[0] != 7 || q[1] != 7 || t[0] != 25 || u[1] != 25 { return 8 }
+  if h[0] != 3 || j[1] != 3 || lanes.sum() != 39 { return 9 }
   c := select(m, high, v)
   d := blend.pick(m, v, high, high, 0 as u64)
   if c[0] != high || c[1] != 4 || d != high { return 3 }

@@ -45,7 +45,7 @@ Comparing vectors yields a `maskN<T>`; you use it as data, not as control flow:
 fn main() -> i32 {
     scores: vec4<i32> := [90, 45, 82, 60]
     m := scores > 80                        // mask4<i32>: [t, f, t, f]
-    picked := select(m, scores, scores * 0) // lane-wise blend, no branch
+    picked := select(m, scores, 0) // lane-wise blend, no branch
     print(picked.sum_where(m))              // 172 — masked reduction: 90 + 82
     return 0
 }
@@ -53,25 +53,23 @@ fn main() -> i32 {
 
 `select(mask, a, b)` chooses each lane from `a` or `b` according to the mask. `v.sum_where(mask)` sums only the selected lanes. A pipeline such as `xs.where(p).sum()` can use the same technique: replace rejected values with the additive identity, zero, to sum without a branch.
 
-Masks may cross scalar types when lane count and lane bit width agree. A `mask4<f32>` can select both `vec4<f32>` scores and `vec4<i32>` indices, or gate either type's `sum_where`. It cannot gate `vec4<i64>` or `vec2<f32>`. The comparison still produces its own `maskN<T>` type; `select` requires its two value vectors to have the same type.
+Masks may cross scalar types when lane count and lane bit width agree. A `mask4<f32>` can select both `vec4<f32>` scores and `vec4<i32>` indices, or gate either type's `sum_where`. It cannot gate `vec4<i64>` or `vec2<f32>`. The comparison produces its own `maskN<T>` type. With a `vecN<T>` on either side of `select`, the other side accepts a matching vector or a scalar of type `T`.
 
-Both value arguments are evaluated before `select` chooses the lanes. It is not a lane-wise `if`: `select(d != 0, n / d, zero)` still divides by zero in any zero-denominator lane. Make the operands safe first, then choose the requested fallback result:
+Both value arguments are evaluated before `select` chooses the lanes. It is not a lane-wise `if`: `select(d != 0, n / d, 0)` still divides by zero in any zero-denominator lane. Make the operands safe first, then choose the requested fallback result:
 
 ```align
 fn main() -> i32 {
     numerators: vec4<i32> := [12, 20, 30, 40]
     denominators: vec4<i32> := [3, 0, 5, 0]
-    ones: vec4<i32> := [1, 1, 1, 1]
-    zero: vec4<i32> := [0, 0, 0, 0]
     valid := denominators != 0
-    safe := select(valid, denominators, ones)
-    quotients := select(valid, numerators / safe, zero)
+    safe := select(valid, denominators, 1)
+    quotients := select(valid, numerators / safe, 0)
     print(quotients.sum())    // 10: 4 + 0 + 6 + 0
     return 0
 }
 ```
 
-The first selection prevents invalid division. The second implements the chosen policy that a zero denominator contributes zero. `select` requires two vectors of the same type; unlike arithmetic, it does not broadcast a scalar fallback.
+The first selection prevents invalid division. The second implements the chosen policy that a zero denominator contributes zero. The scalar fallbacks `1` and `0` each broadcast to every lane.
 
 ## Bridging memory and registers: `load` / `store`
 

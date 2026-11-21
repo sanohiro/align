@@ -14660,9 +14660,13 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 // A `mask` cond (`<N x i1>`, from `select(mask, a, b)`) blends two vectors lane-wise;
                 // a scalar `i1` cond (branchless `where`) blends two scalars.
                 if matches!(self.f.operand_ty(cond), Ty::Mask(..)) {
-                    let c = self.operand(cond)?.into_vector_value();
-                    let av = self.operand(a)?.into_vector_value();
-                    let bv = self.operand(b)?.into_vector_value();
+                    let vector = |op| match self.operand(op)? {
+                        BasicValueEnum::VectorValue(value) => Ok(value),
+                        _ => Err(self.err("expected a vector operand for masked select")),
+                    };
+                    let c = vector(cond)?;
+                    let av = vector(a)?;
+                    let bv = vector(b)?;
                     self.builder.build_select(c, av, bv, "vsel").map_err(|e| self.err(e))?
                 } else {
                     let c = self.operand(cond)?.into_int_value();
@@ -15539,6 +15543,9 @@ impl<'c, 'a> FnGen<'c, 'a> {
                 let mut acc = vty.get_poison();
                 for (i, op) in elems.iter().enumerate() {
                     let val = self.operand(op)?;
+                    if val.get_type() != vty.get_element_type() {
+                        return Err(self.err("vector lane has the wrong LLVM type"));
+                    }
                     let idx = self.ctx.i32_type().const_int(i as u64, false);
                     acc = self.builder.build_insert_element(acc, val, idx, "vins").map_err(|e| self.err(e))?;
                 }
