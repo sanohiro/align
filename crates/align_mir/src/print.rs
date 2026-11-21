@@ -1057,6 +1057,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::MakeError { enum_id, tag, code } => {
             format!("make_error(enum#{enum_id}, tag={}, code={})", operand_str(tag), operand_str(code))
         }
+        Rvalue::StrSplit { source, separator } => format!("str_split({}, {})", operand_str(source), operand_str(separator)),
         Rvalue::PathJoin { a, b } => format!("path_join({}, {})", operand_str(a), operand_str(b)),
         Rvalue::PathComponent { kind, path } => format!("path_{kind:?}({})", operand_str(path)),
         Rvalue::PathNormalize { path } => format!("path_normalize({})", operand_str(path)),

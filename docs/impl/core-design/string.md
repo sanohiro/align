@@ -20,6 +20,7 @@ s.parse_i64()              -> Result<i64, Error>  // checked ASCII decimal; no a
 s.len()                    -> i64        // BYTE length ("あ".len() == 3)
 s.contains(n) / s.starts_with(n) / s.ends_with(n)      -> bool
 s.eq_ignore_ascii_case(t)  -> bool       // ASCII fold only, not Unicode
+s.split(separator: str)     -> array<str>    // fields borrow the receiver
 s.find_any(chars: str)      -> Option<i64>   // first byte offset of any scalar in chars
 s.find(n) / s.rfind(n)     -> Option<i64>   // byte index of first/last occurrence
 s.trim() / s.trim_start() / s.trim_end()    -> str   // ASCII-whitespace; zero-copy sub-view
@@ -128,6 +129,13 @@ remain live and valid through index evaluation; a bool result retains no view.
 The operation is Pure and has no fallible result or bounds trap. Ordinary
 `s[a..b]` keeps its range and UTF-8 boundary traps.
 
+`text.split(separator: str) -> array<str>` splits at non-overlapping literal
+UTF-8 matches from left to right, keeping empty fields. An empty separator
+matches every Unicode scalar boundary, including both ends. Splitting empty
+text with an empty separator yields two empty fields. The result owns one
+allocation of field headers and borrows the receiver's bytes. The separator
+is borrowed through the call. Both operands may be owned strings.
+
 `text.find_any(chars: str) -> Option<i64>` returns the first UTF-8 byte
 offset in `text` at which a Unicode scalar from `chars` occurs. Empty text,
 an empty set or no match yields `None`. Set order and repetitions do not
@@ -149,10 +157,6 @@ Frame-regioned `str` (owned-structs work).
 
 ## Spec'd but not implemented
 
-- **`split`** (§18.1 catalog) remains a separate materializing operation.
-  Existing `array<str>` support does not provide a string split method. A selected split
-  capability still needs its exact separator, result, lifetime and allocation contract.
-  Today: `find`/`rfind` + `s[a..b]` compose the manual split.
 - No direct `s[i]` byte access — use the explicit byte view `s.bytes()[i]` so dropping the UTF-8
   obligation is visible at the call site.
 - The §13/§18.1 language template variants (`html`, `raw`, json-template) — only plain

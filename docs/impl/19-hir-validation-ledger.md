@@ -44,7 +44,7 @@ serialized field or optimistic producer evidence.
 owns the five FsTree cases, access/identity qualified schemas, OsIdentity,
 Utf8Lossy/Sha1 discriminators and shared filesystem-owner projection closure.
 The five FsTree cases and OsIdentity are implemented with exact argument/result
-and globally reserved schema validation. The ExprKind sweep contains 342 variants.
+and globally reserved schema validation. The ExprKind sweep contains 366 variants.
 Utf8Lossy/Sha1 use the existing transform/hash validators. Shared filesystem
 projections retain complete place provenance; borrowed String-to-Str normalization
 certifies the physical source and read-only authority before descriptor use.
@@ -1076,6 +1076,7 @@ The result formula in every row is followed by the universal
 | `StrClone` | `env[]`; `child[text]`; `post[text.ty is Str or String; result String; source borrowed without transfer; a fresh owned receiver is kept live only through the copy; result individually owned unless current arena captures it]`. |
 | `StrParseI64` | `child[input]`; `post[input exact Str; result exact Result<i64, builtin Error>; borrowed input; strict child completion; no result borrow roots; Pure]`. Whole-input ASCII signed decimal grammar and Invalid failures are owned by plan 83; independent validation derives the canonical Error enum identity. |
 | `StrCharBoundary` | `child[receiver,index]`; `post[receiver Str; index exact signed i64; result Bool; receiver borrowed; strict child completion]`. |
+| `StrSplit` | `child[source,separator]`; `post[both Str; result DynArray(Str); fields borrow source]`. |
 | `StrPredicate` | `env[kind]`; `child[haystack,needle]`; `post[both Str; Contains/StartsWith/EndsWith/EqIgnoreCase result Bool; Find/Rfind/FindAny result Option<i64>; both borrowed]`. |
 | `StrTrim` | `env[kind]`; `child[recv]`; `post[recv Str; result Str; view inherits recv roots/region]`. |
 | `StrBorrow` | `env[]`; `child[string]`; `post[string.ty == String; result Str; owned source is borrowed and remains live]`. |
@@ -1587,7 +1588,7 @@ if any of those five variants is absent from validation or ownership analysis.
 
 The implementation must derive an exhaustiveness constant from the Rust enum
 definitions and assert that this file has exactly one owner id for every
-`Stmt`, all 342 `ExprKind` variants, `ArithMode`, `MathFn`, every
+`Stmt`, all 366 `ExprKind` variants, `ArithMode`, `MathFn`, every
 `BuilderWriteKind`, `StrPredKind`, `StrTrimKind`, `TemplatePart`, `StageKind`,
 `GroupSource`, `GroupAgg1`, `GroupOp`, `CliFlagKind`, `EncodingKind`, `CompressKind`,
 `PathComponentKind`, `AeadCipher`, `AeadDir`, and `HashAlgo`. The test fails on

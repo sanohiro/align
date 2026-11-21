@@ -6,8 +6,7 @@
 
 These files collect the current `core` library signatures, ownership and effect
 rules, errors, and test coverage by area. Each file distinguishes implemented
-operations from specified operations that have not shipped, such as string
-`split`.
+operations from specified operations that have not shipped.
 
 `draft.md` remains authoritative for language semantics and design decisions.
 These references give the detailed library contracts and implementation limits.

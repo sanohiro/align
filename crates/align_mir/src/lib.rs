@@ -1589,6 +1589,8 @@ pub enum Rvalue {
     /// `memchr`-class scan. Pure read, no allocation.
     /// Checked decimal scanner: i32 status and an exact i64 output slot.
     StrParseI64 { input: Operand, out: Slot },
+    /// Individually allocated headers retaining the source bytes.
+    StrSplit { source: Operand, separator: Operand },
     StrPredicate {
         kind: hir::StrPredKind,
         haystack: Operand,
@@ -7638,21 +7640,20 @@ fn lower_stmt(b: &mut Builder, s: &hir::Stmt) {
             // `break e` ends the innermost loop: evaluate `e`, store it into the loop's result slot,
             // then jump to the loop's exit. A moved-out owned value has its source slot nulled so the
             // per-iteration drops below (and the exit cleanup) free null, not the transferred buffer.
-            let Some(frame) = b.loops.last() else {
+            let Some(frame_index) = b.loops.len().checked_sub(1) else {
                 // Checked HIR never marks an out-of-loop break accepted, but malformed direct
                 // callers must fail closed before evaluating its payload or inspecting a frame.
                 b.terminate(Term::Unreachable);
                 return;
             };
-            let (result_slot, iter_drops, exit) = (
-                frame.result_slot,
-                frame.iter_drops.clone(),
-                frame.exit,
-            );
             let op = match value {
                 Some(e) => Some(lower_required!(b, lower_expr(b, e), ())),
                 None => None,
             };
+            // The payload can register additional synthetic owners in this iteration.
+            // Sema rejects a break value borrowing any of those iteration-local owners.
+            let frame = &b.loops[frame_index];
+            let (result_slot, iter_drops, exit) = (frame.result_slot, frame.iter_drops.clone(), frame.exit);
             if let (Some(slot), Some(op)) = (result_slot, op) {
                 b.push(Stmt::Store(slot, op));
             }
@@ -10821,6 +10822,21 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                     new_len: len_op,
                 });
                 Operand::Const(Const::Unit)
+            }
+            hir::ExprKind::StrSplit { source, separator } => {
+                lower_required_binding!(b, source = lower_expr(b, source), Operand::Const(Const::Unit));
+                lower_required_binding!(b, separator = lower_expr(b, separator), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                // A field may outlive the header array. Scope cleanup owns the backing text.
+                let source_owners = b.borrow_owners(&source);
+                let separator_owners = b.borrow_owners(&separator);
+                b.push(Stmt::Let(v, Rvalue::StrSplit { source, separator }));
+                for owner in separator_owners {
+                    if !source_owners.contains(&owner) {
+                        b.emit_drop_if_live(owner);
+                    }
+                }
+                Operand::Value(v)
             }
             hir::ExprKind::StrPredicate {
                 kind,
@@ -15077,7 +15093,7 @@ fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bo
         _ => false,
     };
     let always_heap = parallel_par_map
-        || matches!(source.kind, hir::ExprKind::ArrayChunks { .. })
+        || matches!(source.kind, hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::StrSplit { .. })
         || (matches!(source.kind, hir::ExprKind::Call { .. })
             && matches!(source.ty, Ty::DynArray(_) | Ty::DynSliceArray(_)));
     let arena_if_in_arena = matches!(

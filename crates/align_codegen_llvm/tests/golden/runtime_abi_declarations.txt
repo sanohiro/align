@@ -435,6 +435,7 @@ key|StrFinderFree|str_finder_free|IndirectStorage|declare void @align_rt_str_fin
 key|StrFinderNew|str_finder_new|AllocNew|declare noalias ptr @align_rt_str_finder_new(ptr readonly captures(none), i64) #4
 key|StrParseI64|str_parse_i64|IndirectStorage|declare i32 @align_rt_str_parse_i64(ptr readonly captures(none), i64, ptr captures(none)) #2
 key|StrRfind|str_rfind|DispatchCache|declare i64 @align_rt_str_rfind(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #7
+key|StrSplit|str_split|IndirectStorage|declare { ptr, i64 } @align_rt_str_split(ptr readonly, i64, ptr readonly captures(none), i64) #2
 key|StrStartsWith|str_starts_with|PureArgRead|declare i32 @align_rt_str_starts_with(ptr readonly captures(none), i64, ptr readonly captures(none), i64) #6
 key|StrTrim|str_trim|PureArgRead|declare { ptr, i64 } @align_rt_str_trim(ptr readonly, i64) #6
 key|StrTrimEnd|str_trim_end|PureArgRead|declare { ptr, i64 } @align_rt_str_trim_end(ptr readonly, i64) #6

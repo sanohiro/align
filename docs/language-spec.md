@@ -1044,6 +1044,13 @@ buffer
 builder
 ```
 
+`text.split(separator: str) -> array<str>` splits at non-overlapping literal
+UTF-8 matches from left to right, keeping empty fields. An empty separator
+matches every Unicode scalar boundary, including both ends. Splitting empty
+text with an empty separator yields two empty fields. The result owns one
+allocation of field headers and borrows the receiver's bytes. The separator
+is borrowed through the call. Both operands may be owned strings.
+
 `text.find_any(chars: str) -> Option<i64>` returns the first UTF-8 byte
 offset in `text` at which a Unicode scalar from `chars` occurs. Empty text,
 an empty set or no match yields `None`. Set order and repetitions do not

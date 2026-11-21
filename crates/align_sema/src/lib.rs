@@ -18622,7 +18622,8 @@ impl EffectScan<'_> {
                 walk!(value);
                 walk!(region);
             }
-            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
+            ExprKind::StrSplit { source: haystack, separator: needle }
+            | ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 walk!(haystack);
                 walk!(needle);
             }
@@ -22684,7 +22685,7 @@ impl<'a> EscapeCheck<'a> {
                 }
             }
             StorageContentInitializer::CarrierSource => match &expression.kind {
-                ExprKind::ArrayChunks { source, .. } => self.completed_escape_value(source),
+                ExprKind::StrSplit { source, .. } | ExprKind::ArrayChunks { source, .. } => self.completed_escape_value(source),
                 ExprKind::ArrayDictEncode { base, .. } => self
                     .state
                     .storage_values
@@ -25663,7 +25664,7 @@ impl<'a> EscapeCheck<'a> {
             // A trim yields a sub-`str` of its receiver (same bytes), so the view lives exactly as
             // long as the receiver — inherit its region directly. (The receiver is already a `str`:
             // an owned `string` was auto-borrowed to a `Frame` view first, so this stays sound.)
-            ExprKind::StrTrim { recv, .. } => work.push(Work::Eval(recv, depth)),
+            ExprKind::StrSplit { source: recv, .. } | ExprKind::StrTrim { recv, .. } => work.push(Work::Eval(recv, depth)),
             // `path.base`/`dir`/`ext(p)` return a zero-copy substring `str` view of `p`, so the view
             // lives exactly as long as `p` — inherit its region directly (like `StrTrim`). Without this
             // explicit arm the default classification used to mis-infer `Static`, letting a view of
@@ -26582,7 +26583,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::ArrayMapInto { .. }
             | ExprKind::ArrayPartition { .. }
             | ExprKind::ArrayParMap { .. }
-            | ExprKind::ArrayChunks { .. }
+            | ExprKind::ArrayChunks { .. } | ExprKind::StrSplit { .. }
             | ExprKind::Len(..)
             | ExprKind::Template(..)
             | ExprKind::JsonEncode { .. }
@@ -30087,7 +30088,8 @@ impl<'a> EscapeCheck<'a> {
                 self.walk(builder, depth);
                 self.walk(arg, depth);
             }
-            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
+            ExprKind::StrSplit { source: haystack, separator: needle }
+            | ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.walk(haystack, depth);
                 self.walk(needle, depth);
             }
@@ -33060,7 +33062,7 @@ fn retained_header_candidate_completeness_matrix() {
 fn native_storage_is_individual(kind: &ExprKind) -> bool {
     matches!(kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
         | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
-        | ExprKind::JsonDecodeArray { .. } | ExprKind::JsonDecode { .. }
+        | ExprKind::StrSplit { .. } | ExprKind::JsonDecodeArray { .. } | ExprKind::JsonDecode { .. }
         | ExprKind::JsonDecodeStructArray { .. } | ExprKind::JsonDecodeUnion { .. }
         | ExprKind::JsonDecodeScalar { .. }
         | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. })
@@ -33170,7 +33172,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         ExprKind::ArrayGroupAgg { .. } | ExprKind::ArrayGroupAggMulti { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::GroupAggregation)
         }
-        ExprKind::ArrayChunks { .. } | ExprKind::ArrayDictEncode { .. } => {
+        ExprKind::StrSplit { .. } | ExprKind::ArrayChunks { .. } | ExprKind::ArrayDictEncode { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::CarrierSource)
         }
         ExprKind::ArrayBuilderBuild(_) => {
@@ -39943,6 +39945,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayGroupAggMulti { base: root, .. }
             | ExprKind::ArrayDictEncode { base: root, .. }
             | ExprKind::IndexField { base: root, .. } => roots.extend(self.local_storage_roots(*root)),
+            ExprKind::Index { recv, .. } if recv.ty == Ty::DynArray(Scalar::Str) => roots.extend(self.borrow_sources(e)),
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. } => roots.extend(self.storage_roots(recv)),
             ExprKind::BorrowedIndex { base, .. } => {
@@ -40369,7 +40372,7 @@ impl<'a> MoveCheck<'a> {
                 .get(&Self::expr_key(expression))
                 .map(|fact| fact.headers.clone())
                 .unwrap_or_default(),
-            ExprKind::ArrayChunks { source, .. } => self.completed_headers(source),
+            ExprKind::StrSplit { source, .. } | ExprKind::ArrayChunks { source, .. } => self.completed_headers(source),
             ExprKind::ArrayDictEncode { base, .. } => self.local_headers(*base),
             _ => ProjectedHeaderFact::default(),
         }
@@ -40827,7 +40830,7 @@ impl<'a> MoveCheck<'a> {
         expression: &Expr,
     ) -> (ProjectedHeaderFact, bool) {
         match &expression.kind {
-            ExprKind::ArrayChunks { source, .. } => {
+            ExprKind::StrSplit { source, .. } | ExprKind::ArrayChunks { source, .. } => {
                 let headers = self.completed_headers(source);
                 let missing = headers.leaves.is_empty();
                 (headers, missing)
@@ -41904,7 +41907,15 @@ impl<'a> MoveCheck<'a> {
             self.enums,
             self.tagged_types,
         ) {
-            self.element_argument_fact(fact, &self.mutable_backing(source))
+            let mut element = self.element_argument_fact(fact, &self.mutable_backing(source));
+            if source.ty == Ty::DynArray(Scalar::Str) {
+                // A copied str omits the individual generation of the header array.
+                // Caller, arena and iteration roots can also describe the text's backing.
+                let mut spine = self.borrows.header_release_roots(&self.completed_headers(source));
+                spine.retain(|root| matches!(root, BorrowRoot::StorageLocal(..)));
+                element = element.without_root_sources(&spine);
+            }
+            element
         } else {
             BorrowFact::default()
         };
@@ -42767,6 +42778,11 @@ impl<'a> MoveCheck<'a> {
             {
                 self.project_fixed_element_field_fact(recv, index, path, e.ty)
             }
+            ExprKind::Index { recv, .. } if recv.ty == Ty::DynArray(Scalar::Str) => {
+                // Index copies a text descriptor, as does materializing an element in a pipeline.
+                // Its bytes outlive replacement of the flat array of headers.
+                self.pipeline_element_fact(recv, &[]).1
+            }
             ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => {
                 // The legacy fallback names the whole collection for lifetime safety. Its
                 // static property cannot freeze an unselected sibling in the element record.
@@ -43020,6 +43036,7 @@ impl<'a> MoveCheck<'a> {
                 let (_, element) = self.pipeline_element_fact(source, &[]);
                 element.flatten_lifetimes()
             }
+            ExprKind::StrSplit { source, .. } => self.completed_value_fact(source).flatten_lifetimes(),
             ExprKind::ArrayChunks { source, .. } => {
                 BorrowFact::from_direct(self.storage_roots(source))
             }
@@ -43287,6 +43304,7 @@ impl<'a> MoveCheck<'a> {
                 self.storage_roots(column)
             }
             ExprKind::BytesAsStr { bytes }
+            | ExprKind::StrSplit { source: bytes, .. }
             | ExprKind::StrTrim { recv: bytes, .. }
             | ExprKind::PathComponent { path: bytes, .. } => self.storage_roots(bytes),
             ExprKind::SoaColumn { base, .. }
@@ -50448,7 +50466,8 @@ impl<'a> MoveCheck<'a> {
             }
             ExprKind::WriterStd { .. } | ExprKind::ReaderStdin => {}
             // Text operands are borrowed; scalar indices are Copy. Nothing is consumed.
-            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
+            ExprKind::StrSplit { source: haystack, separator: needle }
+            | ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 move_expr!(self, haystack, moved, false, false);
                 move_expr!(self, needle, moved, false, false);
             }
@@ -58778,10 +58797,10 @@ impl<'a, 't> Checker<'a, 't> {
             "is_char_boundary" if matches!(recv_ty, Ty::Str | Ty::String) => {
                 self.check_str_char_boundary(recv_expr, args, span)
             }
-            "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "find_any" | "eq_ignore_ascii_case"
+            "contains" | "starts_with" | "ends_with" | "find" | "rfind" | "find_any" | "split" | "eq_ignore_ascii_case"
                 if matches!(recv_ty, Ty::Str | Ty::String) =>
             {
-                self.check_str_predicate(recv_expr, method, args, span)
+                self.check_str_scan(recv_expr, method, args, span)
             }
             "trim" | "trim_start" | "trim_end" if matches!(recv_ty, Ty::Str | Ty::String) => {
                 self.check_str_trim(recv_expr, method, args, span)
@@ -64405,8 +64424,8 @@ impl<'a, 't> Checker<'a, 't> {
     /// scans (`core.string`, draft.md §18). The receiver (`recv`, already a `str`/`string`) and the
     /// single argument are both treated as `str` views: an owned `string` is auto-borrowed
     /// (`StrBorrow`), so neither operand is moved — the scan only reads bytes. The predicates yield
-    /// `bool`; `find` yields `Option<i64>` (the first byte index, `None` if absent).
-    fn check_str_predicate(&mut self, recv: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
+    /// `bool`; searches yield `Option<i64>`. Literal split owns field headers borrowing the haystack.
+    fn check_str_scan(&mut self, recv: Expr, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
         // Borrow an owned `string` receiver as a `str` view; a `str` receiver passes through.
         let haystack = if recv.ty == Ty::String {
@@ -64426,6 +64445,12 @@ impl<'a, 't> Checker<'a, 't> {
             return err;
         }
         let opt_i64 = Ty::Option(Scalar::Int(IntTy { bits: 64, signed: true }));
+        if method == "split" {
+            return Expr {
+                kind: ExprKind::StrSplit { source: Box::new(haystack), separator: Box::new(needle) },
+                ty: Ty::DynArray(Scalar::Str), span,
+            };
+        }
         let (kind, ty) = match method {
             "contains" => (hir::StrPredKind::Contains, Ty::Bool),
             "starts_with" => (hir::StrPredKind::StartsWith, Ty::Bool),
@@ -64434,7 +64459,7 @@ impl<'a, 't> Checker<'a, 't> {
             "find" => (hir::StrPredKind::Find, opt_i64),
             "rfind" => (hir::StrPredKind::Rfind, opt_i64),
             "find_any" => (hir::StrPredKind::FindAny, opt_i64),
-            _ => unreachable!("check_str_predicate called with non-scan method"),
+            _ => unreachable!("check_str_scan called with non-scan method"),
         };
         Expr {
             kind: ExprKind::StrPredicate { kind, haystack: Box::new(haystack), needle: Box::new(needle) },
@@ -74572,7 +74597,8 @@ impl<'a, 't> Checker<'a, 't> {
             },
             k @ (ExprKind::ArrayBuilderNew { .. } | ExprKind::ArrayBuilderPush { .. }
             | ExprKind::ArrayBuilderAppend { .. } | ExprKind::ArrayBuilderBuild(_)) => self.finalize_array_builder(k),
-            ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
+            ExprKind::StrSplit { source: haystack, separator: needle }
+            | ExprKind::StrCharBoundary { receiver: haystack, index: needle } | ExprKind::StrPredicate { haystack, needle, .. } => {
                 self.finalize_expr(haystack);
                 self.finalize_expr(needle);
             }
@@ -82981,7 +83007,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // FileReadAt borrows File and writes an initialized byte view, returning count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 365,
+            variants, 366,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

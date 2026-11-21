@@ -17993,14 +17993,15 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .map_err(|e| self.err(e))?
                     .try_as_basic_value().basic().expect("fs_read_bytes_view returns i32")
             }
-            // std.path — join/normalize return an owned `{ptr,len}`; base/dir/ext a borrowed view.
-            Rvalue::PathJoin { a, b } => {
+            // Each operation returns a new owned buffer with the common two-view ABI.
+            Rvalue::StrSplit { source: a, separator: b } | Rvalue::PathJoin { a, b } => {
+                let key = if matches!(rv, Rvalue::StrSplit { .. }) { RuntimeKey::StrSplit } else { RuntimeKey::PathJoin };
                 let (ap, al) = self.split_str(a)?;
                 let (bp, bl) = self.split_str(b)?;
                 self.builder
-                    .build_call(self.runtime(RuntimeKey::PathJoin), &[ap.into(), al.into(), bp.into(), bl.into()], "pjoin")
+                    .build_call(self.runtime(key), &[ap.into(), al.into(), bp.into(), bl.into()], key.logical_name())
                     .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("path_join returns a {ptr,len}")
+                    .try_as_basic_value().basic().expect("text operation returns a {ptr,len}")
             }
             Rvalue::PathComponent { kind, path } => {
                 let key = match kind {

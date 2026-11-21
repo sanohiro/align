@@ -421,6 +421,7 @@ fn walk_body_records<'a>(
                     ptr: lhs,
                     offset: rhs,
                 }
+                | ExprKind::StrSplit { source: lhs, separator: rhs }
                 | ExprKind::StrCharBoundary { receiver: lhs, index: rhs }
                 | ExprKind::ArrayTruncate { receiver: lhs, new_len: rhs, .. }
                 | ExprKind::StrPredicate {

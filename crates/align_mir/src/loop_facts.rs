@@ -273,7 +273,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::MakeDictEncoded { .. } | Rvalue::DictField { .. } | Rvalue::GatherColumnI64 { .. } |
         Rvalue::DictLookup { .. } | Rvalue::Chunks { .. } | Rvalue::ParMapParallel { .. } |
         Rvalue::ParMapReduce { .. } | Rvalue::StaticData { .. } | Rvalue::StrClone { .. } |
-        Rvalue::CloneIn { .. } | Rvalue::StrPredicate { .. } | Rvalue::StrFinderNew { .. } |
+        Rvalue::CloneIn { .. } | Rvalue::StrSplit { .. } | Rvalue::StrPredicate { .. } | Rvalue::StrFinderNew { .. } |
         Rvalue::StrFinderFind { .. } | Rvalue::StrTrim { .. } | Rvalue::BuilderNew { .. } |
         Rvalue::BuilderWriteStr { .. } | Rvalue::BuilderWriteInt { .. } | Rvalue::BuilderWriteBool { .. } |
         Rvalue::BuilderWriteChar { .. } | Rvalue::BuilderWriteFloat { .. } | Rvalue::BuilderWriteStrIntStr { .. } |

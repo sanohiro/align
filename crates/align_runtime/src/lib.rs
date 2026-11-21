@@ -15808,6 +15808,34 @@ fn str_subview(s: &[u8]) -> AlignStr {
     AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }
 }
 
+/// Allocate contiguous borrowed field headers for a literal UTF-8 split.
+///
+/// # Safety
+/// Each non-null input must cover its declared readable extent. The source bytes
+/// must remain valid for every use of the returned fields. Free the header pointer once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_str_split(
+    source: *const u8, source_len: i64, separator: *const u8, separator_len: i64,
+) -> AlignStr {
+    let empty = AlignStr { ptr: core::ptr::null(), len: 0 };
+    if source_len < 0 || separator_len < 0
+        || (source.is_null() && source_len != 0) || (separator.is_null() && separator_len != 0)
+    {
+        return empty;
+    }
+    let (Some(source), Some(separator)) = (unsafe { abi_str_view(source, source_len) },
+        unsafe { abi_str_view(separator, separator_len) }) else { return empty; };
+    let fields = source.split(separator);
+    let count = fields.clone().count();
+    let bytes = count.checked_mul(size_of::<AlignStr>()).and_then(|n| i64::try_from(n).ok())
+        .unwrap_or_else(|| align_rt_alloc_size_fail());
+    let headers = align_rt_alloc(bytes).cast::<AlignStr>();
+    for (index, field) in fields.enumerate() {
+        unsafe { headers.add(index).write(str_subview(field.as_bytes())) };
+    }
+    AlignStr { ptr: headers.cast(), len: count as i64 }
+}
+
 /// `s.trim()` (M5, `core.string`) — return a borrowed sub-`str` `{ptr,len}` of `s` with leading
 /// and trailing ASCII whitespace removed. No allocation: the result points into the same buffer.
 /// The whitespace set is Rust's `[u8]::trim_ascii` (space, `\t`, `\n`, `\x0c`, `\r` — the WHATWG
@@ -37578,6 +37606,38 @@ mod tests {
         assert_eq!((rc, n), (0, 2), "full-decode input still decodes");
         assert_eq!([read_i64(&buf, 0), read_i64(&buf, 16)], [1, 2], "a column");
         assert_eq!([read_i64(&buf, 8), read_i64(&buf, 24)], [10, 20], "b column");
+    }
+
+    #[test]
+    fn str_split_headers_alias_the_input_and_reject_invalid_views() {
+        let text = "界::🚀::::";
+        let separator = &text[3..5];
+        unsafe {
+            let result = align_rt_str_split(text.as_ptr(), 13, separator.as_ptr(), 2);
+            assert_eq!(result.len, 4);
+            let headers = std::slice::from_raw_parts(result.ptr.cast::<AlignStr>(), 4);
+            for (field, (offset, length)) in headers.iter().zip([(0, 3), (5, 4), (11, 0), (13, 0)]) {
+                assert_eq!((field.ptr, field.len), (text.as_ptr().add(offset), length));
+            }
+            align_rt_free(result.ptr.cast_mut());
+
+            let empty = align_rt_str_split(std::ptr::null(), 0, std::ptr::null(), 0);
+            assert_eq!(empty.len, 2);
+            let fields = std::slice::from_raw_parts(empty.ptr.cast::<AlignStr>(), 2);
+            assert!(fields.iter().all(|field| field.len == 0));
+            align_rt_free(empty.ptr.cast_mut());
+
+            let invalid_utf8 = [0xff];
+            for (ptr, len) in [(text.as_ptr(), -1), (std::ptr::null(), 1), (invalid_utf8.as_ptr(), 1)] {
+                for result in [
+                    align_rt_str_split(ptr, len, text.as_ptr(), 3),
+                    align_rt_str_split(text.as_ptr(), 3, ptr, len),
+                ] {
+                    assert!(result.ptr.is_null());
+                    assert_eq!(result.len, 0);
+                }
+            }
+        }
     }
 
     #[test]

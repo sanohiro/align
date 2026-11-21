@@ -13091,7 +13091,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // FileReadAt adds one explicit initialized byte-view native writer.
         // HttpCtxView adds headerless Copy request observation with exact owner provenance.
         variants,
-        365,
+        366,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -20625,6 +20625,24 @@ fn text_boundary_hir_rejects_forged_types_in_every_entrypoint() {
         }
         assert_body_entrypoints_empty("text-boundary-forged", &malformed);
     }
+}
+
+#[test]
+fn str_split_hir_rejects_forged_operands_and_result() -> Result<(), &'static str> {
+    let base = checked_source_program("fn parts(text:str,sep:str)->array<str> { fields:=text.split(sep);return fields }");
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..3 {
+        let mut malformed = base.clone();
+        let expr = body_first_let_init_mut(&mut malformed, "parts");
+        let hir::ExprKind::StrSplit { source, separator } = &mut expr.kind else { return Err("split fixture"); };
+        match mutation {
+            0 => **source = body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+            1 => **separator = body_test_expr(hir::ExprKind::Bool(true), Ty::Bool),
+            _ => expr.ty = Ty::DynArray(Scalar::Bool),
+        }
+        assert_body_entrypoints_empty("str-split-forged", &malformed);
+    }
+    Ok(())
 }
 
 #[test]
