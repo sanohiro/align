@@ -4676,6 +4676,12 @@ unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut 
 /// (16 = a `str` view element). Clean entries borrow `p`'s input and escaped entries borrow its
 /// arena, so the result must not outlive those sources.
 unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_width: usize, elem_signed: bool) -> Option<AlignStr> {
+    let (bytes, count) = unsafe { parse_scalar_array(p, elem_kind, elem_width, elem_signed) }?;
+    Some(publish_scalar_array(&bytes, count))
+}
+
+/// Validate and stage scalar elements. The enclosing field or root chooses when to publish.
+unsafe fn parse_scalar_array(p: &mut JsonParser, elem_kind: i32, elem_width: usize, elem_signed: bool) -> Option<(Vec<u8>, i64)> {
     p.ws();
     p.expect(b'[')?;
     p.ws();
@@ -4696,7 +4702,8 @@ unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_wid
     } else {
         loop {
             let eoff = buf.len();
-            buf.resize(eoff + elem_width, 0);
+            let end = eoff.checked_add(elem_width).filter(|&n| isize::try_from(n).is_ok())?;
+            buf.resize(end, 0);
             let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
             unsafe { write_value(p, elem_kind, elem_width as i64, &ed, eptr)? };
             count += 1;
@@ -4715,12 +4722,15 @@ unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_wid
             }
         }
     }
-    let total = buf.len() as i64;
-    let dst = align_rt_alloc(total);
-    if total > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, buf.len()) };
+    Some((buf, count))
+}
+
+fn publish_scalar_array(bytes: &[u8], count: i64) -> AlignStr {
+    let dst = align_rt_alloc(bytes.len() as i64);
+    if !bytes.is_empty() {
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
     }
-    Some(AlignStr { ptr: dst, len: count })
+    AlignStr { ptr: dst, len: count }
 }
 
 /// Stage independently owned strings until the caller validates its complete container.
@@ -5862,6 +5872,30 @@ pub unsafe extern "C" fn align_rt_json_decode_soa(
 fn json_scalar_tag_valid(tag: i32) -> bool {
     matches!(tag, 1 | 2 | 4 | 8 | 0x10001 | 0x10002 | 0x10004 | 0x10008
         | 0x101 | 0x204 | 0x208 | 0x810)
+}
+
+/// Decode a complete array of borrowed strings. Publish the owned headers only after EOF.
+/// Clean elements retain input bytes and escaped elements require a live lexical arena.
+///
+/// # Safety
+/// Positive input extents must be readable. The non-null output must be an exclusive
+/// AlignStr slot disjoint from the input. A non-null arena must be live and exclusively
+/// accessible during this call. Keep the backing storage alive while using the fields.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_json_decode_str_array(
+    input: *const u8, input_len: i64, out: *mut AlignStr, arena: *mut Arena,
+) -> i32 {
+    if input.is_null() || out.is_null() { return 1; }
+    let Ok(n) = safe_len(input_len) else { return 1; };
+    let src = unsafe { std::slice::from_raw_parts(input, n) };
+    if !validate_utf8(src) { return 1; }
+    let mut parser = JsonParser { src, pos: 0, arena };
+    let Some((bytes, count)) = (unsafe { parse_scalar_array(&mut parser, 3, size_of::<AlignStr>(), false) })
+        else { return 1; };
+    parser.ws();
+    if parser.pos != src.len() { return 1; }
+    unsafe { out.write(publish_scalar_array(&bytes, count)) };
+    0
 }
 
 /// Decode one complete JSON array into an independent owned `{ptr,len}` (element count).

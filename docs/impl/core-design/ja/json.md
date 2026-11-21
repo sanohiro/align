@@ -173,9 +173,15 @@ SoA と scanner は変わらない。
 バイト列を所有する。エスケープされた U+0000 も有効。不正な要素・区切り・UTF-8・
 エスケープ・末尾入力は `Error.Code(1)` となり、結果を公開する前に、それまでの
 文字列領域をすべて解放する。空配列は確保せず、それ以外はヘッダー配列１個と各非空
-文字列の領域を所有する。添字から得る view の寿命は配列所有者に従う。既存の型・
-Result・再帰的 Drop を使う。`array<str>` のデコードは別の対象である。
-配列の ABI と解放の表は Plan183、単独の所有文字列ルートは Plan203 に従う。
+文字列の領域を所有する。添字から得る view の寿命は配列所有者に従う。配列の ABI と解放の表は Plan183 に従う。
+
+**借用文字列配列のデコード。** 期待型が `array<str>` のとき、`json.decode(input)` は
+UTF-8 JSON の文字列配列を１個受理する。非空の結果はヘッダー配列を１個所有し、
+エスケープのない要素は入力を借用する。エスケープされた要素（U+0000 を含む）は
+最も内側の有効な arena に展開する。arena の外でのエスケープ、不正な入力、末尾の余分な
+データ、表現不能なヘッダー領域は `Error.Code(1)` となり、部分配列は公開しない。
+空配列は確保しない。取り出した view は配列を置き換えた後も、入力とデコード時の
+arena が有効な範囲で使える。共有パーサー・ネイティブ出力・寿命検査は Plan262 に従う。
 
 **所有文字列ルートのデコード。** `json.decode(input)` の推論対象に `string` を指定できる。
 前後の JSON 空白を除いて UTF-8 JSON 文字列を１個だけ受理し、既存のエスケープと
@@ -379,11 +385,7 @@ enclosing arena に exact-size materialize されるので、所有スパイン�
 エラーパスは `drop_decoded_owned` kind-7（要素非依存の flat-free）。`sub_owns_buffers` に kind 7 があるので
 `array<Move-struct>` 要素内の scalar/str-array フィールドも cleanup される。J3b と合成する
 （`Table { rows: array<Row>, meta: array<i64> }`、`Row { vals: array<f64> }`）。構造化 MIR の指紋には
-要素型も含まれるため、`array<i64>`→`array<f64>` の変更でキャッシュが無効化される。**なお延期:**
-`array<char>`（JSON 形式なし）と、**top-level** の `array<str> := json.decode`
-（構造体 FIELD は囲む構造体の入力 region 束縛に乗るが、top-level 配列の結果はその region を自身で運ぶ必要がある —
-scalar の top-level 配列は意図的に `Static`/返却可能なので、top-level の `array<str>` は別途 region を運ぶ slice に
-なる）。v1 制限: 所有 scalar-array フィールド上の `.sum()`/pipeline は制限される。
+要素型も含まれるため、`array<i64>`→`array<f64>` の変更でキャッシュが無効化される。`array<char>` は JSON 形式がなく、引き続き延期。v1 制限: 所有 scalar-array フィールド上の `.sum()`/pipeline は制限される。
 R87 は動的 scalar-array の bare ルートを対応するフィールドと同じ要素文法・出力バイトで受理する。
 
 **`Option<T>` フィールド（REST-gateway runway, Slice B）。** 構造体フィールドは `Option<T>`（payload は

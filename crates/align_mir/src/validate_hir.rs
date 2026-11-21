@@ -6407,7 +6407,7 @@ impl<'a> BodyValidator<'a> {
     }
 
     fn json_array_target_ok(&self, ty: Ty) -> bool {
-        self.json_scalar_target_ok(ty)
+        ty == Ty::Str || self.json_scalar_target_ok(ty)
     }
 
     fn json_scalar_target_ok(&self, ty: Ty) -> bool {

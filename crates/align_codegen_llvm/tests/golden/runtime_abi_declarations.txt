@@ -319,6 +319,7 @@ key|JsonDecode|json_decode|IndirectStorage|declare i32 @align_rt_json_decode(ptr
 key|JsonDecodeArray|json_decode_array|IndirectStorage|declare i32 @align_rt_json_decode_array(ptr, i64, i32, ptr) #2
 key|JsonDecodeScalar|json_decode_scalar|IndirectStorage|declare i32 @align_rt_json_decode_scalar(ptr, i64, i32, ptr) #2
 key|JsonDecodeSoa|json_decode_soa|IndirectStorage|declare i32 @align_rt_json_decode_soa(ptr, i64, ptr, i64, ptr, ptr, ptr, i64, i64) #2
+key|JsonDecodeStrArray|json_decode_str_array|IndirectStorage|declare i32 @align_rt_json_decode_str_array(ptr readonly, i64, ptr captures(none), ptr) #2
 key|JsonDecodeStructArray|json_decode_struct_array|IndirectStorage|declare i32 @align_rt_json_decode_struct_array(ptr, i64, ptr, i64, i64, ptr, ptr, i64, i64, ptr) #2
 key|JsonDecodeUnion|json_decode_union|IndirectStorage|declare i32 @align_rt_json_decode_union(ptr, i64, ptr, ptr, ptr) #2
 key|JsonDocAsBool|json_doc_as_bool|IndirectStorage|declare i32 @align_rt_json_doc_as_bool(ptr, i64, ptr) #2

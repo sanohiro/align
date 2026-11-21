@@ -1,4 +1,4 @@
-//! Independent JSON owned-text roots and canonical cleanup (Plans183/203).
+//! JSON text roots, view lifetimes and canonical cleanup (Plans183/203/262).
 #![cfg(unix)]
 #[path = "helpers/owned_fixture.rs"]
 mod owned_fixture;
@@ -201,11 +201,82 @@ fn json_string_array_root_lifecycle_and_replay() {
 }
 
 #[test]
+fn json_borrowed_string_array_root_lifecycle_and_replay() {
+    let model = r#"module model
+import core.json
+pub fn decode(input:str)->Result<array<str>,Error> = json.decode(input)
+pub fn forward<T>(value:T)->T = value
+pub fn map(e:Error)->Error = e
+pub fn choose(input:str,success:bool)->Result<array<str>,Error> {
+  if !success {return Err(Error.Invalid)}
+  value:Result<array<str>,Error>:=match input.len() {0=>loop {break decode("[]")},_=>decode(input)}
+  return value.map_err(map)
+}
+"#;
+    let main = r#"module main
+import core.json
+import model
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+fn clean()->Result<(),Error> {
+  input:="[\"left\",\"界\",\"\"]".clone()
+  mut fields:=model.forward(model.choose(input,true))?
+  first:=fields[0]
+  if fields.len()!=3 || fields[1]!="界" || fields[2]!="" {return Err(Error.Invalid)}
+  fields=model.decode("[]")?
+  if fields.len()!=0 || first!="left" {return Err(Error.Invalid)}
+  return Ok(())
+}
+fn escaped()->Result<(),Error> {
+  arena outer {
+    arena inner {
+      input:="[\"clean\",\"\\u754c\",\"\\ud83d\\ude80\",\"\\u0000\"]".clone_in(inner)
+      value:array<str>:=json.decode(input)?
+      if value.len()!=4 || value[0]!="clean" || value[1]!="界" || value[2]!="🚀" || value[3].bytes()[0]!=0 {return Err(Error.Invalid)}
+    }
+  }
+  return Ok(())
+}
+fn main()->i32 {
+  owner:=[(91 as u8),(34 as u8),(120 as u8),(34 as u8),(93 as u8)].to_array()
+  mut alias:slice<u8>:=owner
+  text:=alias.as_str() else {return 7}
+  mut decoded:=model.decode(text) else {return 8}
+  saved:=decoded[0]
+  decoded=model.decode("[]") else {return 9}
+  if saved!="x" || decoded.len()!=0 {return 10}
+  alias[0]=255
+  a:=unsafe {align_rt_alloc_count()}
+  f:=unsafe {align_rt_free_count()}
+  clean() else {return 1}
+  if unsafe {align_rt_alloc_count()}-a != unsafe {align_rt_free_count()}-f {return 2}
+  escaped() else {return 3}
+  match model.decode("[\"\\n\"]") {Err(e)=>{},Ok(v)=>{return 4}}
+  match model.decode("[\"ok\",false]") {Err(e)=>{},Ok(v)=>{return 5}}
+  match model.decode("[\"ok\"] x") {Err(e)=>{},Ok(v)=>{return 6}}
+  return 0
+}
+"#;
+    lifecycle_and_replay("json_borrowed_string_array_root_lifecycle_and_replay", model, main);
+}
+
+#[test]
 fn json_string_array_root_rejects_invalid_source_and_view_escape() {
     owned_fixture::run(
         "json_string_array_root_rejects_invalid_source_and_view_escape",
         |stage| {
+            std::fs::write(stage.join("borrowed.align"),
+                "module borrowed\nimport core.json\npub fn decode(s:str)->Result<array<str>,Error> = json.decode(s)\n"
+            ).unwrap();
             let cases = [
+                (
+                    "import borrowed\nfn bad() {owner:=[(91 as u8),(34 as u8),(120 as u8),(34 as u8),(93 as u8)].to_array();mut alias:slice<u8>:=owner;text:=alias.as_str() else {return};mut values:=borrowed.decode(text) else {return};field:=values[0];values=borrowed.decode(\"[]\") else {return};alias[0]=255;print(field)}",
+                    Some("validated bytes were modified"),
+                ),
+                (
+                    "fn bad()->Result<array<str>,Error> = json.decode(\"[]\".clone())",
+                    Some("cannot return"),
+                ),
                 (
                     "fn bad()->Result<str,Error> {values:array<string>:=json.decode(\"[\\\"x\\\"]\")?;return Ok(values[0])}",
                     Some("cannot return"),
@@ -215,8 +286,16 @@ fn json_string_array_root_rejects_invalid_source_and_view_escape() {
                     Some("invalidated borrow"),
                 ),
                 (
-                    "fn bad()->Result<array<str>,Error> = json.decode(\"[]\")",
-                    Some("not supported yet"),
+                    "fn bad()->Result<array<str>,Error> {input:=\"[\\\"x\\\"]\".clone(); return json.decode(input)}",
+                    Some("cannot return"),
+                ),
+                (
+                    "fn bad()->Result<array<str>,Error> {arena { v:array<str>:=json.decode(\"[\\\"\\\\n\\\"]\")?; return Ok(v) }}",
+                    Some("cannot return"),
+                ),
+                (
+                    "fn bad()->Result<str,Error> {input:=\"[\\\"x\\\"]\".clone(); v:array<str>:=json.decode(input)?; return Ok(v[0])}",
+                    Some("cannot return"),
                 ),
                 (
                     "fn bad()->Result<array<char>,Error> = json.decode(\"[]\")",

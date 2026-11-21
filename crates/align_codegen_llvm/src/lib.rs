@@ -16920,8 +16920,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
             Rvalue::JsonOwnedDecode { root_kind, plan, input, out, arena } => {
                 self.gen_json_owned_decode(*root_kind, plan, input, *out, arena.as_ref())?
             }
-            Rvalue::JsonDecodeArray { elem, input, out } => {
-                self.gen_json_decode_array(*elem, input, *out)?
+            Rvalue::JsonDecodeArray { elem, input, out, arena } => {
+                self.gen_json_decode_array(*elem, input, *out, arena.as_ref())?
             }
             Rvalue::JsonDecodeScalar { scalar, input, out } => {
                 self.gen_json_decode_scalar(*scalar, input, *out)?
@@ -22754,7 +22754,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
 
     /// `json.decode` into an owned `array<elem>`: zero the out `{ptr,len}` slot, then call the
     /// runtime array parser with the element tag `(kind << 8) | width`. Returns the i32 status.
-    fn gen_json_decode_array(&mut self, elem: Ty, input: &Operand, out: Slot) -> Result<BasicValueEnum<'c>, CodegenError> {
+    fn gen_json_decode_array(&mut self, elem: Ty, input: &Operand, out: Slot, arena: Option<&Operand>) -> Result<BasicValueEnum<'c>, CodegenError> {
         let out_ptr = self.slots[&out];
         // Zero the {ptr,len} so a failed decode reads {null,0} (its Drop / unused value frees null).
         self.builder.build_store(out_ptr, slice_struct_type(self.ctx).const_zero()).map_err(|e| self.err(e))?;
@@ -22762,6 +22762,16 @@ impl<'c, 'a> FnGen<'c, 'a> {
         let agg = self.operand(input)?.into_struct_value();
         let in_ptr = self.builder.build_extract_value(agg, 0, "jin_p").map_err(|e| self.err(e))?;
         let in_len = self.builder.build_extract_value(agg, 1, "jin_l").map_err(|e| self.err(e))?;
+        if elem == Ty::Str {
+            let arena = match arena {
+                Some(handle) => self.operand(handle)?.into_pointer_value(),
+                None => self.ctx.ptr_type(AddressSpace::default()).const_null(),
+            };
+            let call = self.builder.build_call(self.runtime(RuntimeKey::JsonDecodeStrArray),
+                &[in_ptr.into(), in_len.into(), out_ptr.into(), arena.into()], "json_str_array")
+                .map_err(|e| self.err(e))?;
+            return call.try_as_basic_value().basic().ok_or_else(|| self.err("JSON text array decoder must return status"));
+        }
         // Same tag encoding as struct fields: (signed << 16) | (kind << 8) | byte-width. kind 0 =
         // int, 1 = bool, 2 = float, 8 = owned string. Bit 16 is the int sign flag (1 = signed) for the runtime
         // range-check.

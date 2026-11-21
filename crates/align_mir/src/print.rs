@@ -746,8 +746,9 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(input)
             )
         }
-        Rvalue::JsonDecodeArray { elem, input, out } => {
-            format!("json_decode_array({} x {}, -> _{out})", operand_str(input), crate::ty_name(*elem))
+        Rvalue::JsonDecodeArray { elem, input, out, arena } => {
+            let arena = arena.as_ref().map(|a| format!(", arena={}", operand_str(a))).unwrap_or_default();
+            format!("json_decode_array({} x {}, -> _{out}{arena})", operand_str(input), crate::ty_name(*elem))
         }
         Rvalue::JsonDecodeScalar { scalar, input, out } => {
             format!("json_decode_scalar({} : {}, -> _{out})", operand_str(input), crate::ty_name(*scalar))
