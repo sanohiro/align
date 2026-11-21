@@ -1692,8 +1692,8 @@ pub enum ExprKind {
     /// the key column computes every aggregate in `aggs` (in result order) into its own result column,
     /// instead of one `group_by` pass per aggregate. The `key`-once / K-accumulator shape that matches
     /// idiomatic fast Rust (`HashMap<K,[Acc;K]>`). The expression `ty` is a tuple
-    /// `(array<K>, array<i64>, …)` — distinct keys followed by one `array<i64>` per aggregate. First
-    /// cut: an AoS `str` key (`GroupSource::AosStr`), i64 values, `sum`/`min`/`max`/`count`.
+    /// `(array<K>, array<i64>, …)` — distinct keys followed by one `array<i64>` per aggregate. AoS supports a `str` key, SoA a `str` or
+    /// `i64` key. All values are i64 for `sum`/`min`/`max`; `count` needs no value field.
     ArrayGroupAggMulti { base: LocalId, struct_id: u32, key_field: u32, aggs: Vec<GroupAgg1>, source: GroupSource },
     /// `s.dict_encode(.key)` — intern the `str` `key_field` column of the AoS `array<Struct>` local
     /// `base` to a dense-id column + a dictionary, yielding a [`crate::Ty::DictEncoded`] value. The

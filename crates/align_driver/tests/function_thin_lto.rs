@@ -440,16 +440,28 @@ fn shared_codegen_table_change_invalidates_every_function_partition() {
     );
 }
 
+const OWNED_LEAF_CHAIN: &str = "fn leaf(text: str) -> string { return text.clone() }\n\
+         fn middle(text: str) -> i64 = leaf(text).len()\n\
+         fn main() -> i32 { print(middle(\"x\")); return 0 }\n";
+
+const FUNCTION_VALUE_CHAIN: &str = "fn bump(n: i64) -> i64 = n + 1\n\
+         fn apply(f: fn(i64) -> i64, n: i64) -> i64 = f(n)\n\
+         fn middle(n: i64) -> i64 = apply(bump, n)\n\
+         fn main() -> i32 { print(middle(41)); return 0 }\n";
+
 /// Every owned-leaf arm of the call-provenance predicate, carried by the *second* edge of a
 /// depth-2 same-unit chain. `main`'s partition declares only its direct callee, so the peer body
 /// references a function the partition cannot see. Regression for #1070: the whole-program
 /// validators were run unchanged over that truncated partition and rejected correct programs.
 const DEPTH_TWO_CHAINS: &[(&str, &str, &[u8])] = &[
     (
+        "fused-soa-with-deeper-call",
+        "Row { key:i64, n:i64 }\nfn leaf(n:i64)->i64 = n+1\nfn middle(s:soa<Row>)->i64 { g:=s.group_by(.key).agg(sum(.n)); return leaf(g.1[0]) }\nfn main()->i32 { arena { s:=[Row{key:3,n:41}].to_soa(); print(middle(s)) }; return 0 }\n",
+        b"42\n",
+    ),
+    (
         "str-arg-string-return",
-        "fn leaf(text: str) -> string { return text.clone() }\n\
-         fn middle(text: str) -> i64 = leaf(text).len()\n\
-         fn main() -> i32 { print(middle(\"x\")); return 0 }\n",
+        OWNED_LEAF_CHAIN,
         b"1\n",
     ),
     (
@@ -468,10 +480,7 @@ const DEPTH_TWO_CHAINS: &[(&str, &str, &[u8])] = &[
     ),
     (
         "fn-value-arg",
-        "fn bump(n: i64) -> i64 = n + 1\n\
-         fn apply(f: fn(i64) -> i64, n: i64) -> i64 = f(n)\n\
-         fn middle(n: i64) -> i64 = apply(bump, n)\n\
-         fn main() -> i32 { print(middle(41)); return 0 }\n",
+        FUNCTION_VALUE_CHAIN,
         b"42\n",
     ),
     (
@@ -567,7 +576,7 @@ fn partition_scoped_validators_match_emission_scope() {
     };
 
     // (a) Owned-leaf call provenance: `middle` calls `leaf`, which the partition cannot see.
-    let owned_leaf = partition(DEPTH_TWO_CHAINS[0].1, &["main", "middle"]);
+    let owned_leaf = partition(OWNED_LEAF_CHAIN, &["main", "middle"]);
     assert!(
         validate_resource_rvalues(&owned_leaf).is_err(),
         "the whole-program validator must keep rejecting a truncated program"
@@ -611,7 +620,7 @@ fn partition_scoped_validators_match_emission_scope() {
     );
 
     // (c) Callable targets: `middle` takes the address of `bump`, which the partition cannot see.
-    let fn_value = partition(DEPTH_TWO_CHAINS[3].1, &["main", "middle"]);
+    let fn_value = partition(FUNCTION_VALUE_CHAIN, &["main", "middle"]);
     assert!(
         validate_tagged_program(&fn_value).is_err(),
         "the whole-program validator must keep rejecting a truncated callable table"
@@ -623,7 +632,7 @@ fn partition_scoped_validators_match_emission_scope() {
 
     // …and only the *unseen* reference is exempt. A peer body whose callable target the partition
     // can resolve keeps every signature check.
-    let mut resolvable = partition(DEPTH_TWO_CHAINS[3].1, &["main", "middle", "bump"]);
+    let mut resolvable = partition(FUNCTION_VALUE_CHAIN, &["main", "middle", "bump"]);
     let peer = resolvable
         .fns
         .iter_mut()
@@ -684,7 +693,7 @@ fn unit_validation_precedes_partition_formation() {
     // re-derives.
     let proj = Proj::new(
         "partition-unit-gate",
-        &[("main.align", DEPTH_TWO_CHAINS[3].1)],
+        &[("main.align", FUNCTION_VALUE_CHAIN)],
         "main.align",
     );
     let mut built = walk(&proj);

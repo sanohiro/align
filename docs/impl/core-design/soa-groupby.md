@@ -25,12 +25,14 @@ s.where(.flag)                                   // column-predicate filter stag
 
 s.group_by(.k).sum(.v)           -> (keys, sums)     // i64 or str key on soa; str key on array<Struct>
 s.group_by(.k).min(.v) / .max(.v) / .count()         // count takes NO field
-xs.group_by(.name).agg(sum(.a), max(.b), count())    // fused multi-aggregate, ONE pass
+s.group_by(.k).agg(sum(.a), max(.b), count())        // SoA i64 or str key, or AoS str key
 xs.dict_encode(.name)            -> encoded          // intern str key column; reuse across group_bys
 ```
 
 `group_by` results are a tuple of parallel columns: `g.0` = distinct keys, `g.1..` = one column
-per aggregate, row-aligned with `g.0`.
+per aggregate, row-aligned with `g.0`. A fused SoA aggregation scans the selected
+columns once. String keys appear in first-occurrence order and borrow the source
+text. Integer group order is unspecified. Every output owns its column.
 
 ## Type & ownership classification
 
@@ -69,9 +71,7 @@ column's *elements* may point at longer-lived text, e.g. the decoded JSON input,
 
 ## Spec'd / deferred, not implemented
 
-- **soa-source `.agg(...)`** — first cut is str-key AoS `array<Struct>` only (`soa.rs`
-  `group_by_agg_soa_source_is_rejected`). i64-key soa multi-aggregate is a recorded follow-up.
-- `.agg` / `dict_encode` need a **dynamic** `array<Struct>` source (a fixed-size stack literal
+- The AoS forms of `.agg` and `dict_encode` need a **dynamic** `array<Struct>` source (a fixed-size stack literal
   array is rejected; decode one or take an `array<T>` parameter).
 - **Owned soa columns** (soa that outlives an arena), **`soa_slice<T>`** (windowed soa view —
   repr decided in #330, unification not a new type), **packed-bool columns** — post-M6 backlog,
@@ -85,7 +85,7 @@ column's *elements* may point at longer-lived text, e.g. the decoded JSON input,
   arena bound, drop tracking of per-column buffers would need a Move soa (deferred). Do not
   "fix" the compile error by making `to_soa` allocate on the heap silently.
 - P2 — **`agg` reads AoS strided**: the fused pass gathers fields from row-major memory. It beats
-  per-aggregate passes ~3×, but a pre-transposed soa source (when implemented) reads dense — do
+  per-aggregate passes ~3×, but a pre-transposed SoA source reads contiguous fields — do
   not benchmark-compare the two shapes as if equivalent.
 - P3 — **dict_encode reuse discipline**: the win is hash-once; a second `dict_encode` of the same
   column costs the hash again. Bind the encoded value once, run all group_bys off that binding.

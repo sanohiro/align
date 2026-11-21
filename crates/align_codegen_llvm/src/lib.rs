@@ -11443,6 +11443,84 @@ impl<'c, 'a> FnGen<'c, 'a> {
         Ok(off)
     }
 
+    /// Column addressing consumes one captured descriptor and its certified backing extent.
+    fn project_soa_column(
+        &self, soa: inkwell::values::StructValue<'c>, struct_id: u32, field: u32,
+    ) -> Result<(PointerValue<'c>, IntValue<'c>), CodegenError> {
+        let ptr = self.builder.build_extract_value(soa, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
+        let len = self.builder.build_extract_value(soa, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
+        let sizes = self.soa_field_sizes(struct_id);
+        let offset = self.soa_column_offset(len, &sizes, field as usize)?;
+        let projected = unsafe {
+            self.builder.build_in_bounds_gep(self.ctx.i8_type(), ptr, &[offset], "colptr").map_err(|e| self.err(e))?
+        };
+        Ok((projected, len))
+    }
+
+    fn gen_group_multi_cols(
+        &mut self, base: Slot, struct_id: u32, key_field: u32,
+        aggs: &[(align_sema::hir::GroupOp, Option<u32>)], result_ty: Ty,
+    ) -> Result<BasicValueEnum<'c>, CodegenError> {
+        use align_sema::hir::GroupOp;
+        let source = *self.slots.get(&base).ok_or_else(|| self.err("missing SoA aggregate input slot"))?;
+        let soa = self.builder.build_load(self.llvm_type(Ty::Soa(struct_id)), source, "group_source")
+            .map_err(|e| self.err(e))?.into_struct_value();
+        let (keys, len) = self.project_soa_column(soa, struct_id, key_field)?;
+        let field = self.structs.get(struct_id as usize).and_then(|s| s.fields.get(key_field as usize))
+            .ok_or_else(|| self.err("missing SoA grouping key"))?;
+        let key_kind = u64::from(field.ty == Ty::Str);
+        let i64t = self.ctx.i64_type();
+        let ptr = self.ctx.ptr_type(AddressSpace::default());
+        let spec_ty = self.ctx.struct_type(&[ptr.into(), i64t.into()], false);
+        let k = u32::try_from(aggs.len()).map_err(|_| self.err("SoA aggregate table is too large"))?;
+        let columns = k.checked_add(1).filter(|_| k > 0).ok_or_else(|| self.err("invalid SoA aggregate arity"))?;
+        let Ty::Tuple(id) = result_ty else { return Err(self.err("invalid SoA aggregate result")); };
+        let tuple = *self.tuple_types.get(id as usize).ok_or_else(|| self.err("missing SoA aggregate tuple"))?;
+        let header = slice_struct_type(self.ctx);
+        let header_table = header.array_type(columns);
+        let output = self.alloca_at_entry(header_table.into(), "group_headers")?;
+        let table_ty = spec_ty.array_type(k);
+        let table = self.alloca_at_entry(table_ty.into(), "group_specs")?;
+        for (j, (op, field)) in aggs.iter().enumerate() {
+            let values = match field {
+                Some(field) => self.project_soa_column(soa, struct_id, *field)?.0,
+                None => ptr.const_null(),
+            };
+            let tag = match op { GroupOp::Sum => 0, GroupOp::Min => 1, GroupOp::Max => 2, GroupOp::Count => 3 };
+            let row = self.builder.build_insert_value(spec_ty.get_poison(), values, 0, "values").map_err(|e| self.err(e))?.into_struct_value();
+            let row = self.builder.build_insert_value(row, i64t.const_int(tag, false), 1, "op").map_err(|e| self.err(e))?.into_struct_value();
+            let address = unsafe {
+                self.builder.build_in_bounds_gep(table_ty, table, &[i64t.const_zero(), i64t.const_int(j as u64, false)], "group_spec").map_err(|e| self.err(e))?
+            };
+            self.builder.build_store(address, row).map_err(|e| self.err(e))?;
+        }
+        let call = self.builder.build_call(self.runtime(RuntimeKey::GroupMultiCols), &[
+            keys.into(), table.into(), len.into(), output.into(),
+            i64t.const_int(u64::from(k), false).into(), i64t.const_int(key_kind, false).into(),
+        ], "group_count").map_err(|e| self.err(e))?;
+        let count = call.try_as_basic_value().basic().ok_or_else(|| self.err("missing SoA aggregate count"))?.into_int_value();
+        let negative = self.builder.build_int_compare(IntPredicate::SLT, count, i64t.const_zero(), "group_error").map_err(|e| self.err(e))?;
+        let beyond_input = self.builder.build_int_compare(IntPredicate::SGT, count, len, "group_overrun").map_err(|e| self.err(e))?;
+        let failed = self.builder.build_or(negative, beyond_input, "group_failed").map_err(|e| self.err(e))?;
+        let failure = self.ctx.append_basic_block(self.func, "group.fail");
+        let success = self.ctx.append_basic_block(self.func, "group.ok");
+        self.builder.build_conditional_branch(failed, failure, success).map_err(|e| self.err(e))?;
+        self.builder.position_at_end(failure);
+        self.builder.build_call(self.runtime(RuntimeKey::ProcessAbort), &[], "").map_err(|e| self.err(e))?;
+        self.builder.build_unreachable().map_err(|e| self.err(e))?;
+        self.builder.position_at_end(success);
+        let mut result = tuple.get_poison();
+        for j in 0..columns {
+            let cell = unsafe {
+                self.builder.build_in_bounds_gep(header_table, output, &[i64t.const_zero(), i64t.const_int(u64::from(j), false)], "group_column")
+                    .map_err(|e| self.err(e))?
+            };
+            let owned = self.builder.build_load(header, cell, "owned_column").map_err(|e| self.err(e))?;
+            result = self.builder.build_insert_value(result, owned, j, "group_tuple").map_err(|e| self.err(e))?.into_struct_value();
+        }
+        Ok(result.into())
+    }
+
     fn column_batch_fields(&self, struct_id: u32) -> Result<Vec<(Ty, bool, bool)>, CodegenError> {
         let definition = self
             .structs
@@ -14618,15 +14696,7 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .build_load(sty, self.slots[base], "soa")
                     .map_err(|e| self.err(e))?
                     .into_struct_value();
-                let ptr = self.builder.build_extract_value(soa, 0, "soaptr").map_err(|e| self.err(e))?.into_pointer_value();
-                let len = self.builder.build_extract_value(soa, 1, "soalen").map_err(|e| self.err(e))?.into_int_value();
-                let sizes = self.soa_field_sizes(*struct_id);
-                let byte_off = self.soa_column_offset(len, &sizes, *field as usize)?;
-                let new_ptr = unsafe {
-                    self.builder
-                        .build_in_bounds_gep(self.ctx.i8_type(), ptr, &[byte_off], "colptr")
-                        .map_err(|e| self.err(e))?
-                };
+                let (new_ptr, len) = self.project_soa_column(soa, *struct_id, *field)?;
                 let agg = self.builder.build_insert_value(sty.get_poison(), new_ptr, 0, "colptr").map_err(|e| self.err(e))?.into_struct_value();
                 self.builder.build_insert_value(agg, len, 1, "collen").map_err(|e| self.err(e))?.into_struct_value().into()
             }
@@ -15942,6 +16012,8 @@ impl<'c, 'a> FnGen<'c, 'a> {
                     .basic()
                     .expect("str group aggregate returns the group count (i64)")
             }
+            Rvalue::GroupAggMultiCols { base, struct_id, key_field, aggs } =>
+                self.gen_group_multi_cols(*base, *struct_id, *key_field, aggs, result_ty)?,
             Rvalue::GroupAggMultiStr { base, struct_id, key_field, aggs, out_keys, out_vals } => {
                 // Like `GroupAggStr` but builds a `[k x {i64 val_off, i64 op, ptr out_vals}]` spec
                 // table on the stack and calls the one-pass fused runtime.

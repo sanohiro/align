@@ -12532,22 +12532,22 @@ impl<'a> BodyValidator<'a> {
         source: hir::GroupSource,
         result_ty: Ty,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
-        if !self.local_ok(context, base)
-            || source != hir::GroupSource::AosStr
-            || aggregates.is_empty()
-        {
-            return None;
-        }
-        if self.local_type(context, base)?
-            != Ty::DynStructArray(struct_id, align_sema::Layout::Aos)
-        {
-            return None;
-        }
-        let definition = self.program.structs.get(struct_id as usize)?;
-        if definition.fields.get(key_field as usize)?.ty != Ty::Str {
+        if !self.local_ok(context, base) || aggregates.is_empty() || u32::try_from(aggregates.len().saturating_add(1)).is_err() {
             return None;
         }
         let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });
+        let (base_ty, key_ty) = match source {
+            hir::GroupSource::AosStr => (Ty::DynStructArray(struct_id, align_sema::Layout::Aos), Ty::Str),
+            hir::GroupSource::SoaStr => (Ty::Soa(struct_id), Ty::Str),
+            hir::GroupSource::SoaI64 => (Ty::Soa(struct_id), i64_ty),
+            hir::GroupSource::Encoded => return None,
+        };
+        let definition = self.program.structs.get(struct_id as usize)?;
+        if !self.body_ty_matches(self.local_type(context, base)?, base_ty)
+            || !self.body_ty_matches(definition.fields.get(key_field as usize)?.ty, key_ty)
+        {
+            return None;
+        }
         for aggregate in aggregates {
             match aggregate.op {
                 hir::GroupOp::Count if aggregate.value_field.is_some() => return None,
@@ -12560,7 +12560,7 @@ impl<'a> BodyValidator<'a> {
                 }
             }
         }
-        let array_str = align_sema::ty_to_scalar(Ty::DynArray(Scalar::Str))?;
+        let array_key = align_sema::ty_to_scalar(Ty::DynArray(align_sema::ty_to_scalar(key_ty)?))?;
         let array_i64 = align_sema::ty_to_scalar(Ty::DynArray(Scalar::Int(
             align_sema::IntTy { bits: 64, signed: true },
         )))?;
@@ -12568,7 +12568,7 @@ impl<'a> BodyValidator<'a> {
             return None;
         };
         let tuple = self.program.tuples.get(tuple_id as usize)?;
-        if tuple.elems.first().copied() != Some(array_str)
+        if tuple.elems.first().copied() != Some(array_key)
             || tuple.elems.len() != aggregates.len().saturating_add(1)
             || tuple.elems.iter().skip(1).any(|element| *element != array_i64)
         {

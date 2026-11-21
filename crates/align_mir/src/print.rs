@@ -523,6 +523,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
                 operand_str(out_vals)
             )
         }
+        Rvalue::GroupAggMultiCols { base, struct_id, key_field, aggs } => {
+            let specs: Vec<_> = aggs.iter().map(|(op, field)| format!("{op:?}/{field:?}")).collect();
+            format!("group_multi_cols(slot{base} struct#{struct_id}.key{key_field} [{}])", specs.join(", "))
+        }
         Rvalue::GroupAggMultiStr { base, struct_id, key_field, aggs, out_keys, out_vals } => {
             let specs: Vec<String> = aggs
                 .iter()

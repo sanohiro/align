@@ -4819,6 +4819,42 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 equation.checks.extend(inputs.dependencies.into_iter().map(|source| (source, OperandRequirement::READ)));
                 equation.seed = Some(XmlAccessProvenance::Owned);
             }
+            Rvalue::GroupAggMultiCols { base, struct_id, key_field, aggs } => {
+                let integer = Scalar::Int(IntTy { bits: 64, signed: true });
+                let fields = self.graph.program.structs.get(struct_id as usize);
+                let field = |i: u32| fields?.fields.get(i as usize).map(|f| f.ty);
+                let key = field(key_field).and_then(align_sema::ty_to_scalar);
+                let tuple = match result_ty {
+                    Ty::Tuple(id) => self.graph.program.tuples.get(id as usize),
+                    _ => None,
+                };
+                let width = aggs.len().checked_add(1).and_then(|k| u32::try_from(k).ok());
+                let valid = self.graph.function.slots.get(base as usize) == Some(&Ty::Soa(struct_id))
+                    && matches!(key, Some(k) if k == integer || k == Scalar::Str)
+                    && !aggs.is_empty() && width.is_some()
+                    && tuple.is_some_and(|t| Some(t.elems.len()) == width.map(|n| n as usize)
+                        && t.elems.iter().enumerate().all(|(i, t)| {
+                            matches!(scalar_to_ty(*t), Ty::DynArray(k) if Some(k) == if i == 0 { key } else { Some(integer) })
+                        }))
+                    && aggs.iter().all(|(op, index)| match (op, index) {
+                        (hir::GroupOp::Count, None) => true,
+                        (hir::GroupOp::Sum | hir::GroupOp::Min | hir::GroupOp::Max, Some(i)) => field(*i) == Some(scalar_to_ty(integer)),
+                        _ => false,
+                    });
+                if !valid {
+                    equation.invalid = true;
+                    return equation;
+                }
+                let source = self.queue(XmlAccessNode::Slot(base, Vec::new()));
+                Self::add_required_source(&mut equation, source, OperandRequirement::READ);
+                for index in std::iter::once(key_field).chain(aggs.iter().filter_map(|(_, i)| *i)) {
+                    let column = self.queue(XmlAccessNode::Slot(base, vec![XmlAccessPathSegment::StructField(index)]));
+                    Self::add_required_source(&mut equation, column, OperandRequirement::READ);
+                }
+                equation.seed = Some(if key == Some(Scalar::Str) && path == [
+                    XmlAccessPathSegment::TupleElement(0), XmlAccessPathSegment::Element,
+                ] { XmlAccessProvenance::Shared } else { XmlAccessProvenance::Owned });
+            }
             runtime @ (Rvalue::GroupAggStr { .. } | Rvalue::GroupAggMultiStr { .. } | Rvalue::DictEncode { .. }) => {
                 let i64_ty = Ty::Int(IntTy { bits: 64, signed: true });
                 let out = match &runtime {
@@ -9188,6 +9224,13 @@ fn validate_resource_rvalues_inner(
 ) -> Result<(), ProducerError> {
     validate_host_mir(program)?;
     validate_json_decode_arenas(program)?;
+    // Peers of an emitted partition retain signatures, but their own callees need not
+    // be in this partition. The complete-unit pass already certified their bodies.
+    for function in &program.fns {
+        if defined.is_none_or(|emitted| emitted.contains(&function.name)) {
+            crate::group_source::validate(program, function)?;
+        }
+    }
     validate_template_html_mir_signatures(program)?;
     let components = xml_local_call_components(program)?;
     // A partition peer carries its real signature in `program.fns`; seeding it grants the same
@@ -9764,12 +9807,7 @@ fn validate_resource_rvalues_component(
                                 *definition = Some(rvalue);
                             }
                         }
-                        let auxiliary = match rvalue {
-                            Rvalue::CallWithCleanup(call) => Some(call.cleanup),
-                            Rvalue::CallIndirectWithCleanup(call) => Some(call.cleanup),
-                            Rvalue::XmlParse { cleanup, .. } => Some(*cleanup),
-                            _ => None,
-                        };
+                        let auxiliary = rvalue.auxiliary_result();
                         if let Some(auxiliary) = auxiliary
                             && let Some(count) = auxiliary_definitions.get_mut(auxiliary as usize)
                         {
@@ -10556,6 +10594,7 @@ fn validate_resource_rvalues_component(
                     | Rvalue::GroupAggStrCols { .. }
                     | Rvalue::GroupAggStr { .. }
                     | Rvalue::GroupAggMultiStr { .. }
+                    | Rvalue::GroupAggMultiCols { .. }
                     | Rvalue::DictEncode { .. }
                     | Rvalue::GatherColumnI64 { .. }
                     | Rvalue::DictLookup { .. } => matches!(
@@ -13486,6 +13525,162 @@ mod tests {
             }
             assert!(validate_mir_producers(&malformed).is_err(), "mutation {mutation}");
             assert!(validate_partition_resource_rvalues(&malformed, &defined).is_err(), "partition mutation {mutation}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_soa_group_producer_rejects_substituted_metadata_and_outputs() -> Result<(), Box<dyn std::error::Error>> {
+        for field in ["name","k"] {
+            let source = format!("Row {{ flag:bool, name:str, k:i64, v:i64 }}\nfn group(s:soa<Row>)->i64 {{g:=s.group_by(.{field}).agg(sum(.v),count());return g.1.len()}}\nfn main() {{}}\n");
+            let mut diags = align_diag::Diagnostics::new();
+            let ast = align_parser::parse_file(align_lexer::tokenize(0, &source, &mut diags), &mut diags);
+            let hir = align_sema::check_file(&ast, &mut diags);
+            assert!(!diags.has_errors(), "{:?}", diags.iter().collect::<Vec<_>>());
+            let base = crate::lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
+            let scope = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+            validate_partition_resource_rvalues(&base, &scope)?;
+            for mutation in 0..17 {
+                let mut program = base.clone();
+                let f = program.fns.iter_mut().find(|f| f.name.as_str() == "group").ok_or("missing group")?;
+                let (bb, pos) = f.blocks.iter().enumerate().find_map(|(id, b)| b.stmts.iter().position(|s|
+                    matches!(s, Stmt::Let(_, Rvalue::GroupAggMultiCols { .. }))).map(|pos| (id,pos))).ok_or("missing fused call")?;
+                let Stmt::Let(result, Rvalue::GroupAggMultiCols { base, struct_id, key_field, aggs }) =
+                    &mut f.blocks[bb].stmts[pos] else { return Err("operation".into()); };
+                let slot = *base;
+                match mutation {
+                    0 => *struct_id = u32::MAX,
+                    1 => *key_field = 0,
+                    2 => aggs[0].1 = Some(1),
+                    3 => aggs[1].1 = Some(3),
+                    4 => aggs.clear(),
+                    5 => *base = u32::MAX,
+                    6 => f.value_tys[*result as usize] = Ty::Bool,
+                    7 => {
+                        let duplicate = f.blocks[bb].stmts[pos].clone();
+                        f.blocks[bb].stmts.insert(pos, duplicate);
+                    }
+                    8 => {
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s, Stmt::Store(dst, _) if *dst == slot)).ok_or("param init")?;
+                        let init = f.blocks[bb].stmts.remove(store);
+                        f.blocks[bb].stmts.insert(pos, init);
+                    }
+                    9 => {
+                        let v = u32::try_from(f.value_tys.len())?;
+                        f.value_tys.push(f.slots[slot as usize]);
+                        let store = f.blocks[bb].stmts.iter_mut().find(|s| matches!(s, Stmt::Store(dst, _) if *dst == slot)).ok_or("param init")?;
+                        *store = Stmt::Store(slot, Operand::Value(v));
+                        f.blocks[bb].stmts.insert(pos+1, Stmt::Let(v, Rvalue::Use(Operand::Arg(0))));
+                    }
+                    10 => {
+                        // The join has a typed source writer on only one of two incoming paths.
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s, Stmt::Store(dst, _) if *dst == slot)).ok_or("param init")?;
+                        let init = f.blocks[bb].stmts.remove(store);
+                        let yes = u32::try_from(f.blocks.len())?;
+                        let join = yes + 1;
+                        let tail = f.blocks[bb].stmts.split_off(store);
+                        let term = std::mem::replace(&mut f.blocks[bb].term, Term::Branch(Operand::Const(Const::Bool(true)), yes, join));
+                        f.blocks.push(crate::Block { id: yes, stmts: vec![init], stmt_lines: vec![], term: Term::Goto(join) });
+                        f.blocks.push(crate::Block { id: join, stmts: tail, stmt_lines: vec![], term });
+                    }
+                    11 => { f.param_modes[0] = align_ast::ParamMode::Out; }
+                    16 => {
+                        let c = u32::try_from(f.value_tys.len())?;
+                        let row = *struct_id;
+                        let it = IntTy {bits:64,signed:true};
+                        let base_ty = f.slots[slot as usize];
+                        f.value_tys.extend([Ty::Slice(Scalar::Int(it)),Ty::Int(it),Ty::Bool,base_ty]);
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s,Stmt::Store(dst,_) if *dst == slot)).ok_or("parameter")?;
+                        f.blocks[bb].stmts.splice(store..=store, [
+                            Stmt::Let(c, Rvalue::SoaColumn {base:slot,struct_id:row,field:2}),
+                            Stmt::Let(c+1, Rvalue::SliceLen(Operand::Value(c))),
+                            Stmt::Let(c+2, Rvalue::Bin(align_ast::BinOp::Gt,Operand::Value(c+1),Operand::Const(Const::Int(0,Ty::Int(it))))),
+                            Stmt::Let(c+3, Rvalue::Select {cond: Operand::Value(c+2),a:Operand::Arg(0),b:Operand::Arg(0)}),
+                            Stmt::Store(slot,Operand::Value(c+3)),
+                        ]);
+                    }
+                    15 => {
+                        let Ty::Soa(row) = f.slots[slot as usize] else { return Err("source type".into()); };
+                        let wrapper = Ty::Option(Scalar::Soa(row));
+                        let saved = u32::try_from(f.slots.len())?;
+                        f.slots.push(wrapper);
+                        let read = u32::try_from(f.value_tys.len())?;
+                        f.value_tys.extend([wrapper, Ty::Soa(row), wrapper]);
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s, Stmt::Store(dst, _) if *dst == slot)).ok_or("init")?;
+                        f.blocks[bb].stmts.splice(store..=store, [
+                            Stmt::Let(read, Rvalue::Load(saved)),
+                            Stmt::Let(read + 1, Rvalue::OptionUnwrap(Operand::Value(read))),
+                            Stmt::Store(slot, Operand::Value(read + 1)),
+                        ]);
+                        f.blocks[bb].stmts.splice(pos+3..pos+3, [
+                            Stmt::Let(read + 2, Rvalue::OptionSome(Operand::Arg(0))),
+                            Stmt::Store(saved, Operand::Value(read + 2)),
+                        ]);
+                    }
+                    _ => {
+                        let chosen = u32::try_from(f.value_tys.len())?;
+                        let later = chosen + 1;
+                        let source_ty = f.slots[slot as usize];
+                        f.value_tys.extend([source_ty, if mutation == 13 { Ty::Bool } else { source_ty }]);
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s, Stmt::Store(dst, _) if *dst == slot)).ok_or("init")?;
+                        let selected = if mutation == 13 {
+                            Rvalue::Select { cond: Operand::Value(later), a: Operand::Arg(0), b: Operand::Arg(0) }
+                        } else {
+                            Rvalue::Select { cond: Operand::Const(Const::Bool(true)), a: Operand::Value(later), b: Operand::Arg(0) }
+                        };
+                        let tail = if mutation == 13 { Operand::Const(Const::Bool(true)) } else { Operand::Arg(0) };
+                        f.blocks[bb].stmts.splice(store..=store, [Stmt::Let(chosen, selected), Stmt::Store(slot, Operand::Value(chosen))]);
+                        if mutation == 14 {
+                            // A definition cycle has no incoming descriptor.
+                            f.blocks[bb].stmts.insert(store, Stmt::Let(later, Rvalue::Use(Operand::Value(chosen))));
+                        } else {
+                            f.blocks[bb].stmts.insert(pos+2, Stmt::Let(later, Rvalue::Use(tail)));
+                        }
+                    }
+                }
+                if mutation >= 7 {
+                    assert!(crate::group_source::validate(&program, program.fns.iter().find(|f| f.name.as_str() == "group").ok_or("group")?).is_err(),
+                        "{field}/{mutation} program-point proof");
+                }
+                assert!(validate_mir_producers(&program).is_err(), "{field}/{mutation} whole");
+                assert!(validate_partition_resource_rvalues(&program, &scope).is_err(), "{field}/{mutation} partition");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_soa_group_backing_lives_at_each_read() -> Result<(), Box<dyn std::error::Error>> {
+        let source = "Row { k:i64,v:i64 }\nfn group()->i64 {\n result := arena {\n  s:=[Row{k:1,v:5}].to_soa()\n  col:=s.v\n  g:=s.group_by(.k).agg(sum(.v),count())\n  x:=arena { col.sum() }\n  g.1[0]+x\n }; return result\n}\nfn main(){}\n";
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+        let base = crate::lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
+        let scope = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+        validate_mir_producers(&base)?;
+        validate_partition_resource_rvalues(&base,&scope)?;
+        for target in 0..4 {
+            let mut program = base.clone();
+            let f = program.fns.iter_mut().find(|f| f.name.as_str() == "group").ok_or("group")?;
+            let outer = f.blocks.iter().flat_map(|b| &b.stmts).find_map(|s| match s {
+                Stmt::Let(_, Rvalue::SoaAlloc {handle:Operand::Value(v),..}) => Some(*v), _ => None
+            }).ok_or("outer allocation")?;
+            let (last,n) = f.blocks.iter().enumerate().find_map(|(b,block)| block.stmts.iter().position(|s|
+                matches!(s, Stmt::ArenaEnd(Operand::Value(v)) if *v == outer)).map(|n|(b,n))).ok_or("cleanup")?;
+            let end = f.blocks[last].stmts.remove(n);
+            let (block,pos) = f.blocks.iter().enumerate().find_map(|(b,block)| block.stmts.iter().position(|s|
+                matches!((target,s),
+                    (0,Stmt::Let(_,Rvalue::SoaAlloc{..}))
+                    | (1,Stmt::Let(_,Rvalue::SoaColumn{..}))
+                    | (2,Stmt::Let(_,Rvalue::GroupAggMultiCols{..}))
+                    | (3,Stmt::Let(_,Rvalue::ArenaBegin))
+                ) && !(target == 3 && matches!(s, Stmt::Let(v,_) if *v == outer))
+            ).map(|n|(b,n))).ok_or("target")?;
+            f.blocks[block].stmts.insert(pos,end);
+            assert!(validate_mir_producers(&program).is_err(), "whole {target}");
+            assert!(validate_partition_resource_rvalues(&program,&scope).is_err(), "partition {target}");
         }
         Ok(())
     }

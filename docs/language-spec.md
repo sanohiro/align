@@ -793,6 +793,13 @@ while the sources may alias each other.
 aggregate — not a hash map. First cut: an `i64` or `str` key over a `soa`, or a `str` key over an
 `array<Struct>`, with an `i64` value and `sum`/`min`/`max`/`count`.
 
+A bound `soa<R>` also supports `rows.group_by(.key).agg(sum(.v), min(.v), max(.v), count())`.
+It groups once per row and updates the requested aggregates in argument order.
+The first owned column holds the distinct `str` or `i64` keys. Each following
+owned `array<i64>` holds the corresponding aggregate. String key bytes borrow
+the source and groups appear in first-occurrence order. Integer key order is
+unspecified. Empty input produces empty columns. Sums wrap on overflow.
+
 ### Reduction
 
 ```text

@@ -25,11 +25,12 @@ s.where(.flag)                                   // column-predicate filter stag
 
 s.group_by(.k).sum(.v)           -> (keys, sums)     // i64 or str key on soa; str key on array<Struct>
 s.group_by(.k).min(.v) / .max(.v) / .count()         // count takes NO field
-xs.group_by(.name).agg(sum(.a), max(.b), count())    // fused multi-aggregate, ONE pass
+s.group_by(.k).agg(sum(.a), max(.b), count())        // SoA は i64 / str キー、AoS は str キー
 xs.dict_encode(.name)            -> encoded          // intern str key column; reuse across group_bys
 ```
 
-`group_by` の結果は、並列に並んだカラムのタプルとなる。`g.0` = 相異なるキー、`g.1..` = 各集約ごとのカラム（1 つの集約につき 1 本）であり、行は `g.0` と揃っている。
+`group_by` の結果は、並列に並んだカラムのタプルとなる。`g.0` = 相異なるキー、`g.1..` = 各集約ごとのカラム（1 つの集約につき 1 本）であり、行は `g.0` と揃っている。SoA の多重集約では、選んだカラムを一度だけ走査する。
+文字列キーは元のテキストを借用し、初出順に並ぶ。整数キーの並び順は未規定。各出力はカラムを所有する。
 
 ## Type & ownership classification
 
@@ -57,15 +58,14 @@ SoA の直接操作とグループ集約は `Result` を返さない。不正な
 
 ## 仕様先行・保留(未実装)
 
-- **soa をソースとする `.agg(...)`** — 初版では `str` キーを持つ AoS `array<Struct>` のみに対応している（`soa.rs` の `group_by_agg_soa_source_is_rejected` を参照）。`i64` キーの soa による多重集約は、フォローアップタスクとして記録済みである。
-- `.agg` / `dict_encode` には **動的に確保された** `array<Struct>` ソースが必要である（固定長のスタック上のリテラル配列は拒否される。decode されるか、`array<T>` を引数として受け取る必要がある）。
+- AoS の `.agg` と `dict_encode` には **動的に確保された** `array<Struct>` ソースが必要である（固定長のスタック上のリテラル配列は拒否される。decode されるか、`array<T>` を引数として受け取る必要がある）。
 - **所有権を持つ soa カラム**（arena の寿命を越えて存続する soa）、**`soa_slice<T>`**（ウィンドウとして切り出された soa ビュー — 内部表現は #330 で決定済みであり、新しい型ではなく統一的に扱う）、**packed-bool カラム** — これらはいずれも M6 以降のバックログであり、ロードマップおよび `open-questions.md` に記録済みである。
 - 集約機能における `avg` / `median` / フィールドを引数に取る `count(.f)` — 設計上の判断により、初版では拒否される。`avg` はフォローアップの候補であり、`median` は別種のアルゴリズムクラスを必要とする。
 
 ## Pitfalls
 
 - P1 — **arena 要件は重要な前提条件（load-bearing）である**: カラムはバンプアロケーションで確保されるバッチデータである。arena による束縛がない場合、カラムごとのバッファを破棄（drop）追跡するために Move 可能な soa が必要になってしまう（現在は保留中）。「裏でヒープに確保させる」といった手法で `to_soa` のコンパイルエラーを暗黙のうちに「修正」してはならない。
-- P2 — **`agg` は AoS をストライド（strided）アクセスで読み取る**: fused されたパスは、行優先（row-major）のメモリ配置からフィールドを gather する。これは集約ごとに個別のパスを回すよりも約 3 倍高速だが、事前に転置された soa ソース（実装された場合）は密に（連続して）読み取ることができる — これら 2 つの形態を、あたかも等価であるかのようにベンチマークで単純比較してはならない。
+- P2 — **`agg` は AoS をストライド（strided）アクセスで読み取る**: fused されたパスは、行優先（row-major）のメモリ配置からフィールドを gather する。これは集約ごとに個別のパスを回すよりも約 3 倍高速だが、事前に転置された SoA ソースは密に（連続して）読み取ることができる — これら 2 つの形態を、あたかも等価であるかのようにベンチマークで単純比較してはならない。
 - P3 — **`dict_encode` の再利用**: 同じカラムで再度呼ぶとハッシュ計算も繰り返す。エンコード結果を一度だけ束縛し、複数の `group_by` で使う。
 - P4 — **`str` カラムは decode 入力のゼロコピービュー**: soa を使う間は参照先も生存している必要がある。region チェッカは、ビューが参照先の寿命を越えて持ち出される箇所でエラーを報告する。
 

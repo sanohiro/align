@@ -85,6 +85,8 @@ mod unicode_nfc;
 pub use unicode_nfc::align_rt_unicode_nfc;
 mod time_formats;
 pub use time_formats::*;
+mod group_multi_cols;
+pub use group_multi_cols::{GroupColumnSpec, align_rt_group_multi_cols};
 mod str_prims;
 pub use str_prims::*;
 mod crypto_asymmetric;

@@ -1873,6 +1873,13 @@ repair review found one P3 in the recursively reachable reader/writer/logger car
 A fresh complete review accepted the fifth repair with no P0–P3 finding; implementation then
 followed the recorded prerequisite order and activated the package and checked timeout row together.
 
+## Fused aggregation on SoA columns
+
+Reading one key per row lets all requested sums, counts and extrema share the
+same group lookup. The operation captures the SoA descriptor once. Its length
+sizes each independent output and its field layout selects the source columns.
+String key bytes retain the lifetime of their original payloads. [Plan263](impl/263-soa-fused-group-aggregates.md)
+
 ## Why `pkg.csv` decodes directly to typed SoA instead of exposing a parser object
 
 CSV is useful here when it becomes columns without creating a second dynamic value model. The
