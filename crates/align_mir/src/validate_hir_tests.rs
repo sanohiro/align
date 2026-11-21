@@ -13091,7 +13091,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // FileReadAt adds one explicit initialized byte-view native writer.
         // HttpCtxView adds headerless Copy request observation with exact owner provenance.
         variants,
-        365,
+        366,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
