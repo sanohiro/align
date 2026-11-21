@@ -245,7 +245,7 @@ fn one_process_builds_edit_and_revert_then_stops_cleanly() {
     let (child, lines) = spawn_watch(&temp.0);
     wait_for(&lines, "revision 1 ready");
     std::fs::write(&entry, source(2)).expect("edit source");
-    wait_for(&lines, "revision 2 ready");
+    wait_for_ready_output(&lines, 2, &temp.0.join("main"), 2);
     std::fs::write(&entry, source(1)).expect("revert source");
     // A normal file write may be observed between truncation and completion. The watcher then
     // retries that unstable revision and publishes the next one once the reverted bytes settle.
@@ -282,7 +282,7 @@ fn failed_revision_keeps_watching_and_recovers() {
         Some(0)
     );
     std::fs::write(&entry, source(3)).expect("repair source");
-    wait_for(&lines, "revision 3 ready");
+    wait_for_ready_output(&lines, 3, &temp.0.join("main"), 3);
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
     assert!(stdout.is_empty());
@@ -337,11 +337,11 @@ fn imported_diagnostic_paths_use_the_watch_path_codec() {
         "single-encoded missing-import path absent: {missing:#?}"
     );
 
-    std::fs::write(
-        root.join("dep.align"),
-        "module wrong\npub fn value() -> i32 = 1\n",
-    )
-    .expect("write mismatched import");
+    let staged = root.join("staged");
+    let dependency = root.join("dep.align");
+    std::fs::write(&staged, "module wrong\npub fn value() -> i32 = 1\n")
+        .expect("write mismatched import");
+    std::fs::rename(&staged, &dependency).expect("publish mismatched import");
     let mismatch = wait_for(&lines, "revision 2 failed");
     assert!(
         mismatch
@@ -350,8 +350,8 @@ fn imported_diagnostic_paths_use_the_watch_path_codec() {
         "single-encoded module-declaration path absent: {mismatch:#?}"
     );
 
-    std::fs::write(root.join("dep.align"), "module dep\nfn value( {\n")
-        .expect("write malformed import");
+    std::fs::write(&staged, "module dep\nfn value( {\n").expect("write malformed import");
+    std::fs::rename(&staged, &dependency).expect("publish malformed import");
     let malformed = wait_for(&lines, "revision 3 failed");
     assert!(
         malformed
@@ -622,7 +622,7 @@ fn same_bytes_regular_replacement_rearms_without_a_revision() {
         Err(RecvTimeoutError::Disconnected) => panic!("watch process exited after replacement"),
     }
     std::fs::write(&entry, source(2)).expect("write semantic edit");
-    wait_for(&lines, "revision 2 ready");
+    wait_for_ready_output(&lines, 2, &temp.0.join("main"), 2);
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
     assert!(stdout.is_empty());
@@ -643,8 +643,9 @@ fn same_bytes_symlink_retarget_starts_a_revision() {
     symlink(&first, &entry).expect("create entry symlink");
     let (child, lines) = spawn_watch(&temp.0);
     wait_for(&lines, "revision 1 ready");
-    std::fs::remove_file(&entry).expect("remove entry symlink");
-    symlink(&second, &entry).expect("retarget entry symlink");
+    let replacement = temp.0.join("replacement-link");
+    symlink(&second, &replacement).expect("stage replacement symlink");
+    std::fs::rename(&replacement, &entry).expect("retarget entry symlink");
     wait_for(&lines, "revision 2 ready");
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
@@ -665,10 +666,12 @@ fn replaced_directory_rearms_the_new_native_generation() {
     std::fs::write(replacement.join("main.align"), source(0)).expect("write replacement source");
     std::fs::rename(&current, temp.0.join("retired")).expect("retire watched directory");
     std::fs::rename(&replacement, &current).expect("install replacement directory");
-    wait_for(&lines, "revision 2 ready");
+    // The watcher can report a missing entry between the two directory renames.
+    let output = temp.0.join("main");
+    wait_for_ready_output(&lines, 2, &output, 0);
 
     std::fs::write(current.join("main.align"), source(4)).expect("edit replacement source");
-    wait_for(&lines, "revision 3 ready");
+    wait_for_ready_output(&lines, 3, &output, 4);
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
     assert!(stdout.is_empty());
@@ -692,7 +695,7 @@ fn imported_source_disappearance_and_recovery_are_observed() {
     wait_for(&lines, "revision 2 failed");
     std::fs::write(&dependency, "module dep\npub fn value() -> i32 = 6\n")
         .expect("restore dependency");
-    wait_for(&lines, "revision 3 ready");
+    wait_for_ready_output(&lines, 3, &temp.0.join("main"), 6);
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
     assert!(stdout.is_empty());
@@ -727,7 +730,7 @@ fn thin_lto_watch_reuses_the_observed_per_unit_route() {
     );
     std::fs::write(&dependency, "module dep\npub fn value() -> i32 = 5\n")
         .expect("edit dependency");
-    wait_for(&lines, "revision 2 ready");
+    wait_for_ready_output(&lines, 2, &temp.0.join("main"), 5);
     let (status, stdout) = stop(child);
     assert_eq!(status.code(), Some(143));
     assert!(stdout.is_empty());
