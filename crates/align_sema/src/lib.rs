@@ -39945,6 +39945,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArrayGroupAggMulti { base: root, .. }
             | ExprKind::ArrayDictEncode { base: root, .. }
             | ExprKind::IndexField { base: root, .. } => roots.extend(self.local_storage_roots(*root)),
+            ExprKind::Index { recv, .. } if recv.ty == Ty::DynArray(Scalar::Str) => roots.extend(self.borrow_sources(e)),
             ExprKind::Index { recv, .. }
             | ExprKind::ElemField { recv, .. } => roots.extend(self.storage_roots(recv)),
             ExprKind::BorrowedIndex { base, .. } => {
@@ -41906,7 +41907,15 @@ impl<'a> MoveCheck<'a> {
             self.enums,
             self.tagged_types,
         ) {
-            self.element_argument_fact(fact, &self.mutable_backing(source))
+            let mut element = self.element_argument_fact(fact, &self.mutable_backing(source));
+            if source.ty == Ty::DynArray(Scalar::Str) {
+                // A copied str omits the individual generation of the header array.
+                // Caller, arena and iteration roots can also describe the text's backing.
+                let mut spine = self.borrows.header_release_roots(&self.completed_headers(source));
+                spine.retain(|root| matches!(root, BorrowRoot::StorageLocal(..)));
+                element = element.without_root_sources(&spine);
+            }
+            element
         } else {
             BorrowFact::default()
         };
@@ -42768,6 +42777,11 @@ impl<'a> MoveCheck<'a> {
                 if self.fixed_array_shape(recv.ty).is_some() =>
             {
                 self.project_fixed_element_field_fact(recv, index, path, e.ty)
+            }
+            ExprKind::Index { recv, .. } if recv.ty == Ty::DynArray(Scalar::Str) => {
+                // Index copies a text descriptor, as does materializing an element in a pipeline.
+                // Its bytes outlive replacement of the flat array of headers.
+                self.pipeline_element_fact(recv, &[]).1
             }
             ExprKind::Index { recv, .. } | ExprKind::ElemField { recv, .. } => {
                 // The legacy fallback names the whole collection for lifetime safety. Its
@@ -82993,7 +83007,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // FileReadAt borrows File and writes an initialized byte view, returning count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 365,
+            variants, 366,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

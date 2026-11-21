@@ -40,7 +40,9 @@ fn lifecycle() {
   "discarded".split(",")
   print("one,two".split(",").len())
   mut fields:="before".split(",")
+  saved:=fields[0]
   fields="after,replace".split(",")
+  print(saved)
   print(fields[1])
   arena {
     print("a,b".clone().split(",").where(keep).count())
@@ -61,6 +63,10 @@ fn exercise() {
   mut i:=0
   loop {
     if i==2 {break}
+    from_break:=loop {break "a,b".split(",".clone())}
+    print(from_break[1])
+    scalar:=loop {break "a,b".clone().split(",").len()}
+    print(scalar)
     collected:="L,R".clone().split(",").where(keep).to_array()
     print(collected[0])
     i=i+1
@@ -83,7 +89,7 @@ fn main() {
     ] {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout),
-            "101\n102\n3\na\n界🚀\n\n101\n7\n3\n\n\na\n4\n\né\n🚀\n\n2\n\n\n1\n\n2\na\nb\n1\none\nR\nR\nb\nd\nmissing\n2\nreplace\n2\ny\ntrue\n");
+            "101\n102\n3\na\n界🚀\n\n101\n7\n3\n\n\na\n4\n\né\n🚀\n\n2\n\n\n1\n\n2\na\nb\n1\none\nb\n2\nR\nb\n2\nR\nb\nd\nmissing\n2\nbefore\nreplace\n2\ny\ntrue\n");
     }
 }
 
@@ -96,6 +102,7 @@ fn split_views_retain_only_source_and_its_validation() {
         ("value := text.split(1)", true),
         ("value := text.split({ alias[0] = 255; \",\" }); print(value.len())", true),
         ("value := text.split(\",\"); alias[0] = 255; print(value[0])", true),
+        ("mut value := text.split(\",\"); kept:=value[0]; value=\"new\".split(\",\"); alias[0]=255; print(kept)", true),
         ("value := \"abc\".split(text); alias[0] = 255; print(value[0])", false),
         ("value := text.split(\",\"); print(value[0]); alias[0] = 255", false),
     ] {
@@ -107,6 +114,8 @@ fn split_views_retain_only_source_and_its_validation() {
     cases.push(("fn bad()->array<str> = \"short\".clone().split(\",\")\nfn main() {}\n".into(), true));
     cases.push(("fn bad()->str {arena a {s:=\"x,y\".clone_in(a); values:=s.split(\",\"); return values[0]}}\nfn main() {}\n".into(), true));
     cases.push(("fn fields(text:str,sep:str)->array<str> = text.split(sep)\nfn good()->array<str> {sep:=\",\".clone(); return fields(\"a,b\",sep)}\nfn main() {}\n".into(), false));
+    cases.push(("fn main() { parts:=loop {break \"x,y\".clone().split(\",\")}; print(parts[0]) }\n".into(), true));
+    cases.push(("fn main() {mut s:=\"x,y\".clone(); parts:=s.split(\",\"); kept:=parts[0]; s=\"new\".clone();print(kept)}\n".into(), true));
     for (src, error) in cases {
         let result = diff_check_multi("literal-split-check", &[("main.align", &src)], "main.align");
         assert_eq!(result.whole_errors, error, "{src}\n{}", result.whole_diags);
