@@ -9224,7 +9224,13 @@ fn validate_resource_rvalues_inner(
 ) -> Result<(), ProducerError> {
     validate_host_mir(program)?;
     validate_json_decode_arenas(program)?;
-    for function in &program.fns { crate::group_source::validate(program, function)?; }
+    // Peers of an emitted partition retain signatures, but their own callees need not
+    // be in this partition. The complete-unit pass already certified their bodies.
+    for function in &program.fns {
+        if defined.is_none_or(|emitted| emitted.contains(&function.name)) {
+            crate::group_source::validate(program, function)?;
+        }
+    }
     validate_template_html_mir_signatures(program)?;
     let components = xml_local_call_components(program)?;
     // A partition peer carries its real signature in `program.fns`; seeding it grants the same

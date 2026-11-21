@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum Origin {
     Arena(ValueId),
+    CallerArena(u32),
     Columns { allocation: ValueId, arena: ValueId },
     Owner(Slot, Vec<u32>),
     // A moved owner remains usable at its consuming call. Borrowing it converts its
@@ -93,6 +94,7 @@ impl Origins {
 #[derive(Clone, Default, Eq, PartialEq)]
 pub(super) struct Backing {
     arenas: Vec<ValueId>,
+    caller_arenas: BTreeSet<u32>,
     slots: BTreeMap<Slot, Origins>,
     values: BTreeMap<ValueId, Origins>,
     // Text cells hold independent byte views. The column buffer itself owns only their headers.
@@ -110,13 +112,20 @@ fn record(map: &mut BTreeMap<u32, Origins>, id: u32, origins: Origins) {
 impl Backing {
     pub(super) fn at_entry(function: &Function) -> Self {
         let mut state = Self::default();
+        for (i, slot) in function.params.iter().enumerate() {
+            if function.slots.get(*slot as usize) == Some(&Ty::ArenaHandle)
+                && let Ok(i) = u32::try_from(i)
+            {
+                state.caller_arenas.insert(i);
+            }
+        }
         for (i, ty) in function.slots.iter().enumerate() {
-            if matches!(ty, Ty::Resource(_)) {
-                if let Ok(slot) = u32::try_from(i) {
-                    state
-                        .slots
-                        .insert(slot, Origins::root(Origin::MovedResource));
-                }
+            if matches!(ty, Ty::Resource(_))
+                && let Ok(slot) = u32::try_from(i)
+            {
+                state
+                    .slots
+                    .insert(slot, Origins::root(Origin::MovedResource));
             }
         }
         state
@@ -212,6 +221,9 @@ impl Backing {
             Operand::BorrowedElementPlace(p) => {
                 self.read(p.base.slot, &borrowed_path(&p.base.path)).flat()
             }
+            Operand::Arg(i) if self.caller_arenas.contains(i) => {
+                Origins::root(Origin::CallerArena(*i))
+            }
             Operand::Const(_) | Operand::Arg(_) | Operand::BorrowedCleanupArg(_) => {
                 Origins::default()
             }
@@ -236,12 +248,14 @@ impl Backing {
     }
 
     fn local_arena(&self, handle: &Operand) -> Option<Origins> {
-        let Operand::Value(v) = handle else {
-            return None;
-        };
-        self.arenas
-            .contains(v)
-            .then(|| Origins::root(Origin::Arena(*v)))
+        let origins = self.op(handle);
+        (!origins.0.is_empty()
+            && origins.0.iter().all(|(_, origin)| match origin {
+                Origin::Arena(v) => self.arenas.contains(v),
+                Origin::CallerArena(i) => self.caller_arenas.contains(i),
+                _ => false,
+            }))
+        .then_some(origins)
     }
 
     fn call(
@@ -311,6 +325,7 @@ impl Backing {
                     return None;
                 }
                 self.arenas.push(*v);
+                record(&mut self.values, *v, Origins::root(Origin::Arena(*v)));
             }
             Stmt::ArenaEnd(Operand::Value(v)) if self.arenas.last() == Some(v) => {
                 self.arenas.pop();
@@ -588,10 +603,18 @@ impl Backing {
                             .retain(|(_, o)| !matches!(o, Origin::ResourcePlace(..)));
                         result.extend(Origins::root(Origin::ResourcePlace(slot, path)));
                     }
-                } else if matches!(
-                    ty,
-                    Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Unit
-                ) {
+                } else if !result.0.is_empty()
+                    && !matches!(ty, Ty::Raw | Ty::Box(_))
+                    && !align_sema::ty_may_borrow(
+                        ty,
+                        &program.structs,
+                        &program.tuples,
+                        &program.enums,
+                        &program.tagged_types,
+                    )
+                {
+                    // A cloned string and any aggregate of independent values own the bytes
+                    // they just copied. Their inputs had to be live at this instruction only.
                     result = Origins::default();
                 }
                 // A finite, well-typed aggregate can contribute at most two coordinates per layout

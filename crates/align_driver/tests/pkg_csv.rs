@@ -116,6 +116,54 @@ fn main() -> i32 {
 }
 
 #[test]
+fn grouped_csv_rejects_a_retired_named_return_region() {
+    use align_mir::{Operand, Rvalue, Stmt, producer};
+    let source = r#"module main
+import pkg.csv
+Row { k:i64 }
+fn forward(out:region, options:pkg.csv.DecodeOptions)->Result<soa<Row>,pkg.csv.Error> =
+  pkg.csv.decode("1",out,options)
+fn main()->i32 {
+  arena out {
+    options:=pkg.csv.DecodeOptions {header:pkg.csv.Header.Absent,line_ending:pkg.csv.LineEnding.Lf,max_rows:1}
+    rows:=forward(out, options) else { return 2 }
+    g:=rows.group_by(.k).agg(count())
+    return g.1.len() as i32
+  }
+}
+"#;
+    let built = build_per_unit_multi("grouped-csv-region", &files(source), "main.align");
+    let mut program = built.walk.units.iter().find(|u| u.is_entry).expect("entry unit").mir.clone();
+    let scope = program.fns.iter().map(|f| f.name.clone()).collect();
+    producer::validate_mir_producers(&program).expect("live CSV region");
+    {
+        let main = program.fns.iter_mut().find(|f| f.name.as_str()=="main").expect("main");
+        let (block,group) = main.blocks.iter().find_map(|b| b.stmts.iter().position(|s|
+            matches!(s,Stmt::Let(_,Rvalue::GroupAggMultiCols {..}))).map(|i|(b.id,i))).expect("successful decode");
+        let mut pending = vec![block];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut ends = Vec::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) { continue; }
+            let b = &main.blocks[id as usize];
+            ends.extend(b.stmts.iter().enumerate().filter_map(|(i,s)|
+                matches!(s,Stmt::ArenaEnd(Operand::Value(_))).then_some((id,i))));
+            match b.term {
+                align_mir::Term::Goto(next) => pending.push(next),
+                align_mir::Term::Branch(_,yes,no) => pending.extend([yes,no]),
+                align_mir::Term::Return(_) | align_mir::Term::Unreachable => {}
+                _ => panic!("unexpected CSV cleanup edge"),
+            }
+        }
+        let [(end_block,end)] = ends.as_slice() else { panic!("one successful arena cleanup: {ends:?}") };
+        let release = main.blocks[*end_block as usize].stmts.remove(*end);
+        main.blocks[block as usize].stmts.insert(group,release);
+    }
+    assert!(producer::validate_mir_producers(&program).is_err());
+    assert!(producer::validate_partition_resource_rvalues(&program,&scope).is_err());
+}
+
+#[test]
 fn generic_forwarding_and_explicit_row_layouts_keep_the_soa_plain_domain() {
     let main = r#"module main
 import pkg.csv

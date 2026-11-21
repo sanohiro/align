@@ -446,6 +446,11 @@ fn shared_codegen_table_change_invalidates_every_function_partition() {
 /// validators were run unchanged over that truncated partition and rejected correct programs.
 const DEPTH_TWO_CHAINS: &[(&str, &str, &[u8])] = &[
     (
+        "fused-soa-with-deeper-call",
+        "Row { key:i64, n:i64 }\nfn leaf(n:i64)->i64 = n+1\nfn middle(s:soa<Row>)->i64 { g:=s.group_by(.key).agg(sum(.n)); return leaf(g.1[0]) }\nfn main()->i32 { arena { s:=[Row{key:3,n:41}].to_soa(); print(middle(s)) }; return 0 }\n",
+        b"42\n",
+    ),
+    (
         "str-arg-string-return",
         "fn leaf(text: str) -> string { return text.clone() }\n\
          fn middle(text: str) -> i64 = leaf(text).len()\n\

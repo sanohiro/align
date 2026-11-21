@@ -1119,9 +1119,10 @@ fn main() -> i32 {
     Ok(_) => false
   }
   if !malformed_soa_ok { return 44 }
+  key_copy := grouped.0[1].clone()
   amounts := grouped.1
   consumed := release_batch(first)
-  if amounts.sum() + consumed != 201 { return 46 }
+  if amounts.sum() + consumed != 201 || key_copy != "medium-label" { return 46 }
 
   rich_result := pkg.db.rows(
     pkg.db.exec_conn(connection),
@@ -3193,7 +3194,7 @@ pkg-db-a1-postgres-streamed-one 485206604faf2733
 pkg-db-a1-postgres-streamed-timeout-drop f8c274359241b762
 pkg-db-a1-postgres-streamed-unsafe-statuses d174d9b087289404
 pkg-db-a1-postgres-value-matrix 900160246701aeff
-pkg-db-a1-sqlite-batches 1bbeff2eb1390de1
+pkg-db-a1-sqlite-batches 46cb9aa82f01a537
 pkg-db-a1-zero-column-plan 866983be583f9bc9
 ";
 
