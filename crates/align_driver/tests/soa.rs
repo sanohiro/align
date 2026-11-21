@@ -639,6 +639,17 @@ fn main() {arena {
     let out = build_and_run("soa-fused-live-columns", &source.replace("ROWS", &rows));
     assert!(out.status.success(), "{}",String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n18\n18\n0\n");
+
+    let rebind = r#"Row {key:str,v:i64}
+fn main() {arena {
+  mut rows:=[Row{key:"a",v:1}].to_array()
+  mut s:=rows.to_soa(); first:=s.group_by(.key).agg(sum(.v)); kept:=first.0[0]
+  rows=[Row{key:"new",v:2}].to_array(); s=rows.to_soa()
+  next:=s.group_by(.key).agg(sum(.v)); print(kept); print(next.0[0])
+}}"#;
+    let out = build_and_run("soa-group-source-rebind", rebind);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a\nnew\n");
 }
 
 #[test]
@@ -689,6 +700,25 @@ fn soa_fused_aggregate_projection_lifetimes() {
         let r = diff_check_multi("soa-fused-key-view", &[("main.align",&src)], "main.align");
         assert_eq!(r.whole_errors, errors, "{src}\n{}",r.whole_diags);
         assert_eq!(r.per_unit_errors, errors, "{src}\n{}",r.per_unit_diags);
+    }
+    for materialize in ["", ".to_array()"] {
+        for (key, other, replaced, errors) in [("a", "b", "first", true), ("a", "b", "second", false),
+            ("b", "a", "first", false)] {
+            let src = format!(r#"Row {{key:str, other:str}}
+fn main() {{
+  mut first:="one".clone(); mut second:="two".clone()
+  a:str:=first; b:str:=second
+  arena {{
+    rows:=[Row{{key:{key},other:{other}}}]{materialize}
+    s:=rows.to_soa(); g:=s.group_by(.key).agg(count()); kept:=g.0[0]
+    {replaced}="new".clone(); print(kept)
+  }}
+}}
+"#);
+            let result = diff_check_multi("soa-group-dynamic-owners", &[("main.align",&src)], "main.align");
+            assert_eq!(result.whole_errors, errors, "{src}\n{}", result.whole_diags);
+            assert_eq!(result.per_unit_errors, errors, "{src}\n{}", result.per_unit_diags);
+        }
     }
     for (projection, write, errors) in [("g.0[0]", "a", true), ("g.0[0]", "b", false),
                                         ("g.1[0]", "a", false), ("g.1[0]", "b", false)] {

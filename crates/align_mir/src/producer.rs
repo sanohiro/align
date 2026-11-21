@@ -9153,82 +9153,6 @@ fn validate_partition_scope(
     Ok(())
 }
 
-/// Track actual initialization at the native read, independently of the producer graph's
-/// whole-function type and projection proofs. A predecessor without a value removes the
-/// fact at a join. A loop can preserve an incoming descriptor but cannot create it on entry.
-fn validate_group_source_initialization(function: &Function) -> Result<(), ProducerError> {
-    let mut uses = BTreeSet::new();
-    for block in &function.blocks {
-        for stmt in &block.stmts {
-            if let Stmt::Let(v, Rvalue::GroupAggMultiCols { .. }) = stmt { uses.insert(*v); }
-        }
-    }
-    if uses.is_empty() { return Ok(()); }
-    let fail = || ProducerError::Lowering(format!("uninitialized SoA group source in '{}'", function.name));
-    #[derive(Clone, Default)]
-    struct Initialized {
-        slots: BTreeSet<Slot>,
-        values: BTreeSet<ValueId>,
-    }
-    let mut entries = vec![None; function.blocks.len()];
-    *entries.get_mut(function.entry as usize).ok_or_else(&fail)? = Some(Initialized::default());
-    let mut pending = VecDeque::from([function.entry]);
-    while let Some(id) = pending.pop_front() {
-        let block = function.blocks.get(id as usize).filter(|b| b.id == id).ok_or_else(&fail)?;
-        let mut state = entries[id as usize].clone().ok_or_else(&fail)?;
-        for stmt in &block.stmts {
-            let available = |op: &Operand| match op {
-                Operand::Value(v) => state.values.contains(v),
-                Operand::Arg(i) => function.param_modes.get(*i as usize).is_some_and(|m| *m != align_ast::ParamMode::Out),
-                Operand::Const(_) => true,
-                Operand::BorrowedPlace(p) => state.slots.contains(&p.slot),
-                _ => false,
-            };
-            match stmt {
-                Stmt::Store(slot, op) => {
-                    if available(op) { state.slots.insert(*slot); } else { state.slots.remove(slot); }
-                }
-                Stmt::Drop(slot) | Stmt::DropFlagMoveOut { slot, .. } | Stmt::DropFlagInit(slot) => { state.slots.remove(slot); }
-                Stmt::Let(v, rv) => {
-                    if let Rvalue::GroupAggMultiCols { base, .. } = rv {
-                        if !state.slots.contains(base) { return Err(fail()); }
-                        uses.remove(v);
-                    }
-                    // Track descriptor forwarding through common aggregate and result carriers.
-                    // Only SoA reads consume this proof; the producer graph verifies every shape.
-                    let ready = match rv {
-                        Rvalue::Use(op) | Rvalue::ResultOk(op) | Rvalue::ResultErr(op)
-                        | Rvalue::ResultUnwrapOk(op) | Rvalue::ResultUnwrapErr(op) => available(op),
-                        Rvalue::Load(slot) if matches!(function.slots.get(*slot as usize), Some(Ty::Soa(_))) => state.slots.contains(slot),
-                        Rvalue::MakeDynArray { ptr, len } => available(ptr) && available(len),
-                        Rvalue::SoaAlloc { handle, len, .. } => available(handle) && available(len),
-                        Rvalue::ColumnBatchSoa { payload, owner, .. } => available(payload) && available(owner),
-                        Rvalue::JsonDecodeSoa { out, input, arena, .. } | Rvalue::CsvDecode { out, input, arena, .. } => {
-                            let initialized = available(input) && available(arena);
-                            if initialized { state.slots.insert(*out); } else { state.slots.remove(out); }
-                            initialized
-                        }
-                        _ => true,
-                    };
-                    if ready { state.values.insert(*v); } else { state.values.remove(v); }
-                }
-                _ => {}
-            }
-        }
-        for next in crate::byte_ranges::successors(&block.term) {
-            let entry = entries.get_mut(next as usize).ok_or_else(&fail)?;
-            if let Some(previous) = entry {
-                let sizes = (previous.slots.len(), previous.values.len());
-                previous.slots.retain(|slot| state.slots.contains(slot));
-                previous.values.retain(|v| state.values.contains(v));
-                if sizes == (previous.slots.len(), previous.values.len()) { continue; }
-            } else { *entry = Some(state.clone()); }
-            pending.push_back(next);
-        }
-    }
-    if uses.is_empty() { Ok(()) } else { Err(fail()) }
-}
-
 // Mixed decode's optional arena is exactly the active lexical arena, never a typed but
 // expired/foreign capability. Check CFG paths before producer trust, including partition peers.
 fn validate_json_decode_arenas(program: &Program) -> Result<(), ProducerError> {
@@ -9300,7 +9224,7 @@ fn validate_resource_rvalues_inner(
 ) -> Result<(), ProducerError> {
     validate_host_mir(program)?;
     validate_json_decode_arenas(program)?;
-    for function in &program.fns { validate_group_source_initialization(function)?; }
+    for function in &program.fns { crate::group_source::validate(program, function)?; }
     validate_template_html_mir_signatures(program)?;
     let components = xml_local_call_components(program)?;
     // A partition peer carries its real signature in `program.fns`; seeding it grants the same
@@ -9877,12 +9801,7 @@ fn validate_resource_rvalues_component(
                                 *definition = Some(rvalue);
                             }
                         }
-                        let auxiliary = match rvalue {
-                            Rvalue::CallWithCleanup(call) => Some(call.cleanup),
-                            Rvalue::CallIndirectWithCleanup(call) => Some(call.cleanup),
-                            Rvalue::XmlParse { cleanup, .. } => Some(*cleanup),
-                            _ => None,
-                        };
+                        let auxiliary = rvalue.auxiliary_result();
                         if let Some(auxiliary) = auxiliary
                             && let Some(count) = auxiliary_definitions.get_mut(auxiliary as usize)
                         {
@@ -13615,7 +13534,7 @@ mod tests {
             let base = crate::lower_program_checked(&hir, false, None).map_err(|e| format!("{e:?}"))?;
             let scope = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
             validate_partition_resource_rvalues(&base, &scope)?;
-            for mutation in 0..12 {
+            for mutation in 0..16 {
                 let mut program = base.clone();
                 let f = program.fns.iter_mut().find(|f| f.name.as_str() == "group").ok_or("missing group")?;
                 let (bb, pos) = f.blocks.iter().enumerate().find_map(|(id, b)| b.stmts.iter().position(|s|
@@ -13658,7 +13577,49 @@ mod tests {
                         f.blocks.push(crate::Block { id: yes, stmts: vec![init], stmt_lines: vec![], term: Term::Goto(join) });
                         f.blocks.push(crate::Block { id: join, stmts: tail, stmt_lines: vec![], term });
                     }
-                    _ => { f.param_modes[0] = align_ast::ParamMode::Out; }
+                    11 => { f.param_modes[0] = align_ast::ParamMode::Out; }
+                    15 => {
+                        let Ty::Soa(row) = f.slots[slot as usize] else { return Err("source type".into()); };
+                        let wrapper = Ty::Option(Scalar::Soa(row));
+                        let saved = u32::try_from(f.slots.len())?;
+                        f.slots.push(wrapper);
+                        let read = u32::try_from(f.value_tys.len())?;
+                        f.value_tys.extend([wrapper, Ty::Soa(row), wrapper]);
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s, Stmt::Store(dst, _) if *dst == slot)).ok_or("init")?;
+                        f.blocks[bb].stmts.splice(store..=store, [
+                            Stmt::Let(read, Rvalue::Load(saved)),
+                            Stmt::Let(read + 1, Rvalue::OptionUnwrap(Operand::Value(read))),
+                            Stmt::Store(slot, Operand::Value(read + 1)),
+                        ]);
+                        f.blocks[bb].stmts.splice(pos+3..pos+3, [
+                            Stmt::Let(read + 2, Rvalue::OptionSome(Operand::Arg(0))),
+                            Stmt::Store(saved, Operand::Value(read + 2)),
+                        ]);
+                    }
+                    _ => {
+                        let chosen = u32::try_from(f.value_tys.len())?;
+                        let later = chosen + 1;
+                        let source_ty = f.slots[slot as usize];
+                        f.value_tys.extend([source_ty, if mutation == 13 { Ty::Bool } else { source_ty }]);
+                        let store = f.blocks[bb].stmts.iter().position(|s| matches!(s, Stmt::Store(dst, _) if *dst == slot)).ok_or("init")?;
+                        let selected = if mutation == 13 {
+                            Rvalue::Select { cond: Operand::Value(later), a: Operand::Arg(0), b: Operand::Arg(0) }
+                        } else {
+                            Rvalue::Select { cond: Operand::Const(Const::Bool(true)), a: Operand::Value(later), b: Operand::Arg(0) }
+                        };
+                        let tail = if mutation == 13 { Operand::Const(Const::Bool(true)) } else { Operand::Arg(0) };
+                        f.blocks[bb].stmts.splice(store..=store, [Stmt::Let(chosen, selected), Stmt::Store(slot, Operand::Value(chosen))]);
+                        if mutation == 14 {
+                            // A definition cycle has no incoming descriptor.
+                            f.blocks[bb].stmts.insert(store, Stmt::Let(later, Rvalue::Use(Operand::Value(chosen))));
+                        } else {
+                            f.blocks[bb].stmts.insert(pos+2, Stmt::Let(later, Rvalue::Use(tail)));
+                        }
+                    }
+                }
+                if mutation >= 7 {
+                    assert!(crate::group_source::validate(&program, program.fns.iter().find(|f| f.name.as_str() == "group").ok_or("group")?).is_err(),
+                        "{field}/{mutation} program-point proof");
                 }
                 assert!(validate_mir_producers(&program).is_err(), "{field}/{mutation} whole");
                 assert!(validate_partition_resource_rvalues(&program, &scope).is_err(), "{field}/{mutation} partition");

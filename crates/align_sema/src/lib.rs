@@ -3151,7 +3151,7 @@ pub fn ty_contains_http_client(
     ty_contains_leaf(root, structs, tuples, enums, tagged_types, |ty| ty == Ty::HttpClient)
 }
 
-fn ty_contains_leaf(
+pub fn ty_contains_leaf(
     root: Ty,
     structs: &[StructDef],
     tuples: &[hir::TupleDef],
@@ -41908,8 +41908,9 @@ impl<'a> MoveCheck<'a> {
             self.normalize_borrow_fact(source.ty, self.borrow_fact(source))
                 .project_array_elements()
         } else {
-            let mut fact = self.borrow_fact(source).without_readonly_origin().flatten_lifetimes()
-                .join(&self.collection_generation_content(source, None, &[]).non_storage);
+            let source_fact = self.borrow_fact(source).without_readonly_origin();
+            let retained = if matches!(element_ty, Ty::Struct(_)) { source_fact } else { source_fact.flatten_lifetimes() };
+            let mut fact = retained.join(&self.collection_generation_content(source, None, &[]).non_storage);
             if self.completed_headers(source).leaves.values().any(|header| {
                 header.fallback_roots.contains(&BorrowRoot::ReadOnly)
             }) {
@@ -43058,8 +43059,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::ArraySort { source, stages, .. }
             | ExprKind::ArraySortBy { source, stages, .. }
             | ExprKind::ArraySortCmp { source, stages, .. } => {
-                let (_, element) = self.pipeline_element_fact(source, stages);
-                element.flatten_lifetimes()
+                let (ty, element) = self.pipeline_element_fact(source, stages);
+                if matches!(ty, Ty::Struct(_)) { element } else { element.flatten_lifetimes() }
             }
             ExprKind::ArrayParMap { source, stages, func, captures, .. } => {
                 let (_, element) = self.pipeline_element_fact(source, stages);
@@ -43075,8 +43076,7 @@ impl<'a> MoveCheck<'a> {
                     .join(&roots.prefixed(BorrowProjection::TupleElement(1)))
             }
             ExprKind::ArrayToSoa { source, .. } => {
-                let (_, element) = self.pipeline_element_fact(source, &[]);
-                element.flatten_lifetimes()
+                self.pipeline_element_fact(source, &[]).1
             }
             ExprKind::StrSplit { source, .. } => self.completed_value_fact(source).flatten_lifetimes(),
             ExprKind::ArrayChunks { source, .. } => {

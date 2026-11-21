@@ -23,9 +23,12 @@ pub mod byte_storage;
 pub mod byte_ranges;
 pub mod byte_prepare;
 mod cold;
+#[macro_use]
+mod operand_inputs;
 pub mod loop_facts;
 mod canonical_graph;
 mod generated_id;
+mod group_source;
 mod json_encode;
 pub use json_encode::json_encode_sequence_is_valid;
 pub mod print;
@@ -657,6 +660,7 @@ pub struct Block {
     pub term: Term,
 }
 
+mir_inputs_enum! {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     /// `v = rvalue` (a temporary). A `Unit`-typed rvalue (e.g. a void call) has no value.
@@ -811,6 +815,7 @@ pub enum Stmt {
         new_len: Operand,
     },
 }
+}
 
 /// A length-preserving stage in a fused staged `par_map` range kernel. Captures are flattened into
 /// the surrounding [`Rvalue::ParMapParallel`] context in stage order. `Filter`, `FilterField`, and
@@ -832,6 +837,7 @@ pub enum ParMapStageKind {
     },
 }
 
+mir_inputs_struct! {
 #[derive(Clone, Debug)]
 pub struct ParMapStage {
     pub kind: ParMapStageKind,
@@ -842,7 +848,9 @@ pub struct ParMapStage {
     pub elem_in: Ty,
     pub elem_out: Ty,
 }
+}
 
+mir_inputs_enum! {
 /// Physical input retained by one synchronous parallel range operation. A materialized source is
 /// the ordinary `{ptr,len}` collection whose elements are loaded by index. A virtual chunks source
 /// carries the borrowed base slice and evaluated chunk width; codegen derives the logical count and
@@ -857,6 +865,7 @@ pub enum ParallelSource {
         width: Operand,
         elem: Ty,
     },
+}
 }
 
 /// Non-type signature facts attached to function values and indirect calls. The parameter and
@@ -923,6 +932,7 @@ pub struct StaticData {
     pub relocations: Vec<StaticDataRelocation>,
 }
 
+mir_inputs_enum! {
 /// One already validated current-row input supplied to a generated column-batch append. Scalar
 /// readers return `Option<T>` for both required and nullable fields; variable-width readers retain
 /// `-1` as the null length until the append atomically commits the lane.
@@ -930,6 +940,7 @@ pub struct StaticData {
 pub enum ColumnBatchInput {
     Scalar(Operand),
     View { ptr: Operand, len: Operand },
+}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -943,6 +954,7 @@ pub enum FsTreeOutput {
     CursorNext { entry: Slot, present: Slot },
 }
 
+mir_inputs_enum! {
 #[derive(Clone, Debug)]
 pub enum Rvalue {
     Use(Operand),
@@ -3061,7 +3073,20 @@ pub enum Rvalue {
         rb: Operand,
     },
 }
+}
 
+impl Rvalue {
+    fn auxiliary_result(&self) -> Option<ValueId> {
+        match self {
+            Self::CallWithCleanup(call) => Some(call.cleanup),
+            Self::CallIndirectWithCleanup(call) => Some(call.cleanup),
+            Self::XmlParse { cleanup, .. } => Some(*cleanup),
+            _ => None,
+        }
+    }
+}
+
+mir_inputs_enum! {
 /// One piece of a lowered `template`: a static run, or an interpolated value.
 #[derive(Clone, Debug)]
 pub enum TemplatePiece {
@@ -3123,6 +3148,7 @@ pub enum TemplatePiece {
         value: Operand,
         enum_id: u32,
     },
+}
 }
 
 #[derive(Clone, Debug)]
@@ -3191,6 +3217,7 @@ pub struct BorrowedElementGuard {
     pub len: Operand,
 }
 
+mir_inputs_struct! {
 #[derive(Clone, Debug)]
 pub struct IndirectCallWithCleanup {
     pub callee: Operand,
@@ -3200,14 +3227,18 @@ pub struct IndirectCallWithCleanup {
     pub signature: FnSignatureFacts,
     pub cleanup: ValueId,
 }
+}
 
+mir_inputs_struct! {
 #[derive(Clone, Debug)]
 pub struct DirectCallWithCleanup {
     pub target: ProgramCall,
     pub args: Vec<Operand>,
     pub cleanup: ValueId,
 }
+}
 
+mir_inputs_struct! {
 /// The boxed operands of a [`Rvalue::CryptoArgon2`] — two byte views (`password` / `salt`) and the
 /// four `i64` Argon2 tuning knobs read out of the caller's `argon2_params` struct (`m_cost` KiB,
 /// `t_cost` iterations, `parallelism` lanes, `len` output bytes), plus the owned-`buffer` out slot.
@@ -3222,7 +3253,9 @@ pub struct Argon2Args {
     pub len: Operand,
     pub out: Slot,
 }
+}
 
+mir_inputs_struct! {
 #[derive(Clone, Debug)]
 pub struct SignatureJwkArgs {
     pub algorithm: align_sema::SignatureAlgorithm,
@@ -3230,7 +3263,9 @@ pub struct SignatureJwkArgs {
     pub second: Option<Operand>,
     pub out: Slot,
 }
+}
 
+mir_inputs_struct! {
 #[derive(Clone, Debug)]
 pub struct SignatureVerifyArgs {
     pub algorithm: align_sema::SignatureAlgorithm,
@@ -3238,6 +3273,7 @@ pub struct SignatureVerifyArgs {
     pub message: Operand,
     pub signature: Operand,
     pub out: Slot,
+}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3261,6 +3297,7 @@ pub enum ConstElem {
     Str(String),
 }
 
+mir_inputs_enum! {
 #[derive(Clone, Debug)]
 pub enum Term {
     Goto(BlockId),
@@ -3276,6 +3313,7 @@ pub enum Term {
     /// Return a recursively Move value and its path-selected ownership bit atomically.
     ReturnWithCleanup(Box<(Operand, Operand)>),
     Unreachable,
+}
 }
 
 /// A native C library the runtime only references when a program uses a std feature that needs it
