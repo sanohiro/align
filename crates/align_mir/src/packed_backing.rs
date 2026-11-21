@@ -8,38 +8,106 @@ pub(super) fn parameter_type(ty: Ty) -> bool {
     )
 }
 
-fn call_arguments(
-    value: &Rvalue,
-) -> Option<(Option<&ProgramCall>, &[Operand], &[align_ast::ParamMode])> {
+pub(super) fn read_type(ty: Ty) -> bool {
+    parameter_type(ty) || matches!(ty, Ty::Bool | Ty::Int(_) | Ty::Str)
+}
+
+pub(super) fn native_value(function: &Function, operand: &Operand, ty: Ty) -> bool {
+    direct_value_form(function, operand)
+        || matches!(operand, Operand::Arg(i)
+        if matches!(ty, Ty::Slice(_)) && function.param_modes.get(*i as usize) == Some(&align_ast::ParamMode::Out))
+}
+
+fn call_arguments(value: &Rvalue) -> Option<&[Operand]> {
     match value {
-        Rvalue::Call(DirectCall::Program(target), args) => Some((Some(target), args, &[])),
-        Rvalue::CallWithCleanup(site) => Some((Some(&site.target), &site.args, &[])),
-        Rvalue::CallIndirect {
-            args, signature, ..
-        }
-        | Rvalue::RawCall {
-            args, signature, ..
-        } => Some((None, args, &signature.param_modes)),
-        Rvalue::CallIndirectWithCleanup(site) => {
-            Some((None, &site.args, &site.signature.param_modes))
-        }
+        Rvalue::Call(DirectCall::Program(_), args)
+        | Rvalue::CallIndirect { args, .. }
+        | Rvalue::RawCall { args, .. } => Some(args),
+        Rvalue::CallWithCleanup(site) => Some(&site.args),
+        Rvalue::CallIndirectWithCleanup(site) => Some(&site.args),
         _ => None,
     }
 }
 
+// Keep every possible function address. SSA joins and local copies can select a named
+// function without making its descriptor effects unknown.
+fn call_effect_targets(
+    function: &Function,
+    call: &Rvalue,
+    index: usize,
+) -> Option<Vec<ProgramCall>> {
+    use align_ast::ParamMode::{Borrow, ByValue};
+    let (callee, modes) = match call {
+        Rvalue::Call(DirectCall::Program(target), _) => return Some(vec![target.clone()]),
+        Rvalue::CallWithCleanup(site) => return Some(vec![site.target.clone()]),
+        Rvalue::CallIndirect {
+            callee, signature, ..
+        } => (callee, &signature.param_modes),
+        Rvalue::CallIndirectWithCleanup(site) => (&site.callee, &site.signature.param_modes),
+        Rvalue::RawCall { signature, .. }
+            if matches!(signature.param_modes.get(index), Some(Borrow | ByValue)) =>
+        {
+            return Some(Vec::new());
+        }
+        _ => return None,
+    };
+    if matches!(modes.get(index), Some(Borrow | ByValue)) {
+        return Some(Vec::new());
+    }
+    let mut pending = vec![callee];
+    let mut values = HashSet::new();
+    let mut slots = HashSet::new();
+    let mut targets = BTreeSet::new();
+    while let Some(operand) = pending.pop() {
+        let Operand::Value(id) = operand else {
+            return None;
+        };
+        if !values.insert(*id) {
+            continue;
+        }
+        let mut definitions = function
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .filter_map(|stmt| match stmt {
+                Stmt::Let(value, rv) if value == id => Some(rv),
+                _ => None,
+            });
+        match definitions.next()? {
+            Rvalue::FnAddr { target, .. } | Rvalue::Closure { lifted: target, .. } => {
+                targets.insert(target.clone());
+            }
+            Rvalue::Use(child) => pending.push(child),
+            Rvalue::Select { a, b, .. } => pending.extend([a, b]),
+            Rvalue::Load(slot) if !function.params.contains(slot) => {
+                if slots.insert(*slot) {
+                    for stmt in function.blocks.iter().flat_map(|b| &b.stmts) {
+                        match stmt {
+                            Stmt::Store(dest, value) if dest == slot => pending.push(value),
+                            Stmt::Let(_, rv) if call_arguments(rv).is_some_and(|args| args.iter()
+                                .any(|op| matches!(op, Operand::BorrowedPlace(p) if p.slot == *slot))) => return None,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+        if definitions.next().is_some() {
+            return None;
+        }
+    }
+    (!targets.is_empty()).then(|| targets.into_iter().collect())
+}
+
 // A call can replace the descriptor itself only through a mutable place. Follow local
 // forwarding to a fixed point; a separate unit supplies its certified no-rebind record.
-fn preserves_header(
-    program: &Program,
-    target: Option<&ProgramCall>,
-    index: usize,
-    modes: &[align_ast::ParamMode],
-) -> bool {
+fn preserves_header(program: &Program, caller: &Function, call: &Rvalue, index: usize) -> bool {
     use align_ast::ParamMode::{Borrow, ByValue};
-    let Some(target) = target else {
-        return matches!(modes.get(index), Some(Borrow | ByValue));
+    let Some(targets) = call_effect_targets(caller, call, index) else {
+        return false;
     };
-    let mut pending = vec![(target.clone(), index)];
+    let mut pending: Vec<_> = targets.into_iter().map(|target| (target, index)).collect();
     let mut seen = HashSet::new();
     while let Some((name, index)) = pending.pop() {
         if !seen.insert((name.clone(), index)) {
@@ -87,15 +155,14 @@ fn preserves_header(
                     return false;
                 }
                 Stmt::Let(_, value) => {
-                    if let Some((callee, args, modes)) = call_arguments(value) {
+                    if let Some(args) = call_arguments(value) {
                         for (i, argument) in args.iter().enumerate() {
                             if matches!(argument, Operand::BorrowedPlace(place) if place.slot == *slot)
                             {
-                                if let Some(target) = callee {
-                                    pending.push((target.clone(), i));
-                                } else if !matches!(modes.get(i), Some(Borrow | ByValue)) {
+                                let Some(targets) = call_effect_targets(function, value, i) else {
                                     return false;
-                                }
+                                };
+                                pending.extend(targets.into_iter().map(|target| (target, i)));
                             }
                         }
                     }
@@ -113,6 +180,7 @@ impl XmlAccessAnalyzer<'_> {
         slot: Slot,
         path: Vec<XmlAccessPathSegment>,
         at: ValueId,
+        writable: bool,
     ) -> XmlAccessEquation {
         let invalid = || XmlAccessEquation {
             invalid: true,
@@ -184,8 +252,24 @@ impl XmlAccessAnalyzer<'_> {
                         };
                         (op, tail)
                     }
-                    Stmt::Let(_, value) => {
-                        if let Some((name, args, modes)) = call_arguments(value) {
+                    Stmt::Let(id, _)
+                        if !writable
+                            && self
+                                .graph
+                                .slot_stores
+                                .producers
+                                .get(slot as usize)
+                                .is_some_and(|producers| {
+                                    producers.iter().any(|(producer, _)| producer == id)
+                                }) =>
+                    {
+                        let source = self.queue(XmlAccessNode::Slot(slot, path.clone()));
+                        Self::add_source(&mut equation, source);
+                        found = true;
+                        break;
+                    }
+                    Stmt::Let(_, value) if writable => {
+                        if let Some(args) = call_arguments(value) {
                             for (arg, op) in args.iter().enumerate() {
                                 let Operand::BorrowedPlace(place) = op else {
                                     continue;
@@ -199,7 +283,7 @@ impl XmlAccessAnalyzer<'_> {
                                     return invalid();
                                 };
                                 if path.starts_with(&prefix)
-                                    && !preserves_header(self.graph.program, name, arg, modes)
+                                    && !preserves_header(self.graph.program, function, value, arg)
                                 {
                                     return invalid();
                                 }
@@ -215,7 +299,18 @@ impl XmlAccessAnalyzer<'_> {
                 {
                     return invalid();
                 }
-                let source = self.buffer_source(operand, tail.to_vec());
+                if !native_value(
+                    function,
+                    operand,
+                    xml_operand_base_ty(function, operand).unwrap_or(Ty::Error),
+                ) {
+                    return invalid();
+                }
+                let source = if writable {
+                    self.buffer_source(operand, tail.to_vec())
+                } else {
+                    self.read_source(&mut equation, operand, selected, tail.to_vec())
+                };
                 Self::add_source(&mut equation, source);
                 found = true;
                 break;
@@ -236,7 +331,11 @@ impl XmlAccessAnalyzer<'_> {
                 let Ok(arg) = u32::try_from(arg) else {
                     return invalid();
                 };
-                let source = self.buffer_source(&Operand::Arg(arg), path.clone());
+                let source = if writable {
+                    self.buffer_source(&Operand::Arg(arg), path.clone())
+                } else {
+                    self.source(&Operand::Arg(arg), selected, path.clone())
+                };
                 Self::add_source(&mut equation, source);
             }
             for &pred in &predecessors[i] {

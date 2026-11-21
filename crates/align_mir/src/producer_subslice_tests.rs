@@ -204,3 +204,70 @@ fn main() {}"#;
     }
     Ok(())
 }
+
+#[test]
+fn packed_reads_require_a_dominating_header_and_native_value_lanes() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"import core.bitset
+Holder { bits:bitset }
+fn inspect(borrow header:bitset, borrow position:i64, borrow flag:bool) -> bool {
+  mut bytes := [1 as u8]
+  mut view := bitset.view(bytes[..],8)
+  view[position] = flag
+  return header[position]
+}
+fn card(data:slice<u8>, flag:bool) -> i64 {
+  mut bits := bitset.view(data,8)
+  if flag { bits = bitset.view(data,4) }
+  return bits.count()
+}
+fn carried(data:slice<u8>, flag:bool) -> i64 {
+  mut record := Holder {bits:bitset.view(data,8)}
+  if flag { record.bits = bitset.view(data,4) }
+  return record.bits.count()
+}
+fn bytes(data:slice<u8>, flag:bool) -> i64 {
+  mut alias := data
+  if flag { alias = data }
+  return bitset.view(alias,1).count()
+}
+fn main() {}"#;
+    let mut diags = align_diag::Diagnostics::new();
+    let ast = align_parser::parse_file(align_lexer::tokenize(0, source, &mut diags), &mut diags);
+    let hir = align_sema::check_file(&ast, &mut diags);
+    assert!(!diags.has_errors(), "{:?}", diags.iter().collect::<Vec<_>>());
+    let good = crate::lower_program_checked(&hir, false, None).map_err(|error| format!("{error:?}"))?;
+    let defined = good.fns.iter().map(|function| function.name.clone()).collect::<BTreeSet<_>>();
+    validate_mir_producers(&good)?;
+    validate_partition_resource_rvalues(&good, &defined)?;
+    for mutation in 0..7 {
+        let mut bad = good.clone();
+        let name = match mutation { 3 | 5 => "card", 4 => "carried", 6 => "bytes", _ => "inspect" };
+        let f = bad.fns.iter_mut().find(|f| f.name.as_str() == name).ok_or("fixture function")?;
+        if mutation < 3 {
+            let op = if mutation == 2 { crate::BitsetOp::Write } else { crate::BitsetOp::Read };
+            let args = f.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
+                Stmt::Let(_, Rvalue::Bitset { op: found, operands }) if *found == op => Some(operands),
+                _ => None,
+            }).ok_or("packed operation")?;
+            args[mutation] = Operand::Arg(u32::try_from(mutation)?);
+        } else {
+            let slot = f.blocks.iter().flat_map(|b| &b.stmts).rev().find_map(|s| match s {
+                Stmt::Let(id, Rvalue::Load(slot) | Rvalue::Field(slot, _))
+                    if (mutation != 6 && f.value_tys[*id as usize] == Ty::Bitset)
+                        || (mutation == 6 && matches!(f.value_tys[*id as usize], Ty::Slice(_))) => Some(*slot),
+                _ => None,
+            }).ok_or("loaded descriptor")?;
+            let entry = f.blocks.get_mut(f.entry as usize).ok_or("entry")?;
+            let initial = entry.stmts.iter().position(|s| matches!(s,
+                Stmt::Store(dest, _) | Stmt::StoreField(dest, _, _) if *dest == slot)).ok_or("initial store")?;
+            let store = entry.stmts.remove(initial);
+            if mutation == 5 {
+                let final_block = f.blocks.iter_mut().find(|b| matches!(b.term, Term::Return(_))).ok_or("return")?;
+                final_block.stmts.push(store);
+            }
+        }
+        assert!(validate_mir_producers(&bad).is_err(), "whole, mutation {mutation}");
+        assert!(validate_partition_resource_rvalues(&bad, &defined).is_err(), "partition, mutation {mutation}");
+    }
+    Ok(())
+}

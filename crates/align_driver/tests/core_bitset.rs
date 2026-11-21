@@ -360,3 +360,32 @@ fn main()->i32 {
         );
     }
 }
+
+#[test]
+fn closed_numeric_slice_writers_preserve_backing_across_indirect_calls() {
+    if !backend_available() {
+        return;
+    }
+    let lib = r#"module writers
+pub fn put(borrow mut data:slice<i64>) { data[0] = 7 }
+pub fn idle(borrow mut data:slice<i64>) {}
+"#;
+    let source = r#"import writers
+fn run(flag:bool)->i64 {
+  mut a := [0 as i64]
+  mut view := a[..]
+  f := if flag { writers.put } else { writers.idle }
+  f(view)
+  writers.put(view)
+  return a[0]
+}
+fn main()->i32 { return if run(true)==7 && run(false)==7 { 0 } else { 1 } }
+"#;
+    let files = [("writers.align", lib), ("main.align", source)];
+    for output in [
+        build_and_run_multi("numeric-writers", &files, "main.align"),
+        build_per_unit_multi("numeric-writers-unit", &files, "main.align").link_and_run(),
+    ] {
+        assert!(output.status.success(), "{output:?}");
+    }
+}

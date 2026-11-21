@@ -11,6 +11,24 @@ struct BitView<'c> {
     len: IntValue<'c>,
 }
 
+/// Quotient and low bits keep the signed logical index representable at i64::MAX.
+fn bit_position<'c>(
+    builder: &inkwell::builder::Builder<'c>,
+    head: IntValue<'c>,
+    index: IntValue<'c>,
+) -> Result<(IntValue<'c>, IntValue<'c>), inkwell::builder::BuilderError> {
+    let ty = index.get_type();
+    let three = ty.const_int(3, false);
+    let seven = ty.const_int(7, false);
+    let whole = builder.build_right_shift(index, three, false, "bits.whole")?;
+    let low = builder.build_and(index, seven, "bits.low")?;
+    let relative = builder.build_int_add(head, low, "bits.relative")?;
+    let carry = builder.build_right_shift(relative, three, false, "bits.carry")?;
+    let byte = builder.build_int_add(whole, carry, "bits.byte")?;
+    let bit = builder.build_and(relative, seven, "bits.bit")?;
+    Ok((byte, bit))
+}
+
 impl<'c> FnGen<'c, '_> {
     fn pack_bits(&self, view: BitView<'c>) -> Result<BasicValueEnum<'c>, CodegenError> {
         let descriptor = bitset_type(self.ctx).const_zero();
@@ -43,42 +61,6 @@ impl<'c> FnGen<'c, '_> {
             head: field(1, "bits.head")?.into_int_value(),
             len: field(2, "bits.len")?.into_int_value(),
         })
-    }
-
-    /// Split the physical position without forming head + index at full width.
-    fn bit_position(
-        &self,
-        head: IntValue<'c>,
-        index: IntValue<'c>,
-    ) -> Result<(IntValue<'c>, IntValue<'c>), CodegenError> {
-        let ty = self.ctx.i64_type();
-        let three = ty.const_int(3, false);
-        let seven = ty.const_int(7, false);
-        let whole = self
-            .builder
-            .build_right_shift(index, three, false, "bits.whole")
-            .map_err(|error| self.err(error))?;
-        let low = self
-            .builder
-            .build_and(index, seven, "bits.low")
-            .map_err(|error| self.err(error))?;
-        let relative = self
-            .builder
-            .build_int_add(head, low, "bits.relative")
-            .map_err(|error| self.err(error))?;
-        let carry = self
-            .builder
-            .build_right_shift(relative, three, false, "bits.carry")
-            .map_err(|error| self.err(error))?;
-        let byte = self
-            .builder
-            .build_int_add(whole, carry, "bits.byte")
-            .map_err(|error| self.err(error))?;
-        let bit = self
-            .builder
-            .build_and(relative, seven, "bits.bit")
-            .map_err(|error| self.err(error))?;
-        Ok((byte, bit))
     }
 
     fn bit_byte_ptr(
@@ -186,7 +168,8 @@ impl<'c> FnGen<'c, '_> {
                     .build_conditional_branch(empty, join, nonempty)
                     .map_err(|error| self.err(error))?;
                 self.builder.position_at_end(nonempty);
-                let (offset, head) = self.bit_position(view.head, lo)?;
+                let (offset, head) =
+                    bit_position(self.builder, view.head, lo).map_err(|e| self.err(e))?;
                 let base = self.bit_byte_ptr(view.base, offset)?;
                 self.builder
                     .build_unconditional_branch(join)
@@ -222,7 +205,8 @@ impl<'c> FnGen<'c, '_> {
                     .build_int_compare(IntPredicate::ULT, index, view.len, "bits.bounded")
                     .map_err(|error| self.err(error))?;
                 self.xml_abort_unless(valid, "bitset.index")?;
-                let (offset, bit) = self.bit_position(view.head, index)?;
+                let (offset, bit) =
+                    bit_position(self.builder, view.head, index).map_err(|e| self.err(e))?;
                 let address = self.bit_byte_ptr(view.base, offset)?;
                 let bit = self
                     .builder
@@ -315,7 +299,8 @@ impl<'c> FnGen<'c, '_> {
             .builder
             .build_int_sub(view.len, one, "bits.last.index")
             .map_err(|error| self.err(error))?;
-        let (last_byte, last_bit) = self.bit_position(view.head, last_index)?;
+        let (last_byte, last_bit) =
+            bit_position(self.builder, view.head, last_index).map_err(|e| self.err(e))?;
         let head = self
             .builder
             .build_int_truncate(view.head, i8, "bits.head.shift")
@@ -408,5 +393,51 @@ impl<'c> FnGen<'c, '_> {
             .map_err(|error| self.err(error))?;
         result.add_incoming(&[(&zero, entry), (&sum, body)]);
         Ok(result.as_basic_value().into_int_value())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn high_packed_offsets_and_final_byte_span_match_wide_integer_oracle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let context = Context::create();
+        let module = context.create_module("offsets");
+        let builder = context.create_builder();
+        let function =
+            module.add_function("offsets", context.void_type().fn_type(&[], false), None);
+        builder.position_at_end(context.append_basic_block(function, "entry"));
+        let ty = context.i64_type();
+        for head in 0..8u64 {
+            for distance in [0, 1, 7, 8, 9, 63, 64, 65] {
+                let index = i64::MAX as u64 - distance;
+                let absolute = u128::from(index) + u128::from(head);
+                let (byte, bit) = bit_position(
+                    &builder,
+                    ty.const_int(head, false),
+                    ty.const_int(index, false),
+                )?;
+                assert_eq!(
+                    byte.get_zero_extended_constant().map(u128::from),
+                    Some(absolute / 8)
+                );
+                assert_eq!(
+                    bit.get_zero_extended_constant().map(u128::from),
+                    Some(absolute % 8)
+                );
+                let (last, _) = bit_position(
+                    &builder,
+                    ty.const_int(head, false),
+                    ty.const_int(index - 1, false),
+                )?;
+                assert_eq!(
+                    last.get_zero_extended_constant().map(|n| u128::from(n) + 1),
+                    Some(absolute.div_ceil(8))
+                );
+            }
+        }
+        Ok(())
     }
 }

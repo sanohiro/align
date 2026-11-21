@@ -419,7 +419,7 @@ enum XmlAccessNode {
     CaptureSlot(Slot, Vec<XmlAccessPathSegment>),
     BufferValue(ValueId, Vec<XmlAccessPathSegment>),
     BufferSlot(Slot, Vec<XmlAccessPathSegment>),
-    PackedSlotAt(Slot, Vec<XmlAccessPathSegment>, ValueId),
+    PackedSlotAt(Slot, Vec<XmlAccessPathSegment>, ValueId, bool),
 }
 
 #[derive(Clone, Debug)]
@@ -2389,6 +2389,7 @@ struct XmlAccessCache {
 
 struct XmlAccessAnalyzer<'a> {
     packed_backing: bool,
+    checks_packed_headers: bool,
     graph: &'a ValidatedProducerGraph<'a>,
     equations: HashMap<XmlAccessNode, XmlAccessEquation>,
     scheduled: HashSet<XmlAccessNode>,
@@ -2400,6 +2401,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
         Self {
             graph,
             packed_backing: false,
+            checks_packed_headers: graph.function.value_tys.contains(&Ty::Bitset) || graph.function.slots.contains(&Ty::Bitset),
             equations: HashMap::new(),
             scheduled: HashSet::new(),
             pending: VecDeque::new(),
@@ -2614,7 +2616,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     _ => Vec::new(),
                 };
                 selected.extend(path);
-                return self.packed_slot_at(slot, selected, value);
+                return self.packed_slot_at(slot, selected, value, true);
             }
             Rvalue::ResourceViewFromRaw { .. } if self.packed_backing => {}
             Rvalue::BufferBytes(ref owner) | Rvalue::BuilderBytes(ref owner) if self.packed_backing => {
@@ -4107,6 +4109,8 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if !self.graph.function.slots.get(slot as usize)
                     .is_some_and(|actual| xml_flow_matches(self.graph.program, *actual, result_ty)) {
                     equation.invalid = true;
+                } else if selected_ty == Ty::Bitset || (self.checks_packed_headers && path.is_empty() && packed_backing::read_type(selected_ty)) {
+                    return self.packed_slot_at(slot, path, value, false);
                 } else if path.is_empty()
                     && let Some((element, length, _)) = xml_fixed_construction_shape(self.graph.program, result_ty)
                 {
@@ -5034,7 +5038,11 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 {
                     equation.invalid = true;
                 } else {
+                    let direct = path.is_empty();
                     selected_path.extend(path);
+                    if selected_ty == Ty::Bitset || (self.checks_packed_headers && direct && packed_backing::read_type(selected_ty)) {
+                        return self.packed_slot_at(slot, selected_path, value, false);
+                    }
                     Self::add_source(
                         &mut equation,
                         self.queue(XmlAccessNode::Slot(slot, selected_path)),
@@ -6041,6 +6049,16 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     return equation;
                 }
                 for (operand, ty) in operands.iter().zip(inputs) {
+                    if !packed_backing::native_value(self.graph.function, operand, *ty) { equation.invalid = true; }
+                    if let Operand::BorrowedPlace(place) = operand {
+                        let Some((_, selected)) = self.graph.function.slots.get(place.slot as usize)
+                            .and_then(|root| xml_borrowed_path(self.graph.program, *root, &place.path)) else {
+                            equation.invalid = true;
+                            return equation;
+                        };
+                        let proof = self.queue(XmlAccessNode::PackedSlotAt(place.slot, selected, value, false));
+                        Self::add_required_source(&mut equation, proof, OperandRequirement::READ);
+                    }
                     self.check_operand(&mut equation, operand, *ty);
                 }
                 if result == Ty::Bitset {
@@ -8305,7 +8323,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 }
                 XmlAccessNode::BufferValue(value, path) => self.buffer_value_equation(*value, path.clone()),
                 XmlAccessNode::BufferSlot(slot, path) => self.buffer_slot_equation(*slot, path.clone()),
-                XmlAccessNode::PackedSlotAt(slot, path, at) => self.packed_slot_at(*slot, path.clone(), *at),
+                XmlAccessNode::PackedSlotAt(slot, path, at, writable) => self.packed_slot_at(*slot, path.clone(), *at, *writable),
             };
             equation.requires_inputs = matches!(node,
                 XmlAccessNode::Value(..) | XmlAccessNode::CaptureValue(..) | XmlAccessNode::BufferValue(..));
@@ -8749,11 +8767,20 @@ fn xml_place_call_access_valid(
         requirement.callable = matches!(selected, Ty::Fn(_));
         requirement.is_satisfied_by(selected_access(*selected, path, false))
     }) { return false; }
+    for (leaf, tail) in leaves {
+        if *leaf == Ty::Bitset {
+            let mut selected = prefix.clone();
+            selected.extend_from_slice(tail);
+            let mut analyzer = XmlAccessAnalyzer::new(graph);
+            let proof = analyzer.queue(XmlAccessNode::PackedSlotAt(place.slot, selected, call, false));
+            if !OperandRequirement::READ.is_satisfied_by(analyzer.build(proof, Some(&graph.access_cache))) { return false; }
+        }
+    }
     if mode != align_ast::ParamMode::BorrowMut { return true; }
     if packed_backing::parameter_type(expected) {
         let mut analyzer = XmlAccessAnalyzer::new(graph);
         analyzer.packed_backing = true;
-        let proof = analyzer.queue(XmlAccessNode::PackedSlotAt(place.slot, prefix.clone(), call));
+        let proof = analyzer.queue(XmlAccessNode::PackedSlotAt(place.slot, prefix.clone(), call, true));
         let required = OperandRequirement { read: true, ..exclusive };
         if !required.is_satisfied_by(analyzer.build(proof, None)) { return false; }
     }
@@ -9071,7 +9098,8 @@ pub fn validate_checked_byte_views(program: &Program) -> Result<(), ProducerErro
                 Rvalue::Bitset { op, operands } => {
                     let (inputs, result) = op.signature();
                     result_ty == Some(result) && inputs.len() == operands.len() && inputs.iter().zip(operands)
-                        .all(|(ty, operand)| xml_operand_base_ty(function, operand) == Some(*ty))
+                        .all(|(ty, operand)| xml_operand_base_ty(function, operand) == Some(*ty)
+                            && packed_backing::native_value(function, operand, *ty))
                 }
                 Rvalue::SliceAsBytes { slice, elem } => {
                     checked_byte_view_element(*elem)
@@ -10400,7 +10428,7 @@ fn validate_resource_rvalues_component(
                 if (produces_checked_view || retypes_checked_view)
                     && !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result))
                 {
-                    return Err(fail(function, "HTTP view producer or retype contract mismatch"));
+                    return Err(fail(function, "view producer or retype contract mismatch"));
                 }
                 if let Rvalue::Bitset { op, operands } = rvalue {
                     if !OperandRequirement::READ.is_satisfied_by(xml_access(&Operand::Value(*value), result)) {
