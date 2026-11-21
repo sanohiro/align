@@ -1379,15 +1379,17 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             input: boxed!(input),
         },
         ExprKind::Utf8Valid { data } => ExprKind::Utf8Valid { data: boxed!(data) },
-        ExprKind::Compress { kind, data, level } => ExprKind::Compress {
+        ExprKind::Compress { kind, data, level, dictionary } => ExprKind::Compress {
             kind: *kind,
             data: boxed!(data),
             level: boxed!(level),
+            dictionary: take_optional_boxed_expr(clones, dictionary.is_some())?,
         },
-        ExprKind::Decompress { kind, data, max_bytes } => ExprKind::Decompress {
+        ExprKind::Decompress { kind, data, max_bytes, dictionary } => ExprKind::Decompress {
             kind: *kind,
             data: boxed!(data),
             max_bytes: boxed!(max_bytes),
+            dictionary: take_optional_boxed_expr(clones, dictionary.is_some())?,
         },
         ExprKind::RandSeedWith { seed } => ExprKind::RandSeedWith { seed: boxed!(seed) },
         ExprKind::RandNext { rng } => ExprKind::RandNext { rng: boxed!(rng) },
@@ -2514,16 +2516,6 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             command: lhs,
             limit: rhs,
         }
-        | ExprKind::Compress {
-            data: lhs,
-            level: rhs,
-            ..
-        }
-        | ExprKind::Decompress {
-            data: lhs,
-            max_bytes: rhs,
-            ..
-        }
         | ExprKind::RegexIsMatch {
             regex: lhs,
             text: rhs,
@@ -2936,6 +2928,12 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(index);
         }
         ExprKind::BorrowedIndex { index, .. } => one!(index),
+        ExprKind::Compress { data, level, dictionary, .. }
+        | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
+            one!(data);
+            one!(level);
+            optional!(dictionary);
+        }
         ExprKind::ArrayBuilderNew { region, capacity, .. } => { optional!(region); one!(capacity); }
         ExprKind::BufferNew { capacity, fill, alignment, pages } | ExprKind::BufferTryNew { capacity, fill, alignment, pages } => { one!(capacity); optional!(fill); one!(alignment); one!(pages); }
         ExprKind::BuilderNew { capacity } => optional!(capacity),

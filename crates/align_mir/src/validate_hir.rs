@@ -9971,11 +9971,16 @@ impl<'a> BodyValidator<'a> {
             hir::ExprKind::Utf8Valid { data } => {
                 (data.ty == Ty::Slice(u8_scalar)).then(|| strict(Ty::Bool, &[data]))?
             }
-            hir::ExprKind::Compress { data, level, .. } => {
-                (byte_view(data.ty) && level.ty == i64).then(|| result(Ty::Buffer, &[data, level]))?
-            }
-            hir::ExprKind::Decompress { data, max_bytes, .. } => {
-                (byte_view(data.ty) && max_bytes.ty == i64).then(|| result(Ty::Buffer, &[data, max_bytes]))?
+            hir::ExprKind::Compress { kind, data, level, dictionary }
+            | hir::ExprKind::Decompress { kind, data, max_bytes: level, dictionary } => {
+                if !byte_view(data.ty) || level.ty != i64 { return None; }
+                match dictionary {
+                    None => result(Ty::Buffer, &[data, level]),
+                    Some(dict) if *kind != hir::CompressKind::Gzip && byte_view(dict.ty) => {
+                        result(Ty::Buffer, &[data, level, dict])
+                    }
+                    Some(_) => None,
+                }
             }
             hir::ExprKind::RandSeed => (expression.ty == Ty::Rng).then_some((Ty::Rng, true, Vec::new())),
             hir::ExprKind::RandSeedWith { seed } => {

@@ -17895,10 +17895,11 @@ impl EffectScan<'_> {
             // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
             // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
             // `par_map`. Recurse into the operands.
-            ExprKind::Compress { data, level, .. }
-            | ExprKind::Decompress { data, max_bytes: level, .. } => {
+            ExprKind::Compress { data, level, dictionary, .. }
+            | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 walk!(data);
                 walk!(level);
+                if let Some(dictionary) = dictionary { walk!(dictionary); }
                 self.impure_direct = true;
             }
             // `std.rand` — **all impure**: `seed()` reads OS entropy; `seed_with`/`next`/`range`/
@@ -30349,10 +30350,11 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.compress` — the owned `buffer` result borrows nothing from `data`; just recurse
             // into the operands so any escape inside them is still checked.
-            ExprKind::Compress { data, level, .. }
-            | ExprKind::Decompress { data, max_bytes: level, .. } => {
+            ExprKind::Compress { data, level, dictionary, .. }
+            | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 self.walk(data, depth);
                 self.walk(level, depth);
+                if let Some(dictionary) = dictionary { self.walk(dictionary, depth); }
             }
             // `std.rand`: an `rng` is Copy/`Static` (borrows nothing); `sample` returns a fresh owned
             // `array<T>` that borrows nothing from `xs`. Nothing escapes — just recurse into the
@@ -51280,10 +51282,11 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => move_expr!(self, input, moved, false, false),
             // `std.compress` borrows its byte-view `data` (never consumed) — like `encoding.*`.
-            ExprKind::Compress { data, level, .. }
-            | ExprKind::Decompress { data, max_bytes: level, .. } => {
+            ExprKind::Compress { data, level, dictionary, .. }
+            | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 move_expr!(self, data, moved, false, false);
                 move_expr!(self, level, moved, false, false);
+                if let Some(dictionary) = dictionary { move_expr!(self, dictionary, moved, false, false); }
             }
             // `std.rand`: the `rng` receiver is Copy (advanced in place, never consumed) and `xs` is a
             // Copy slice view (borrowed), so nothing is moved — recurse non-consuming to catch a
@@ -68287,40 +68290,42 @@ impl<'a, 't> Checker<'a, 't> {
         };
         let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
         let what = format!("compress.{method}");
-        if method.ends_with("_decompress") {
-            if !(1..=2).contains(&args.len()) {
-                self.diags
-                    .error(format!("'{what}' expects 1 or 2 arguments (data, max_bytes), got {}", args.len()), span);
+        let decompress = method.ends_with("_decompress");
+        let (arity, signature) = match (decompress, kind == hir::CompressKind::Gzip) {
+            (false, true) => (2..=2, "2 arguments (data, level)"),
+            (false, false) => (2..=3, "2 or 3 arguments (data, level, optional dictionary)"),
+            (true, true) => (1..=2, "1 or 2 arguments (data, optional max_bytes)"),
+            (true, false) => (1..=3, "1 to 3 arguments (data, optional max_bytes, optional dictionary)"),
+        };
+        if !arity.contains(&args.len()) {
+            self.diags.error(format!("'{what}' expects {signature}, got {}", args.len()), span);
+            return err;
+        }
+        let parameter = if decompress { "max_bytes" } else { "level" };
+        let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
+        let numeric = if let Some(argument) = args.get(1) {
+            let value = self.check_expr(argument, None);
+            if value.ty == Ty::Error || !self.require_i64_arg(value.ty, argument.span, &format!("'{what}' {parameter}")) {
                 return err;
             }
-            let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
-            let max_bytes = if let Some(argument) = args.get(1) {
-                let value = self.check_expr(argument, None);
-                if value.ty == Ty::Error || !self.require_i64_arg(value.ty, argument.span, &format!("'{what}' max_bytes")) {
-                    return err;
-                }
-                value
-            } else {
-                Expr { kind: ExprKind::Int(1 << 30), ty: Ty::Int(IntTy { bits: 64, signed: true }), span }
-            };
-            return Expr { kind: ExprKind::Decompress { kind, data: Box::new(data), max_bytes: Box::new(max_bytes) }, ty: result_ty, span };
-        }
-        // `*_compress(data, level)`.
-        if args.len() != 2 {
-            self.diags
-                .error(format!("'{what}' expects 2 arguments (data, level), got {}", args.len()), span);
-            return err;
-        }
-        let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
-        // `level` must be exactly `i64` (the runtime ABI); the range is a runtime concern (abort).
-        let level = self.check_expr(&args[1], None);
-        if level.ty == Ty::Error {
-            return err;
-        }
-        if !self.require_i64_arg(level.ty, args[1].span, &format!("'{what}' level")) {
-            return err;
-        }
-        Expr { kind: ExprKind::Compress { kind, data: Box::new(data), level: Box::new(level) }, ty: result_ty, span }
+            value
+        } else {
+            Expr { kind: ExprKind::Int(1 << 30), ty: Ty::Int(IntTy { bits: 64, signed: true }), span }
+        };
+        let dictionary = if let Some(argument) = args.get(2) {
+            let Some(value) = self.check_byte_view(argument, &format!("{what} dictionary")) else { return err };
+            Some(Box::new(value))
+        } else {
+            None
+        };
+        let data = Box::new(data);
+        let numeric = Box::new(numeric);
+        let operation = if decompress {
+            ExprKind::Decompress { kind, data, max_bytes: numeric, dictionary }
+        } else {
+            ExprKind::Compress { kind, data, level: numeric, dictionary }
+        };
+        Expr { kind: operation, ty: result_ty, span }
     }
 
     /// `std.crypto` — the self-hosted `constant_time_equal` and the OS-CSPRNG `random` (Slice 1),
@@ -74250,10 +74255,11 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
             | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
-            ExprKind::Compress { data, level, .. }
-            | ExprKind::Decompress { data, max_bytes: level, .. } => {
+            ExprKind::Compress { data, level, dictionary, .. }
+            | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 self.finalize_expr(data);
                 self.finalize_expr(level);
+                if let Some(dictionary) = dictionary { self.finalize_expr(dictionary); }
             }
             ExprKind::RandSeed => {}
             ExprKind::RandSeedWith { seed } => self.finalize_expr(seed),

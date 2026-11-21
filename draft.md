@@ -4723,9 +4723,25 @@ compress.zlib_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.zlib_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.deflate_raw_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.deflate_raw_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
+compress.zlib_compress(data: bytes, level: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.zlib_decompress(data: bytes, max_bytes: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.deflate_raw_compress(data: bytes, level: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.deflate_raw_decompress(data: bytes, max_bytes: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.zstd_compress(data: bytes, level: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.zstd_decompress(data: bytes, max_bytes: i64, dictionary: bytes) -> Result<buffer, Error>
 ```
 
-All four decoders accept an optional trailing `max_bytes`, default 1073741824.
+Zlib, raw DEFLATE and Zstandard accept a third positional `dictionary: bytes`
+after the explicit level or output limit. The call borrows both views through
+all three operand evaluations and the native operation. An empty dictionary
+selects ordinary framing. Zlib checks the requested Adler-32 identifier. Raw
+DEFLATE carries no identifier or checksum, so a wrong dictionary can decode
+to different bytes. Zstandard accepts raw or trained dictionaries, treats
+fewer than eight bytes as empty, and uses one dictionary across all frames.
+Malformed trained headers and mismatched frame dictionary IDs return
+`Error.Invalid`. Gzip accepts its original arities.
+
+All four decoders accept an optional second `max_bytes`, default 1073741824.
 It must be i64 in `0..=1073741824`; an invalid value aborts after source-order operand
 evaluation, before input inspection or native initialization. Zero admits complete
 empty-output streams only; excess output returns `Error.Invalid`. Output allocation
@@ -4748,12 +4764,11 @@ Zlib and raw DEFLATE use `libz` with window bits 15 and -15 respectively.
 Each decompressor requires exactly one complete stream and all input consumed;
 a second stream or any trailing byte is `Error.Invalid`. Raw final-byte padding
 bits remain part of that byte; raw DEFLATE has no checksum or identifying magic.
-Zlib rejects bad Adler-32 and preset dictionaries. Both keep the inclusive caller
+Zlib rejects bad checksums and unsatisfied dictionary requests. Both keep the inclusive caller
 output cap, atomic owned output, Impure effect and existing error mapping.
 Compression emits one stream, even for empty input. Levels are `i64` 0..=9;
 out-of-range levels abort before native initialization, as for gzip. The source
-arguments evaluate in order. No streaming API, dictionary API
-or PNG policy is added. [Plan226](docs/impl/226-deflate-framing.md) owns this completion.
+arguments evaluate in order. [Plan226](docs/impl/226-deflate-framing.md) owns this completion.
 
 ### std.rand
 

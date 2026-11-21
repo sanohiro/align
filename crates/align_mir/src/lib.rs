@@ -2530,6 +2530,7 @@ pub enum Rvalue {
         kind: hir::CompressKind,
         data: Operand,
         level: Operand,
+        dictionary: Option<Operand>,
         out: Slot,
     },
     /// `compress.gzip_decompress(data, max_bytes)` — inflate the gzip byte view `data`; the runtime writes an
@@ -2539,6 +2540,7 @@ pub enum Rvalue {
         kind: hir::CompressKind,
         data: Operand,
         max_bytes: Operand,
+        dictionary: Option<Operand>,
         out: Slot,
     },
     /// `encoding.utf8_valid(b)` — whether the byte view `b` (`{ptr,len}`) is valid UTF-8, an `i32`
@@ -9764,36 +9766,24 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             // `compress.gzip_compress(data, level)` / `gzip_decompress(data)` → `Result<buffer, Error>`:
             // the runtime writes an owned `buffer` handle into `out` + returns an i32 status; branch
             // `Ok(<buffer>)` / `Err(<mapped>)` via the shared status→result helper.
-            hir::ExprKind::Compress { kind, data, level } => {
+            hir::ExprKind::Compress { kind, data, level, dictionary }
+            | hir::ExprKind::Decompress { kind, data, max_bytes: level, dictionary } => {
                 let out = b.new_slot(Ty::Buffer);
-                lower_required_binding!(b, d = lower_expr(b, data), Operand::Const(Const::Unit));
-                lower_required_binding!(b, lv = lower_expr(b, level), Operand::Const(Const::Unit));
+                lower_required_binding!(b, data = lower_expr(b, data), Operand::Const(Const::Unit));
+                lower_required_binding!(b, numeric = lower_expr(b, level), Operand::Const(Const::Unit));
+                let dictionary = if let Some(value) = dictionary {
+                    lower_required_binding!(b, dict = lower_expr(b, value), Operand::Const(Const::Unit));
+                    Some(dict)
+                } else {
+                    None
+                };
+                let operation = if matches!(e.kind, hir::ExprKind::Compress { .. }) {
+                    Rvalue::CompressCompress { kind: *kind, data, level: numeric, dictionary, out }
+                } else {
+                    Rvalue::CompressDecompress { kind: *kind, data, max_bytes: numeric, dictionary, out }
+                };
                 let code = b.fresh_value(status_ty());
-                b.push(Stmt::Let(
-                    code,
-                    Rvalue::CompressCompress {
-                        kind: *kind,
-                        data: d,
-                        level: lv,
-                        out,
-                    },
-                ));
-                emit_status_buffer_result(b, code, out, e.ty)
-            }
-            hir::ExprKind::Decompress { kind, data, max_bytes } => {
-                let out = b.new_slot(Ty::Buffer);
-                lower_required_binding!(b, d = lower_expr(b, data), Operand::Const(Const::Unit));
-                lower_required_binding!(b, limit = lower_expr(b, max_bytes), Operand::Const(Const::Unit));
-                let code = b.fresh_value(status_ty());
-                b.push(Stmt::Let(
-                    code,
-                    Rvalue::CompressDecompress {
-                        kind: *kind,
-                        data: d,
-                        max_bytes: limit,
-                        out,
-                    },
-                ));
+                b.push(Stmt::Let(code, operation));
                 emit_status_buffer_result(b, code, out, e.ty)
             }
             // `encoding.utf8_valid(b)` → the runtime returns an `i32` (1/0); compare `!= 0` to a `bool`

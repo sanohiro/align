@@ -2227,11 +2227,11 @@ pub enum ExprKind {
     /// a programmer error like `rand.range`) into an owned `buffer` (the `ty` is
     /// `Result<buffer, Error>`). Wraps the libz DEFLATE engine (draft §15). **Impure** (a C-engine
     /// call — never `Pure`, so excluded from `par_map`). `data` is borrowed, never consumed.
-    Compress { kind: CompressKind, data: Box<Expr>, level: Box<Expr> },
+    Compress { kind: CompressKind, data: Box<Expr>, level: Box<Expr>, dictionary: Option<Box<Expr>> },
     /// `compress.gzip_decompress(data, max_bytes)` — inflate the gzip byte view `data` into an owned `buffer`
     /// (the `ty` is `Result<buffer, Error>`). Corrupt / truncated input, or a decompress "bomb" that
     /// would exceed the caller output cap, yields `Error.Invalid`. **Impure**; `data` is borrowed.
-    Decompress { kind: CompressKind, data: Box<Expr>, max_bytes: Box<Expr> },
+    Decompress { kind: CompressKind, data: Box<Expr>, max_bytes: Box<Expr>, dictionary: Option<Box<Expr>> },
     /// `rand.seed()` — a fresh [`crate::Ty::Rng`] seeded from the OS CSPRNG (`getrandom`). The `ty`
     /// is [`crate::Ty::Rng`], a **Copy** state-only value (no fd/ownership). Impure (reads OS
     /// entropy — a different sequence each run).

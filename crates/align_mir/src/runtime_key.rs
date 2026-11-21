@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 485] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 491] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -132,13 +132,19 @@ runtime_keys! {
     CommandStdoutTo => "command_stdout_to",
     CommandTimeout => "command_timeout",
     CompressDeflateRawCompress => "compress_deflate_raw_compress",
+    CompressDeflateRawCompressDict => "compress_deflate_raw_compress_dict",
     CompressDeflateRawDecompress => "compress_deflate_raw_decompress",
+    CompressDeflateRawDecompressDict => "compress_deflate_raw_decompress_dict",
     CompressGzipCompress => "compress_gzip_compress",
     CompressGzipDecompress => "compress_gzip_decompress",
     CompressZlibCompress => "compress_zlib_compress",
+    CompressZlibCompressDict => "compress_zlib_compress_dict",
     CompressZlibDecompress => "compress_zlib_decompress",
+    CompressZlibDecompressDict => "compress_zlib_decompress_dict",
     CompressZstdCompress => "compress_zstd_compress",
+    CompressZstdCompressDict => "compress_zstd_compress_dict",
     CompressZstdDecompress => "compress_zstd_decompress",
+    CompressZstdDecompressDict => "compress_zstd_decompress_dict",
     CryptoAesGcmOpen => "crypto_aes_gcm_open",
     CryptoAesGcmSeal => "crypto_aes_gcm_seal",
     CryptoArgon2id => "crypto_argon2id",
@@ -510,7 +516,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 485] = [(); RuntimeKey::ALL.len()];
+const _: [(); 491] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -519,7 +525,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 485);
+        assert_eq!(RuntimeKey::ALL.len(), 491);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

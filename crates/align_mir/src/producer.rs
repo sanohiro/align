@@ -1678,15 +1678,15 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
-        Rvalue::CompressCompress { data, level, out, .. } => {
+        Rvalue::CompressCompress { kind, data, level, dictionary, out }
+        | Rvalue::CompressDecompress { kind, data, max_bytes: level, dictionary, out } => {
             contract.result = i32_ty;
             contract.outputs = vec![(*out, Ty::Buffer)];
             contract.operands = vec![(data, byte_view(data), read), (level, i64_ty, read)];
-        }
-        Rvalue::CompressDecompress { data, max_bytes, out, .. } => {
-            contract.result = i32_ty;
-            contract.outputs = vec![(*out, Ty::Buffer)];
-            contract.operands = vec![(data, byte_view(data), read), (max_bytes, i64_ty, read)];
+            if let Some(dict) = dictionary {
+                let expected = if *kind == align_sema::hir::CompressKind::Gzip { Ty::Error } else { byte_view(dict) };
+                contract.operands.push((dict, expected, read));
+            }
         }
         Rvalue::JsonDocCollect { kind, doc, arena, out } => {
             contract.outputs = vec![(*out, Ty::Slice(kind.element()))];
@@ -2197,8 +2197,12 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::RegexSplit { regex, text, .. }
         | Rvalue::RegexCaptures { regex, text, .. } => vec![regex, text],
         Rvalue::CapturesGroup { caps, index, .. } => vec![caps, index],
-        Rvalue::CompressCompress { data, level, .. }
-        | Rvalue::CompressDecompress { data, max_bytes: level, .. } => vec![data, level],
+        Rvalue::CompressCompress { data, level, dictionary, .. }
+        | Rvalue::CompressDecompress { data, max_bytes: level, dictionary, .. } => {
+            let mut operands = vec![data, level];
+            operands.extend(dictionary.as_ref());
+            operands
+        }
         Rvalue::CryptoHkdf {
             salt,
             ikm,

@@ -1449,8 +1449,8 @@ merely because its `Ty` matches.
 | `UnicodeNfc` | Canonical `pkg.unicode$nfc` body with one ByValue Str parameter; exact Local child and builtin `Result<string, Error>` output; fresh owned output, no input retention, Pure. Source or imported-inline origin only; malformed signature/body/origin/child/result/cleanup rejects. Plan191 owns the complete boundary. |
 | `EncodingDecode` | `env[kind]`; `child[input]`; `Str; result ERR(Buffer); fresh owned output on success; Pure`. |
 | `Utf8Valid` | `env[]; child[data]`; `bytes; result Bool; borrowed; Pure`. |
-| `Compress` | `env[kind=Gzip\|Zlib\|DeflateRaw\|Zstd]`; `child[data,level]`; `byte-view,i64; result ERR(Buffer); fresh owned output; Impure`. |
-| `Decompress` | `env[kind=Gzip\|Zlib\|DeflateRaw\|Zstd]`; `child[data,max_bytes]`; `byte-view, exact i64 limit; result ERR(Buffer); fresh owned output; Impure`. |
+| `Compress` | `env[kind=Gzip\|Zlib\|DeflateRaw\|Zstd]`; `child[data,level,dictionary?]`; `byte-view,i64,optional byte-view; dictionary requires Zlib/DeflateRaw/Zstd; result ERR(Buffer); fresh owned output; Impure`. |
+| `Decompress` | `env[kind=Gzip\|Zlib\|DeflateRaw\|Zstd]`; `child[data,max_bytes,dictionary?]`; `byte-view, exact i64 limit, optional byte-view; dictionary requires Zlib/DeflateRaw/Zstd; result ERR(Buffer); fresh owned output; Impure`. |
 | `RandSeed` | `env[]; child[]; result Rng; Copy mutable state; Impure`. |
 | `RandSeedWith` | `env[]; child[seed]`; `i64; result Rng; Copy mutable state; Impure`. |
 | `RandNext` | `env[]; child[rng]`; `SourceMutLocal(Rng,rng); result i64; rng mutated; Impure`. |
@@ -1551,6 +1551,11 @@ merely because its `Ty` matches.
 | `PathComponentKind::Base` | Returns final path component view. |
 | `PathComponentKind::Dir` | Returns directory-prefix view. |
 | `PathComponentKind::Ext` | Returns extension view. |
+
+Plan265 adds one optional checked byte-view operand for zlib, raw DEFLATE and
+Zstandard. Both directions validate its presence against the framing kind and
+visit it after data and the numeric parameter, including in unused operations.
+The complete owner is `deflate_codec_hir_signature_matrix`.
 
 ### Heap-record array-builder producer/validator closure
 

@@ -714,3 +714,37 @@ pub fn main() -> i32 {
 ";
     assert!(check_errs("m11z-decomp-parmap", src), "an impure decompress-using closure must be rejected by par_map");
 }
+
+#[test]
+fn preset_dictionary_temporaries_drop_on_success_error_and_early_exit() {
+    if !backend_available() { return; }
+    let program = r#"
+import std.compress
+extern "C" fn align_rt_alloc_count() -> i64
+extern "C" fn align_rt_free_count() -> i64
+fn exercise(leave:bool)->Result<i64,Error> {
+  packed:=compress.zlib_compress("temperature".clone(),6,{
+    if leave { return Ok(1) }
+    "sample dictionary:temperature".clone()
+  })?
+  plain:=compress.zlib_decompress(packed.bytes(),11,"sample dictionary:temperature".clone())?
+  return match compress.zlib_decompress(packed.bytes(),11,"wrong dictionary".clone()) {
+    Ok(_) => Ok(0),
+    Err(_) => Ok(plain.len()),
+  }
+}
+fn main()->Result<(),Error> {
+  allocated:=unsafe { align_rt_alloc_count() }
+  freed:=unsafe { align_rt_free_count() }
+  print(exercise(true)?)
+  print(exercise(false)?)
+  allocations:=unsafe { align_rt_alloc_count() }-allocated
+  deallocations:=unsafe { align_rt_free_count() }-freed
+  print(allocations>=5 && allocations==deallocations)
+  return Ok(())
+}
+"#;
+    let result = build_and_run("preset-dictionary-drops", program);
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert_eq!(result.stdout, b"1\n11\ntrue\n");
+}

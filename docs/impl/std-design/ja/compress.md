@@ -21,9 +21,24 @@ compress.zlib_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.zlib_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
 compress.deflate_raw_compress(data: bytes, level: i64) -> Result<buffer, Error>
 compress.deflate_raw_decompress(data: bytes, max_bytes: i64 = 1073741824) -> Result<buffer, Error>
+compress.zlib_compress(data: bytes, level: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.zlib_decompress(data: bytes, max_bytes: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.deflate_raw_compress(data: bytes, level: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.deflate_raw_decompress(data: bytes, max_bytes: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.zstd_compress(data: bytes, level: i64, dictionary: bytes) -> Result<buffer, Error>
+compress.zstd_decompress(data: bytes, max_bytes: i64, dictionary: bytes) -> Result<buffer, Error>
 ```
 
-4種類の展開関数は省略可能な末尾引数 `max_bytes` を受け取り、既定値は 1073741824。
+zlib・raw DEFLATE・Zstandard は、圧縮レベルまたは展開上限を指定した後に、第3引数
+`dictionary: bytes` を受け取る。両方のバイト列を借用し、すべての引数を左から
+評価してからネイティブ処理を呼ぶ。空の辞書は通常の形式を選ぶ。zlib は要求された
+辞書の Adler-32 を照合する。raw DEFLATE は辞書識別子もチェックサムも持たず、
+誤った辞書で異なる内容に展開できることがある。Zstandard は生の辞書と学習済み
+辞書を受け付け、8バイト未満は空として扱う。連結した全フレームに同じ辞書を使う。
+学習済みヘッダーの破損や辞書 ID の不一致は `Error.Invalid` になる。gzip は従来の
+引数を使う。
+
+4種類の展開関数は省略可能な第2引数 `max_bytes` を受け取り、既定値は 1073741824。
 型は厳密に i64、範囲は `0..=1073741824`。引数をソース順に一度ずつ評価した後、
 範囲外なら入力検査・ネイティブ初期化より前に abort する。入力は上限引数の評価中も生存する。
 0 は出力が空の完全なストリームを許可し、空の符号化入力は拒否する。超過は `Error.Invalid`。
@@ -53,17 +68,17 @@ C エンジンのエラーコードは `Error.Invalid`（破損・切り詰め�
 - 空入力、不完全・破損したメンバーやフレーム（後続のチェックサムも含む）、末尾の余分なバイト（gzip のゼロパディングも含む）は `Error.Invalid` となる。
 - 展開後の合計ペイロードは全メンバー・フレームを通じて呼び出し側の上限以下（省略時は **1 GiB**）とする。超過は `Error.Invalid`。gzip/zstd は上限ちょうどでも後続の正常な空メンバーやスキップ可能フレームを許可する。この制限は返却ペイロードに対するものであり、ネイティブ作業領域やプロセス RSS の上限ではない。
 
-一つのネイティブストリームと伸長する出力ベクターを呼び出し中に再利用する。上限ではスタック上の 1 バイトを出力先としてメタデータの処理を進め、実データが出力された場合は `Error.Invalid` とする。ネイティブエラーはこの判定より優先する。失敗時はネイティブ状態と部分出力を解放する。圧縮は引き続き一つのメンバー・フレームを生成する。ストリーミング入力 API、辞書、部分展開 API は追加しない。正確な契約と検証範囲は [Plan 124](../../124-complete-decompression.md) に定める。
+一つのネイティブストリームと伸長する出力ベクターを呼び出し中に再利用する。上限ではスタック上の 1 バイトを出力先としてメタデータの処理を進め、実データが出力された場合は `Error.Invalid` とする。ネイティブエラーはこの判定より優先する。失敗時はネイティブ状態と部分出力を解放する。圧縮は引き続き一つのメンバー・フレームを生成する。正確な契約と検証範囲は [Plan 124](../../124-complete-decompression.md) に定める。
 
 zlib と raw DEFLATE はそれぞれ window bits 15・-15 で `libz` を利用する。
 各デコーダーは完全な1ストリームで入力全体を消費し、後続ストリームや余分な
 バイトは `Error.Invalid` にする。raw の最終バイト内のパディングビットは
 そのバイトの一部であり、raw にはチェックサムや形式を識別するマジック値はない。
-zlib は不正な Adler-32 とプリセット辞書を拒否する。呼び出し側の上限、成功時だけの
+zlib はチェックサムの不一致と、指定した辞書で満たせない要求を拒否する。呼び出し側の上限、成功時だけの
 独立した所有出力、Impure 効果、既存のエラー対応を共有する。
 圧縮は空入力でも1ストリームを生成する。level は `i64` の 0..=9 で、範囲外は
 ネイティブ初期化前に abort する。引数はソース順に評価する。
-ストリーミング API・辞書 API・PNG 方針は追加しない。
+
 [Plan226](../../226-deflate-framing.md) が正確な契約を定める。
 
 ## Runtime and dependencies
