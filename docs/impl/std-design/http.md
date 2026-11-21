@@ -29,7 +29,7 @@ Empty trust uses the system store. Explicit trust accepts self-signed CA certifi
 
 A nonempty CRL list requires explicit trust. Every new connection verifies the peer's chain and identity against current, signed revocation evidence. These clients establish a fresh connection for each request. Missing coverage, revoked certificates, and expired or future evidence yield `Error.Denied`. The configured client owns the parsed credentials and its connection pool. [Full contract](../269-private-http-client-tls.md)
 
-When `resume_sessions` is true, supply explicit roots and an empty CRL list. On a fresh TCP connection the client may offer one TLS 1.2 session or TLS 1.3 ticket from a completed request to the same origin. Each issuance is single-use. The original certificate validity, the native session lifetime and 90 seconds of monotonic time bound reuse. A server can select a new verified handshake. HTTP data follows the handshake. [Session resumption contract](../270-http-session-resumption.md)
+When `resume_sessions` is true, supply explicit roots and an empty CRL list. On a fresh TCP connection the client may offer one TLS 1.2 session or TLS 1.3 ticket from a completed request to the same origin. Each issuance is single-use. The original certificate validity, the native session lifetime and 90 seconds of monotonic time bound reuse. A server can select a new verified handshake. Before sending HTTP data, this mode checks the peer chain and all configured client certificates again, including credentials the peer did not request. [Session resumption contract](../270-http-session-resumption.md)
 
 ## Signatures
 

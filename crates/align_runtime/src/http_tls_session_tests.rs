@@ -437,10 +437,13 @@ fn earliest_peer_path_or_client_certificate_bounds_the_offer() {
             at(&c, start, 0);
             assert_eq!(get(&c, &peer.url), 0);
             at(&c, expiry + delta, 1);
-            assert_eq!(get(&c, &peer.url), 0);
+            assert_eq!(get(&c, &peer.url), if expected { 0 } else { AL_DENIED });
+            let observations = peer.worker.join().unwrap();
+            let last = &observations[1];
+            assert!(last.handshake);
             assert_eq!(
-                hits(peer),
-                [false, expected],
+                (last.resumed, last.request),
+                (expected, expected),
                 "{mid} {leaf} identity={identity} delta={delta}"
             );
         }
@@ -545,4 +548,71 @@ fn ticket_survives_producing_connection_drop_after_another_worker_offers_it() {
         request.join().unwrap();
     });
     assert!(worker.join().unwrap());
+}
+
+#[test]
+fn session_lifetime_hint_follows_the_negotiated_protocol() {
+    unsafe extern "C" {
+        fn align_tls_session_bounds(
+            protocol: c_int,
+            ticket: c_int,
+            issued: i64,
+            lifetime: c_long,
+            hint: std::ffi::c_ulong,
+            until: *mut i64,
+        ) -> c_int;
+    }
+    for (version, ticket, hint, expected) in [
+        (0x0303, 0, 0, Some(160)),
+        (0x0303, 1, 0, Some(160)),
+        (0x0303, 1, 20, Some(120)),
+        (0x0304, 1, 0, None),
+        (0x0304, 0, 20, None),
+        (0x0304, 1, 20, Some(120)),
+        (0x0304, 1, 120, Some(160)),
+    ] {
+        let mut until = -1;
+        let ok =
+            unsafe { align_tls_session_bounds(version, ticket, 100, 60, hint, &mut until) } != 0;
+        assert_eq!(
+            ok.then_some(until),
+            expected,
+            "{version} ticket={ticket} hint={hint}"
+        );
+    }
+}
+
+#[test]
+fn full_and_fallback_handshakes_recheck_the_peer_before_sending_http() {
+    let _network = network();
+    let now = wall() + 5;
+    let expires = 2_524_608_000; // server_short, 2050-01-01
+    for fallback in [false, true] {
+        let script = if fallback {
+            vec![Exchange::Body, Exchange::FreshContext]
+        } else {
+            vec![Exchange::Body]
+        };
+        let peer = configured_server(
+            TLS13,
+            false,
+            script,
+            format!("{}\n{}", dated("server_short"), dated("mid")),
+            dated("server_key"),
+            0,
+        );
+        let c = client_mode([&peer.url, dated("root"), "", "", ""], 1).unwrap();
+        if fallback {
+            at(&c, now, 0);
+            assert_eq!(get(&c, &peer.url), 0);
+        }
+        clock(&c, &[(now, 1), (expires, 2)]);
+        assert_eq!(get(&c, &peer.url), AL_DENIED);
+        let observed = peer.worker.join().unwrap();
+        let last = observed.last().unwrap();
+        assert!(
+            last.handshake && !last.resumed && !last.request,
+            "{observed:?}"
+        );
+    }
 }

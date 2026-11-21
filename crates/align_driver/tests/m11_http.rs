@@ -754,6 +754,8 @@ pub fn forward(origin: str) -> Result<http_client, Error> {
 }"#;
         let main = r#"import policy
 import std.http
+import core.json
+fn id<T>(x: T) -> T = x
 fn denied(e: Error) -> bool = match e { Denied => true, _ => false }
 fn mark(i: i32) -> str { print(i); return "" }
 fn flag() -> bool { print(6); return true }
@@ -773,7 +775,8 @@ fn main() -> Result<(), Error> {
     }
     print(stop())
     print(stop_flag())
-    no_resume := policy.explicit("https://localhost", false, 0)?
+    no_resume := http.tls_client("https://localhost", "", "", "", "", json.decode("false")?)?
+    wrapped := http.tls_client("https://localhost", "", "", "", "", id(json.decode("false")?))?
     match policy.explicit("https://localhost", flag(), 0) {
         Err(e) => { match e { Invalid => {}, _ => {return Err(e)} } },
         Ok(_) => { return Err(Error.Invalid) }

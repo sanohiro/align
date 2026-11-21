@@ -114,11 +114,11 @@ static int intersect_certificate(struct interval *auth, const ASN1_TIME *epoch, 
     if (auth->until > until) auth->until = until;
     return auth->from < auth->until;
 }
-static int certificate_interval(SSL *ssl, struct interval *auth, struct clock_pair now) {
+static int check_certificates(SSL *ssl, struct interval *auth, struct clock_pair now) {
     const STACK_OF(X509) *peer = SSL_get0_verified_chain(ssl);
-    if (sk_X509_num(peer) <= 0) return 0;
+    if (sk_X509_num(peer) <= 0) return denied;
     ASN1_TIME *epoch = ASN1_TIME_set(NULL, 0);
-    if (!epoch) return 0;
+    if (!epoch) return engine_error;
     *auth = (struct interval){ .from = now.wall, .until = INT64_MAX, .verified_at = now.monotonic };
     int valid = 1;
     for (int i = 0; valid && i < sk_X509_num(peer); i++)
@@ -131,7 +131,7 @@ static int certificate_interval(SSL *ssl, struct interval *auth, struct clock_pa
             valid = intersect_certificate(auth, epoch, sk_X509_value(chain, i));
     }
     ASN1_TIME_free(epoch);
-    return valid && current(*auth, now);
+    return valid && current(*auth, now) ? 0 : denied;
 }
 
 int align_tls_sessions_verified(SSL *ssl, const struct clock_pair *clock) {
@@ -140,9 +140,22 @@ int align_tls_sessions_verified(SSL *ssl, const struct clock_pair *clock) {
     int timed = read_clock(clock, &now);
     if (SSL_get_verify_result(ssl) != X509_V_OK) return denied;
     if (SSL_session_reused(ssl)) return timed && ex->authenticated && current(ex->auth, now) ? 0 : denied;
-    ex->authenticated = timed && certificate_interval(ssl, &ex->auth, now);
+    int status = timed ? check_certificates(ssl, &ex->auth, now) : engine_error;
+    ex->authenticated = status == 0;
     ERR_clear_error();
-    return 0;
+    return status;
+}
+
+/* Provider-independent interpretation of the native session and its wire lifetime hint. */
+int align_tls_session_bounds(int protocol, int has_ticket, int64_t issued, long lifetime,
+                             unsigned long hint, int64_t *until) {
+    if (protocol != TLS1_2_VERSION && protocol != TLS1_3_VERSION) return 0;
+    if (protocol == TLS1_3_VERSION && (!has_ticket || !hint)) return 0;
+    if (issued < 0 || lifetime <= 0 || issued > INT64_MAX - lifetime) return 0;
+    int64_t end = issued + lifetime;
+    if (hint && hint < (unsigned long)lifetime) end = issued + (int64_t)hint;
+    *until = end;
+    return 1;
 }
 
 static int intersect_session(struct interval *auth, SSL_SESSION *session) {
@@ -151,11 +164,10 @@ static int intersect_session(struct interval *auth, SSL_SESSION *session) {
 #else
     int64_t issued = SSL_SESSION_get_time(session);
 #endif
-    long lifetime = SSL_SESSION_get_timeout(session);
-    unsigned long hint = SSL_SESSION_get_ticket_lifetime_hint(session);
-    if (issued < 0 || lifetime <= 0 || issued > INT64_MAX - lifetime) return 0;
-    int64_t end = (int64_t)issued + lifetime;
-    if (hint && hint < (unsigned long)lifetime) end = (int64_t)issued + (int64_t)hint;
+    int64_t end;
+    if (!align_tls_session_bounds(SSL_SESSION_get_protocol_version(session), SSL_SESSION_has_ticket(session),
+                                  issued, SSL_SESSION_get_timeout(session),
+                                  SSL_SESSION_get_ticket_lifetime_hint(session), &end)) return 0;
     if (auth->from < issued) auth->from = issued;
     if (auth->until > end) auth->until = end;
     return auth->from < auth->until;

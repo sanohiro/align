@@ -58044,7 +58044,7 @@ impl<'a, 't> Checker<'a, 't> {
                     }
                 }
                 let resume = if let Some(flag) = args.get(5) {
-                    let flag = self.check_expr(flag, None);
+                    let flag = self.check_expr_inner(flag, Some(Ty::Bool));
                     if !hir_expr_diverges(&flag) { self.constrain(flag.ty, Some(Ty::Bool), flag.span); }
                     flag
                 } else {
