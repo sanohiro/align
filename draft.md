@@ -1270,6 +1270,13 @@ and aliases of the consumed source expire. Contained views retain their original
 Borrowed roots cannot be consumed. Deeper `owner.inner.field` and indexed Move-element extraction
 remain outside this direct-field rule. See Plan192.
 
+A call returning an owning record can also transfer a complete direct owning field:
+`make().field` evaluates as `{ owner := make(); owner.field }`. For a fallible call,
+`read()?.field` propagates the error before extraction. The receiver is evaluated once.
+The extracted value retains its backing and cleanup mode, and the temporary owns its
+remaining fields through ordinary local cleanup. The field must be known to need Drop
+where the expression is checked. Bind the record explicitly to read a Copy or view field.
+
 A mutable owning record, or an existing whole-record exclusive parameter, permits
 `owner.field[index] = value` through a finite ordinary record path when the field is
 `array<T>` and T is an integer, float, bool, char, or borrowed `str`. Evaluate the index

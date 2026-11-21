@@ -3291,7 +3291,9 @@ other elements usable; MoveCheck tracks moves per field (`MovedKey::Field`), for
 field or using the tuple as a whole afterwards, and a borrowing read (`t.0.sum()`) does not move.
 MIR nulls the moved field (`NullTupleField`) so the tuple's exit `Drop` frees null there.
 The same existing ownership model permits any complete direct owning record field (Plan192),
-including owned arrays, nested Move records and flat tuples. The exact selected field is zeroed;
+including owned arrays, nested Move records and flat tuples. An owning field of a returned
+record can be selected with `make().field` or `read()?.field`; the record has the same
+ownership and cleanup as an expression-local binding. The exact selected field is zeroed;
 its siblings retain their values and cleanup, while deeper/indexed extraction and refilling a
 previously moved field remain unsupported. Indexing
 an owned element out of a *temporary* tuple (`f().0`) is rejected (it would orphan the other owned
