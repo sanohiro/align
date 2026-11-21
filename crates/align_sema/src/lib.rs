@@ -22536,6 +22536,14 @@ impl<'a> EscapeCheck<'a> {
         value
     }
 
+    fn decoded_text_content(&self, input: &Expr, expression: &Expr) -> EscapeValueFact {
+        let mut content = self.completed_escape_value(input);
+        content.non_storage = content.non_storage.join(
+            &EscapeRegionFact::from_direct(self.allocation_region(expression)),
+        );
+        content
+    }
+
     fn escape_initializer_value(
         &mut self,
         expression: &Expr,
@@ -22610,12 +22618,11 @@ impl<'a> EscapeCheck<'a> {
                 // Mixed graphs own their allocations but retain borrowed text in their content.
                 // Array generations need the arena fact here as well as in `region_of`: their
                 // independent spine must not erase the shorter lifetime of escaped elements.
+                ExprKind::JsonDecodeArray { elem: Ty::Str, input } => {
+                    self.decoded_text_content(input, expression)
+                }
                 ExprKind::JsonOwnedDecode { plan, input, .. } if plan.borrows_text() => {
-                    let mut content = self.completed_escape_value(input);
-                    content.non_storage = content.non_storage.join(
-                        &EscapeRegionFact::from_direct(self.allocation_region(expression)),
-                    );
-                    content
+                    self.decoded_text_content(input, expression)
                 }
                 // Fully owned graphs copy every text leaf and retain neither input nor arena.
                 ExprKind::JsonOwnedDecode { .. }
@@ -25329,6 +25336,9 @@ impl<'a> EscapeCheck<'a> {
             // so the inferred region is the meet of input and allocation region only for
             // str-bearing targets.
             ExprKind::JsonOwnedDecode { plan, input, .. } if plan.borrows_text() => {
+                push_fold(&mut work, self.allocation_region(expression), vec![(input, depth, None)]);
+            }
+            ExprKind::JsonDecodeArray { elem: Ty::Str, input } => {
                 push_fold(&mut work, self.allocation_region(expression), vec![(input, depth, None)]);
             }
             ExprKind::JsonDecode { input, struct_id } if self.struct_has_str(*struct_id) => {
@@ -43363,6 +43373,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::JsonOwnedDecode { plan, input, .. } if plan.borrows_text() => {
                 self.storage_roots(input)
             }
+            ExprKind::JsonDecodeArray { elem: Ty::Str, input } => self.storage_roots(input),
             // Encoded output and fully owned decoded graphs retain no source borrow.
             ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
@@ -65647,22 +65658,17 @@ impl<'a, 't> Checker<'a, 't> {
         // The decode target is the Ok type of the expected `Result<T, _>`.
         let sid = match expected.map(|e| self.resolve(e)) {
             Some(Ty::Result(Scalar::Struct(id), _)) => id,
-            // `array<T>` target (MMv2 slice 8c): parse a JSON array of scalars into an *owned*
-            // `array<T>` (elements copied → `Static`/returnable, not region-tied to the input).
+            // An array root owns its headers. Only `str` elements borrow input or arena bytes.
             Some(Ty::Result(Scalar::DynArray(prim), _)) => {
                 let elem = scalar_to_ty(prim_to_scalar(prim));
-                // The element must be runtime-parseable. Scalar `str` elements are not admitted on
-                // this arena-free top-level path because selected escapes need an arena; typed struct
-                // fields use the arena-bearing decoder below.
-                if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::String) {
+                if !matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str | Ty::String) {
                     self.diags.error(
-                        format!("'json.decode' into array<{}> is not supported yet (int/float/bool/string elements only)", ty_name(elem)),
+                        format!("'json.decode' into array<{}> is not supported yet (int/float/bool/str/string elements only)", ty_name(elem)),
                         span,
                     );
                     return err;
                 }
-                // `check_str_init` accepts a `str` or auto-borrows an owned `string` (the result
-                // owns its bytes, so the input's region does not constrain it), and reports a mismatch.
+                // Accept a `str` or the normal auto-borrow of an owned `string`.
                 let input = self.check_str_init(&args[0]);
                 if input.ty == Ty::Error {
                     return err;

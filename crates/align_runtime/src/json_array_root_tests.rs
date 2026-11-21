@@ -1,6 +1,43 @@
 //! Plan183: direct ABI ownership, exact tags and complete-root validation.
 use super::*;
 
+#[test]
+fn borrowed_json_array_publishes_only_valid_headers() -> Result<(), Box<dyn std::error::Error>> {
+    let marker = b"sentinel";
+    let mut out = AlignStr { ptr: marker.as_ptr(), len: 8 };
+    let null = core::ptr::null_mut();
+    for bytes in [b"".as_slice(), b"null", br#"["ok",false]"#, br#"["ok"] trailing"#,
+        br#"["\n"]"#, br#"["\uD800"]"#, b"[\"\xff\"]", b"[\"a\0b\"]"] {
+        assert_eq!(unsafe {
+            align_rt_json_decode_str_array(bytes.as_ptr(), i64::try_from(bytes.len())?, &mut out, null)
+        }, 1, "{bytes:?}");
+        assert_eq!((out.ptr, out.len), (marker.as_ptr(), 8));
+    }
+    for (ptr, len) in [(core::ptr::null(), 0), (core::ptr::null(), 5), (marker.as_ptr(), -1)] {
+        assert_eq!(unsafe { align_rt_json_decode_str_array(ptr, len, &mut out, null) }, 1);
+        assert_eq!((out.ptr, out.len), (marker.as_ptr(), 8));
+    }
+    assert_eq!(unsafe { align_rt_json_decode_str_array(b"[]".as_ptr(), 2, core::ptr::null_mut(), null) }, 1);
+    assert_eq!(unsafe { align_rt_json_decode_str_array(b"[]".as_ptr(), 2, &mut out, null) }, 0);
+    assert_eq!((out.ptr, out.len), (core::ptr::null(), 0));
+
+    let arena = align_rt_arena_begin();
+    let input = br#"["clean","\uD83D\uDE80\u0000"]"#;
+    assert_eq!(unsafe {
+        align_rt_json_decode_str_array(input.as_ptr(), i64::try_from(input.len())?, &mut out, arena)
+    }, 0);
+    assert_eq!(out.len, 2);
+    let fields = unsafe { core::slice::from_raw_parts(out.ptr.cast::<AlignStr>(), 2) };
+    assert_eq!(fields[0].ptr, input[2..].as_ptr());
+    assert_eq!(fields[0].len, 5);
+    let escaped = &fields[1];
+    let (ptr, len) = (escaped.ptr, escaped.len);
+    unsafe { align_rt_free(out.ptr.cast_mut()) };
+    assert_eq!(unsafe { safe_slice(ptr, len) }, "🚀\0".as_bytes());
+    unsafe { align_rt_arena_end(arena) };
+    Ok(())
+}
+
 #[cfg(feature = "alloc-count")]
 #[test]
 fn json_string_root_grammar_and_cleanup() -> Result<(), Box<dyn std::error::Error>> {

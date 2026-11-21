@@ -205,9 +205,17 @@ own their decoded bytes; escaped U+0000 is valid. Malformed elements, separators
 UTF-8, escapes or trailing input return `Error.Code(1)` and free every completed
 payload before exposing a result. Empty arrays allocate nothing; other arrays
 own one header spine and each nonempty string payload. Index views retain the
-array owner's lifetime. This reuses the existing type, Result and deep Drop;
-`array<str>` decoding remains separate. Plan183 owns the array ABI and cleanup
-matrix; Plan203 supplies the standalone owned-string root below.
+array owner's lifetime. Plan183 owns the array ABI and cleanup matrix.
+
+**Borrowed string-array decoding.** With `array<str>` as the expected target,
+`json.decode(input)` accepts one complete UTF-8 JSON array of strings. A
+nonempty result owns one array of headers. Unescaped elements borrow the input.
+Escaped elements, including escaped U+0000, use the innermost active arena.
+An escaped element without an arena, malformed input, trailing data or an
+unrepresentable header extent yields `Error.Code(1)` without publishing a
+partial array. Empty arrays allocate nothing. A selected view may survive
+replacement of the array while its input and any decode arena remain live.
+Plan262 specifies the shared parser, native output and lifetime checks.
 
 **Owned string-root decoding.** The inferred target of `json.decode(input)` may
 be `string`. It accepts one complete UTF-8 JSON string, including existing
@@ -423,11 +431,7 @@ the decoded record remains input/arena-region-bound. Encode: a
 flat-free) on the decode error path (`sub_owns_buffers` has kind 7 so a scalar/str-array field inside an
 `array<Move-struct>` element is cleaned up). Composes with J3b (`Table { rows: array<Row>, meta: array<i64> }`
 where `Row { vals: array<f64> }`). The structural MIR fingerprint includes the element type, so an
-`array<i64>`→`array<f64>` change invalidates the cache. **Still deferred:** `array<char>` (no JSON
-form); a **top-level** `array<str> := json.decode`
-(a struct FIELD rides the enclosing struct's input-region binding, but a top-level array result would
-have to carry that region itself — the scalar top-level array is deliberately `Static`/returnable, so
-`array<str>` at top level is a separate region-carrying slice). v1 limits: `.sum()`/pipelines over an
+`array<i64>`→`array<f64>` change invalidates the cache. `array<char>` remains deferred (no JSON form). v1 limits: `.sum()`/pipelines over an
 owned scalar-array field stay restricted. R87 admits bare dynamic scalar-array roots with the same
 element grammar and bytes as their corresponding fields.
 

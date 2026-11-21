@@ -2535,9 +2535,17 @@ own their decoded bytes; escaped U+0000 is valid. Malformed elements, separators
 UTF-8, escapes or trailing input return `Error.Code(1)` and free every completed
 payload before exposing a result. Empty arrays allocate nothing; other arrays
 own one header spine and each nonempty string payload. Index views retain the
-array owner's lifetime. This reuses the existing type, Result and deep Drop;
-`array<str>` decoding remains separate. Plan183 owns the array ABI and cleanup
-matrix; Plan203 supplies the standalone owned-string root below.
+array owner's lifetime. Plan183 owns the array ABI and cleanup matrix.
+
+**Borrowed string-array decoding.** With `array<str>` as the expected target,
+`json.decode(input)` accepts one complete UTF-8 JSON array of strings. A
+nonempty result owns one array of headers. Unescaped elements borrow the input.
+Escaped elements, including escaped U+0000, use the innermost active arena.
+An escaped element without an arena, malformed input, trailing data or an
+unrepresentable header extent yields `Error.Code(1)` without publishing a
+partial array. Empty arrays allocate nothing. A selected view may survive
+replacement of the array while its input and any decode arena remain live.
+Plan262 specifies the shared parser, native output and lifetime checks.
 
 **Owned string-root decoding.** The inferred target of `json.decode(input)` may
 be `string`. It accepts one complete UTF-8 JSON string, including existing

@@ -1695,13 +1695,14 @@ pub enum Rvalue {
         out: Slot,
         arena: Option<Operand>,
     },
-    /// `json.decode` into an owned `array<elem>`: parse JSON int/float/bool/owned-string elements
+    /// `json.decode` into an owned `array<elem>`: parse JSON numeric, boolean or text elements
     /// and write the materialized `{ptr,len}` into the `out` slot. Yields an `i32` status
-    /// (0 = ok). `elem` is the element scalar (its kind/width gives the runtime element tag).
+    /// (0 = ok). Borrowed `str` elements use `arena` for escapes and borrow clean input bytes.
     JsonDecodeArray {
         elem: Ty,
         input: Operand,
         out: Slot,
+        arena: Option<Operand>,
     },
     /// `json.decode` into int/float/bool/string: write an independent scalar/header to `out`.
     /// Yields i32 status (0 = ok); kind/width/sign encode the exact runtime target tag.
@@ -19627,6 +19628,7 @@ fn lower_json_decode_array(b: &mut Builder, elem: Ty, input: &hir::Expr, result_
             elem,
             input: inp,
             out,
+            arena: if elem == Ty::Str { b.arenas.last().copied().map(Operand::Value) } else { None },
         },
     ));
 

@@ -2112,14 +2112,14 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         Rvalue::JsonEncode { max_bytes, options, .. } => max_bytes.iter().chain(options.iter()).collect(),
         Rvalue::JsonDecode { input, arena, .. }
         | Rvalue::JsonOwnedDecode { input, arena, .. }
+        | Rvalue::JsonDecodeArray { input, arena, .. }
         | Rvalue::JsonDecodeStructArray { input, arena, .. }
         | Rvalue::JsonDecodeUnion { input, arena, .. } => {
             let mut operands = vec![input];
             operands.extend(arena.iter());
             operands
         }
-        Rvalue::JsonDecodeArray { input, .. }
-        | Rvalue::StrParseI64 { input, .. }
+        Rvalue::StrParseI64 { input, .. }
         | Rvalue::JsonDecodeScalar { input, .. }
         | Rvalue::FsReadFile { path: input, .. }
         | Rvalue::FsCreatePrivateTempDir { prefix: input, .. }
@@ -7273,20 +7273,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
                 if let Some(arena) = arena { self.check_operand(equation, arena, Ty::ArenaHandle); }
                 (*out, XmlAccessProvenance::Owned)
             }
-            Rvalue::JsonDecodeArray { elem, input, out } => {
+            Rvalue::JsonDecodeArray { elem, input, out, arena } => {
                 let Some(scalar) = align_sema::ty_to_scalar(*elem)
-                    .filter(|_| matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::String))
+                    .filter(|_| matches!(elem, Ty::Int(_) | Ty::Float(_) | Ty::Bool | Ty::Str | Ty::String))
                 else {
                     equation.invalid = true;
                     return;
                 };
                 if slot_ty != Ty::DynArray(scalar)
+                    || (arena.is_some() && *elem != Ty::Str)
                     || xml_operand_base_ty(self.graph.function, input) != Some(Ty::Str)
                 {
                     equation.invalid = true;
                     return;
                 }
                 self.check_operand(equation, input, Ty::Str);
+                if let Some(arena) = arena { self.check_operand(equation, arena, Ty::ArenaHandle); }
                 (*out, XmlAccessProvenance::Owned)
             }
             Rvalue::JsonDecodeScalar { scalar, input, out } => {
@@ -7575,6 +7577,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             // The output slot owns its record/array, while an exact Str projection borrows
             // input or arena text. Never promote that text to exclusive storage authority.
             let selected_access = if matches!(rvalue, Rvalue::JsonOwnedDecode { .. }
+                | Rvalue::JsonDecodeArray { elem: Ty::Str, .. }
                 | Rvalue::JsonDecode { .. } | Rvalue::JsonDecodeStructArray { .. }
                 | Rvalue::JsonDecodeUnion { .. })
                 && selected_ty == Ty::Str
@@ -9119,7 +9122,7 @@ fn validate_partition_scope(
 fn validate_json_decode_arenas(program: &Program) -> Result<(), ProducerError> {
     for function in &program.fns {
         if !function.blocks.iter().flat_map(|block| &block.stmts)
-            .any(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { .. })))
+            .any(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { .. } | Rvalue::JsonDecodeArray { elem: Ty::Str, .. } | Rvalue::JsonDecodeArray { arena: Some(_), .. })))
         {
             continue;
         }
@@ -9146,8 +9149,10 @@ fn validate_json_decode_arenas(program: &Program) -> Result<(), ProducerError> {
                         stack.pop();
                     }
                     Stmt::ArenaEnd(_) => return Err(fail()),
-                    Stmt::Let(_, Rvalue::JsonOwnedDecode { plan, arena, .. }) => {
-                        let expected = if plan.borrows_text() { stack.last().copied() } else { None };
+                    Stmt::Let(_, op @ (Rvalue::JsonOwnedDecode { arena, .. } | Rvalue::JsonDecodeArray { arena, .. })) => {
+                        let borrows_text = matches!(op, Rvalue::JsonDecodeArray { elem: Ty::Str, .. })
+                            || matches!(op, Rvalue::JsonOwnedDecode { plan, .. } if plan.borrows_text());
+                        let expected = if borrows_text { stack.last().copied() } else { None };
                         if !match (arena, expected) {
                             (None, None) => true,
                             (Some(Operand::Value(actual)), Some(expected)) => *actual == expected,
@@ -9170,7 +9175,7 @@ fn validate_json_decode_arenas(program: &Program) -> Result<(), ProducerError> {
         }
         for (block, entry) in function.blocks.iter().zip(entries) {
             if entry.is_none() && block.stmts.iter().any(|stmt|
-                matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { arena: Some(_), .. })))
+                matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { arena: Some(_), .. } | Rvalue::JsonDecodeArray { arena: Some(_), .. })))
             { return Err(fail()); }
         }
     }
@@ -13412,7 +13417,7 @@ mod tests {
 
     #[test]
     fn producer_mixed_json_arena_is_current_on_every_cfg_path() -> Result<(), Box<dyn std::error::Error>> {
-        for root in ["Mixed", "array<Mixed>"] {
+        for root in ["Mixed", "array<Mixed>", "array<str>"] {
             let source = format!("import core.json\nMixed {{owned:string,text:str}}\nfn probe(input:str)->Result<string,Error> {{ arena outer {{ arena inner {{ value:{root}:=json.decode(input)?;return json.encode(value) }} }} }}\nfn main()->i32=0\n");
             let mut diagnostics = align_diag::Diagnostics::new();
             let tokens = align_lexer::tokenize(0, &source, &mut diagnostics);
@@ -13430,12 +13435,12 @@ mod tests {
                 ).collect::<Vec<_>>();
                 assert_eq!(arenas.len(), 2);
                 let (block, statement) = function.blocks.iter().enumerate().find_map(|(b, block)|
-                    block.stmts.iter().position(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { .. }))).map(|s| (b, s))
+                    block.stmts.iter().position(|stmt| matches!(stmt, Stmt::Let(_, Rvalue::JsonOwnedDecode { .. } | Rvalue::JsonDecodeArray { .. }))).map(|s| (b, s))
                 ).ok_or("decode fixture")?;
                 if mutation == 5 {
                     function.blocks[block].stmts.insert(statement, Stmt::ArenaEnd(Operand::Value(arenas[1])));
                 } else {
-                    let Stmt::Let(_, Rvalue::JsonOwnedDecode { arena, .. }) = &mut function.blocks[block].stmts[statement] else { return Err("decode shape".into()); };
+                    let Stmt::Let(_, Rvalue::JsonOwnedDecode { arena, .. } | Rvalue::JsonDecodeArray { arena, .. }) = &mut function.blocks[block].stmts[statement] else { return Err("decode shape".into()); };
                     *arena = match mutation {
                         0 => None,
                         1 => Some(Operand::Const(Const::Bool(true))),
@@ -13503,7 +13508,7 @@ mod tests {
             let operation = function.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| {
                 if let Stmt::Let(_, r @ Rvalue::JsonDecodeArray { .. }) = s { Some(r) } else { None }
             }).ok_or("array operation")?;
-            let Rvalue::JsonDecodeArray { elem, input, out } = operation else { return Err("array fixture".into()); };
+            let Rvalue::JsonDecodeArray { elem, input, out, .. } = operation else { return Err("array fixture".into()); };
             match mutation {
                 0 => *elem = Ty::Str,
                 1 => *elem = Ty::Bool,

@@ -6531,8 +6531,8 @@ runtime loop (`ScalarArrayField` template piece → `align_rt_json_encode_scalar
 `sub_owns_buffers` gained kind 7). The structural MIR fingerprint includes the element scalar, so an
 `array<i64>`→`array<f64>` change invalidates the cache; the human MIR type name remains element-aware
 for inspection. `array<str>` fields are now shipped by Request 7: clean elements borrow the input
-and selected escaped elements materialize in the enclosing arena; a top-level `array<str>` target
-and `array<char>` remain deferred. v1
+and selected escaped elements materialize in the enclosing arena. Plan262 applies the same rule to
+a top-level `array<str>` target. `array<char>` remains deferred. v1
 historical limits: `.sum()`/pipelines over an owned scalar-array field and bare scalar-array encoding
 were restricted. R87/plan 59 supersedes the encoding exclusion only. Tests: `m5.rs` T1b, `cache_codegen` gate2d, runtime alloc-count. **T1b (part 2) — SHIPPED: top-level (bare) scalar decode targets** (`x: i64 := json.decode("42")?` for
 int / float / bool). Parses the WHOLE input as one JSON number / bool; the value is `Copy` (copied out,

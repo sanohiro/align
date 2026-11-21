@@ -2255,8 +2255,12 @@ therefore admits the root using the same string parser and RAII staging list as
 an owned record field. The root delays header publication until trailing-input
 validation succeeds. Ownership-directed materialization remains explicit in
 `array<string>` and `json.decode`; no input/arena view or implicit wrapper is
-introduced. Plan188 closes the separate owned-record AoS decoder; input-borrowing
-`array<str>` roots remain outside this capability.
+introduced. Plan188 closes the separate owned-record AoS decoder.
+
+For a borrowed `array<str>` root, Plan262 reuses the scalar-array field parser.
+The array owns the headers. Their lifetime and the lifetime of the text they
+reference are independent: dropping the headers leaves clean input text and
+arena-decoded bytes available to previously extracted views.
 
 ### JSON owned-string root decoding
 
