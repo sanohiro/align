@@ -85,6 +85,20 @@ pub fn raw(data:slice<u8>)->Result<buffer,Error> {
   decoded:=compress.deflate_raw_decompress(packed.bytes())?
   return Ok(identity(decoded))
 }
+pub fn preset<T>(tag:T, data:slice<u8>)->Result<T,Error> {
+  z:=compress.zlib_compress(data,6,data)?
+  r:=compress.deflate_raw_compress(data,6,data)?
+  s:=compress.zstd_compress(data,3,data)?
+  a:=compress.zlib_decompress(z.bytes(),data.len(),data)?
+  b:=compress.deflate_raw_decompress(r.bytes(),data.len(),data)?
+  c:=compress.zstd_decompress(s.bytes(),data.len(),data)?
+  if a.len()!=data.len() || b.bytes()[1]!=data[1] || c.bytes()[0]!=data[0] { return Err(Error.Invalid) }
+  return Ok(tag)
+}
+pub fn early(flag:bool)->Result<i64,Error> {
+  b:=compress.zlib_decompress("",-1,{ if flag { return Ok(19) }; "seed" })?
+  return Ok(b.len())
+}
 "#;
 const MAIN: &str = r#"import codecs
 import std.compress
@@ -92,6 +106,9 @@ import std.encoding
 fn keep(error:Error)->Error=error
 fn main()->Result<(),Error> {
   input:=encoding.hex_decode("00ff8041")?
+  tag:=codecs.preset(7,input.bytes())?
+  early:=codecs.early(true)?
+  if tag!=7 || early!=19 { return Err(Error.Invalid) }
   mut decoded:=codecs.zlib(input.bytes()).map_err(keep)?
   if decoded.len()!=4 || decoded.bytes()[1]!=255 { return Err(Error.Invalid) }
   decoded=codecs.raw(input.bytes())?
@@ -248,20 +265,26 @@ fn limits_source_domain_and_input_liveness() {
                 assert!(checked.diags.has_errors(), "{source}");
             }
             for mutation in ["input=buffer(0)", "consumed:=input", "input.append(\"x\")"] {
-                let source = format!(
-                    "import std.compress\nfn main()->Result<(),Error> {{ mut input:=buffer(16); b:=compress.{codec}_decompress(input.bytes(),{{ {mutation}; 4 }})?; return Ok(()) }}\n"
-                );
-                let path = stage.join("main.align");
-                std::fs::write(&path, &source).unwrap_or_else(|error| panic!("{error}"));
-                for per_unit in [false, true] {
-                    let mut sources = SourceMap::new();
-                    let entry = path.to_str().unwrap_or("invalid fixture path");
-                    let diags = if per_unit {
-                        align_driver::build_per_unit(&mut sources, entry, &source).diags
-                    } else {
-                        align_driver::check(&mut sources, entry, &source).diags
-                    };
-                    assert!(diags.has_errors(), "input invalidation accepted: {source}");
+                let mut calls = vec![format!("compress.{codec}_decompress(input.bytes(),{{ {mutation}; 4 }})")];
+                if codec != "gzip" {
+                    for action in ["compress", "decompress"] {
+                        calls.push(format!("compress.{codec}_{action}(input.bytes(),4,{{ {mutation}; \"seed\" }})"));
+                    }
+                }
+                for call in calls {
+                    let source = format!("import std.compress\nfn main()->Result<(),Error> {{ mut input:=buffer(16); b:={call}?; return Ok(()) }}\n");
+                    let path = stage.join("main.align");
+                    std::fs::write(&path, &source).unwrap_or_else(|error| panic!("{error}"));
+                    for per_unit in [false, true] {
+                        let mut sources = SourceMap::new();
+                        let entry = path.to_str().unwrap_or("invalid fixture path");
+                        let diags = if per_unit {
+                            align_driver::build_per_unit(&mut sources, entry, &source).diags
+                        } else {
+                            align_driver::check(&mut sources, entry, &source).diags
+                        };
+                        assert!(diags.has_errors(), "input invalidation accepted: {source}");
+                    }
                 }
             }
         }
@@ -393,6 +416,10 @@ fn framing_source_domain_and_effects() {
             (format!("compress.{codec}_compress(true,6)"), false),
             (format!("compress.{codec}_decompress(1)"), false),
             (format!("compress.{codec}_decompress(\"x\",6,0)"), false),
+            (format!("compress.{codec}_compress(\"x\",6,\"seed\")"), codec != "gzip"),
+            (format!("compress.{codec}_decompress(\"x\",6,\"seed\")"), codec != "gzip"),
+            (format!("compress.{codec}_compress(\"x\",6,true)"), false),
+            (format!("compress.{codec}_decompress(\"x\",\"seed\")"), false),
         ] {
             let source = format!(
                 "import std.compress\nfn main()->Result<(),Error> {{ result:={call}?; return Ok(()) }}\n"

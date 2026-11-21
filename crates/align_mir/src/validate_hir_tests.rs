@@ -14406,6 +14406,7 @@ fn hir_body_validator_native() {
         body_test_expr(
             hir::ExprKind::Compress {
                 kind: hir::CompressKind::Gzip,
+                dictionary: None,
                 data: Box::new(native_str()),
                 level: Box::new(native_i64()),
             },
@@ -14419,6 +14420,7 @@ fn hir_body_validator_native() {
         body_test_expr(
             hir::ExprKind::Decompress {
                 kind: hir::CompressKind::Zstd,
+                dictionary: None,
                 data: Box::new(native_str()),
                 max_bytes: Box::new(native_i64()),
             },
@@ -21928,12 +21930,14 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
             let expression = if compress {
                 hir::ExprKind::Compress {
                     kind,
+                    dictionary: (kind != hir::CompressKind::Gzip).then(|| Box::new(native_str())),
                     data: Box::new(native_str()),
                     level: Box::new(native_i64()),
                 }
             } else {
                 hir::ExprKind::Decompress {
                     kind,
+                    dictionary: (kind != hir::CompressKind::Gzip).then(|| Box::new(native_str())),
                     data: Box::new(native_str()),
                     max_bytes: Box::new(native_i64()),
                 }
@@ -21944,7 +21948,7 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
                 result,
             ));
             assert!(body_core_metadata_is_valid(&program));
-            for mutation in 0..4 {
+            for mutation in 0..6 {
                 let mut bad = program.clone();
                 let expression = body_statement_expression_mut(&mut bad, "framing");
                 let hir::ExprKind::Try(inner) = &mut expression.kind else {
@@ -21959,6 +21963,18 @@ fn deflate_codec_hir_signature_matrix() -> Result<(), String> {
                         _ => return Err("fixture codec".into()),
                     },
                     1 => inner.ty = Ty::Result(Scalar::String, Scalar::Enum(error)),
+                    4 | 5 => match &mut inner.kind {
+                        hir::ExprKind::Compress { kind, dictionary, .. }
+                        | hir::ExprKind::Decompress { kind, dictionary, .. } => {
+                            *dictionary = Some(Box::new(if mutation == 4 {
+                                body_test_expr(hir::ExprKind::Bool(false), Ty::Bool)
+                            } else {
+                                *kind = hir::CompressKind::Gzip;
+                                native_str()
+                            }));
+                        }
+                        _ => return Err("fixture dictionary".into()),
+                    },
                     _ => match &mut inner.kind {
                         hir::ExprKind::Compress { level, .. }
                         | hir::ExprKind::Decompress { max_bytes: level, .. } => {

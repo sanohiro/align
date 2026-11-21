@@ -15003,6 +15003,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn deflate(strm: *mut ZStream, flush: c_int) -> c_int;
     fn deflateEnd(strm: *mut ZStream) -> c_int;
+    fn deflateSetDictionary(strm: *mut ZStream, dictionary: *const u8, length: c_uint) -> c_int;
+    fn inflateSetDictionary(strm: *mut ZStream, dictionary: *const u8, length: c_uint) -> c_int;
     fn inflateInit2_(strm: *mut ZStream, window_bits: c_int, version: *const c_char, stream_size: c_int) -> c_int;
     fn inflate(strm: *mut ZStream, flush: c_int) -> c_int;
     fn inflateReset(strm: *mut ZStream) -> c_int;
@@ -15054,11 +15056,17 @@ fn gzip_deflate(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
 }
 
 fn zlib_deflate(data: &[u8], level: i64, format: DeflateFormat, input_chunk: usize) -> Result<Vec<u8>, i32> {
-    if !(0..=9).contains(&level) {
-        panic_abort(format.invalid_level());
-    }
+    zlib_deflate_with_dictionary(data, deflate_level(format, level), format, input_chunk, &[])
+}
+
+fn deflate_level(format: DeflateFormat, level: i64) -> c_int {
+    if !(0..=9).contains(&level) { panic_abort(format.invalid_level()); }
+    level as c_int
+}
+
+fn zlib_deflate_with_dictionary(data: &[u8], level: c_int, format: DeflateFormat, input_chunk: usize, dictionary: &[u8]) -> Result<Vec<u8>, i32> {
     if input_chunk == 0 || c_uint::try_from(input_chunk).is_err() { return Err(AL_INVALID); }
-    let level = level as c_int;
+    let dict_len = c_uint::try_from(dictionary.len()).map_err(|_| AL_INVALID)?;
     let mut strm = ZStream::zeroed();
     let ret = unsafe {
         deflateInit2_(
@@ -15077,7 +15085,14 @@ fn zlib_deflate(data: &[u8], level: i64, format: DeflateFormat, input_chunk: usi
         return Err(zlib_error_to_status(ret));
     }
     // From here `deflateEnd` must run on every path (it frees the internal state).
-    let result = deflate_run(&mut strm, data, input_chunk);
+    let setup = if dictionary.is_empty() { Z_OK } else {
+        unsafe { deflateSetDictionary(&mut strm, dictionary.as_ptr(), dict_len) }
+    };
+    let result = if setup == Z_OK {
+        deflate_run(&mut strm, data, input_chunk)
+    } else {
+        Err(zlib_error_to_status(setup))
+    };
     unsafe { deflateEnd(&mut strm) };
     result
 }
@@ -15134,6 +15149,11 @@ fn gzip_inflate(data: &[u8]) -> Result<Vec<u8>, i32> {
 }
 
 fn zlib_inflate(data: &[u8], format: DeflateFormat, max_cap: usize, input_chunk: usize) -> Result<Vec<u8>, i32> {
+    zlib_inflate_with_dictionary(data, format, max_cap, input_chunk, &[])
+}
+
+fn zlib_inflate_with_dictionary(data: &[u8], format: DeflateFormat, max_cap: usize, input_chunk: usize, dictionary: &[u8]) -> Result<Vec<u8>, i32> {
+    let dict_len = c_uint::try_from(dictionary.len()).map_err(|_| AL_INVALID)?;
     let mut strm = ZStream::zeroed();
     let ret = unsafe {
         inflateInit2_(
@@ -15146,7 +15166,13 @@ fn zlib_inflate(data: &[u8], format: DeflateFormat, max_cap: usize, input_chunk:
     if ret != Z_OK {
         return Err(zlib_error_to_status(ret));
     }
-    let result = inflate_run_with_chunk(&mut strm, data, max_cap, input_chunk, format == DeflateFormat::Gzip);
+    // Raw DEFLATE cannot signal a dictionary ID. Seed its history before the first bit.
+    let setup = if format == DeflateFormat::Raw && !dictionary.is_empty() {
+        unsafe { inflateSetDictionary(&mut strm, dictionary.as_ptr(), dict_len) }
+    } else { Z_OK };
+    let result = if setup == Z_OK {
+        inflate_run_with_chunk(&mut strm, data, max_cap, input_chunk, format == DeflateFormat::Gzip, dictionary)
+    } else { Err(zlib_error_to_status(setup)) };
     unsafe { inflateEnd(&mut strm) };
     result
 }
@@ -15155,10 +15181,10 @@ fn zlib_inflate(data: &[u8], format: DeflateFormat, max_cap: usize, input_chunk:
 /// use small caps and input windows to exercise the same loop without multi-gigabyte fixtures.
 #[cfg(test)]
 fn inflate_run(strm: &mut ZStream, data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
-    inflate_run_with_chunk(strm, data, max_cap, c_uint::MAX as usize, true)
+    inflate_run_with_chunk(strm, data, max_cap, c_uint::MAX as usize, true, &[])
 }
 
-fn inflate_run_with_chunk(strm: &mut ZStream, data: &[u8], max_cap: usize, input_chunk: usize, concatenated: bool) -> Result<Vec<u8>, i32> {
+fn inflate_run_with_chunk(strm: &mut ZStream, data: &[u8], max_cap: usize, input_chunk: usize, concatenated: bool, mut dictionary: &[u8]) -> Result<Vec<u8>, i32> {
     if input_chunk == 0 || c_uint::try_from(input_chunk).is_err() || data.is_empty() {
         return Err(AL_INVALID);
     }
@@ -15193,6 +15219,15 @@ fn inflate_run_with_chunk(strm: &mut ZStream, data: &[u8], max_cap: usize, input
         let in_before = strm.avail_in;
         let ret = unsafe { inflate(strm, Z_NO_FLUSH) };
         let produced = (before - strm.avail_out) as usize;
+        if ret == Z_NEED_DICT && !dictionary.is_empty() {
+            // RFC 1950 asks before emitting any payload. libz verifies the Adler ID.
+            if produced != 0 { return Err(AL_INVALID); }
+            let length = c_uint::try_from(dictionary.len()).map_err(|_| AL_INVALID)?;
+            let setup = unsafe { inflateSetDictionary(strm, dictionary.as_ptr(), length) };
+            if setup != Z_OK { return Err(zlib_error_to_status(setup)); }
+            dictionary = &[];
+            continue;
+        }
         if !matches!(ret, Z_OK | Z_STREAM_END | Z_BUF_ERROR) {
             return Err(zlib_error_to_status(ret));
         }
@@ -15364,6 +15399,13 @@ const ZSTD_ERROR_WORKSPACE_TOO_SMALL: c_int = 66;
 
 #[link(name = "zstd")]
 unsafe extern "C" {
+    fn ZDICT_getDictHeaderSize(dictionary: *const c_void, size: usize) -> usize;
+    fn ZSTD_createCCtx() -> *mut c_void;
+    fn ZSTD_freeCCtx(ctx: *mut c_void) -> usize;
+    fn ZSTD_CCtx_setParameter(ctx: *mut c_void, parameter: c_int, value: c_int) -> usize;
+    fn ZSTD_CCtx_loadDictionary(ctx: *mut c_void, dictionary: *const c_void, size: usize) -> usize;
+    fn ZSTD_compress2(ctx: *mut c_void, dst: *mut c_void, capacity: usize, src: *const c_void, size: usize) -> usize;
+    fn ZSTD_DCtx_loadDictionary(ctx: *mut c_void, dictionary: *const c_void, size: usize) -> usize;
     fn ZSTD_compressBound(src_size: usize) -> usize;
     fn ZSTD_compress(dst: *mut c_void, dst_cap: usize, src: *const c_void, src_size: usize, level: c_int) -> usize;
     fn ZSTD_isError(code: usize) -> c_uint;
@@ -15398,10 +15440,40 @@ fn zstd_decompress_error_to_status(ret: usize) -> i32 {
 /// total-or-abort policy (#345), never a silent clamp / `Error`. The output is sized by
 /// `ZSTD_compressBound` (worst-case single-pass size) and bounded by the input, so no bomb cap.
 fn zstd_compress_impl(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
+    zstd_compress_with_dictionary(data, zstd_level(level), &[])
+}
+
+/// Dictionary validation can occur during loading or the first compression. Keep other provider
+/// setup/engine errors distinct from these stable ZSTD_ErrorCode values from zstd_errors.h.
+fn zstd_operation_result(code: usize) -> Result<usize, i32> {
+    if unsafe { ZSTD_isError(code) } == 0 { return Ok(code); }
+    const DICTIONARY_CORRUPTED: c_int = 30;
+    const DICTIONARY_WRONG: c_int = 32;
+    const DICTIONARY_CREATION_FAILED: c_int = 34;
+    match unsafe { ZSTD_getErrorCode(code) } {
+        DICTIONARY_CORRUPTED | DICTIONARY_WRONG | DICTIONARY_CREATION_FAILED => Err(AL_INVALID),
+        _ => Err(zstd_error_code(code)),
+    }
+}
+
+fn zstd_dictionary(dictionary: &[u8]) -> Result<&[u8], i32> {
+    if dictionary.len() < 8 { return Ok(&[]); }
+    if dictionary.starts_with(&[0x37, 0xa4, 0x30, 0xec]) {
+        let header = unsafe { ZDICT_getDictHeaderSize(dictionary.as_ptr().cast(), dictionary.len()) };
+        if unsafe { ZSTD_isError(header) } != 0 { return Err(zstd_decompress_error_to_status(header)); }
+    }
+    Ok(dictionary)
+}
+
+fn zstd_level(level: i64) -> c_int {
     if !(0..=ZSTD_MAX_CLEVEL).contains(&level) {
         panic_abort("compress.zstd_compress: level out of range (must be 0..=22; 0 = default)");
     }
-    let level = level as c_int;
+    level as c_int
+}
+
+fn zstd_compress_with_dictionary(data: &[u8], level: c_int, dictionary: &[u8]) -> Result<Vec<u8>, i32> {
+    let dictionary = zstd_dictionary(dictionary)?;
     // `ZSTD_compressBound` is pure arithmetic on the length (never an error for a real in-memory
     // length); it yields the worst-case compressed size for a single pass.
     let bound = unsafe { ZSTD_compressBound(data.len()) };
@@ -15410,14 +15482,23 @@ fn zstd_compress_impl(data: &[u8], level: i64) -> Result<Vec<u8>, i32> {
     out.try_reserve_exact(bound).map_err(|_| AL_CODE)?;
     // `data.as_ptr()` is non-null even for an empty slice (a valid 0-length source); `out` has at
     // least `bound` bytes of spare capacity, which zstd never overruns.
-    let written = unsafe {
-        ZSTD_compress(out.as_mut_ptr() as *mut c_void, bound, data.as_ptr() as *const c_void, data.len(), level)
+    let destination = out.as_mut_ptr().cast();
+    let written = if dictionary.is_empty() {
+        zstd_operation_result(unsafe {
+            ZSTD_compress(destination, bound, data.as_ptr().cast(), data.len(), level)
+        })?
+    } else {
+        let ctx = unsafe { ZSTD_createCCtx() };
+        if ctx.is_null() { return Err(AL_CODE); }
+        let result = (|| {
+            const ZSTD_C_COMPRESSION_LEVEL: c_int = 100;
+            zstd_operation_result(unsafe { ZSTD_CCtx_setParameter(ctx, ZSTD_C_COMPRESSION_LEVEL, level) })?;
+            zstd_operation_result(unsafe { ZSTD_CCtx_loadDictionary(ctx, dictionary.as_ptr().cast(), dictionary.len()) })?;
+            zstd_operation_result(unsafe { ZSTD_compress2(ctx, destination, bound, data.as_ptr().cast(), data.len()) })
+        })();
+        unsafe { ZSTD_freeCCtx(ctx) };
+        result?
     };
-    if unsafe { ZSTD_isError(written) } != 0 {
-        // Compress runs on our own valid input into a `compressBound`-sized dst, so a failure here is
-        // an engine/resource fault (e.g. OOM), never invalid user data → Error.Code.
-        return Err(zstd_error_code(written));
-    }
     debug_assert!(written <= bound, "zstd wrote past compressBound");
     // SAFETY: zstd wrote `written` (<= bound <= capacity) bytes into the reserved spare capacity.
     unsafe { out.set_len(written) };
@@ -15433,6 +15514,11 @@ fn zstd_decompress_impl(data: &[u8]) -> Result<Vec<u8>, i32> {
 /// Decode all current frames under the caller limit without trusting frame size hints.
 /// Free the DStream on initialization failure, decode error and success.
 fn zstd_decompress_limited_impl(data: &[u8], max_cap: usize) -> Result<Vec<u8>, i32> {
+    zstd_decompress_with_dictionary(data, max_cap, &[])
+}
+
+fn zstd_decompress_with_dictionary(data: &[u8], max_cap: usize, dictionary: &[u8]) -> Result<Vec<u8>, i32> {
+    let dictionary = zstd_dictionary(dictionary)?;
     let zds = unsafe { ZSTD_createDStream() };
     if zds.is_null() {
         return Err(AL_CODE); // allocation failure creating the stream — engine fault
@@ -15445,7 +15531,11 @@ fn zstd_decompress_limited_impl(data: &[u8], max_cap: usize) -> Result<Vec<u8>, 
         unsafe { ZSTD_freeDStream(zds) };
         return Err(st);
     }
-    let result = zstd_decompress_stream(zds, data, max_cap);
+    let loaded = if dictionary.is_empty() { 0 } else {
+        unsafe { ZSTD_DCtx_loadDictionary(zds, dictionary.as_ptr().cast(), dictionary.len()) }
+    };
+    let result = zstd_operation_result(loaded)
+        .and_then(|_| zstd_decompress_stream(zds, data, max_cap));
     unsafe { ZSTD_freeDStream(zds) };
     result
 }
@@ -15528,6 +15618,108 @@ pub unsafe extern "C" fn align_rt_compress_zstd_decompress(ptr: *const u8, len: 
     let max_cap = decompression_limit(max_bytes);
     let data = unsafe { bytes_view(ptr, len) };
     unsafe { publish_buffer(zstd_decompress_limited_impl(data, max_cap), out) }
+}
+
+/// Validate the dictionary's native width before forming a slice. A readable nonempty input and
+/// writable result slot have the same caller preconditions as the original one-shot codec ABI.
+unsafe fn run_preset_codec(
+    data: *const u8, len: i64, dictionary: *const u8, dict_len: i64, max_dictionary: usize,
+    out: *mut *mut Buffer, run: impl FnOnce(&[u8], &[u8]) -> Result<Vec<u8>, i32>,
+) -> i32 {
+    if out.is_null() { return AL_INVALID; }
+    let result = match usize::try_from(dict_len) {
+        Ok(0) => run(unsafe { bytes_view(data, len) }, &[]),
+        Ok(size) if !dictionary.is_null() && size <= max_dictionary && isize::try_from(size).is_ok() => {
+            let dict = unsafe { core::slice::from_raw_parts(dictionary, size) };
+            run(unsafe { bytes_view(data, len) }, dict)
+        }
+        _ => Err(AL_INVALID),
+    };
+    unsafe { publish_buffer(result, out) }
+}
+
+/// One-shot `zlib_compress` with a caller-supplied dictionary.
+///
+/// # Safety
+/// Both nonempty byte views must be readable and `out` must be a writable buffer-handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zlib_compress_dict(
+    data: *const u8, len: i64, level: i64, dictionary: *const u8, dict_len: i64, out: *mut *mut Buffer,
+) -> i32 {
+    let level = deflate_level(DeflateFormat::Zlib, level);
+    unsafe { run_preset_codec(data, len, dictionary, dict_len, zlib_input_chunk(), out, |input, dict| {
+        zlib_deflate_with_dictionary(input, level, DeflateFormat::Zlib, zlib_input_chunk(), dict)
+    }) }
+}
+
+/// One-shot `zlib_decompress` with a caller-supplied dictionary.
+///
+/// # Safety
+/// Both nonempty byte views must be readable and `out` must be a writable buffer-handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zlib_decompress_dict(
+    data: *const u8, len: i64, max_bytes: i64, dictionary: *const u8, dict_len: i64, out: *mut *mut Buffer,
+) -> i32 {
+    let cap = decompression_limit(max_bytes);
+    unsafe { run_preset_codec(data, len, dictionary, dict_len, zlib_input_chunk(), out, |input, dict| {
+        zlib_inflate_with_dictionary(input, DeflateFormat::Zlib, cap, zlib_input_chunk(), dict)
+    }) }
+}
+
+/// One-shot `deflate_raw_compress` with a caller-supplied dictionary.
+///
+/// # Safety
+/// Both nonempty byte views must be readable and `out` must be a writable buffer-handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_deflate_raw_compress_dict(
+    data: *const u8, len: i64, level: i64, dictionary: *const u8, dict_len: i64, out: *mut *mut Buffer,
+) -> i32 {
+    let level = deflate_level(DeflateFormat::Raw, level);
+    unsafe { run_preset_codec(data, len, dictionary, dict_len, zlib_input_chunk(), out, |input, dict| {
+        zlib_deflate_with_dictionary(input, level, DeflateFormat::Raw, zlib_input_chunk(), dict)
+    }) }
+}
+
+/// One-shot `deflate_raw_decompress` with a caller-supplied dictionary.
+///
+/// # Safety
+/// Both nonempty byte views must be readable and `out` must be a writable buffer-handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_deflate_raw_decompress_dict(
+    data: *const u8, len: i64, max_bytes: i64, dictionary: *const u8, dict_len: i64, out: *mut *mut Buffer,
+) -> i32 {
+    let cap = decompression_limit(max_bytes);
+    unsafe { run_preset_codec(data, len, dictionary, dict_len, zlib_input_chunk(), out, |input, dict| {
+        zlib_inflate_with_dictionary(input, DeflateFormat::Raw, cap, zlib_input_chunk(), dict)
+    }) }
+}
+
+/// One-shot `zstd_compress` with a caller-supplied dictionary.
+///
+/// # Safety
+/// Both nonempty byte views must be readable and `out` must be a writable buffer-handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zstd_compress_dict(
+    data: *const u8, len: i64, level: i64, dictionary: *const u8, dict_len: i64, out: *mut *mut Buffer,
+) -> i32 {
+    let level = zstd_level(level);
+    unsafe { run_preset_codec(data, len, dictionary, dict_len, usize::MAX, out, |input, dict| {
+        zstd_compress_with_dictionary(input, level, dict)
+    }) }
+}
+
+/// One-shot `zstd_decompress` with a caller-supplied dictionary.
+///
+/// # Safety
+/// Both nonempty byte views must be readable and `out` must be a writable buffer-handle slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn align_rt_compress_zstd_decompress_dict(
+    data: *const u8, len: i64, max_bytes: i64, dictionary: *const u8, dict_len: i64, out: *mut *mut Buffer,
+) -> i32 {
+    let cap = decompression_limit(max_bytes);
+    unsafe { run_preset_codec(data, len, dictionary, dict_len, usize::MAX, out, |input, dict| {
+        zstd_decompress_with_dictionary(input, cap, dict)
+    }) }
 }
 
 /// Byte-lexicographic order of two `str` views (`Ord(str)`, 2026-07-09): returns -1 if `a < b`,

@@ -2581,6 +2581,10 @@ caller-selected output limit to all four decoders: a PNG header's expected exten
 can bound staging before allocation, rather than reject only after decompression.
 The default remains 1 GiB; this payload limit does not promise bounded native
 workspace or RSS.
+Dictionary selection belongs on the existing one-shot operations. Zlib identifies the
+expected preset through Adler-32, while raw DEFLATE requires the caller to share
+the bytes out of band. Zstandard accepts both raw contents and trained dictionaries.
+[Plan265](impl/265-compression-dictionaries.md) records the validation and framing rules.
 
 ### Fallible raw carriers (Plan236)
 

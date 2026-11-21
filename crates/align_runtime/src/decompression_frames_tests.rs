@@ -204,7 +204,7 @@ impl Drop for ZstdOwner {
 fn limited(data: &[u8], cap: usize, gzip_chunk: Option<usize>) -> Result<Vec<u8>, i32> {
     if let Some(chunk) = gzip_chunk {
         let mut stream = InflateOwner::new()?;
-        inflate_run_with_chunk(stream.0.as_mut(), data, cap, chunk, true)
+        inflate_run_with_chunk(stream.0.as_mut(), data, cap, chunk, true, &[])
     } else {
         let stream = ZstdOwner::new()?;
         zstd_decompress_stream(stream.0, data, cap)
@@ -324,4 +324,114 @@ fn decompress_publishes_independent_complete_output_or_null() -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+type PresetCodec = unsafe extern "C" fn(*const u8, i64, i64, *const u8, i64, *mut *mut Buffer) -> i32;
+
+fn preset_call(op: PresetCodec, input: &[u8], number: i64, dictionary: &[u8]) -> Result<Vec<u8>, i32> {
+    let sentinel = core::ptr::dangling_mut();
+    let mut output = sentinel;
+    let status = unsafe { op(input.as_ptr(), input.len() as i64, number, dictionary.as_ptr(), dictionary.len() as i64, &mut output) };
+    if status != 0 {
+        assert!(output.is_null(), "failure must clear a previously non-null result slot");
+        return Err(status);
+    }
+    assert!(!output.is_null() && output != sentinel);
+    let owner = BufferOwner(output);
+    let value = unsafe { &*owner.0 };
+    Ok(value.data[..value.len].to_vec())
+}
+
+// Reference frames from Python zlib.compressobj(zdict=...) and ZSTD_compress_usingDict.
+// ZDICT_trainFromBuffer produced this 256-byte dictionary from 200 weather records.
+const TRAINED_DICTIONARY: &str = concat!(
+    "37a430ec08ef185b1610f06c1c000000bc90524a29656a43efbdf7de7bef1d73",
+    "07000020c00d0700000004000406404b844e4901d0a3d013510c000080400000",
+    "b802080000188101180000000000f46fcb1b0000000000000000000000000000",
+    "000100000004000000080000000a73746174696f6e3d3030323b2074656d7065",
+    "7261747572653d3035313b2068756d69646974793d3032313b2077696e643d0a",
+    "73746174696f6e3d3031333b2074656d70657261747572653d3034353b206875",
+    "6d69646974793d3031353b2077696e643d0a73746174696f6e3d3031313b2074",
+    "656d70657261747572653d3030393b2068756d69646974793d3037393b207769",
+);
+const TRAINED_FRAME: &str = "28b52ffd2308ef185b69d50000606f62736572767c7c7c00ff0a040063145112dc41155915141c";
+const RAW_ZSTD_FRAME: &str = "28b52ffd20693d0000000100c6a40a08";
+const WEATHER: &[u8] = b"humidity|pressure|wind|observation|temperature|station|\0\xff\n";
+
+#[test]
+fn preset_codecs_read_independent_frames_and_publish_atomically() -> Result<(), String> {
+    let expected = b"observation|temperature|station|\0\xff\n".repeat(3);
+    let trained = bytes(TRAINED_DICTIONARY)?;
+    for (encode, decode, frame, dictionary) in [
+        (align_rt_compress_zlib_compress_dict as PresetCodec, align_rt_compress_zlib_decompress_dict as PresetCodec, "78f9e59918e6a39b1200414f2c8c", WEATHER),
+        (align_rt_compress_deflate_raw_compress_dict, align_rt_compress_deflate_raw_decompress_dict, "a39b1200", WEATHER),
+        (align_rt_compress_zstd_compress_dict, align_rt_compress_zstd_decompress_dict, RAW_ZSTD_FRAME, WEATHER),
+        (align_rt_compress_zstd_compress_dict, align_rt_compress_zstd_decompress_dict, TRAINED_FRAME, trained.as_slice()),
+    ] {
+        let frame = bytes(frame)?;
+        let n = expected.len() as i64;
+        assert_eq!(preset_call(decode, &frame, n, dictionary), Ok(expected.clone()));
+        assert_eq!(preset_call(decode, &frame, n - 1, dictionary), Err(AL_INVALID));
+        assert_eq!(preset_call(decode, &frame[..frame.len() - 1], n, dictionary), Err(AL_INVALID));
+        for payload in [expected.as_slice(), &[]] {
+            for dict in [dictionary, &[]] {
+                let compressed = preset_call(encode, payload, 6, dict).map_err(|s| s.to_string())?;
+                assert_eq!(preset_call(decode, &compressed, payload.len() as i64, dict), Ok(payload.to_vec()));
+            }
+        }
+        let trailing = [frame.as_slice(), &[0x60]].concat();
+        assert_eq!(preset_call(decode, &trailing, n, dictionary), Err(AL_INVALID));
+    }
+    let frame = bytes("78f9e59918e6a39b1200414f2c8c")?;
+    for missing in [&[][..], b"wrong dictionary here"] {
+        assert_eq!(preset_call(align_rt_compress_zlib_decompress_dict, &frame, 105, missing), Err(AL_INVALID));
+    }
+    let raw = bytes("a39b1200")?;
+    let wrong = vec![b'X'; WEATHER.len()];
+    assert_eq!(preset_call(align_rt_compress_deflate_raw_decompress_dict, &raw, 105, &wrong), Ok(vec![b'X'; 105]));
+    let ordinary = bytes("789ccb494d2b0100042301ac")?;
+    assert_eq!(preset_call(align_rt_compress_zlib_decompress_dict, &ordinary, 4, WEATHER), Ok(b"left".to_vec()));
+    for chunk in [1, 2, 4] {
+        assert_eq!(zlib_inflate_with_dictionary(&frame, DeflateFormat::Zlib, 105, chunk, WEATHER), Ok(expected.clone()));
+    }
+    Ok(())
+}
+
+#[test]
+fn preset_zstd_validates_dictionary_before_frames_and_keeps_dictionary_across_frames() -> Result<(), String> {
+    let decode = align_rt_compress_zstd_decompress_dict;
+    let encode = align_rt_compress_zstd_compress_dict;
+    let dictionary = bytes(TRAINED_DICTIONARY)?;
+    let frame = bytes(TRAINED_FRAME)?;
+    let skip = bytes("502a4d1800000000")?;
+    for length in [8, 16, 63] {
+        assert_eq!(preset_call(decode, &skip, 0, &dictionary[..length]), Err(AL_INVALID));
+        assert_eq!(preset_call(encode, b"abc", 3, &dictionary[..length]), Err(AL_INVALID));
+    }
+    assert_eq!(preset_call(decode, &skip, 0, &dictionary[..7]), Ok(vec![]));
+    for dict in [b"1234567".as_slice(), b"12345678"] {
+        let compressed = preset_call(encode, b"12345678", 6, dict).map_err(|s| s.to_string())?;
+        assert_eq!(preset_call(decode, &compressed, 8, dict), Ok(b"12345678".to_vec()));
+    }
+    let payload = b"observation|temperature|station|\0\xff\n".repeat(3);
+    let joined = [frame.as_slice(), &skip, &frame].concat();
+    assert_eq!(preset_call(decode, &joined, 210, &dictionary), Ok(payload.repeat(2)));
+    let suffix = [frame.as_slice(), &skip].concat();
+    assert_eq!(preset_call(decode, &suffix, 105, &dictionary), Ok(payload.clone()));
+    assert_eq!(preset_call(decode, &frame, 105, WEATHER), Err(AL_INVALID));
+    let mut wrong_id = frame.clone();
+    wrong_id[5] ^= 1;
+    assert_eq!(preset_call(decode, &[frame.as_slice(), &wrong_id].concat(), 105, &dictionary), Err(AL_INVALID));
+    Ok(())
+}
+
+#[test]
+fn preset_libz_rejects_unrepresentable_dictionary_before_access() {
+    for codec in [align_rt_compress_zlib_compress_dict as PresetCodec, align_rt_compress_zlib_decompress_dict,
+        align_rt_compress_deflate_raw_compress_dict, align_rt_compress_deflate_raw_decompress_dict] {
+        let mut output = core::ptr::dangling_mut();
+        let status = unsafe { codec(core::ptr::null(), 0, 6, core::ptr::dangling(), i64::from(u32::MAX) + 1, &mut output) };
+        assert_eq!(status, AL_INVALID);
+        assert!(output.is_null());
+    }
 }

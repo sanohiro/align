@@ -1080,11 +1080,13 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::TimeSleep { ns } => format!("time_sleep({})", operand_str(ns)),
         Rvalue::EncodingEncode { kind, data } => format!("encode_{kind:?}({})", operand_str(data)),
         Rvalue::EncodingDecode { kind, input, out } => format!("decode_{kind:?}({}, -> _{out})", operand_str(input)),
-        Rvalue::CompressCompress { kind, data, level, out } => {
-            format!("compress_{kind:?}({}, {}, -> _{out})", operand_str(data), operand_str(level))
+        Rvalue::CompressCompress { kind, data, level, dictionary, out } => {
+            let suffix = dictionary.as_ref().map(|d| format!(", {}", operand_str(d))).unwrap_or_default();
+            format!("compress_{kind:?}({}, {}{suffix}, -> _{out})", operand_str(data), operand_str(level))
         }
-        Rvalue::CompressDecompress { kind, data, max_bytes, out } => {
-            format!("decompress_{kind:?}({}, {}, -> _{out})", operand_str(data), operand_str(max_bytes))
+        Rvalue::CompressDecompress { kind, data, max_bytes, dictionary, out } => {
+            let suffix = dictionary.as_ref().map(|d| format!(", {}", operand_str(d))).unwrap_or_default();
+            format!("decompress_{kind:?}({}, {}{suffix}, -> _{out})", operand_str(data), operand_str(max_bytes))
         }
         Rvalue::Utf8Valid { data } => format!("utf8_valid({})", operand_str(data)),
         Rvalue::CryptoCtEqual { a, b } => format!("crypto_ct_equal({}, {})", operand_str(a), operand_str(b)),

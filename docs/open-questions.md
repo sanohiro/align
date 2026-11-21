@@ -77,6 +77,14 @@ realloc overlap, engine workspace and RSS are outside the payload bound.
 [Plan226 R156](impl/226-deflate-framing.md#caller-selected-output-limits-llm-r156)
 extends the original fixed-default contract below.
 
+### Preset compression dictionaries (settled)
+
+A third byte-view argument on zlib, raw DEFLATE and zstd supplies an explicit
+preset dictionary. A decoding caller supplies the output limit before that
+argument. Raw streams and ID-free Zstandard frames rely on the caller selecting
+the same dictionary at both ends. The exact framing and error contract is in
+[Plan265](impl/265-compression-dictionaries.md).
+
 ### Complete DEFLATE framing (SETTLED 2026-10-18)
 
 The existing compression family includes zlib (RFC1950) and raw DEFLATE (RFC1951)

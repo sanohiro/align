@@ -613,16 +613,6 @@ fn walk_body_records<'a>(
                     command: lhs,
                     limit: rhs,
                 }
-                | ExprKind::Compress {
-                    data: lhs,
-                    level: rhs,
-                    ..
-                }
-                | ExprKind::Decompress {
-                    data: lhs,
-                    max_bytes: rhs,
-                    ..
-                }
                 | ExprKind::RegexIsMatch {
                     regex: lhs,
                     text: rhs,
@@ -1056,6 +1046,12 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(ptr), child_depth));
                     work.push((BodyRecord::Expr(offset), child_depth));
                     work.push((BodyRecord::Expr(value), child_depth));
+                }
+                ExprKind::Compress { data, level, dictionary, .. }
+                | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
+                    work.push((BodyRecord::Expr(data), child_depth));
+                    work.push((BodyRecord::Expr(level), child_depth));
+                    if let Some(value) = dictionary { work.push((BodyRecord::Expr(value), child_depth)); }
                 }
                 ExprKind::ArrayBuilderNew { region, capacity, .. } => {
                     if let Some(region) = region {

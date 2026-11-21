@@ -18398,41 +18398,35 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // std.compress — gzip via libz / zstd via libzstd. The data view splits to `{ptr,len}`;
             // the out handle slot is caller-zeroed (so the Err path frees nothing); the runtime
             // returns an i32 status.
-            Rvalue::CompressCompress { kind, data, level, out } => {
-                let key = match kind {
-                    align_sema::hir::CompressKind::Gzip => RuntimeKey::CompressGzipCompress,
-                    align_sema::hir::CompressKind::Zlib => RuntimeKey::CompressZlibCompress,
-                    align_sema::hir::CompressKind::DeflateRaw => RuntimeKey::CompressDeflateRawCompress,
-                    align_sema::hir::CompressKind::Zstd => RuntimeKey::CompressZstdCompress,
+            Rvalue::CompressCompress { kind, data, level, dictionary, out }
+            | Rvalue::CompressDecompress { kind, data, max_bytes: level, dictionary, out } => {
+                use align_sema::hir::CompressKind::*;
+                let decompress = matches!(rv, Rvalue::CompressDecompress { .. });
+                let (encode, decode) = match (kind, dictionary.is_some()) {
+                    (Gzip, false) => (RuntimeKey::CompressGzipCompress, RuntimeKey::CompressGzipDecompress),
+                    (Zlib, false) => (RuntimeKey::CompressZlibCompress, RuntimeKey::CompressZlibDecompress),
+                    (DeflateRaw, false) => (RuntimeKey::CompressDeflateRawCompress, RuntimeKey::CompressDeflateRawDecompress),
+                    (Zstd, false) => (RuntimeKey::CompressZstdCompress, RuntimeKey::CompressZstdDecompress),
+                    (Zlib, true) => (RuntimeKey::CompressZlibCompressDict, RuntimeKey::CompressZlibDecompressDict),
+                    (DeflateRaw, true) => (RuntimeKey::CompressDeflateRawCompressDict, RuntimeKey::CompressDeflateRawDecompressDict),
+                    (Zstd, true) => (RuntimeKey::CompressZstdCompressDict, RuntimeKey::CompressZstdDecompressDict),
+                    (Gzip, true) => return Err(self.err("gzip does not admit a preset dictionary")),
                 };
+                let key = if decompress { decode } else { encode };
                 let out_ptr = self.slots[out];
-                self.builder
-                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
+                self.builder.build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
                     .map_err(|e| self.err(e))?;
                 let (dp, dl) = self.split_str(data)?;
-                let lv = self.operand(level)?;
-                self.builder
-                    .build_call(self.runtime(key), &[dp.into(), dl.into(), lv.into(), out_ptr.into()], "gzc")
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("gzip_compress returns i32 status")
-            }
-            Rvalue::CompressDecompress { kind, data, max_bytes, out } => {
-                let key = match kind {
-                    align_sema::hir::CompressKind::Gzip => RuntimeKey::CompressGzipDecompress,
-                    align_sema::hir::CompressKind::Zlib => RuntimeKey::CompressZlibDecompress,
-                    align_sema::hir::CompressKind::DeflateRaw => RuntimeKey::CompressDeflateRawDecompress,
-                    align_sema::hir::CompressKind::Zstd => RuntimeKey::CompressZstdDecompress,
+                let numeric = self.operand(level)?;
+                let status = if let Some(dict) = dictionary {
+                    let (ptr, len) = self.split_str(dict)?;
+                    self.builder.build_call(self.runtime(key),
+                        &[dp.into(), dl.into(), numeric.into(), ptr.into(), len.into(), out_ptr.into()], "codec")
+                } else {
+                    self.builder.build_call(self.runtime(key),
+                        &[dp.into(), dl.into(), numeric.into(), out_ptr.into()], "codec")
                 };
-                let out_ptr = self.slots[out];
-                self.builder
-                    .build_store(out_ptr, self.ctx.ptr_type(AddressSpace::default()).const_null())
-                    .map_err(|e| self.err(e))?;
-                let (dp, dl) = self.split_str(data)?;
-                let limit = self.operand(max_bytes)?;
-                self.builder
-                    .build_call(self.runtime(key), &[dp.into(), dl.into(), limit.into(), out_ptr.into()], "gzd")
-                    .map_err(|e| self.err(e))?
-                    .try_as_basic_value().basic().expect("gzip_decompress returns i32 status")
+                status.map_err(|e| self.err(e))?.try_as_basic_value().basic().expect("codec returns i32 status")
             }
             // std.rand — the rng state is passed by pointer to its slot (mutated in place).
             // `seed*` writes into `out`; `next`/`range` advance and return an i64; `shuffle`
@@ -43487,14 +43481,14 @@ fn main() -> i32 = 0
         for codec in ["gzip", "zlib", "deflate_raw", "zstd"] {
             for compress in [false, true] {
                 let method = if compress { "compress" } else { "decompress" };
-                let arguments = if compress { "data,level" } else { "data" };
+                let arguments = if codec != "gzip" { "data,level,data" } else if compress { "data,level" } else { "data" };
                 let source = format!(
                     "import std.compress\nfn use_codec(data:slice<u8>,level:i64)->Result<buffer,Error> = compress.{codec}_{method}({arguments})\nfn main() {{}}\n"
                 );
                 let valid = mir(&source);
                 assert!(validate_resource_rvalues(&valid).is_ok());
                 assert!(validate_thin_partition_program(&valid, &[]).is_ok());
-                for mutation in 0..6 {
+                for mutation in 0..9 {
                     let mut bad = valid.clone();
                     let mut changed = 0;
                     for function in &mut bad.fns {
@@ -43503,11 +43497,11 @@ fn main() -> i32 = 0
                                 let Stmt::Let(id, value) = statement else {
                                     continue;
                                 };
-                                let (data, out, level) = match value {
-                                    Rvalue::CompressCompress {
-                                        data, out, level, ..
-                                    } => (data, out, Some(level)),
-                                    Rvalue::CompressDecompress { data, out, max_bytes, .. } => (data, out, Some(max_bytes)),
+                                let (data, out, numeric, dictionary, kind) = match value {
+                                    Rvalue::CompressCompress { kind, data, out, level, dictionary }
+                                    | Rvalue::CompressDecompress { kind, data, out, max_bytes: level, dictionary } => {
+                                        (data, out, level, dictionary, kind)
+                                    }
                                     _ => continue,
                                 };
                                 changed += 1;
@@ -43516,21 +43510,13 @@ fn main() -> i32 = 0
                                     1 => *out = u32::MAX,
                                     2 => function.value_tys[*id as usize] = Ty::Bool,
                                     3 => function.slots[*out as usize] = Ty::String,
-                                    4 => {
-                                        if let Some(level) = level {
-                                            *level = Operand::Const(Const::Bool(false));
-                                        }
-                                    }
+                                    4 => *numeric = Operand::Const(Const::Bool(false)),
+                                    5 => *numeric = Operand::Const(Const::Int(1, Ty::Int(IntTy { bits: 32, signed: true }))),
+                                    6 => *dictionary = Some(Operand::Const(Const::Bool(false))),
+                                    7 => *dictionary = Some(Operand::Value(u32::MAX)),
                                     _ => {
-                                        if let Some(level) = level {
-                                            *level = Operand::Const(Const::Int(
-                                                1,
-                                                Ty::Int(IntTy {
-                                                    bits: 32,
-                                                    signed: true,
-                                                }),
-                                            ));
-                                        }
+                                        *kind = align_sema::hir::CompressKind::Gzip;
+                                        *dictionary = Some(data.clone());
                                     }
                                 }
                             }

@@ -2305,6 +2305,7 @@ The libz modes are 15 and -15. Both decoders require exactly one complete stream
 reject trailing bytes or a second stream, and share the cap/ownership/error rules.
 Zlib checksum or dictionary failures are Invalid; final raw-byte padding is allowed.
 Levels 0..=9 are accepted; other levels abort before native initialization.
+Zlib, raw DEFLATE and zstd additionally accept an optional third `dictionary: bytes` after an explicit level or output limit. Zlib and dictionary-ID-bearing zstd frames check the supplied dictionary. Raw DEFLATE and ID-free zstd frames can decode different bytes with a wrong dictionary. An empty dictionary selects ordinary framing.
 
 All four decoders accept the optional trailing i64 `max_bytes` in `0..=1073741824`.
 Its default is 1 GiB. Invalid limits abort after ordered operand evaluation and before

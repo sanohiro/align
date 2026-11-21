@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 485] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 491] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -508,9 +508,15 @@ runtime_keys! {
     XmlNext => "xml_next",
     XmlParse => "xml_parse",
     XmlText => "xml_text",
+    CompressDeflateRawCompressDict => "compress_deflate_raw_compress_dict",
+    CompressDeflateRawDecompressDict => "compress_deflate_raw_decompress_dict",
+    CompressZlibCompressDict => "compress_zlib_compress_dict",
+    CompressZlibDecompressDict => "compress_zlib_decompress_dict",
+    CompressZstdCompressDict => "compress_zstd_compress_dict",
+    CompressZstdDecompressDict => "compress_zstd_decompress_dict",
 }
 
-const _: [(); 485] = [(); RuntimeKey::ALL.len()];
+const _: [(); 491] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -519,7 +525,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 485);
+        assert_eq!(RuntimeKey::ALL.len(), 491);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())
