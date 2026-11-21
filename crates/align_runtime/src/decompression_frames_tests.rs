@@ -426,6 +426,39 @@ fn preset_zstd_validates_dictionary_before_frames_and_keeps_dictionary_across_fr
 }
 
 #[test]
+fn preset_trained_encoder_publishes_its_id_and_upstream_decodes_the_frame() -> Result<(), String> {
+    // Independent one-shot API; the Align decoder uses ZSTD_decompressStream.
+    unsafe extern "C" {
+        fn ZSTD_getDictID_fromFrame(frame: *const c_void, size: usize) -> c_uint;
+        fn ZSTD_decompress_usingDict(
+            ctx: *mut c_void, out: *mut c_void, capacity: usize, src: *const c_void,
+            size: usize, dictionary: *const c_void, dict_size: usize,
+        ) -> usize;
+    }
+    let dictionary = bytes(TRAINED_DICTIONARY)?;
+    let data = b"observation|temperature|station|\0\xff\n".repeat(3);
+    let frame = preset_call(align_rt_compress_zstd_compress_dict, &data, 7, &dictionary)
+        .map_err(|s| s.to_string())?;
+    assert_eq!(unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr().cast(), frame.len()) }, 0x5b18ef08);
+    let mut wrong = dictionary.clone();
+    wrong[4] ^= 1;
+    for missing_or_wrong in [&[][..], &wrong] {
+        assert_eq!(preset_call(align_rt_compress_zstd_decompress_dict, &frame, 105, missing_or_wrong), Err(AL_INVALID));
+    }
+    let mut restored = vec![0; data.len()];
+    let ctx = unsafe { ZSTD_createDStream() };
+    assert!(!ctx.is_null());
+    let count = unsafe {
+        ZSTD_decompress_usingDict(ctx, restored.as_mut_ptr().cast(), restored.len(), frame.as_ptr().cast(),
+            frame.len(), dictionary.as_ptr().cast(), dictionary.len())
+    };
+    unsafe { ZSTD_freeDStream(ctx) };
+    assert_eq!(count, data.len());
+    assert_eq!(restored, data);
+    Ok(())
+}
+
+#[test]
 fn preset_libz_rejects_unrepresentable_dictionary_before_access() {
     for codec in [align_rt_compress_zlib_compress_dict as PresetCodec, align_rt_compress_zlib_decompress_dict,
         align_rt_compress_deflate_raw_compress_dict, align_rt_compress_deflate_raw_decompress_dict] {

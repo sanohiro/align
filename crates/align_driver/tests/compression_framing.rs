@@ -292,6 +292,39 @@ fn limits_source_domain_and_input_liveness() {
 }
 
 #[test]
+fn preset_dictionary_expression_cannot_grow_an_earlier_views_owner() {
+    owned_fixture::run("preset_alias_liveness", |stage| {
+        for (argument, accepted) in [("other", true), ("input", false)] {
+            let source = format!(r#"import std.compress
+fn grow(borrow mut owner:buffer)->str {{ owner.append("longer"); return "dictionary" }}
+fn main()->Result<(),Error> {{
+  mut input:=buffer(16)
+  mut other:=buffer(16)
+  input.append("source")
+  saved:=input.bytes()
+  packed:=compress.zlib_compress(saved,6,grow({argument}))?
+  return Ok(())
+}}
+"#);
+            let path = stage.join("main.align");
+            std::fs::write(&path, &source).unwrap();
+            let entry = path.to_str().unwrap();
+            for per_unit in [false, true] {
+                let mut sources = SourceMap::new();
+                let diags = if per_unit {
+                    align_driver::build_per_unit(&mut sources, entry, &source).diags
+                } else {
+                    align_driver::check(&mut sources, entry, &source).diags
+                };
+                let report = align_driver::format_diagnostics(&sources, &diags);
+                assert_eq!(!diags.has_errors(), accepted, "{source}\n{report}");
+                if !accepted { assert!(report.contains("invalidated"), "{report}"); }
+            }
+        }
+    });
+}
+
+#[test]
 fn limits_abort_on_invalid_domain_before_decoding() {
     owned_fixture::run("limits_abort_on_invalid_domain_before_decoding", |stage| {
         use std::os::unix::process::ExitStatusExt;

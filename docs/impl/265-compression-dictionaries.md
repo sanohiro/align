@@ -23,4 +23,3 @@ This extends the completed whole-buffer contract in Plan226. The source operatio
 | Change size | Each selected public call needs source admission, provenance/ordered evaluation, native publication and independent frame decoding to exercise it. The four-layer path and its denials ship together; separating a dormant ABI or frontend-only path would repeat the same proofs. Zlib and Zstandard are independently testable engines behind the same new source arity. No timing or compression ratio is a release criterion. |
 
 Provider definitions: https://www.zlib.net/manual.html and https://facebook.github.io/zstd/zstd_manual.html .
-
