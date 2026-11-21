@@ -13,6 +13,10 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 ## Settled
 
+### Literal text splitting
+
+`str.split(separator)` preserves empty fields and returns `array<str>` borrowing only the receiver. An empty separator matches every Unicode scalar boundary. Plan261 records ownership and cleanup.
+
 ### Literal character-set search
 
 `str.find_any(chars)` matches complete Unicode scalars and returns the first

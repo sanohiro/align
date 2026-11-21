@@ -564,6 +564,9 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
         ExprKind::StrParseI64 { input } => ExprKind::StrParseI64 {
             input: boxed!(input),
         },
+        ExprKind::StrSplit { source, separator } => ExprKind::StrSplit {
+            source: boxed!(source), separator: boxed!(separator),
+        },
         ExprKind::StrCharBoundary { receiver, index } => ExprKind::StrCharBoundary {
             receiver: boxed!(receiver), index: boxed!(index),
         },
@@ -2367,6 +2370,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             ptr: lhs,
             offset: rhs,
         }
+        | ExprKind::StrSplit { source: lhs, separator: rhs }
         | ExprKind::StrCharBoundary { receiver: lhs, index: rhs }
         | ExprKind::ArrayTruncate { receiver: lhs, new_len: rhs, .. }
         | ExprKind::StrPredicate {

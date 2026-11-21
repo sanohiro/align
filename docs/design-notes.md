@@ -1,5 +1,7 @@
 # Align Design Notes
 
+Literal text splitting materializes an independently owned array of borrowed views. Keeping the field headers separate from the input buffer allows fields to survive array replacement while retaining the input's UTF-8 validation and lifetime. An empty separator splits on Unicode scalar boundaries so every field is valid text.
+
 A nonblocking HTTP peer EOF probe reports the narrow TCP receive observation.
 Orderly close and send-half-close share EOF; queued bytes can hide it, and no
 probe guarantees future response success. One per-call nonblocking peek avoids

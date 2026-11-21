@@ -1589,6 +1589,8 @@ pub enum Rvalue {
     /// `memchr`-class scan. Pure read, no allocation.
     /// Checked decimal scanner: i32 status and an exact i64 output slot.
     StrParseI64 { input: Operand, out: Slot },
+    /// Individually allocated headers retaining the source bytes.
+    StrSplit { source: Operand, separator: Operand },
     StrPredicate {
         kind: hir::StrPredKind,
         haystack: Operand,
@@ -10822,6 +10824,14 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
                 });
                 Operand::Const(Const::Unit)
             }
+            hir::ExprKind::StrSplit { source, separator } => {
+                lower_required_binding!(b, source = lower_expr(b, source), Operand::Const(Const::Unit));
+                lower_required_binding!(b, separator = lower_expr(b, separator), Operand::Const(Const::Unit));
+                let v = b.fresh_value(e.ty);
+                // A field may outlive the header array. Scope cleanup owns the backing text.
+                b.push(Stmt::Let(v, Rvalue::StrSplit { source, separator }));
+                Operand::Value(v)
+            }
             hir::ExprKind::StrPredicate {
                 kind,
                 haystack,
@@ -15077,7 +15087,7 @@ fn pipeline_source_needs_drop(b: &Builder, source: &hir::Expr, outside_arena: bo
         _ => false,
     };
     let always_heap = parallel_par_map
-        || matches!(source.kind, hir::ExprKind::ArrayChunks { .. })
+        || matches!(source.kind, hir::ExprKind::ArrayChunks { .. } | hir::ExprKind::StrSplit { .. })
         || (matches!(source.kind, hir::ExprKind::Call { .. })
             && matches!(source.ty, Ty::DynArray(_) | Ty::DynSliceArray(_)));
     let arena_if_in_arena = matches!(

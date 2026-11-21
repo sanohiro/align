@@ -6223,6 +6223,22 @@ impl<'a> XmlAccessAnalyzer<'a> {
                     }
                 }
             }
+            Rvalue::StrSplit { source, separator } => {
+                self.check_operand(&mut equation, &source, Ty::Str);
+                self.check_operand(&mut equation, &separator, Ty::Str);
+                if result_ty != Ty::DynArray(Scalar::Str)
+                    || xml_operand_base_ty(self.graph.function, &source) != Some(Ty::Str)
+                    || xml_operand_base_ty(self.graph.function, &separator) != Some(Ty::Str)
+                {
+                    equation.invalid = true;
+                } else if path.is_empty() {
+                    equation.seed = Some(XmlAccessProvenance::Owned);
+                } else if path.as_slice() == [XmlAccessPathSegment::Element] {
+                    self.add_read_operand(&mut equation, &source, Ty::Str, Vec::new());
+                } else {
+                    equation.invalid = true;
+                }
+            }
             Rvalue::PathJoin { a, b } => {
                 if result_ty != Ty::String
                     || !path.is_empty()
@@ -10695,6 +10711,10 @@ fn validate_resource_rvalues_component(
                             && operand_ty(function, value) == Some(Ty::Str)
                             && result == Ty::Unit
                     }
+                    Rvalue::StrSplit { .. } => {
+                        result == Ty::DynArray(Scalar::Str)
+                            && xml_access(&Operand::Value(*value), result) == XmlProducerState::Present(XmlAccessProvenance::Owned)
+                    }
                     // Check even discarded results: owned-value provenance is demand-driven.
                     Rvalue::EncodingEncode { kind: hir::EncodingKind::Html, data } => {
                         result == Ty::String
@@ -13621,6 +13641,38 @@ mod tests {
             .collect::<BTreeSet<_>>();
         validate_partition_resource_rvalues(&wrapped, &defined)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn str_split_mir_rejects_malformed_producers() -> Result<(), Box<dyn std::error::Error>> {
+        let mut diagnostics = align_diag::Diagnostics::new();
+        let source = "fn parts(text:str, sep:str, wrong:i64)->array<str> = text.split(sep)\nfn discard(text:str, sep:str, wrong:i64) { text.split(sep); return }";
+        let tokens = align_lexer::tokenize(0, source, &mut diagnostics);
+        let ast = align_parser::parse_file(tokens, &mut diagnostics);
+        let hir = align_sema::check_file(&ast, &mut diagnostics);
+        assert!(!diagnostics.has_errors(), "{:?}", diagnostics.iter().collect::<Vec<_>>());
+        let base = crate::lower_program(&hir);
+        validate_mir_producers(&base)?;
+        let defined = base.fns.iter().map(|f| f.name.clone()).collect::<BTreeSet<_>>();
+        for name in ["parts", "discard"] {
+            for mutation in 0..3 {
+                let mut bad = base.clone();
+                let function = bad.fns.iter_mut().find(|f| f.name.as_str() == name).ok_or("split fixture")?;
+                let (value, source, separator) = function.blocks.iter_mut().flat_map(|block| &mut block.stmts)
+                    .find_map(|s| match s {
+                        Stmt::Let(v, Rvalue::StrSplit { source, separator }) => Some((*v, source, separator)),
+                        _ => None,
+                    }).ok_or("split rvalue")?;
+                match mutation {
+                    0 => *source = Operand::Arg(2),
+                    1 => *separator = Operand::Arg(2),
+                    _ => function.value_tys[usize::try_from(value)?] = Ty::Bool,
+                }
+                assert!(validate_mir_producers(&bad).is_err(), "{name} {mutation}");
+                assert!(validate_partition_resource_rvalues(&bad, &defined).is_err(), "{name} {mutation}");
+            }
+        }
         Ok(())
     }
 
