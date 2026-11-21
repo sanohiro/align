@@ -2860,6 +2860,8 @@ pub enum Rvalue {
     /// bound local `Drop`-frees it via `http_client_free`). No operands. Pure (no I/O — the requests
     /// are impure). Slice 2 carries no pooled state.
     HttpClient,
+    /// Five borrowed views in source order. The native constructor owns the published client.
+    HttpTlsClient { views: Vec<Operand>, out: Slot },
     /// `cl.get(url)` — perform a `GET url` over a fresh connection: the runtime writes an owned `http
     /// response` handle to `out` and returns an `i32` status (0 = ok — a 4xx/5xx is still ok, status is
     /// data; else `AL_INVALID` / errno → `Error`). The caller branches `Ok(response)` / `Err`. Impure.
@@ -3432,7 +3434,7 @@ fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
         | Rvalue::HttpSseStreamLastEventId { .. }
         | Rvalue::HttpSseStreamRetryMs { .. }
         | Rvalue::HttpSseStreamNext { .. }
-        | Rvalue::HttpGetMany { .. } => Some(Capability::Tls),
+        | Rvalue::HttpTlsClient { .. } | Rvalue::HttpGetMany { .. } => Some(Capability::Tls),
         _ => None,
     }
 }
@@ -8491,7 +8493,7 @@ fn expression_uses_out_of_line_dispatch(e: &hir::Expr) -> bool {
             | hir::ExprKind::HttpSseStreamLastEventId { .. }
             | hir::ExprKind::HttpSseStreamRetryMs { .. }
             | hir::ExprKind::HttpSseStreamNext { .. }
-            | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpTlsClient { .. } | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -8698,7 +8700,7 @@ fn lower_out_of_line_expr(b: &mut Builder, e: &hir::Expr) -> Operand {
         | hir::ExprKind::HttpSseStreamLastEventId { .. }
         | hir::ExprKind::HttpSseStreamRetryMs { .. }
         | hir::ExprKind::HttpSseStreamNext { .. }
-        | hir::ExprKind::HttpGetMany { .. }
+        | hir::ExprKind::HttpTlsClient { .. } | hir::ExprKind::HttpGetMany { .. }
         | hir::ExprKind::HttpServe { .. }
         | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -10164,7 +10166,7 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             | hir::ExprKind::HttpSseStreamLastEventId { .. }
             | hir::ExprKind::HttpSseStreamRetryMs { .. }
             | hir::ExprKind::HttpSseStreamNext { .. }
-            | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpTlsClient { .. } | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -22455,6 +22457,16 @@ fn lower_http(b: &mut Builder, e: &hir::Expr) -> Operand {
         }
         // `http.client()` → an owned `http client` handle returned by value (the bound local
         // `Drop`-frees it via `http_client_free`).
+        hir::ExprKind::HttpTlsClient { args } => {
+            let mut views = Vec::with_capacity(args.len());
+            for arg in args {
+                views.push(lower_required!(b, lower_expr(b, arg), Operand::Const(Const::Unit)));
+            }
+            let out = b.new_slot(Ty::HttpClient);
+            let code = b.fresh_value(status_ty());
+            b.push(Stmt::Let(code, Rvalue::HttpTlsClient { views, out }));
+            emit_open_handle_result(b, code, out, Ty::HttpClient, e.ty)
+        }
         hir::ExprKind::HttpClient => {
             let v = b.fresh_value(e.ty);
             b.push(Stmt::Let(v, Rvalue::HttpClient));

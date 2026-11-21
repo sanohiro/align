@@ -94,6 +94,8 @@ pub use compress_stream::*;
 mod str_prims;
 pub use str_prims::*;
 mod crypto_asymmetric;
+mod http_tls;
+pub use http_tls::align_rt_http_tls_client_new;
 mod crypto_digest;
 mod os_host;
 mod os_memory;
@@ -23350,7 +23352,6 @@ unsafe extern "C" {
     // EVP wrappers above (every call unsafe-wrapped, every error path frees the handle).
     fn TLS_client_method() -> *const c_void;
     fn SSL_CTX_new(method: *const c_void) -> *mut c_void;
-    #[allow(dead_code)] // symmetry with SSL_CTX_new; the process-wide ctx is never torn down
     fn SSL_CTX_free(ctx: *mut c_void);
     fn SSL_CTX_set_default_verify_paths(ctx: *mut c_void) -> c_int;
     fn SSL_CTX_ctrl(ctx: *mut c_void, cmd: c_int, larg: c_long, parg: *mut c_void) -> c_long;
@@ -23393,6 +23394,11 @@ unsafe extern "C" {
 /// pointee is thread-safe for concurrent `SSL_new` / handshakes across `get_many` workers — OpenSSL
 /// (>= 1.1) does its own internal locking on a shared `SSL_CTX` — so sharing the raw pointer is sound.
 struct TlsCtx(*mut c_void);
+impl Drop for TlsCtx {
+    fn drop(&mut self) {
+        unsafe { SSL_CTX_free(self.0) };
+    }
+}
 // SAFETY: the pointee is an OpenSSL `SSL_CTX`, designed to be shared read-only across threads.
 unsafe impl Send for TlsCtx {}
 unsafe impl Sync for TlsCtx {}
@@ -23426,8 +23432,11 @@ fn build_tls_client_ctx() -> TlsCtx {
         if ctx.is_null() {
             return TlsCtx(core::ptr::null_mut());
         }
-        SSL_CTX_set_default_verify_paths(ctx); // system trust store (mandated root)
-        SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, core::ptr::null_mut()); // TLS >= 1.2
+        if SSL_CTX_set_default_verify_paths(ctx) != 1 ||
+            SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, core::ptr::null_mut()) != 1 {
+            SSL_CTX_free(ctx);
+            return TlsCtx(core::ptr::null_mut());
+        }
         // Test-only trust injection. This whole block is `#[cfg(test)]` — it is compiled OUT of the
         // shipped runtime, so a release build has NO trust hook and cannot reach it (structurally,
         // not by a runtime guard). The test harness names its CA file in `TLS_TEST_CA_FILE` before
@@ -23706,17 +23715,16 @@ unsafe fn plain_peek(fd: i32, dst: *mut u8) -> ConnRead {
 ///
 /// # Safety
 /// `ssl` must be a valid `SSL*`.
-unsafe fn ssl_error_status(ssl: *const c_void, err: c_int) -> i32 {
+unsafe fn ssl_error_status(ssl: *const c_void, err: c_int, e: &std::io::Error) -> i32 {
     unsafe {
         if SSL_get_verify_result(ssl) != X509_V_OK {
             return AL_DENIED;
         }
         if err == SSL_ERROR_SYSCALL {
-            let e = std::io::Error::last_os_error();
             if e.raw_os_error().unwrap_or(0) == 0 {
                 return AL_INVALID; // unclean EOF, not a verify failure
             }
-            return io_error_to_status(&e);
+            return io_error_to_status(e);
         }
         AL_INVALID
     }
@@ -23730,6 +23738,7 @@ unsafe fn ssl_error_status(ssl: *const c_void, err: c_int) -> i32 {
 unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8], has_deadline: bool) -> i32 {
     while !bytes.is_empty() {
         let want = bytes.len().min(c_int::MAX as usize) as c_int;
+        crypto_asymmetric::clear_errors();
         let n = unsafe { SSL_write(ssl, bytes.as_ptr() as *const c_void, want) };
         if n > 0 {
             bytes = &bytes[n as usize..];
@@ -23739,6 +23748,7 @@ unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8], has_deadline: bool) 
         // (http.md "I/O timeouts") is recognisable by its `EAGAIN`/`EWOULDBLOCK`.
         let e = std::io::Error::last_os_error();
         let err = unsafe { SSL_get_error(ssl, n) };
+        crypto_asymmetric::clear_errors();
         if err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE {
             // On a blocking socket a `WANT_*` means the underlying `write(2)` returned `EAGAIN`; with a
             // deadline armed that is our timeout firing → `AL_TIMEOUT` (otherwise we would re-`SSL_write`
@@ -23754,7 +23764,7 @@ unsafe fn tls_write_all(ssl: *mut c_void, mut bytes: &[u8], has_deadline: bool) 
         if has_deadline && err == SSL_ERROR_SYSCALL && e.kind() == std::io::ErrorKind::WouldBlock {
             return AL_TIMEOUT;
         }
-        return unsafe { ssl_error_status(ssl, err) };
+        return unsafe { ssl_error_status(ssl, err, &e) };
     }
     0
 }
@@ -23783,6 +23793,7 @@ unsafe fn tls_receive(
 ) -> ConnRead {
     loop {
         let want = len.min(c_int::MAX as usize) as c_int;
+        crypto_asymmetric::clear_errors();
         let n = if peek {
             unsafe { SSL_peek(ssl, dst as *mut c_void, want) }
         } else {
@@ -23795,6 +23806,7 @@ unsafe fn tls_receive(
         // by its `EAGAIN`/`EWOULDBLOCK` (http.md "I/O timeouts").
         let e = std::io::Error::last_os_error();
         let err = unsafe { SSL_get_error(ssl, n) };
+        crypto_asymmetric::clear_errors();
         if err == SSL_ERROR_ZERO_RETURN {
             return ConnRead::Eof;
         }
@@ -23822,7 +23834,7 @@ unsafe fn tls_receive(
             }
             return ConnRead::Err(io_error_to_status(&e));
         }
-        return ConnRead::Err(unsafe { ssl_error_status(ssl, err) });
+        return ConnRead::Err(unsafe { ssl_error_status(ssl, err, &e) });
     }
 }
 
@@ -23839,8 +23851,9 @@ unsafe fn tls_receive(
 ///
 /// # Safety
 /// Callers must eventually [`Conn::close`] the returned conn.
-unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64) -> Result<Conn, i32> {
-    let ctx = tls_client_ctx();
+unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64, policy: Option<&http_tls::Policy>) -> Result<Conn, i32> {
+    if policy.is_some_and(|p| !p.evidence_current()) { return Err(AL_DENIED); }
+    let ctx = policy.map_or_else(tls_client_ctx, |p| p.ctx.0);
     if ctx.is_null() {
         return Err(AL_INVALID); // engine init failed (OOM-class)
     }
@@ -23877,14 +23890,13 @@ unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64) -> Result<Con
         unsafe { SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS) };
         // SNI (DNS names only). `SSL_set_tlsext_host_name` is a macro over `SSL_ctrl`; OpenSSL
         // strdup's the name, so `host_c` may drop after this call.
-        unsafe {
-            SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, host_c.as_ptr() as *mut c_void);
+        if unsafe { SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, host_c.as_ptr() as *mut c_void) } != 1 {
+            return fail(AL_CODE);
         }
     }
-    // Advertise ALPN `http/1.1` (wire form: a 1-byte length prefix + the token). Advisory — a
-    // non-zero return (only on OOM) is non-fatal; the server may ignore ALPN for HTTP/1.1.
+    // OpenSSL returns zero on successful ALPN setup. A peer may omit protocol selection.
     const ALPN_HTTP11: [u8; 9] = *b"\x08http/1.1";
-    unsafe { SSL_set_alpn_protos(ssl, ALPN_HTTP11.as_ptr(), ALPN_HTTP11.len() as c_uint) };
+    if unsafe { SSL_set_alpn_protos(ssl, ALPN_HTTP11.as_ptr(), ALPN_HTTP11.len() as c_uint) } != 0 { return fail(AL_CODE); }
     // Arm the handshake I/O deadline on the (now blocking) fd BEFORE `SSL_connect` so a peer that
     // completes TCP then stalls the handshake times out rather than hanging (http.md "I/O timeouts").
     // `timeout_ns == 0` leaves the socket blocking, so the handshake is byte-identical to the
@@ -23897,14 +23909,16 @@ unsafe fn http_tls_connect(host: &str, port: i64, timeout_ns: i64) -> Result<Con
     // (alert/protocol) via `ssl_error_status`, which checks `SSL_get_verify_result` first. With a
     // deadline armed, a `WANT_*`/`SYSCALL` whose errno is `EAGAIN`/`EWOULDBLOCK` is that deadline
     // firing → `AL_TIMEOUT` (not a generic transport error).
+    crypto_asymmetric::clear_errors();
     let rc = unsafe { SSL_connect(ssl) };
     if rc != 1 {
         let e = std::io::Error::last_os_error(); // capture errno before `SSL_get_error`
         let err = unsafe { SSL_get_error(ssl, rc) };
+        crypto_asymmetric::clear_errors();
         let timed_out = timeout_ns > 0
             && matches!(err, SSL_ERROR_SYSCALL | SSL_ERROR_WANT_READ | SSL_ERROR_WANT_WRITE)
             && e.kind() == std::io::ErrorKind::WouldBlock;
-        let status = if timed_out { AL_TIMEOUT } else { unsafe { ssl_error_status(ssl, err) } };
+        let status = if timed_out { AL_TIMEOUT } else { unsafe { ssl_error_status(ssl, err, &e) } };
         return fail(status);
     }
     Ok(Conn::Tls { ssl, fd })
@@ -24055,6 +24069,7 @@ type HttpIdlePool = std::collections::HashMap<String, HttpHostPool>;
 /// only ever *idle* in the map between requests, and each request scratch is exclusively leased, so
 /// locks are held only for O(1) take/put operations, never across serialization or blocking I/O.
 pub struct HttpClient {
+    policy: Option<http_tls::Policy>,
     idle: std::sync::Mutex<HttpIdlePool>,
     request_buffers: std::sync::Mutex<Vec<Vec<u8>>>,
     /// The client-default I/O timeout in nanoseconds set by [`align_rt_http_client_timeout`], or `0`
@@ -24078,6 +24093,15 @@ unsafe impl Send for HttpClient {}
 unsafe impl Sync for HttpClient {}
 
 impl HttpClient {
+    fn new(policy: Option<http_tls::Policy>) -> Self {
+        Self {
+            policy,
+            idle: Default::default(),
+            request_buffers: Default::default(),
+            timeout_ns: Default::default(),
+            max_response_body_bytes: Default::default(),
+        }
+    }
     /// Lend one serialized-request scratch buffer. Each concurrent worker owns its buffer until the
     /// returned lease drops, so no lock is held during serialization or socket I/O.
     fn request_buffer(&self) -> HttpRequestBuffer<'_> {
@@ -24103,6 +24127,7 @@ impl HttpClient {
     /// collected under the lock and closed after releasing it, so blocking TLS teardown never stalls a
     /// concurrent `get_many` worker. This preserves the plaintext pool's no-I/O-under-lock property.)
     fn take_idle(&self, scheme: HttpScheme, host: &str, port: i64) -> Option<(i32, *mut c_void)> {
+        if self.policy.as_ref().is_some_and(|p| p.revocation) { return None; }
         let mut stale: Vec<(i32, *mut c_void)> = Vec::new();
         let found = {
             let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -24155,6 +24180,10 @@ impl HttpClient {
     /// lock and torn down AFTER releasing it — a TLS `close_tls` can WRITE a close_notify and block, so
     /// it must never run under the pool lock (preserving the no-I/O-under-lock property).
     fn put_idle(&self, scheme: HttpScheme, host: &str, port: i64, fd: i32, ssl: *mut c_void) {
+        if self.policy.as_ref().is_some_and(|p| p.revocation) {
+            unsafe { close_tls(ssl, fd) };
+            return;
+        }
         let mut to_close: Vec<(i32, *mut c_void)> = Vec::new();
         {
             let mut map = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -24228,12 +24257,7 @@ impl Drop for HttpRequestBuffer<'_> {
 /// `http.client()` — allocate a client handle owning an empty keepalive pool.
 #[unsafe(no_mangle)]
 pub extern "C" fn align_rt_http_client_new() -> *mut HttpClient {
-    Box::into_raw(Box::new(HttpClient {
-        idle: std::sync::Mutex::new(std::collections::HashMap::new()),
-        request_buffers: std::sync::Mutex::new(Vec::new()),
-        timeout_ns: std::sync::atomic::AtomicI64::new(0),
-        max_response_body_bytes: std::sync::atomic::AtomicI64::new(0),
-    }))
+    Box::into_raw(Box::new(HttpClient::new(None)))
 }
 
 /// `cl.timeout(ns)` — set the client's default I/O timeout in nanoseconds applied to every request
@@ -25337,20 +25361,8 @@ unsafe fn http_client_perform_stream(
     client: *mut HttpClient,
     req: HttpRequestView<'_>,
 ) -> Result<HttpReadStream, i32> {
-    if req.method == "CONNECT" {
-        return Err(AL_INVALID);
-    }
-    let Some((scheme, authority, _)) = http_split_url(req.url) else {
-        return Err(AL_INVALID);
-    };
-    let default_port = match scheme {
-        HttpScheme::Http => 80,
-        HttpScheme::Https => 443,
-    };
-    let Some((host, port)) = http_split_authority(authority, default_port) else {
-        return Err(AL_INVALID);
-    };
     let client_ref = unsafe { client.as_ref() }.ok_or(AL_INVALID)?;
+    let (scheme, host, port) = http_tls::destination(Some(client_ref), req)?;
     let client_timeout = client_ref.timeout_ns.load(std::sync::atomic::Ordering::Relaxed);
     let effective_timeout = if req.timeout_ns > 0 {
         req.timeout_ns
@@ -25378,7 +25390,7 @@ unsafe fn http_client_perform_stream(
             Some((fd, ssl)) => (Conn::from_parts(fd, ssl), true),
             None => {
                 let fresh = match scheme {
-                    HttpScheme::Https => unsafe { http_tls_connect(host, port, effective_timeout) },
+                    HttpScheme::Https => unsafe { http_tls_connect(host, port, effective_timeout, client_ref.policy.as_ref()) },
                     HttpScheme::Http => unsafe { http_connect_fd(host, port, effective_timeout) }
                         .map(|fd| Conn::Plain { fd }),
                 };
@@ -25937,26 +25949,11 @@ unsafe fn http_client_perform(
     out: *mut *mut HttpResponse,
     client_body_limit_snapshot: Option<i64>,
 ) -> i32 {
-    // A successful CONNECT switches to a tunnel this whole-response surface cannot represent.
-    // Reject before URL parsing, scratch borrowing, pool access, DNS, connect, write, or TLS work.
-    if req.method == "CONNECT" {
-        return AL_INVALID;
-    }
-    // 1. Split the URL into scheme + authority (`https://` now routes to TLS — Slice 5; any other
-    //    scheme / empty authority / malformed → Error.Invalid).
-    let Some((scheme, authority, _path)) = http_split_url(req.url) else {
-        return AL_INVALID;
+    let client_ref = unsafe { client.as_ref() };
+    let (scheme, host, port) = match http_tls::destination(client_ref, req) {
+        Ok(destination) => destination,
+        Err(status) => return status,
     };
-    // 2. The connect address (`Host:` keeps the full authority; serialize handles that). Default port
-    //    per scheme: 80 (http) / 443 (https).
-    let default_port = match scheme {
-        HttpScheme::Http => 80,
-        HttpScheme::Https => 443,
-    };
-    let Some((host, port)) = http_split_authority(authority, default_port) else {
-        return AL_INVALID;
-    };
-    let client_ref: Option<&HttpClient> = unsafe { client.as_ref() };
     // 3. Resolve the effective per-request I/O timeout (http.md "I/O timeouts"): the request's own
     //    `timeout > 0` overrides; otherwise inherit the client default (`0` for a null client). `0`
     //    means "no timeout" — the pre-timeout blocking path, byte-identical for every existing caller.
@@ -26027,7 +26024,7 @@ unsafe fn http_client_perform(
             Some((fd, ssl)) => (Conn::from_parts(fd, ssl), true),
             None => {
                 let fresh = match scheme {
-                    HttpScheme::Https => unsafe { http_tls_connect(host, port, effective_timeout) },
+                    HttpScheme::Https => unsafe { http_tls_connect(host, port, effective_timeout, client_ref.and_then(|c| c.policy.as_ref())) },
                     HttpScheme::Http => unsafe { http_connect_fd(host, port, effective_timeout) }.map(|fd| Conn::Plain { fd }),
                 };
                 match fresh {
@@ -32255,7 +32252,7 @@ mod tests {
     // --- std.encoding (M10 Slice 1) ----------------------------------------------------------
 
     /// Scalar Base64 oracle for the runtime-dispatched FFI path.
-    fn b64_enc(data: &[u8], url: bool) -> Vec<u8> {
+    pub(super) fn b64_enc(data: &[u8], url: bool) -> Vec<u8> {
         let pad = !url;
         let len = base64_encoded_len(data.len(), pad).unwrap();
         let mut out = vec![core::mem::MaybeUninit::uninit(); len];
@@ -49731,7 +49728,7 @@ event: first\nevent:\ndata: x\n\n";
 
     // Embedded PEM fixtures (generated with the `openssl` CLI, EC P-256 keys, ~100-year validity so
     // they never expire in CI). See the branch commit message for the exact generation commands.
-    const TLS_TEST_CA: &str = r#"-----BEGIN CERTIFICATE-----
+    pub(super) const TLS_TEST_CA: &str = r#"-----BEGIN CERTIFICATE-----
 MIIBiDCCAS2gAwIBAgIUc7UyNyw5AISKiWorONvuSdphVtMwCgYIKoZIzj0EAwIw
 GDEWMBQGA1UEAwwNQWxpZ24gVGVzdCBDQTAgFw0yNjA3MTAxMzAzMTZaGA8yMTI2
 MDYxNjEzMDMxNlowGDEWMBQGA1UEAwwNQWxpZ24gVGVzdCBDQTBZMBMGByqGSM49
@@ -49761,7 +49758,7 @@ fv/1Sa8ypfp9VRcp2RQ/VyNuLR6hRANCAAQ0YHBcuzY2MOSo3EGjhCsYbF5OEzzb
 CwOlGvpL5GZh8qYSFUpudgD7oC0M8rKvCllxIz6OX+o1E2B+7dNa7OeK
 -----END PRIVATE KEY-----
 "#;
-    const TLS_WRONG_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+    pub(super) const TLS_WRONG_CERT: &str = r#"-----BEGIN CERTIFICATE-----
 MIIBljCCATygAwIBAgIUB873hxsoxl/6PhispxYCQNenPOIwCgYIKoZIzj0EAwIw
 GDEWMBQGA1UEAwwNQWxpZ24gVGVzdCBDQTAgFw0yNjA3MTAxMzAzMTZaGA8yMTI2
 MDYxNjEzMDMxNlowGDEWMBQGA1UEAwwNd3JvbmcuZXhhbXBsZTBZMBMGByqGSM49
@@ -49773,7 +49770,7 @@ A0gAMEUCIQCEqqKs35IIBY9UhpEzwCgzLNkhysoPvHNAvZqmtHxMCgIgEFyHFEkJ
 jV8huvf8B7WNNKZDNd7f4Ul/mU1Qm6Onlj8=
 -----END CERTIFICATE-----
 "#;
-    const TLS_WRONG_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+    pub(super) const TLS_WRONG_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
 MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQghUgwEWXn3h0bO+Uh
 2MAJO2/ecIhxNmPuOlvbKFUJN4ehRANCAARFwd71q2+fbid4pVNQNCx8oLzSScoz
 r4YO1yuoNivnD7DZQx8RY4oBa+jsVEWa6oVonDhLr2+nfb+YWW82izC7
@@ -49820,7 +49817,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
 
     /// Build a server-side `SSL_CTX` from cert+key PEM (written to temp files). Leaks the CTX (test
     /// only — a handful per run).
-    fn tls_server_ctx(cert_pem: &str, key_pem: &str) -> *mut c_void {
+    pub(super) fn tls_server_ctx(cert_pem: &str, key_pem: &str) -> *mut c_void {
         let dir = std::env::temp_dir();
         let uniq = tls_unique_id();
         let cert_path = dir.join(format!("align_tls_srv_{uniq}.crt"));
@@ -49846,7 +49843,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// each accepted socket in a server-side `SSL`. Serves keepalive requests on one conn until the
     /// client closes (unless `close_after_each`). Returns the port + a join handle yielding the TCP
     /// accept count (the reuse tests assert it). A tiny test GET fits in one `SSL_read`.
-    fn tls_serve(
+    pub(super) fn tls_serve(
         cert_pem: &'static str,
         key_pem: &'static str,
         response: Vec<u8>,
@@ -50311,7 +50308,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
                 close_tls(ssl, fd);
             }
         });
-        let mut conn = unsafe { http_tls_connect("127.0.0.1", port as i64, 0) }.expect("verified TLS probe");
+        let mut conn = unsafe { http_tls_connect("127.0.0.1", port as i64, 0, None) }.expect("verified TLS probe");
         let ssl = match &mut conn {
             Conn::Tls { ssl, .. } => *ssl,
             Conn::Plain { .. } => panic!("https probe must produce TLS Conn"),
@@ -50412,7 +50409,7 @@ fA7DytdpLTc53+6wwjcTbtV0WNLNCErS6Be+vNL1diaXKmVd2kGcCrVC
     /// `cargo test` runs tests concurrently in ONE process (a shared fd table), so a detached echo
     /// server's fds in one test would otherwise inflate another's fd-leak assertion. Held for each
     /// such test's duration.
-    static GET_MANY_SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static GET_MANY_SERVER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A `{ptr,len}` `AlignStr` view over an owned string, for the `slice<str>` FFI argument of
     /// `align_rt_http_get_many`. The returned `AlignStr` borrows `s` — keep `s` alive across the call.

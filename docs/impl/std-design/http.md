@@ -14,8 +14,20 @@ stays deferred (client-first). HTTP/3, routing, middleware = pkg, not std.
 **Module status: v1 COMPLETE** (Slices 1–6 shipped; client-side TLS is Slice 5). The first
 post-`pkg.db` convergence item, client streaming receive, is **IMPLEMENTED 2026-08-30**: the
 dependent raw `http_read_stream` boundary and its consuming `http_sse_stream` transition are both
-shipped. Server-side TLS, client certs, custom CA, session resumption, and
-revocation remain separate backlog items.
+shipped. An origin-scoped client supports private trust roots, mutual TLS and mandatory offline CRLs. Server-side TLS and session resumption remain separate backlog items.
+
+## Origin-scoped HTTPS
+
+```text
+http.tls_client(origin: str, trust_pem: bytes, certificate_chain_pem: bytes,
+                private_key_pem: bytes, crls_pem: bytes) -> Result<http_client, Error>
+```
+
+All five inputs are borrowed during construction. Use an HTTPS origin with an optional port and trailing slash. The client checks every request, including streaming and batch entries, against the normalized DNS name or IP address and port before network I/O. A malformed URL or caller-supplied Host yields `Error.Invalid`. Another well-formed origin yields `Error.Denied`.
+
+Empty trust uses the system store. Explicit trust accepts self-signed CA certificates and replaces that store for this client. Supply an ordered leaf-first client chain and its matching unencrypted PKCS#8 key together for mutual TLS. Two empty fields omit the identity. The chain ends before the root. The constructor rejects malformed PEM, trailing binary data and oversized inputs. Each field accepts up to 4 MiB, each certificate or CRL list up to 64 objects, and a decoded private key up to 64 KiB.
+
+A nonempty CRL list requires explicit trust. Every new connection verifies the peer's chain and identity against current, signed revocation evidence. These clients establish a fresh connection for each request. Missing coverage, revoked certificates, and expired or future evidence yield `Error.Denied`. The configured client owns the parsed credentials and its connection pool. [Full contract](../269-private-http-client-tls.md)
 
 ## Signatures
 
@@ -407,19 +419,16 @@ deferred. Header parsing uses the memchr-backed scan described in **R2**.
      PEM fixtures. The positive path uses a **test-only trust hook**: a `#[cfg(test)]` `OnceLock`
      (`TLS_TEST_CA_FILE`) that adds the test CA to the client store; it is compiled OUT of the shipped
      runtime (structurally, not a runtime guard), so release builds have no trust hook at all —
-     verification stays mandatory. A driver test proves the routing change (`https://` connects
-     instead of being rejected pre-connect); the positive TLS round-trip is not drivable from the
-     driver harness because the `#[cfg(test)]` trust hook is absent in the driver-linked runtime.
+     verification stays mandatory. A driver test proves the routing change. The scoped-client driver suite separately exercises positive TLS round trips
+     with an explicit root and with a child process's configured system trust.
 
    **Settled design (as ratified):** Zero new user-facing surface — `https://` simply starts working
    through `cl.get/post/request` (the URL scheme is the only input that should change behavior).
    - **Engine = OpenSSL libssl** (the same package as libcrypto; OpenSSL ≥3.0 for TLS), capability-
      linked together with `-lcrypto` when HTTPS is used. The *linkage* reuses crypto's settlement;
-     the **trust decision is a genuinely new semantic and gets its own record (this one)**: certificates are
-     **always verified** against the **system trust store** (`SSL_CTX_set_default_verify_paths()`,
-     never a hardcoded path; deployment note: the `ca-certificates` package must be present or
-     every handshake fails closed). No disable/custom-CA/client-cert/resumption surface in v1 (no
-     config surface exists — consistent with the frozen signatures). Fail closed, always.
+     the default `http.client()` uses system verification through `SSL_CTX_set_default_verify_paths()`.
+     Install the OS trust bundle when using this mode. The later `http.tls_client` constructor
+     specifies private roots, a client certificate and offline CRLs in its own contract above.
    - **Hostname binding is REQUIRED, not optional — chain-verify-only is a defect.** The record
      mandates the exact APIs: `SSL_set_verify(SSL_VERIFY_PEER)` + `SSL_set1_host(host)` (DNS names;
      with `SSL_set_hostflags(X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS)`) or
@@ -939,16 +948,8 @@ deferred. Header parsing uses the memchr-backed scan described in **R2**.
 - **HTTPS is CLIENT-SIDE ONLY (Slice 5).** Server-side TLS is deferred — `http.serve` is plaintext,
   and its recorded trusted-network caveat (below) stands. Client-first matches the align-LLM A5
   consumer; server TLS is coherent post-v1 work, not a half-ship.
-- **No certificate revocation checking (Slice 5).** Verification is chain + hostname against the
-  system trust store; there is no CRL / OCSP / OCSP-stapling check. A revoked-but-not-expired cert
-  that still chains to a trusted root is accepted. Revocation is recorded post-v1 backlog (alongside
-  client certs, custom CA, and session resumption — none of which have a config surface in the frozen
-  signatures).
-- **The system trust store must be present (Slice 5 deployment note).** Trust roots come from
-  `SSL_CTX_set_default_verify_paths()` (never a hardcoded path). If the OS `ca-certificates` package
-  (or equivalent) is absent, the store is empty and **every** HTTPS handshake fails CLOSED with
-  `Error.Denied` — the correct fail-closed posture, but a deployment prerequisite worth stating: ship
-  `ca-certificates` in any container/image that makes HTTPS requests.
+- `http.client()` uses system trust and checks the chain and hostname. An explicitly configured `http.tls_client` can also require offline CRLs.
+- Deploy the OS CA bundle for `http.client()` or an empty `trust_pem`. With explicit trust, the configured client reads only the supplied anchors.
 - **SERVER-SIDE ESCALATION of the timeout gap (Slice 4, security caveat — settled 2026-07-10).**
   On the client the missing I/O deadline is a robustness gap; on the **server** it is a security
   boundary: one slow-loris client (connects, then stalls or dribbles below the caps) holds the

@@ -31,6 +31,7 @@ enum NativeReturn {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeAbiShape {
+    HttpTlsClient,
     CompressDictionary,
     CompressStream,
     BufferAppendFilled,
@@ -637,6 +638,7 @@ fn runtime_effects(id: RuntimeAbiId) -> RuntimeEffects {
         RuntimeAbiId::Keyed(RuntimeKey::HttpStreamReject) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpStreamSend) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpStreamSendEvent) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 1], releases: Release::None, returns_fresh: false, diverges: false },
+        RuntimeAbiId::Keyed(RuntimeKey::HttpTlsClientNew) => RuntimeEffects { class: EffectClass::Foreign, argmem: ArgMem::Unstated, params: &[], escapes: &[0, 2, 4, 6, 8, 10], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpTimeout) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpStreamWriteTimeoutNs) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
         RuntimeAbiId::Keyed(RuntimeKey::HttpUpgradeDeadline) => RuntimeEffects { class: EffectClass::HostState, argmem: ArgMem::Unstated, params: &[], escapes: &[0], releases: Release::None, returns_fresh: false, diverges: false },
@@ -2313,6 +2315,7 @@ pub(super) fn runtime_abi(key: RuntimeKey) -> RuntimeAbi {
             symbol: "align_rt_http_stream_send_event",
             shape: RuntimeAbiShape::A20,
         },
+        RuntimeKey::HttpTlsClientNew => RuntimeAbi { key, symbol: "align_rt_http_tls_client_new", shape: RuntimeAbiShape::HttpTlsClient },
         RuntimeKey::HttpTimeout => RuntimeAbi {
             key,
             symbol: "align_rt_http_timeout",
@@ -3282,15 +3285,15 @@ fn validate_effects(abi: RuntimeAbi, effects: RuntimeEffects) -> Result<(), Stri
 }
 
 pub(super) fn validate_registry() -> Result<(), String> {
-    if RuntimeKey::ALL.len() != 502 || keyed_runtime_abis().len() != 502 {
+    if RuntimeKey::ALL.len() != 503 || keyed_runtime_abis().len() != 503 {
         return Err("runtime ABI registry invariant: key-count".to_string());
     }
-    if runtime_abis().count() != 520 {
+    if runtime_abis().count() != 521 {
         return Err("runtime ABI registry invariant: base-count".to_string());
     }
 
     let mut keys = HashSet::with_capacity(RuntimeKey::ALL.len());
-    let mut symbols = HashSet::with_capacity(520);
+    let mut symbols = HashSet::with_capacity(521);
     for abi in keyed_runtime_abis() {
         validate_effects(abi, runtime_effects(abi.key))?;
         let key = abi
@@ -4032,6 +4035,11 @@ fn shape_spec(shape: RuntimeAbiShape) -> RuntimeAbiShapeSpec {
             ret: NativeReturn::Ptr,
             params: &[NativeType::Ptr, NativeType::I64, NativeType::I64],
         },
+        RuntimeAbiShape::HttpTlsClient => RuntimeAbiShapeSpec {
+            ret: NativeReturn::I32,
+            params: &[NativeType::Ptr, NativeType::I64, NativeType::Ptr, NativeType::I64, NativeType::Ptr,
+                NativeType::I64, NativeType::Ptr, NativeType::I64, NativeType::Ptr, NativeType::I64, NativeType::Ptr],
+        },
         RuntimeAbiShape::CompressStream => RuntimeAbiShapeSpec {
             ret: NativeReturn::I64,
             params: &[NativeType::Ptr, NativeType::Ptr, NativeType::I64, NativeType::Ptr, NativeType::I64],
@@ -4643,17 +4651,17 @@ mod tests {
         );
         validate_registry().unwrap_or_else(|error| panic!("valid runtime registry: {error}"));
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 520);
+        assert_eq!(rows.len(), 521);
         assert_eq!(
             rows.iter().map(|row| row.key).collect::<HashSet<_>>().len(),
-            520
+            521
         );
         assert_eq!(
             rows.iter()
                 .map(|row| row.symbol)
                 .collect::<HashSet<_>>()
                 .len(),
-            520
+            521
         );
         for (key, row) in RuntimeKey::ALL.into_iter().zip(keyed_runtime_abis()) {
             assert_eq!(row.key, RuntimeAbiId::Keyed(key));
@@ -4703,7 +4711,7 @@ mod tests {
     #[test]
     fn runtime_effects_registry_is_total_and_structurally_valid() {
         validate_registry().unwrap();
-        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 520);
+        assert_eq!(runtime_abis().map(|abi| runtime_effects(abi.key)).count(), 521);
 
         let expect_rule = |abi, effects, rule: &str| {
             let error = validate_effects(abi, effects).unwrap_err();
@@ -4830,7 +4838,7 @@ mod tests {
     fn runtime_abi_extern_type_matrix_is_exact_for_every_row_and_ordinal() {
         let ctx = inkwell::context::Context::create();
         let rows: Vec<_> = runtime_abis().collect();
-        assert_eq!(rows.len(), 520);
+        assert_eq!(rows.len(), 521);
 
         for row in rows {
             let symbol = row.symbol;

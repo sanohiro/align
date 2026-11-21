@@ -18236,7 +18236,7 @@ impl EffectScan<'_> {
             // (matching `std.compress`; hashing's determinism does not make it pure). Recurse into
             // the byte view.
             ExprKind::ProcessLive { kind, args } => { for argument in args { walk!(argument); } if !kind.pure() { self.impure_direct = true; } }
-            ExprKind::FsTree { args, .. } => { for argument in args { walk!(argument); } self.impure_direct = true; }
+            ExprKind::HttpTlsClient { args } | ExprKind::FsTree { args, .. } => { for argument in args { walk!(argument); } self.impure_direct = true; }
             ExprKind::CryptoDigestNew => { self.impure_direct = true; }
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => {
@@ -26332,7 +26332,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
-            | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
+            | ExprKind::HttpTlsClient { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -26848,7 +26848,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::HttpStreamReject { .. }
             | ExprKind::CryptoCtEqual { .. }
             | ExprKind::CryptoRandom { .. }
-            | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
+            | ExprKind::HttpTlsClient { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::CryptoDigestNew | ExprKind::CryptoDigestUpdate { .. } | ExprKind::CryptoDigestFinish { .. }
             | ExprKind::CryptoHash { .. }
             | ExprKind::CryptoHmac { .. }
             | ExprKind::CryptoHkdf { .. }
@@ -30652,7 +30652,7 @@ impl<'a> EscapeCheck<'a> {
             // `crypto.sha256`/`sha512` return a fresh *owned* `array<u8>` that borrows nothing (it
             // owns its heap buffer, `Drop`-freed) — freely returnable, like `rand.sample`. Just
             // recurse into the byte view so any escape *inside* it is still checked.
-            ExprKind::FsTree { args, .. } | ExprKind::ProcessLive { args, .. } => { for argument in args { self.walk(argument, depth); } }
+            ExprKind::HttpTlsClient { args } | ExprKind::FsTree { args, .. } | ExprKind::ProcessLive { args, .. } => { for argument in args { self.walk(argument, depth); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => self.walk(data, depth),
@@ -33111,7 +33111,7 @@ fn retained_header_candidate_completeness_matrix() {
 // These native producers allocate independent owners even inside a lexical arena.
 // Escape/Drop selection and generation release must agree on the same provenance.
 fn native_storage_is_individual(kind: &ExprKind) -> bool {
-    matches!(kind, ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
+    matches!(kind, ExprKind::HttpTlsClient { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. }
         | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::JsonOwnedDecode { .. }
         | ExprKind::StrSplit { .. } | ExprKind::JsonDecodeArray { .. } | ExprKind::JsonDecode { .. }
         | ExprKind::JsonDecodeStructArray { .. } | ExprKind::JsonDecodeUnion { .. }
@@ -33233,7 +33233,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         // These native outputs retain no borrowed content. Raw-loaded C records copy their
         // inline numeric fields; keep their fresh storage identity without a source borrow.
         // Copy scalar targets have no headers; Result::Err carries no header either.
-        ExprKind::RawLoad { .. } | ExprKind::JsonDecodeScalar { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
+        ExprKind::RawLoad { .. } | ExprKind::JsonDecodeScalar { .. } | ExprKind::HttpTlsClient { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } | ExprKind::OsHost | ExprKind::OsIdentity | ExprKind::FrameInnerJoin { .. } | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. } => {
             StorageVariantPolicy::Fresh(StorageContentInitializer::FreshEmpty)
         }
 
@@ -43463,7 +43463,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::JsonEncode { .. }
             | ExprKind::JsonOwnedDecode { .. }
             | ExprKind::JsonDecodeArray { .. }
-            | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } => BorrowRoots::new(),
+            | ExprKind::HttpTlsClient { .. } | ExprKind::FsTree { .. } | ExprKind::ProcessLive { .. } => BorrowRoots::new(),
             ExprKind::JsonDecode { input, .. }
             | ExprKind::JsonDecodeStructArray { input, .. } => self.storage_roots(input),
             ExprKind::JsonDecodeSoa { input, struct_id } => {
@@ -51617,7 +51617,7 @@ impl<'a> MoveCheck<'a> {
             ExprKind::CryptoRandom { out } => move_expr!(self, out, moved, false, false),
             // `crypto.sha256`/`sha512` borrow the byte view (never consume it). Recurse non-consuming
             // to catch a use-after-move *inside* the operand.
-            ExprKind::FsTree { args, .. } => { for argument in args { move_expr!(self, argument, moved, false, false); } }
+            ExprKind::HttpTlsClient { args } | ExprKind::FsTree { args, .. } => { for argument in args { move_expr!(self, argument, moved, false, false); } }
             ExprKind::ProcessLive { kind,args } => { for (index,argument) in args.iter().enumerate() { move_expr!(self,argument,moved,kind.consumes(index),kind.consumes(index)); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest } => move_expr!(self, digest, moved, true, true),
@@ -58025,6 +58025,27 @@ impl<'a, 't> Checker<'a, 't> {
             }
             // `std.http` (Slice 2) — `http.client()` builds a Move `http client`; the `get`/`post`/
             // `request` methods dispatch on the receiver type below. Impure (network).
+            if module == "http" && method == "tls_client" {
+                self.require_import("std.http", "http.tls_client", span);
+                if args.len() != 5 {
+                    self.diags.error("http.tls_client expects an origin, trust roots, client chain, private key and CRLs", span);
+                    return err;
+                }
+                let mut checked = Vec::with_capacity(args.len());
+                for (index, field) in args.iter().enumerate() {
+                    let expected = (index == 0 && matches!(field.kind, ast::ExprKind::ElseUnwrap { .. })).then_some(Ty::Str);
+                    let value = self.check_expr(field, expected);
+                    if hir_expr_diverges(&value) {
+                        checked.push(value);
+                    } else {
+                        let view = self.coerce_bytes_init(value, "http.tls_client");
+                        if index == 0 { self.constrain(view.ty, Some(Ty::Str), field.span); }
+                        checked.push(view);
+                    }
+                }
+                return Expr { kind: ExprKind::HttpTlsClient { args: checked },
+                    ty: Ty::Result(Scalar::HttpClient, Scalar::Enum(self.error_enum_id)), span };
+            }
             if module == "http" && method == "client" {
                 self.require_import("std.http", "http.client", span);
                 return self.check_http_client(args, span);
@@ -69350,7 +69371,11 @@ impl<'a, 't> Checker<'a, 't> {
     /// (auto-borrowed to `str`), or a `bytes` `slice<u8>`; anything else is an error. `what` names the
     /// call for the diagnostic. Returns the coerced `Expr` (`Ty::Error` on failure).
     fn check_bytes_init(&mut self, arg: &ast::Expr, what: &str) -> Expr {
-        let mut e = self.check_expr(arg, None);
+        let e = self.check_expr(arg, None);
+        self.coerce_bytes_init(e, what)
+    }
+
+    fn coerce_bytes_init(&mut self, mut e: Expr, what: &str) -> Expr {
         if e.ty == Ty::Error {
             return e;
         }
@@ -69360,8 +69385,8 @@ impl<'a, 't> Checker<'a, 't> {
         }
         if e.ty != Ty::Str && e.ty != Ty::Slice(Scalar::Int(IntTy { bits: 8, signed: false })) {
             self.diags
-                .error(format!("{what} expects bytes (a str, string, or slice<u8>), got {}", ty_name(e.ty)), arg.span);
-            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: arg.span };
+                .error(format!("{what} expects bytes (a str, string, or slice<u8>), got {}", ty_name(e.ty)), e.span);
+            return Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span: e.span };
         }
         e
     }
@@ -74560,7 +74585,7 @@ impl<'a, 't> Checker<'a, 't> {
                 self.finalize_expr(b);
             }
             ExprKind::CryptoRandom { out } => self.finalize_expr(out),
-            ExprKind::FsTree { args, .. } | ExprKind::ProcessLive { args, .. } => { for argument in args { self.finalize_expr(argument); } }
+            ExprKind::HttpTlsClient { args } | ExprKind::FsTree { args, .. } | ExprKind::ProcessLive { args, .. } => { for argument in args { self.finalize_expr(argument); } }
             ExprKind::CryptoDigestNew => {},
             ExprKind::CryptoDigestFinish { digest: data }
             | ExprKind::CryptoHash { data, .. } => self.finalize_expr(data),
@@ -83141,7 +83166,7 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // CompressStream borrows both I/O handles and returns a Copy count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 368,
+            variants, 369,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

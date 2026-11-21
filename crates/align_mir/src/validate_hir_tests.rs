@@ -13118,7 +13118,7 @@ fn request11_expr_kind_inventory_tripwire() {
         // CompressStream authenticates two handle places, a numeric operand and optional dictionary.
         // SocketLocalAddr reads one bound socket and returns an owned qualified record.
         variants,
-        368,
+        369,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -22455,6 +22455,45 @@ fn http_request_view_hir_authority_and_replay() -> Result<(), String> {
     for lowered in [lower_program(&bad), lower_program_located(&bad, &source_map),
         lower_program_per_unit(&bad), lower_program_per_unit_located(&bad, &source_map)] {
         assert!(is_empty(&lowered), "missing transition summary published MIR");
+    }
+    Ok(())
+}
+
+#[test]
+fn scoped_tls_constructor_requires_five_dominating_views_and_client_output() -> Result<(), String> {
+    let original = checked_source_program("import std.http\nfn make(origin:str,borrow trust:str) { ignored:=http.tls_client(origin,trust,\"\",\"\",\"\") }\nfn main() {}\n");
+    let whole = lower_program_checked(&original, false, None).map_err(|e| format!("{e:?}"))?;
+    let selected = whole.fns.iter().filter(|f| f.name.as_str() == "make").map(|f| f.name.clone()).collect();
+    assert!(crate::producer::validate_partition_resource_rvalues(&whole, &selected).is_ok());
+    for mode in 0..8 {
+        let mut h = original.clone();
+        let expr = body_first_let_init_mut(&mut h, "make");
+        let hir::ExprKind::HttpTlsClient { args } = &mut expr.kind else { return Err("expected TLS constructor".into()) };
+        match mode {
+            0 => { args.pop(); }
+            1 => { args.push(args[0].clone()); }
+            2..=6 => { args[mode - 2].ty = Ty::Bool; }
+            _ => expr.ty = Ty::HttpClient,
+        }
+        assert!(lower_program_checked(&h, false, None).is_err(), "unused HIR {mode}");
+    }
+    for mode in 0..11 {
+        let mut m = whole.clone();
+        let f = m.fns.iter_mut().find(|f| f.name.as_str() == "make").ok_or("make")?;
+        let (result, views, out) = f.blocks.iter_mut().flat_map(|b| &mut b.stmts).find_map(|s| match s {
+            Stmt::Let(id, Rvalue::HttpTlsClient { views, out }) => Some((*id, views, out)), _ => None,
+        }).ok_or("TLS operation")?;
+        match mode {
+            0 => { views.pop(); }
+            1 => { views.push(views[0].clone()); }
+            2..=6 => views[mode - 2] = Operand::Const(Const::Bool(false)),
+            7 => views[1] = Operand::Arg(1),
+            8 => views[1] = Operand::Value(result),
+            9 => *out = u32::MAX,
+            _ => f.slots[*out as usize] = Ty::HttpRequest,
+        }
+        assert!(crate::producer::validate_mir_producers(&m).is_err(), "whole MIR {mode}");
+        assert!(crate::producer::validate_partition_resource_rvalues(&m, &selected).is_err(), "unit MIR {mode}");
     }
     Ok(())
 }

@@ -734,3 +734,146 @@ pub fn main(args: array<str>) -> Result<(), Error> {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "200\n200\n");
     assert_eq!(accepted, 1, "two gets on one client reused a single pooled connection (R3)");
 }
+
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
+
+#[test]
+fn scoped_tls_client_across_module_and_cache_boundaries() {
+    if !backend_available() { return; }
+    owned_fixture::run("scoped_tls_client_across_module_and_cache_boundaries", |_| {
+        let policy = r#"module policy
+import std.http
+pub fn configured<T>(origin: str, trust: str, unused: T) -> Result<http_client, Error> =
+    http.tls_client(origin, trust, "", "", "")
+pub fn forward(origin: str) -> Result<http_client, Error> {
+    client := configured(origin, "", 0)?
+    return Ok(client)
+}"#;
+        let main = r#"import policy
+import std.http
+fn denied(e: Error) -> bool = match e { Denied => true, _ => false }
+fn mark(i: i32) -> str { print(i); return "" }
+fn stop() -> i32 {
+    result := http.tls_client("https://localhost", mark(1), mark(2), {return 7}, mark(4))
+    return 0
+}
+fn main() -> Result<(), Error> {
+    first := policy.forward("https://127.0.0.1:9")?
+    cl := first
+    match cl.get("http://127.0.0.1:9/") {
+        Err(e) => { if !denied(e) {return Err(Error.Invalid)} }, Ok(_) => {return Err(Error.Invalid)}
+    }
+    print(stop())
+    return Ok(())
+}"#;
+        let files = [("main.align", main), ("policy.align", policy)];
+        let whole = build_and_run_multi("scoped-client-whole", &files, "main.align");
+        assert!(whole.status.success(), "{whole:?}");
+        assert_eq!(whole.stdout, b"1\n2\n7\n");
+        let project = Proj::new("scoped-client-units", &files, "main.align");
+        let cache = project.cache();
+        for warm in [false, true] {
+            let built = thin_build(&project, &cache, 1);
+            assert!(if warm { built.all_hit() } else { built.all_miss() });
+            assert_eq!(built.run(&project), "1\n2\n7\n");
+        }
+    });
+}
+
+#[test]
+fn scoped_tls_arguments_protect_earlier_byte_views() {
+    let source = r#"import std.http
+fn grow(borrow mut owner: buffer) -> str { owner.append("more"); return "" }
+fn main() -> Result<(), Error> {
+    mut input := buffer(16)
+    mut other := buffer(16)
+    input.append("trust")
+    saved := input.bytes()
+    cl := http.tls_client("https://localhost", saved, "", "", grow(other))?
+    return Ok(())
+}"#;
+    assert!(!check_errs("scoped-independent", source));
+    assert!(check_errs("scoped-stale-view", &source.replace("grow(other)", "grow(input)")));
+    assert!(check_errs("scoped-wrong-arity", &source.replace(", grow(other)", "")));
+    assert!(check_errs("scoped-missing-import", &source.replace("import std.http", "")));
+}
+
+#[test]
+fn scoped_https_transport_uses_only_its_own_roots_and_crls() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    if !backend_available() { return; }
+    owned_fixture::run("scoped_https_transport_uses_only_its_own_roots_and_crls", |stage| {
+        let pem = |name: &str| -> &'static str {
+            include_str!("../../align_runtime/tests/fixtures/scoped_https.pem.txt")
+                .split_once(&format!("[{name}]\n")).unwrap().1.split("\n\n").next().unwrap().trim_end()
+        };
+        let combined = |a: &str, b: &str| format!("{}\n{}\n", pem(a), pem(b));
+        std::fs::write(stage.join("chain.pem"), combined("server", "intermediate")).unwrap();
+        std::fs::write(stage.join("key.pem"), pem("server_key")).unwrap();
+        std::fs::write(stage.join("ambient.pem"), combined("root", "mid_crl")).unwrap();
+        std::fs::create_dir(stage.join("cert-dir")).unwrap();
+        let program = r#"import std.http
+fn denied(e: Error) -> bool = match e { Denied => true, _ => false }
+fn main(args: array<str>) -> Result<(), Error> {
+    url := args[1]
+    defaults := http.client()
+    first := defaults.get(url)?
+    print(first.status())
+    private := http.tls_client(url, args[2], "", "", "")?
+    match private.get(url) { Ok(_) => {return Err(Error.Invalid)}, Err(e) => { if !denied(e) {return Err(e)} } }
+    incomplete := http.tls_client(url, args[3], "", "", args[4])?
+    match incomplete.get(url) { Ok(_) => {return Err(Error.Invalid)}, Err(e) => { if !denied(e) {return Err(e)} } }
+    complete := http.tls_client(url, args[3], "", "", args[5])?
+    sent := complete.post(url, "body")?
+    print(sent.status())
+    request := http.request("GET", url)
+    explicit := complete.request(request)?
+    print(explicit.status())
+    return Ok(())
+}"#;
+        let built = build_exe("scoped-client-private-store", program);
+        let server = r#"
+import socket, ssl
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain('chain.pem', 'key.pem')
+with socket.socket() as listener:
+    listener.bind(('127.0.0.1', 0))
+    listener.listen()
+    listener.settimeout(15)
+    print(listener.getsockname()[1], flush=True)
+    for index in range(5):
+        raw, _ = listener.accept()
+        with raw:
+            raw.settimeout(5)
+            try:
+                with ctx.wrap_socket(raw, server_side=True) as sock:
+                    with sock.makefile('rb') as f:
+                        method = f.readline().split()[0]
+                        length = 0
+                        for line in iter(f.readline, b'\r\n'):
+                            if not line: raise EOFError()
+                            if line.lower().startswith(b'content-length:'):
+                                length = int(line.split(b':')[1])
+                        data = f.read(length)
+                        assert (method, data) == ((b'POST', b'body') if index == 3 else (b'GET', b''))
+                    sock.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            except ssl.SSLError:
+                assert index in (1, 2)
+"#;
+        let mut peer = Command::new("python3").args(["-c", server]).current_dir(stage)
+            .stdout(Stdio::piped()).spawn().unwrap();
+        let mut port = String::new();
+        BufReader::new(peer.stdout.take().unwrap()).read_line(&mut port).unwrap();
+        let port = port.trim().parse::<u16>().unwrap();
+        let url = format!("https://127.0.0.1:{port}/");
+        let output = Command::new(&built.exe).current_dir(stage)
+            .env("SSL_CERT_FILE", stage.join("ambient.pem")).env("SSL_CERT_DIR", stage.join("cert-dir"))
+            .args([url.as_str(), pem("other_root"), pem("root"), pem("root_crl"), &combined("root_crl", "mid_crl")])
+            .output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(peer.wait().unwrap().success());
+        assert_eq!(output.stdout, b"200\n200\n200\n");
+    });
+}

@@ -4935,7 +4935,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::HttpSseStreamLastEventId { .. }
             | hir::ExprKind::HttpSseStreamRetryMs { .. }
             | hir::ExprKind::HttpSseStreamNext { .. }
-            | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpTlsClient { .. } | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServe { .. }
             | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
@@ -5320,7 +5320,7 @@ impl<'a> BodyValidator<'a> {
                 | hir::ExprKind::HttpSseStreamLastEventId { .. }
                 | hir::ExprKind::HttpSseStreamRetryMs { .. }
                 | hir::ExprKind::HttpSseStreamNext { .. }
-            | hir::ExprKind::HttpGetMany { .. }
+            | hir::ExprKind::HttpTlsClient { .. } | hir::ExprKind::HttpGetMany { .. }
             | hir::ExprKind::HttpServerMaxRequestBodyBytes { .. }
             | hir::ExprKind::HttpAccept { .. }
             | hir::ExprKind::HttpCtxMethod { .. }
@@ -10292,6 +10292,15 @@ impl<'a> BodyValidator<'a> {
                     && mutable_local(buffer, Ty::Buffer)
                     && buffer.ty == Ty::Buffer)
                     .then(|| result(Ty::Tagged(option_id), &[stream, buffer]))?
+            }
+            hir::ExprKind::HttpTlsClient { args } => {
+                if args.len() != 5 { return None; }
+                for (index, arg) in args.iter().enumerate() {
+                    if self.expr_flow(arg)?.falls && !(if index == 0 { arg.ty == Ty::Str } else { byte_view(arg.ty) }) {
+                        return None;
+                    }
+                }
+                result(Ty::HttpClient, &args.iter().collect::<Vec<_>>())
             }
             hir::ExprKind::HttpGetMany {
                 client,

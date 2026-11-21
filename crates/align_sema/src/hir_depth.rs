@@ -803,6 +803,7 @@ fn walk_body_records<'a>(
                     payload: operands, ..
                 }
                 | ExprKind::Call { args: operands, .. }
+                | ExprKind::HttpTlsClient { args: operands }
                 | ExprKind::FsTree { args: operands, .. }
                 | ExprKind::ProcessLive { args: operands, .. }
                 | ExprKind::StructLit {
