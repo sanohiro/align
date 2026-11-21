@@ -33075,6 +33075,7 @@ fn native_storage_is_individual(kind: &ExprKind) -> bool {
         | ExprKind::StrSplit { .. } | ExprKind::JsonDecodeArray { .. } | ExprKind::JsonDecode { .. }
         | ExprKind::JsonDecodeStructArray { .. } | ExprKind::JsonDecodeUnion { .. }
         | ExprKind::JsonDecodeScalar { .. }
+        | ExprKind::ArrayGroupAggMulti { source: hir::GroupSource::SoaStr | hir::GroupSource::SoaI64, .. }
         | ExprKind::CryptoDigestFinish { .. } | ExprKind::CryptoHash { .. })
 }
 
@@ -33560,7 +33561,11 @@ fn classify_storage_expression(
         &expression.kind,
         ExprKind::ArrayGroupAggMulti { aggs, source, .. }
             if aggs.is_empty() || *source == hir::GroupSource::Encoded
-                || (*source == hir::GroupSource::SoaI64) != paths.headers.first().is_some_and(|h| h.ty == Ty::DynArray(Scalar::Int(IntTy { bits: 64, signed: true })))
+                || paths.headers.iter().enumerate().any(|(i, h)| {
+                    let elem = if i == 0 && *source != hir::GroupSource::SoaI64 { Scalar::Str }
+                        else { Scalar::Int(IntTy { bits: 64, signed: true }) };
+                    h.ty != Ty::DynArray(elem)
+                })
     ) {
         paths.valid = false;
         paths.headers.clear();
@@ -39951,6 +39956,8 @@ impl<'a> MoveCheck<'a> {
                     roots.extend(self.borrows.resolve_headers(&headers).non_storage.live_roots());
                 }
             }
+            ExprKind::ArrayGroupAggMulti { base, key_field, source: source @ (hir::GroupSource::SoaI64 | hir::GroupSource::SoaStr), .. } =>
+                roots.extend(self.fused_soa_group_borrows(*base, *key_field, *source).live_roots()),
             ExprKind::SoaColumn { base: root, .. }
             | ExprKind::ArrayGroupAgg { base: root, .. }
             | ExprKind::ArrayGroupAggMulti { base: root, .. }
@@ -40640,8 +40647,15 @@ impl<'a> MoveCheck<'a> {
         index: Option<&Expr>,
         field_path: &[u32],
     ) -> MoveValueFact {
-        let headers = self.completed_headers(recv);
-        let fixed = self.fixed_array_shape(recv.ty);
+        self.generation_field_content(recv.ty, self.completed_headers(recv), index, field_path,
+            || self.completed_value_fact(recv))
+    }
+
+    fn generation_field_content(
+        &self, recv_ty: Ty, headers: ProjectedHeaderFact, index: Option<&Expr>, field_path: &[u32],
+        fallback_value: impl FnOnce() -> BorrowFact,
+    ) -> MoveValueFact {
+        let fixed = self.fixed_array_shape(recv_ty);
         let suffix = field_path
             .iter()
             .copied()
@@ -40706,13 +40720,13 @@ impl<'a> MoveCheck<'a> {
         // restriction at unknown and recursive collection boundaries. Preserve known local
         // contents when no boundary was crossed, so a locally installed view keeps its origin.
         if headers.leaves.values().any(|leaf| leaf.readonly_contents) {
-            let selected_ty = self.storage_header_content_ty(recv.ty).and_then(|ty| {
+            let selected_ty = self.storage_header_content_ty(recv_ty).and_then(|ty| {
                 suffix.iter().try_fold(ty, |ty, &projection| self.projection_ty(ty, projection))
             });
             if let Some(ty) = selected_ty {
                 let boundary = self.call_boundary_view_fact(ty, false);
                 selected.non_storage = selected.non_storage.join(&boundary);
-                let fallback = self.completed_value_fact(recv).without_readonly_origin().live_roots();
+                let fallback = fallback_value().without_readonly_origin().live_roots();
                 for header in storage_type_paths(ty, self.storage_type_context()).headers {
                     selected.headers.leaves.entry(header.path).or_insert_with(|| {
                         StorageHeaderLeaf::unknown_typed(fallback.clone(),
@@ -42645,6 +42659,21 @@ impl<'a> MoveCheck<'a> {
         }
     }
 
+    // Only the copied string representatives retain input payloads. A count or a numeric
+    // key is a newly materialized integer, even when another field in the row borrows bytes.
+    fn fused_soa_group_borrows(&self, base: LocalId, key: u32, source: hir::GroupSource) -> BorrowFact {
+        if source != hir::GroupSource::SoaStr { return BorrowFact::default(); }
+        let Some(local) = self.f.locals.get(base as usize) else { return BorrowFact::default(); };
+        let headers = self.local_headers(base);
+        let selected = if headers.leaves.is_empty() {
+            self.local_borrow_fact(base).project_exact(BorrowProjection::StructField(key))
+        } else {
+            let content = self.generation_field_content(local.ty, headers, None, &[key], || self.local_borrow_fact(base));
+            content.non_storage.join(&self.borrows.resolve_headers(&content.headers).non_storage)
+        };
+        selected.prefixed(BorrowProjection::TupleElement(0))
+    }
+
     fn borrow_fact_inner(&self, e: &Expr) -> BorrowFact {
         match &e.kind {
             ExprKind::Local(id) => self.local_borrow_fact(*id),
@@ -42666,6 +42695,8 @@ impl<'a> MoveCheck<'a> {
                 self.pipeline_accumulator_fact(func, captures, init, &element).flatten_lifetimes()
             }
             ExprKind::ArrayBuilderBuild(builder) => self.borrow_fact(builder).flatten_lifetimes(),
+            ExprKind::ArrayGroupAggMulti { base, key_field, source: source @ (hir::GroupSource::SoaI64 | hir::GroupSource::SoaStr), .. } =>
+                self.fused_soa_group_borrows(*base, *key_field, *source),
             ExprKind::ArrayGroupAgg { base, key_field, .. }
             | ExprKind::ArrayGroupAggMulti { base, key_field, .. } => {
                 let mut source = self.local_borrow_fact(*base);
@@ -43318,6 +43349,8 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::StrSplit { source: bytes, .. }
             | ExprKind::StrTrim { recv: bytes, .. }
             | ExprKind::PathComponent { path: bytes, .. } => self.storage_roots(bytes),
+            ExprKind::ArrayGroupAggMulti { base, key_field, source: source @ (hir::GroupSource::SoaI64 | hir::GroupSource::SoaStr), .. } =>
+                self.fused_soa_group_borrows(*base, *key_field, *source).live_roots(),
             ExprKind::SoaColumn { base, .. }
             | ExprKind::ArrayGroupAgg { base, .. }
             | ExprKind::ArrayGroupAggMulti { base, .. }

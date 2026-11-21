@@ -11971,6 +11971,31 @@ fn hir_body_validator_pipeline_deferred_b2b2() {
 }
 
 #[test]
+fn fused_soa_group_hir_requires_the_declared_source_key_and_tuple() -> Result<(), &'static str> {
+    let source = "Row { text:str, k:i64, v:i64 }\nfn group(s:soa<Row>)->(array<str>,array<i64>,array<i64>) = s.group_by(.text).agg(sum(.v),count())\nfn main() {}\n";
+    let base = checked_source_program(source);
+    assert!(!is_empty(&lower_program(&base)));
+    for mutation in 0..8 {
+        let mut bad = base.clone();
+        let f = bad.fns.iter_mut().find(|f| f.name == "group").ok_or("group")?;
+        let expr = f.body.value.as_mut().ok_or("group tail")?;
+        let hir::ExprKind::ArrayGroupAggMulti { source, key_field, aggs, base, .. } = &mut expr.kind else { return Err("group operation"); };
+        match mutation {
+            0 => *source = hir::GroupSource::SoaI64,
+            1 => *source = hir::GroupSource::AosStr,
+            2 => *source = hir::GroupSource::Encoded,
+            3 => *key_field = 1,
+            4 => aggs[0].value_field = Some(0),
+            5 => aggs[1].value_field = Some(1),
+            6 => { aggs.pop(); }
+            _ => *base = u32::MAX,
+        }
+        assert_body_entrypoints_empty(&format!("fused SoA group mutation {mutation}"), &bad);
+    }
+    Ok(())
+}
+
+#[test]
 fn hir_body_validator_pipeline_template_json_group() {
     let integer = int(64);
     let scalar_integer = scalar_int(64);

@@ -12532,7 +12532,7 @@ impl<'a> BodyValidator<'a> {
         source: hir::GroupSource,
         result_ty: Ty,
     ) -> Option<(Ty, bool, Vec<Ty>)> {
-        if !self.local_ok(context, base) || aggregates.is_empty() || u32::try_from(aggregates.len()).is_err() {
+        if !self.local_ok(context, base) || aggregates.is_empty() || u32::try_from(aggregates.len().saturating_add(1)).is_err() {
             return None;
         }
         let i64_ty = Ty::Int(align_sema::IntTy { bits: 64, signed: true });

@@ -605,6 +605,71 @@ fn main() {
 }
 
 #[test]
+fn soa_fused_group_reuses_scratch_without_releasing_live_results() {
+    if !backend_available() { return; }
+    let source = r#"Row { text:str, v:i64 }
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_alloc_count()->i64
+extern "C" fn align_rt_free_count()->i64
+fn measure(s:soa<Row>)->i64 {
+  unsafe {align_rt_requested_live_reset()}
+  first:=s.group_by(.text).agg(sum(.v),count())
+  mut i:=0
+  loop {
+    if i==5 {break}
+    next:=s.group_by(.text).agg(count(),sum(.v))
+    if next.1[0]!=128 || first.1[0]!=896 {return 1}
+    if unsafe {align_rt_requested_live_bytes()}!=64 {return 2}
+    i=i+1
+  }
+  if unsafe {align_rt_requested_live_bytes()}!=32 {return 3}
+  return 0
+}
+fn main() {arena {
+  s:=[ROWS].to_soa()
+  a:=unsafe {align_rt_alloc_count()}; f:=unsafe {align_rt_free_count()}
+  print(measure(s))
+  print(unsafe {align_rt_alloc_count()}-a)
+  print(unsafe {align_rt_free_count()}-f)
+  print(unsafe {align_rt_requested_live_bytes()})
+}}
+"#;
+    let rows = vec![r#"Row{text:"one",v:7}"#; 128].join(",");
+    let out = build_and_run("soa-fused-live-columns", &source.replace("ROWS", &rows));
+    assert!(out.status.success(), "{}",String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n18\n18\n0\n");
+}
+
+#[test]
+fn soa_fused_generic_group_cache_replays_and_invalidates() {
+    if !backend_available() { return; }
+    let provider = "module groups\npub Row { key:i64, v:i64 }\npub fn group<T>(tag:T,s:soa<Row>)->i64 {g:=s.group_by(.key).agg(sum(.v),max(.v));return g.1.sum()}\n";
+    let main = "import groups\nfn main() {arena {s:=[groups.Row{key:1,v:3},groups.Row{key:1,v:5}].to_soa();print(groups.group(true,s))}}\n";
+    let project = Proj::new("soa-group-cache", &[("groups.align",provider),("main.align",main)], "main.align");
+    let build = |expected: &str| {
+        let command = std::process::Command::new(env!("CARGO_BIN_EXE_alignc"))
+            .args(["build","main.align","--cache-stats"]).current_dir(&project.dir)
+            .env("ALIGNC_CACHE",project.cache_root()).output().expect("run alignc");
+        let stats = String::from_utf8(command.stderr).expect("build diagnostics");
+        assert!(command.status.success(), "{stats}");
+        let output = std::process::Command::new(project.dir.join("main")).output().expect("run cached program");
+        assert!(output.status.success(), "{}: {}", output.status, String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        stats
+    };
+    let cold = build("8\n");
+    assert!(cold.contains("2 frontend: 0 hit, 2 miss") && cold.contains("2 unit(s): 0 hit, 2 miss"), "{cold}");
+    let warm = build("8\n");
+    assert!(warm.contains("2 frontend: 2 hit, 0 miss") && warm.contains("2 unit(s): 2 hit, 0 miss"), "{warm}");
+    project.write("groups.align", &provider.replace("sum(.v),max(.v)", "max(.v),sum(.v)"));
+    let changed = build("5\n");
+    assert!(!changed.contains("2 unit(s): 2 hit, 0 miss"), "{changed}");
+    let replay = build("5\n");
+    assert!(replay.contains("2 frontend: 2 hit, 0 miss") && replay.contains("2 unit(s): 2 hit, 0 miss"), "{replay}");
+}
+
+#[test]
 fn soa_fused_aggregate_projection_lifetimes() {
     let prefix = "Row {text:str,v:i64}\n";
     for (body, errors) in [
@@ -625,6 +690,25 @@ fn soa_fused_aggregate_projection_lifetimes() {
         assert_eq!(r.whole_errors, errors, "{src}\n{}",r.whole_diags);
         assert_eq!(r.per_unit_errors, errors, "{src}\n{}",r.per_unit_diags);
     }
+    for (projection, write, errors) in [("g.0[0]", "a", true), ("g.0[0]", "b", false),
+                                        ("g.1[0]", "a", false), ("g.1[0]", "b", false)] {
+        let src = format!(r#"Row {{ key:str, other:str, v:i64 }}
+fn main() {{
+  first:=[(65 as u8)].to_array(); mut a:slice<u8>:=first
+  second:=[(66 as u8)].to_array(); mut b:slice<u8>:=second
+  key:=a.as_str() else {{return}}; other:=b.as_str() else {{return}}
+  arena {{
+    s:=[Row{{key:key,other:other,v:7}}].to_soa()
+    g:=s.group_by(.key).agg(sum(.v),count())
+    kept:={projection}; {write}[0]=255; print(kept)
+  }}
+}}
+"#);
+        let result = diff_check_multi("soa-fused-field-alias", &[("main.align",&src)], "main.align");
+        assert_eq!(result.whole_errors, errors, "{src}\n{}", result.whole_diags);
+        assert_eq!(result.per_unit_errors, errors, "{src}\n{}", result.per_unit_diags);
+    }
+
 }
 
 #[test]

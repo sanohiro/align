@@ -1476,10 +1476,11 @@ payloads. This adds no arena or input lifetime, descriptor or serialized field.
 
 ## Fused SoA group aggregation (Plan263)
 
-A40 `GroupMultiCols(keys, specs, n, out_keys, k, key_kind)` returns a group count
+A40 `GroupMultiCols(keys, specs, n, headers, k, key_kind)` returns a group count
 in 0..=n or -1 before publication. Keys are i64 (tag 0) or str headers (tag 1).
-Each 24-byte spec stores an input pointer, i64 operation tag and output pointer.
-The compiler supplies n output slots per column. Only the key pointer can
+Each 16-byte spec stores an input pointer and i64 operation tag. On success,
+the runtime publishes K+1 owned headers into caller scratch. Each payload is
+sized to the actual number of groups. Only the key pointer can
 escape in output text. Effect IndirectStorage/Unstated, no release or fresh
 pointer return. The full extent and alias contract is in Plan263.
 
