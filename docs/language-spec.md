@@ -2306,6 +2306,12 @@ reject trailing bytes or a second stream, and share the cap/ownership/error rule
 Zlib checksum or dictionary failures are Invalid; final raw-byte padding is allowed.
 Levels 0..=9 are accepted; other levels abort before native initialization.
 Zlib, raw DEFLATE and zstd additionally accept an optional third `dictionary: bytes` after an explicit level or output limit. Zlib and dictionary-ID-bearing zstd frames check the supplied dictionary. Raw DEFLATE and ID-free zstd frames can decode different bytes with a wrong dictionary. An empty dictionary selects ordinary framing.
+Each format also supplies `_compress_to(reader,writer,level)` and
+`_decompress_to(reader,writer,max_bytes = 1073741824)` returning `Result<i64,Error>` for
+output bytes accepted. These borrow bound handles or unbuffered standard streams and leave flushing
+to the caller. The same optional dictionary follows an explicit level or limit except on gzip.
+Stream limits admit all nonnegative i64 values. Late errors can leave partial output. Two bounded
+64 KiB payload windows suffice regardless of total size.
 
 All four decoders accept the optional second i64 argument `max_bytes` in `0..=1073741824`.
 Its default is 1 GiB. Invalid limits abort after ordered operand evaluation and before

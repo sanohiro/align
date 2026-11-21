@@ -11,7 +11,7 @@ macro_rules! runtime_keys {
         }
 
         impl RuntimeKey {
-            pub const ALL: [Self; 491] = [$(Self::$variant,)*];
+            pub const ALL: [Self; 499] = [$(Self::$variant,)*];
 
             pub const fn logical_name(self) -> &'static str {
                 match self {
@@ -133,18 +133,26 @@ runtime_keys! {
     CommandTimeout => "command_timeout",
     CompressDeflateRawCompress => "compress_deflate_raw_compress",
     CompressDeflateRawCompressDict => "compress_deflate_raw_compress_dict",
+    CompressDeflateRawCompressTo => "compress_deflate_raw_compress_to",
     CompressDeflateRawDecompress => "compress_deflate_raw_decompress",
     CompressDeflateRawDecompressDict => "compress_deflate_raw_decompress_dict",
+    CompressDeflateRawDecompressTo => "compress_deflate_raw_decompress_to",
     CompressGzipCompress => "compress_gzip_compress",
+    CompressGzipCompressTo => "compress_gzip_compress_to",
     CompressGzipDecompress => "compress_gzip_decompress",
+    CompressGzipDecompressTo => "compress_gzip_decompress_to",
     CompressZlibCompress => "compress_zlib_compress",
     CompressZlibCompressDict => "compress_zlib_compress_dict",
+    CompressZlibCompressTo => "compress_zlib_compress_to",
     CompressZlibDecompress => "compress_zlib_decompress",
     CompressZlibDecompressDict => "compress_zlib_decompress_dict",
+    CompressZlibDecompressTo => "compress_zlib_decompress_to",
     CompressZstdCompress => "compress_zstd_compress",
     CompressZstdCompressDict => "compress_zstd_compress_dict",
+    CompressZstdCompressTo => "compress_zstd_compress_to",
     CompressZstdDecompress => "compress_zstd_decompress",
     CompressZstdDecompressDict => "compress_zstd_decompress_dict",
+    CompressZstdDecompressTo => "compress_zstd_decompress_to",
     CryptoAesGcmOpen => "crypto_aes_gcm_open",
     CryptoAesGcmSeal => "crypto_aes_gcm_seal",
     CryptoArgon2id => "crypto_argon2id",
@@ -516,7 +524,7 @@ runtime_keys! {
     XmlText => "xml_text",
 }
 
-const _: [(); 491] = [(); RuntimeKey::ALL.len()];
+const _: [(); 499] = [(); RuntimeKey::ALL.len()];
 
 #[cfg(test)]
 mod tests {
@@ -525,7 +533,7 @@ mod tests {
 
     #[test]
     fn runtime_keys_are_complete_unique_and_alphabetical() {
-        assert_eq!(RuntimeKey::ALL.len(), 491);
+        assert_eq!(RuntimeKey::ALL.len(), 499);
         let names: Vec<_> = RuntimeKey::ALL
             .iter()
             .map(|key| key.logical_name())

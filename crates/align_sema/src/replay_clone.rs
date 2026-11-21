@@ -1379,6 +1379,10 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             input: boxed!(input),
         },
         ExprKind::Utf8Valid { data } => ExprKind::Utf8Valid { data: boxed!(data) },
+        ExprKind::CompressStream { kind, decompress, reader, writer, numeric, dictionary } => ExprKind::CompressStream {
+            kind: *kind, decompress: *decompress, reader: boxed!(reader), writer: boxed!(writer),
+            numeric: boxed!(numeric), dictionary: take_optional_boxed_expr(clones, dictionary.is_some())?,
+        },
         ExprKind::Compress { kind, data, level, dictionary } => ExprKind::Compress {
             kind: *kind,
             data: boxed!(data),
@@ -2928,6 +2932,9 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             one!(index);
         }
         ExprKind::BorrowedIndex { index, .. } => one!(index),
+        ExprKind::CompressStream { reader, writer, numeric, dictionary, .. } => {
+            one!(reader); one!(writer); one!(numeric); optional!(dictionary);
+        }
         ExprKind::Compress { data, level, dictionary, .. }
         | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
             one!(data);

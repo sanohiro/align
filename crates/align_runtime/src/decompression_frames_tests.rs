@@ -468,3 +468,6 @@ fn preset_libz_rejects_unrepresentable_dictionary_before_access() {
         assert!(output.is_null());
     }
 }
+
+#[path = "compress_stream_tests.rs"]
+mod streaming;

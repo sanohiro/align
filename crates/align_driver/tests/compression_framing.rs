@@ -38,7 +38,7 @@ fn execute(stage: &Path, programs: &[align_mir::Program], label: &str, rt_lto: b
         &libraries,
         Profile::Release,
     )?;
-    let output = std::process::Command::new(binary).output()?;
+    let output = std::process::Command::new(binary).current_dir(stage).output()?;
     assert!(
         output.status.success() && output.stdout.is_empty() && output.stderr.is_empty(),
         "{label}: {output:?}"
@@ -74,6 +74,7 @@ fn programs(stage: &Path, source: &str, per_unit: bool) -> TestResult<Vec<align_
 
 const MODEL: &str = r#"module codecs
 import std.compress
+import std.fs
 pub fn identity<T>(value:T)->T=value
 pub fn zlib(data:slice<u8>)->Result<buffer,Error> {
   packed:=compress.zlib_compress(data,6)?
@@ -100,12 +101,47 @@ pub fn early(flag:bool)->Result<i64,Error> {
   return Ok(b.len())
 }
 "#;
+fn stream_model() -> String {
+    let mut source = MODEL.to_owned();
+    for codec in ["gzip", "zlib", "deflate_raw", "zstd"] {
+        let (dict, limit) = if codec == "gzip" { ("", "") } else { (", data", ", data.len(), data") };
+        source.push_str(&format!(r#"
+pub fn {codec}_stream<T>(tag:T, data:slice<u8>)->Result<T,Error> {{
+  input:=fs.open("stream-input")?
+  packed:=fs.create("stream-packed")?
+  size:=compress.{codec}_compress_to(input,packed,3{dict})?
+  packed.flush()?
+  mut scratch:=buffer.try_new(16)?
+  eof:=input.read(scratch)?
+  if size<=0 || eof!=0 {{ return Err(Error.Invalid) }}
+  encoded:=fs.open("stream-packed")?
+  result:=fs.create("stream-decoded")?
+  bytes:=compress.{codec}_decompress_to(encoded,result{limit})?
+  result.flush()?
+  decoded:=fs.open("stream-decoded")?
+  read:=decoded.read(scratch)?
+  if read!=4 || bytes!=4 || scratch.bytes()[1]!=255 {{ return Err(Error.Invalid) }}
+  return Ok(tag)
+}}
+"#));
+    }
+    source
+}
 const MAIN: &str = r#"import codecs
+import std.fs
 import std.compress
 import std.encoding
 fn keep(error:Error)->Error=error
 fn main()->Result<(),Error> {
   input:=encoding.hex_decode("00ff8041")?
+  file:=fs.create("stream-input")?
+  file.write(input.bytes())?
+  file.flush()?
+  a_tag:=codecs.gzip_stream(true,input.bytes())?
+  b_tag:=codecs.zlib_stream(2,input.bytes())?
+  c_tag:=codecs.deflate_raw_stream(3,input.bytes())?
+  d_tag:=codecs.zstd_stream(4,input.bytes())?
+  if !a_tag || b_tag+c_tag+d_tag!=9 { return Err(Error.Invalid) }
   tag:=codecs.preset(7,input.bytes())?
   early:=codecs.early(true)?
   if tag!=7 || early!=19 { return Err(Error.Invalid) }
@@ -241,6 +277,123 @@ fn {codec}_check()->Result<(),Error> {{
         })();
         if let Err(error) = result {
             panic!("{error}");
+        }
+    });
+}
+
+// ELF symbol wrapping counts the actual standard-handle shells across all three exits.
+#[cfg(target_os = "linux")]
+#[test]
+fn stream_standard_handle_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    owned_fixture::run("stream_standard_handle_cleanup", |stage| {
+        let result = (|| -> TestResult {
+            let source = r#"import std.compress
+import std.io
+extern "C" fn observed() -> i64
+fn exercise(mode:i64)->Result<i64,Error> {
+  if mode==1 { return compress.gzip_decompress_to(io.stdin,io.stdout) }
+  return compress.gzip_compress_to(io.stdin,io.stdout,{ if mode==2 { return Ok(71) }; 6 })
+}
+fn main()->Result<(),Error> {
+  a:=exercise(2)?
+  n:=unsafe { observed() }
+  if a!=71 || n!=1 { return Err(Error.Invalid) }
+  match exercise(1) { Ok(_) => { return Err(Error.Invalid) }, Err(_) => {} }
+  m:=unsafe { observed() }
+  if m!=2 { return Err(Error.Invalid) }
+  size:=exercise(0)?
+  k:=unsafe { observed() }
+  if size<=0 || k!=3 { return Err(Error.Invalid) }
+  return Ok(())
+}
+"#;
+            let c = stage.join("observe.c");
+            let observer = stage.join("observe.o");
+            std::fs::write(&c, r#"#include <stdint.h>
+#include <stdlib.h>
+static int made_r, dropped_r, made_w, dropped_w;
+extern void *__real_align_rt_io_reader_stdin(void);
+extern void *__real_align_rt_io_writer_std(int32_t,int32_t);
+extern void __real_align_rt_io_reader_free(void *);
+extern void __real_align_rt_io_writer_free(void *);
+void *__wrap_align_rt_io_reader_stdin(void) { made_r++; return __real_align_rt_io_reader_stdin(); }
+void *__wrap_align_rt_io_writer_std(int32_t f,int32_t b) { made_w++; return __real_align_rt_io_writer_std(f,b); }
+void __wrap_align_rt_io_reader_free(void *p) { if(p)dropped_r++; __real_align_rt_io_reader_free(p); }
+void __wrap_align_rt_io_writer_free(void *p) { if(p)dropped_w++; __real_align_rt_io_writer_free(p); }
+int64_t observed(void) { return made_r==made_w && made_r==dropped_r && made_w==dropped_w ? made_r : -1; }
+"#)?;
+            assert!(Command::new("cc").arg("-c").arg(c).arg("-o").arg(&observer).status()?.success());
+            let wrapper = stage.join("link-observer");
+            std::fs::write(&wrapper, "#!/bin/sh\nexec cc -Wl,--wrap=align_rt_io_reader_stdin,--wrap=align_rt_io_reader_free,--wrap=align_rt_io_writer_std,--wrap=align_rt_io_writer_free \"$@\"\n")?;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))?;
+            let program = programs(stage, source, false)?.remove(0);
+            let object = stage.join("exercise.o");
+            align_driver::emit_object_file(&program, &object, BuildTarget::Baseline, Profile::Release, &[], false)?;
+            let output = stage.join("exercise");
+            align_driver::link_objects(&align_driver::CDriver::explicit(wrapper)?, &[&object, &observer], &output, &program.link_libs, Profile::Release)?;
+            let run = Command::new(output).output()?;
+            assert!(run.status.success(), "{run:?}");
+            assert!(run.stdout.starts_with(&[0x1f, 0x8b]), "{run:?}");
+            Ok(())
+        })();
+        if let Err(error) = result { panic!("{error}") }
+    });
+}
+
+#[test]
+fn stream_numeric_preconditions_abort_before_io() {
+    use std::os::unix::process::ExitStatusExt;
+    owned_fixture::run("stream_numeric_preconditions_abort_before_io", |_| {
+        for (method, number, diagnostic) in [
+            ("gzip_compress_to", 10, "level out of range"),
+            ("deflate_raw_compress_to", -1, "level out of range"),
+            ("zstd_compress_to", 23, "level out of range"),
+            ("zlib_decompress_to", -1, "max_bytes must be nonnegative"),
+        ] {
+            let source = format!("import std.compress\nimport std.io\nfn main()->Result<(),Error> {{ n:=compress.{method}(io.stdin,io.stdout,{number})?; return Ok(()) }}\n");
+            let output = common::build_and_run("stream-numeric", &source);
+            assert_eq!(output.status.signal(), Some(libc::SIGABRT));
+            assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic), "{output:?}");
+            assert!(output.stdout.is_empty());
+        }
+    });
+}
+
+#[test]
+fn stream_source_argument_domain_and_handle_liveness() {
+    owned_fixture::run("stream_source_argument_domain_and_handle_liveness", |stage| {
+        for (call, accepted) in [
+            ("compress.gzip_compress_to(r,w,3)", true),
+            ("compress.gzip_compress_to(io.stdin,io.stdout,3)", true),
+            ("compress.zstd_decompress_to(r,io.stderr,17,\"dictionary\")", true),
+            ("compress.zlib_compress_to(r,w,take_r(other))", true),
+            ("compress.zlib_compress_to(r,w,take_r(r))", false),
+            ("compress.zlib_compress_to(r,w,take_w(w))", false),
+            ("compress.zstd_decompress_to(r,w,4,{ take_w(w); \"dictionary\" })", false),
+            ("compress.zlib_compress_to(r,w,retire(conn))", false),
+            ("compress.gzip_compress_to(w,r,3)", false),
+            ("compress.gzip_compress_to(r,w)", false),
+            ("compress.gzip_decompress_to(r,w,3,\"seed\")", false),
+            ("compress.zstd_decompress_to(r,w,true)", false),
+            ("compress.zlib_decompress_to(r,w,3,4)", false),
+            ("compress.zlib_compress_to(fs.open(\"x\")?,w,4)", false),
+            ("compress.zlib_compress_to(r,io.stdout.buffered(),4)", false),
+        ] {
+            let source = format!("import std.compress\nimport std.io\nimport std.fs\nimport std.net\nfn take_r(p:reader)->i64=3\nfn take_w(p:writer)->i64=3\nfn retire(c:tcp_conn)->i64=3\nfn f(other:reader)->Result<i64,Error> {{ conn:=tcp.connect(\"localhost\",80)?; r:=conn.reader(); w:=conn.writer(); return {call} }}\nfn main(){{}}\n");
+            let path = stage.join("main.align");
+            std::fs::write(&path, &source).unwrap();
+            let entry = path.to_str().unwrap();
+            for partition in [false, true] {
+                let mut sources = SourceMap::new();
+                let diag = if partition {
+                    align_driver::build_per_unit(&mut sources, entry, &source).diags
+                } else {
+                    align_driver::check(&mut sources, entry, &source).diags
+                };
+                assert_eq!(!diag.has_errors(), accepted, "{call}: {}", align_driver::format_diagnostics(&sources, &diag));
+            }
         }
     });
 }
@@ -381,7 +534,7 @@ fn main(args:array<str>)->Result<(),Error> {{
 fn framing_whole_per_unit_and_cached_lifecycle() {
     owned_fixture::run("framing_whole_per_unit_and_cached_lifecycle", |stage| {
         let result = (|| -> TestResult {
-            std::fs::write(stage.join("codecs.align"), MODEL)?;
+            std::fs::write(stage.join("codecs.align"), stream_model())?;
             for per_unit in [false, true] {
                 execute(
                     stage,

@@ -1678,6 +1678,14 @@ pub fn native_owner_mir_contract<'a>(
         access: XmlAccessProvenance::Owned,
     };
     match value {
+        Rvalue::CompressStream { kind, reader, writer, numeric, dictionary, .. } => {
+            contract.result = i64_ty;
+            contract.operands = vec![(reader, Ty::Reader, read), (writer, Ty::Writer, read), (numeric, i64_ty, read)];
+            if let Some(dict) = dictionary {
+                let expected = if *kind == align_sema::hir::CompressKind::Gzip { Ty::Error } else { byte_view(dict) };
+                contract.operands.push((dict, expected, read));
+            }
+        }
         Rvalue::CompressCompress { kind, data, level, dictionary, out }
         | Rvalue::CompressDecompress { kind, data, max_bytes: level, dictionary, out } => {
             contract.result = i32_ty;
@@ -2197,6 +2205,11 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         | Rvalue::RegexSplit { regex, text, .. }
         | Rvalue::RegexCaptures { regex, text, .. } => vec![regex, text],
         Rvalue::CapturesGroup { caps, index, .. } => vec![caps, index],
+        Rvalue::CompressStream { reader, writer, numeric, dictionary, .. } => {
+            let mut inputs = vec![reader, writer, numeric];
+            inputs.extend(dictionary.as_ref());
+            inputs
+        }
         Rvalue::CompressCompress { data, level, dictionary, .. }
         | Rvalue::CompressDecompress { data, max_bytes: level, dictionary, .. } => {
             let mut operands = vec![data, level];
@@ -6984,7 +6997,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::OsIdentity { .. }
             | Rvalue::OsMemory { .. }
             | Rvalue::FrameInnerJoin { .. }
-            | Rvalue::IoCopy(..)
+            | Rvalue::CompressStream { .. } | Rvalue::IoCopy(..)
             | Rvalue::FileCreateRw { .. }
             | Rvalue::FileOpenRw { .. }
             | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. }

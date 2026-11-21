@@ -1373,6 +1373,8 @@ merely because its `Ty` matches.
 | `WriterWrite` | `env[builder]`; `child[writer,arg]`; `Writer borrowed; builder=false requires byte-view, true requires Builder; result ERR(Unit); arg borrowed; Impure`. |
 | `WriterFlush` | `env[]; child[writer]`; `Writer; result ERR(Unit); borrowed; Impure`. |
 | `WriterSync` | `env[]; child[writer]`; `WriterPlace(writer); result ERR(Unit); borrowed without consuming its containing/dependent owner; Impure`. |
+| `CompressStream` | `env[kind,direction]; child[reader,writer,numeric,dictionary?]`; exact reader and writer places under IoCopy rules, i64 level/limit and optional byte view except for gzip. Borrows and reserves both handles, returns ERR(i64), Impure. |
+
 | `IoCopy` | `env[]; child[reader,writer]`; `Reader,Writer; result ERR(i64); both borrowed; Impure`. |
 | `FileCreateRw` | `env[]; child[path]`; `Str; result ERR(File); new owned fd; Impure`. |
 | `FileCreateRwExclusive` | `env[]; child[path]`; `Str; result ERR(File); new exclusive read/write owned fd; Impure`. |
