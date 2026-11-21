@@ -1,0 +1,58 @@
+import std.compress
+import std.io
+import std.fs
+import std.encoding
+extern "C" fn observed() -> i64
+extern "C" fn fail_next_setup()
+extern "C" fn fail_descriptor(fd:i32)->i32
+extern "C" fn balanced(kind:i32)->i64
+extern "C" fn observed_injections()->i32
+fn exercise(mode:i64)->Result<i64,Error> {
+  if mode==1 { return compress.gzip_decompress_to(io.stdin,io.stdout) }
+  return compress.gzip_compress_to(io.stdin,io.stdout,{ if mode==2 { return Ok(71) }; 6 })
+}
+fn main()->Result<(),Error> {
+  a:=exercise(2)?
+  n:=unsafe { observed() }
+  if a!=71 || n!=1 { return Err(Error.Invalid) }
+  match exercise(1) { Ok(_) => { return Err(Error.Invalid) }, Err(_) => {} }
+  m:=unsafe { observed() }
+  if m!=2 { return Err(Error.Invalid) }
+  size:=exercise(0)?
+  k:=unsafe { observed() }
+  if size<=0 || k!=3 { return Err(Error.Invalid) }
+  if unsafe { balanced(0) }!=1 || unsafe { balanced(1) }!=1 { return Err(Error.Invalid) }
+  unsafe { fail_next_setup() }
+  match compress.zlib_compress_to(io.stdin,io.stdout,3,"a preset dictionary") {
+    Ok(_) => { return Err(Error.Invalid) }, Err(_) => {}
+  }
+  unsafe { fail_next_setup() }
+  match compress.zstd_compress_to(io.stdin,io.stdout,3,"a preset dictionary") {
+    Ok(_) => { return Err(Error.Invalid) }, Err(_) => {}
+  }
+  if unsafe { observed_injections() }!=2 || unsafe { balanced(0) }!=2 || unsafe { balanced(2) }!=1 { return Err(Error.Invalid) }
+  bad:=fs.create("corrupt-frame")?
+  binary:=encoding.hex_decode("28b52ffdff0000000000000000000000")?
+  bad.write(binary.bytes())?
+  bad.flush()?
+  input:=fs.open("corrupt-frame")?
+  match compress.zstd_decompress_to(input,io.stdout) {
+    Ok(_) => { return Err(Error.Invalid) }, Err(_) => {}
+  }
+  plain:=fs.open("corrupt-frame")?
+  match compress.gzip_decompress_to(plain,io.stdout) {
+    Ok(_) => { return Err(Error.Invalid) }, Err(_) => {}
+  }
+  if unsafe { balanced(3) }!=1 || unsafe { balanced(1) }!=2 { return Err(Error.Invalid) }
+  if unsafe { fail_descriptor(1) }!=1 { return Err(Error.Invalid) }
+  match compress.zstd_compress_to(io.stdin,io.stdout,3) {
+    Ok(_) => { return Err(Error.Invalid) }, Err(_) => {}
+  }
+  if unsafe { balanced(2) }!=2 { return Err(Error.Invalid) }
+  if unsafe { fail_descriptor(0) }!=0 { return Err(Error.Invalid) }
+  match compress.gzip_compress_to(io.stdin,io.stdout,3) {
+    Ok(_) => { return Err(Error.Invalid) }, Err(_) => {}
+  }
+  if unsafe { balanced(0) }!=3 { return Err(Error.Invalid) }
+  return Ok(())
+}

@@ -87,6 +87,8 @@ mod time_formats;
 pub use time_formats::*;
 mod group_multi_cols;
 pub use group_multi_cols::{GroupColumnSpec, align_rt_group_multi_cols};
+mod compress_stream;
+pub use compress_stream::*;
 mod str_prims;
 pub use str_prims::*;
 mod crypto_asymmetric;
@@ -11526,6 +11528,20 @@ const _: unsafe extern "C" fn(*mut Logger) = align_rt_log_free;
 // Both producers must retain the portable pump's write boundaries and error cursor semantics.
 const _: () = assert!(READ_LINE_CHUNK == BUF_WRITER_CAP);
 
+fn io_copy_scratch(reader: &Reader) -> Result<Option<Buffer>, i32> {
+    // Refill cannot reserve once this private capacity invariant holds. Neither producer lends
+    // its uninitialized tail, and the returned borrow ends before the next read/refill.
+    Ok(if reader.buffered && reader.buf.capacity() >= READ_LINE_CHUNK {
+        None
+    } else {
+        let mut data: Vec<u8> = Vec::new();
+        if data.try_reserve_exact(BUF_WRITER_CAP).is_err() {
+            return Err(AL_INVALID);
+        }
+        Some(Buffer { data: data.into(), cap: BUF_WRITER_CAP, len: 0 })
+    })
+}
+
 /// Produce one initialized copy window. Eligible readers lend their existing lookahead until the
 /// synchronous writer returns; other readers overwrite the portable scratch buffer as before.
 fn io_copy_window<'a>(
@@ -11574,18 +11590,10 @@ pub unsafe extern "C" fn align_rt_io_copy(r: *mut Reader, w: *mut Writer) -> i64
         return -(AL_INVALID as i64);
     }
     let reader = unsafe { &mut *r };
-    // Refill cannot reserve once this private capacity invariant holds. Neither producer lends
-    // its uninitialized tail, and the returned borrow ends before the next read/refill.
-    let mut scratch = if reader.buffered && reader.buf.capacity() >= READ_LINE_CHUNK {
-        None
-    } else {
-        let mut data: Vec<u8> = Vec::new();
-        if data.try_reserve_exact(BUF_WRITER_CAP).is_err() {
-            return -i64::from(AL_INVALID);
-        }
-        Some(Buffer { data: data.into(), cap: BUF_WRITER_CAP, len: 0 })
+    let mut scratch = match io_copy_scratch(reader) {
+        Ok(scratch) => scratch,
+        Err(status) => return -i64::from(status),
     };
-
     let mut total: i64 = 0;
     loop {
         let bytes = match io_copy_window(reader, scratch.as_mut()) {
@@ -15389,6 +15397,7 @@ struct ZstdOutBuffer {
 /// (down to `ZSTD_minCLevel()`) are a power-user niche and are deliberately excluded to keep the API
 /// one-way (a single non-negative range) — an out-of-range level aborts, mirroring gzip's `0..=9`.
 const ZSTD_MAX_CLEVEL: i64 = 22;
+const ZSTD_C_COMPRESSION_LEVEL: c_int = 100;
 
 // Stable `ZSTD_ErrorCode` values (`zstd_errors.h`) used to split an engine/resource failure from
 // invalid input on the decompress path. These two are the only realistic non-input faults for a
@@ -15491,7 +15500,6 @@ fn zstd_compress_with_dictionary(data: &[u8], level: c_int, dictionary: &[u8]) -
         let ctx = unsafe { ZSTD_createCCtx() };
         if ctx.is_null() { return Err(AL_CODE); }
         let result = (|| {
-            const ZSTD_C_COMPRESSION_LEVEL: c_int = 100;
             zstd_operation_result(unsafe { ZSTD_CCtx_setParameter(ctx, ZSTD_C_COMPRESSION_LEVEL, level) })?;
             zstd_operation_result(unsafe { ZSTD_CCtx_loadDictionary(ctx, dictionary.as_ptr().cast(), dictionary.len()) })?;
             zstd_operation_result(unsafe { ZSTD_compress2(ctx, destination, bound, data.as_ptr().cast(), data.len()) })
@@ -30846,14 +30854,18 @@ mod tests {
                 assert_eq!(unsafe { align_rt_log_flush(logger) }, expected);
                 unsafe { align_rt_log_free(logger) };
             }
-            "io-copy" => {
+            "io-copy" | "compress-stream" => {
                 let mut pipe_fds = [-1; 2];
                 assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
                 assert_eq!(unsafe { libc::write(pipe_fds[1], b"x".as_ptr().cast(), 1) }, 1);
                 unsafe { libc::close(pipe_fds[1]) };
                 let reader = Box::into_raw(Box::new(Reader::unbuffered(pipe_fds[0], true)));
                 assert_eq!(
-                    unsafe { align_rt_io_copy(reader, writer) },
+                    unsafe {
+                        if route == "io-copy" { align_rt_io_copy(reader, writer) } else {
+                            align_rt_compress_gzip_compress_to(reader, writer, 3, core::ptr::null(), 0)
+                        }
+                    },
                     -i64::from(expected),
                 );
                 unsafe {
@@ -30935,7 +30947,7 @@ mod tests {
 
     #[test]
     fn tcp_writer_closed_peer_routes_do_not_sigpipe() {
-        for route in ["slice", "builder", "logger", "io-copy"] {
+        for route in ["slice", "builder", "logger", "io-copy", "compress-stream"] {
             let output = run_tcp_writer_closed_peer_probe(route);
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);

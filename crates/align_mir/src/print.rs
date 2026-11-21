@@ -844,6 +844,11 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::ReaderBuffered(r) => format!("io_buffered({})", operand_str(r)),
         Rvalue::ReaderReadLine(r, buf) => format!("io_read_line({}, {})", operand_str(r), operand_str(buf)),
         Rvalue::BytesAsStr { bytes, out } => format!("bytes_as_str({}, -> _{out})", operand_str(bytes)),
+        Rvalue::CompressStream { kind, decompress, reader, writer, numeric, dictionary } => {
+            let action = if *decompress { "decompress" } else { "compress" };
+            let dict = dictionary.as_ref().map(|d| format!(", {}", operand_str(d))).unwrap_or_default();
+            format!("{action}_{kind:?}_to({}, {}, {}{dict})", operand_str(reader), operand_str(writer), operand_str(numeric))
+        }
         Rvalue::IoCopy(r, w) => format!("io_copy({}, {})", operand_str(r), operand_str(w)),
         Rvalue::WriterWrite(w, s) => format!("io_write({}, {})", operand_str(w), operand_str(s)),
         Rvalue::WriterWriteBuilder(w, b) => format!("io_write_builder({}, {})", operand_str(w), operand_str(b)),

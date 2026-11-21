@@ -1047,6 +1047,10 @@ fn walk_body_records<'a>(
                     work.push((BodyRecord::Expr(offset), child_depth));
                     work.push((BodyRecord::Expr(value), child_depth));
                 }
+                ExprKind::CompressStream { reader, writer, numeric, dictionary, .. } => {
+                    for input in [reader, writer, numeric] { work.push((BodyRecord::Expr(input), child_depth)); }
+                    if let Some(value) = dictionary { work.push((BodyRecord::Expr(value), child_depth)); }
+                }
                 ExprKind::Compress { data, level, dictionary, .. }
                 | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                     work.push((BodyRecord::Expr(data), child_depth));

@@ -77,6 +77,12 @@ realloc overlap, engine workspace and RSS are outside the payload bound.
 [Plan226 R156](impl/226-deflate-framing.md#caller-selected-output-limits-llm-r156)
 extends the original fixed-default contract below.
 
+### Reader-to-writer compression (settled)
+
+All four formats borrow the existing reader and writer through one synchronous call, return the
+accepted output count and check through EOF. Earlier output may have reached the destination on
+a later frame or I/O error. [Plan266](impl/266-streaming-compression.md) owns buffer and limit rules.
+
 ### Preset compression dictionaries (settled)
 
 A third byte-view argument on zlib, raw DEFLATE and zstd supplies an explicit

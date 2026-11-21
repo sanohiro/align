@@ -4804,7 +4804,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CodecEncoderNew { .. }
             | hir::ExprKind::CodecEncoderPut { .. }
             | hir::ExprKind::CodecEncoderFinish { .. }
-            | hir::ExprKind::IoCopy { .. }
+            | hir::ExprKind::CompressStream { .. } | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
@@ -5212,7 +5212,7 @@ impl<'a> BodyValidator<'a> {
             | hir::ExprKind::CodecEncoderNew { .. }
             | hir::ExprKind::CodecEncoderPut { .. }
             | hir::ExprKind::CodecEncoderFinish { .. }
-            | hir::ExprKind::IoCopy { .. }
+            | hir::ExprKind::CompressStream { .. } | hir::ExprKind::IoCopy { .. }
             | hir::ExprKind::FileCreateRw { .. }
             | hir::ExprKind::FileOpenRw { .. }
             | hir::ExprKind::FileOpenRo { .. } | hir::ExprKind::FileCreateRwExclusive { .. }
@@ -9440,6 +9440,18 @@ impl<'a> BodyValidator<'a> {
                     && self.body_ty_matches(right.ty, column)
                     && self.body_ty_matches(max_pairs.ty, i64))
                     .then(|| strict(expression.ty, &[left, right, max_pairs]))?
+            }
+            hir::ExprKind::CompressStream { reader, writer, kind, numeric, dictionary, .. } => {
+                if reader.ty != Ty::Reader || !self.reader_place(reader, context)
+                    || writer.ty != Ty::Writer || !self.writer_place(writer, context) || numeric.ty != i64 {
+                    return None;
+                }
+                match dictionary {
+                    None => result(i64, &[reader, writer, numeric]),
+                    Some(dict) if *kind != hir::CompressKind::Gzip && byte_view(dict.ty) =>
+                        result(i64, &[reader, writer, numeric, dict]),
+                    Some(_) => None,
+                }
             }
             hir::ExprKind::IoCopy { reader, writer } => {
                 if !self.reader_place(reader, context)

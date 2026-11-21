@@ -2222,6 +2222,8 @@ pub enum ExprKind {
     /// [`crate::Ty::Bool`]). A thin wrapper over the shared UTF-8 validator, for checking `bytes`
     /// before turning them into a `str`. Pure; `data` is borrowed.
     Utf8Valid { data: Box<Expr> },
+    /// Reader-to-writer transform, returning the accepted output count.
+    CompressStream { kind: CompressKind, decompress: bool, reader: Box<Expr>, writer: Box<Expr>, numeric: Box<Expr>, dictionary: Option<Box<Expr>> },
     /// `compress.gzip_compress(data, level)` — compress the byte view `data` (`str` / owned `string`
     /// auto-borrowed / `slice<u8>`) at `level` (an `i64` in `0..=9`; out-of-range aborts at runtime,
     /// a programmer error like `rand.range`) into an owned `buffer` (the `ty` is

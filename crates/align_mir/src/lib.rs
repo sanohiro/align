@@ -2056,6 +2056,9 @@ pub enum Rvalue {
     /// fixed-size buffer (O(buffer) memory), borrowing both. Yields an `i64`: bytes transferred on
     /// success, or `-(status)` on error (same sign convention as [`Self::ReaderRead`]).
     IoCopy(Operand, Operand),
+    /// Codec operating over two borrowed native handles. Returns i64 count or negative status.
+    CompressStream { kind: hir::CompressKind, decompress: bool, reader: Operand, writer: Operand,
+        numeric: Operand, dictionary: Option<Operand> },
     /// `fs.create_rw(path)`: open `path` `O_RDWR|O_CREAT|O_TRUNC`, writing the owned `file` handle
     /// into `out`. Yields an `i32` errno-status (0 = ok). Mirrors [`Self::ReaderOpen`]. (A4.)
     FileCreateRw {
@@ -3402,7 +3405,7 @@ impl Capability {
 #[inline(never)]
 fn rvalue_capability(rv: &Rvalue) -> Option<Capability> {
     match rv {
-        Rvalue::CompressCompress { kind, .. } | Rvalue::CompressDecompress { kind, .. } => {
+        Rvalue::CompressStream { kind, .. } | Rvalue::CompressCompress { kind, .. } | Rvalue::CompressDecompress { kind, .. } => {
             Some(match kind {
                 hir::CompressKind::Gzip | hir::CompressKind::Zlib | hir::CompressKind::DeflateRaw => Capability::Zlib,
                 hir::CompressKind::Zstd => Capability::Zstd,
@@ -9256,6 +9259,22 @@ fn lower_expr_recursive(b: &mut Builder, e: &hir::Expr) -> Operand {
             hir::ExprKind::FrameInnerJoin { .. } => lower_frame_inner_join(b, e),
             // `io.copy(r, w)` yields `Result<i64, Error>` from the runtime's i64 (bytes transferred, or
             // `-(status)` on error) — the same sign convention (and lowering) as `reader.read`.
+            hir::ExprKind::CompressStream { kind, decompress, reader, writer, numeric, dictionary } => {
+                lower_required_binding!(b, source = lower_borrowed_owned(b, reader), terminated_operand());
+                lower_required_binding!(b, destination = lower_borrowed_owned(b, writer), terminated_operand());
+                lower_required_binding!(b, number = lower_expr(b, numeric), terminated_operand());
+                let dict = if let Some(value) = dictionary {
+                    lower_required_binding!(b, bytes = lower_expr(b, value), terminated_operand());
+                    Some(bytes)
+                } else { None };
+                let count = b.fresh_value(i64_ty());
+                b.push(Stmt::Let(count, Rvalue::CompressStream { kind: *kind, decompress: *decompress,
+                    reader: source.clone(), writer: destination.clone(), numeric: number, dictionary: dict.clone() }));
+                if let Some(bytes) = &dict { drop_borrow_owners(b, bytes); }
+                drop_borrow_owners(b, &destination);
+                drop_borrow_owners(b, &source);
+                lower_count_or_status_result(b, count, e.ty)
+            }
             hir::ExprKind::IoCopy { reader, writer } => {
                 lower_required_binding!(
                     b,

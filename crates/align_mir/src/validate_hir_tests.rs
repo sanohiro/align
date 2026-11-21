@@ -13115,8 +13115,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // HttpCtxPeerEof adds a checked shared receiver and Copy bool/Error result.
         // FileReadAt adds one explicit initialized byte-view native writer.
         // HttpCtxView adds headerless Copy request observation with exact owner provenance.
+        // CompressStream authenticates two handle places, a numeric operand and optional dictionary.
         variants,
-        366,
+        367,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -21911,6 +21912,32 @@ fn json_doc_encode_checked_source_and_piece_matrix() -> Result<(), &'static str>
                 }
             });
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn stream_codec_hir_signature_matrix() -> Result<(), String> {
+    let source = "import std.compress\nimport std.io\nfn f()->Result<i64,Error> { result:=compress.zstd_decompress_to(io.stdin,io.stdout,4,\"seed\"); result }\nfn main() {}\n";
+    let valid = checked_source_program(source);
+    assert!(body_core_metadata_is_valid(&valid));
+    for mutation in 0..7 {
+        let mut bad = valid.clone();
+        let expression = body_first_let_init_mut(&mut bad, "f");
+        let hir::ExprKind::CompressStream { reader, writer, kind, numeric, dictionary, .. } = &mut expression.kind else {
+            return Err("missing stream operation".into());
+        };
+        match mutation {
+            0 => std::mem::swap(reader, writer),
+            1 => writer.kind = hir::ExprKind::WriterStd { fd: 1, buffered: true },
+            2 => numeric.ty = int(32),
+            3 => numeric.kind = hir::ExprKind::Bool(false),
+            4 => *kind = hir::CompressKind::Gzip,
+            5 => *dictionary = Some(Box::new(native_i64())),
+            _ => expression.ty = Ty::Unit,
+        }
+        assert!(!body_core_metadata_is_valid(&bad), "mutation {mutation}");
+        assert!(crate::lower_program_checked(&bad, false, None).is_err());
     }
     Ok(())
 }

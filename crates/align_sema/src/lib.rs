@@ -17895,6 +17895,13 @@ impl EffectScan<'_> {
             // `std.compress` — a C-engine (libz) call, inferred **Impure** (draft §15: any
             // extern-calling fn is non-Pure), so a compress/decompress-using closure is rejected by
             // `par_map`. Recurse into the operands.
+            ExprKind::CompressStream { reader, writer, numeric, dictionary, .. } => {
+                walk!(reader);
+                walk!(writer);
+                walk!(numeric);
+                if let Some(dictionary) = dictionary { walk!(dictionary); }
+                self.impure_direct = true;
+            }
             ExprKind::Compress { data, level, dictionary, .. }
             | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 walk!(data);
@@ -26166,7 +26173,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CodecEncoderNew { .. }
             | ExprKind::CodecEncoderPut { .. }
             | ExprKind::CodecEncoderFinish { .. }
-            | ExprKind::IoCopy { .. }
+            | ExprKind::CompressStream { .. } | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
@@ -26658,7 +26665,7 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::CodecEncoderPut { .. }
             | ExprKind::CodecEncoderFinish { .. }
             | ExprKind::FrameInnerJoin { .. }
-            | ExprKind::IoCopy { .. }
+            | ExprKind::CompressStream { .. } | ExprKind::IoCopy { .. }
             | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. }
             | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
@@ -30350,6 +30357,12 @@ impl<'a> EscapeCheck<'a> {
             | ExprKind::EncodingDecode { input, .. } => self.walk(input, depth),
             // `std.compress` — the owned `buffer` result borrows nothing from `data`; just recurse
             // into the operands so any escape inside them is still checked.
+            ExprKind::CompressStream { reader, writer, numeric, dictionary, .. } => {
+                self.walk(reader, depth);
+                self.walk(writer, depth);
+                self.walk(numeric, depth);
+                if let Some(dictionary) = dictionary { self.walk(dictionary, depth); }
+            }
             ExprKind::Compress { data, level, dictionary, .. }
             | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 self.walk(data, depth);
@@ -33300,7 +33313,7 @@ fn storage_variant_policy(kind: &ExprKind) -> StorageVariantPolicy {
         | ExprKind::CodecEncoderNew { .. }
         | ExprKind::CodecEncoderPut { .. }
         | ExprKind::CodecEncoderFinish { .. }
-        | ExprKind::IoCopy { .. }
+        | ExprKind::CompressStream { .. } | ExprKind::IoCopy { .. }
         | ExprKind::FileCreateRw { .. }
         | ExprKind::FileOpenRw { .. }
         | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. }
@@ -36218,8 +36231,8 @@ impl<'a> MoveCheck<'a> {
                     }
                 }
             }
-            if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
-                for receiver in std::iter::once(file).chain(buffer) {
+            if let Some((first, second)) = Self::native_handle_action_inputs(&expression.kind) {
+                for receiver in std::iter::once(first).chain(second) {
                     arguments.insert(Self::expr_key(receiver));
                     places.insert(Self::expr_key(receiver));
                 }
@@ -41666,10 +41679,11 @@ impl<'a> MoveCheck<'a> {
         )
     }
 
-    /// Native File operands are loaded before eager scalar arguments; reserve their source places
+    /// Native handle operands are loaded before eager scalar arguments; reserve their source places
     /// using the existing owning-handle machinery until the complete operation starts.
-    fn file_action_inputs(kind: &ExprKind) -> Option<(&Expr, Option<&Expr>)> {
+    fn native_handle_action_inputs(kind: &ExprKind) -> Option<(&Expr, Option<&Expr>)> {
         match kind {
+            ExprKind::CompressStream { reader, writer, .. } => Some((reader, Some(writer))),
             ExprKind::FilePread { file, buffer, .. } | ExprKind::FilePreadInto { file, buffer, .. }
             | ExprKind::FileReadAt { file, destination: buffer, .. } => Some((file, Some(buffer))),
             ExprKind::FilePwrite { file, .. } | ExprKind::FileLen { file } | ExprKind::FileSync { file } => Some((file, None)),
@@ -41727,10 +41741,10 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn retire_builtin_action_input(&mut self, expression: &Expr, children: &mut Vec<usize>) {
-        if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
+        if let Some((first, second)) = Self::native_handle_action_inputs(&expression.kind) {
             // File methods return scalars/unit, so their call-scoped owner reservations end here.
             // Other eager operands and independently retained byte views keep their own snapshots.
-            for receiver in std::iter::once(file).chain(buffer) {
+            for receiver in std::iter::once(first).chain(second) {
                 let key = Self::expr_key(receiver);
                 self.clear_value_snapshot(key);
                 children.retain(|snapshot| *snapshot != key);
@@ -43704,7 +43718,7 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::CodecEncoderNew { .. }
             | ExprKind::CodecEncoderPut { .. } | ExprKind::CodecEncoderFinish { .. }
             | ExprKind::FrameInnerJoin { .. }
-            | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
+            | ExprKind::CompressStream { .. } | ExprKind::IoCopy { .. } | ExprKind::FileCreateRw { .. }
             | ExprKind::FileOpenRw { .. } | ExprKind::FileOpenRo { .. } | ExprKind::FileCreateRwExclusive { .. } | ExprKind::FilePread { .. } | ExprKind::FilePreadInto { .. } | ExprKind::FileReadAt { .. } | ExprKind::FilePwrite { .. }
             | ExprKind::FileLen { .. } | ExprKind::FileSync { .. } | ExprKind::BufferNew { .. } | ExprKind::BufferTryNew { .. } | ExprKind::BufferLen { .. } | ExprKind::BufferCapacity { .. } | ExprKind::BuilderLen { .. } | ExprKind::ArrayBuilderLen { .. }
             | ExprKind::BytesRead { .. }
@@ -48118,8 +48132,8 @@ impl<'a> MoveCheck<'a> {
                 }
             }
         }
-        if let Some((file, buffer)) = Self::file_action_inputs(&expression.kind) {
-            for receiver in std::iter::once(file).chain(buffer) {
+        if let Some((first, second)) = Self::native_handle_action_inputs(&expression.kind) {
+            for receiver in std::iter::once(first).chain(second) {
                 let key = Self::expr_key(receiver);
                 self.validate_value_snapshot(Self::expr_key(expression), key, expression.span);
                 self.borrows.finish_mutable_place_source(key);
@@ -51282,6 +51296,12 @@ impl<'a> MoveCheck<'a> {
             | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => move_expr!(self, input, moved, false, false),
             // `std.compress` borrows its byte-view `data` (never consumed) — like `encoding.*`.
+            ExprKind::CompressStream { reader, writer, numeric, dictionary, .. } => {
+                move_expr!(self, reader, moved, false, false);
+                move_expr!(self, writer, moved, false, false);
+                move_expr!(self, numeric, moved, false, false);
+                if let Some(dictionary) = dictionary { move_expr!(self, dictionary, moved, false, false); }
+            }
             ExprKind::Compress { data, level, dictionary, .. }
             | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 move_expr!(self, data, moved, false, false);
@@ -57946,7 +57966,7 @@ impl<'a, 't> Checker<'a, 't> {
             // byte→byte codecs (owned `buffer` output) wrapping the tuned C engines (draft §15
             // keystone strategy). The codec is the method prefix; the direction is the suffix.
             if module == "compress"
-                && matches!(method, "gzip_compress" | "gzip_decompress" | "zstd_compress" | "zstd_decompress"
+                && matches!(method.strip_suffix("_to").unwrap_or(method), "gzip_compress" | "gzip_decompress" | "zstd_compress" | "zstd_decompress"
                     | "zlib_compress" | "zlib_decompress" | "deflate_raw_compress" | "deflate_raw_decompress")
             {
                 self.require_import("std.compress", &format!("compress.{method}"), span);
@@ -68274,11 +68294,13 @@ impl<'a, 't> Checker<'a, 't> {
     }
 
     /// `std.compress` delegates gzip/zlib/raw DEFLATE to libz and zstd to libzstd.
-    /// All directions borrow a byte view and return an independent owned buffer.
+    /// One-shot calls return owned buffers; streaming calls borrow both I/O handles.
     /// Compression levels are exact i64; the runtime enforces each codec's range.
     fn check_compress_op(&mut self, method: &str, args: &[ast::Expr], span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Bool(false), ty: Ty::Error, span };
-        let kind = match method {
+        let stream = method.ends_with("_to");
+        let operation = method.strip_suffix("_to").unwrap_or(method);
+        let kind = match operation {
             "gzip_compress" | "gzip_decompress" => hir::CompressKind::Gzip,
             "zlib_compress" | "zlib_decompress" => hir::CompressKind::Zlib,
             "deflate_raw_compress" | "deflate_raw_decompress" => hir::CompressKind::DeflateRaw,
@@ -68288,22 +68310,34 @@ impl<'a, 't> Checker<'a, 't> {
                 return err;
             }
         };
-        let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
         let what = format!("compress.{method}");
-        let decompress = method.ends_with("_decompress");
+        let decompress = operation.ends_with("_decompress");
         let (arity, signature) = match (decompress, kind == hir::CompressKind::Gzip) {
             (false, true) => (2..=2, "2 arguments (data, level)"),
             (false, false) => (2..=3, "2 or 3 arguments (data, level, optional dictionary)"),
             (true, true) => (1..=2, "1 or 2 arguments (data, optional max_bytes)"),
             (true, false) => (1..=3, "1 to 3 arguments (data, optional max_bytes, optional dictionary)"),
         };
-        if !arity.contains(&args.len()) {
-            self.diags.error(format!("'{what}' expects {signature}, got {}", args.len()), span);
+        let extra = usize::from(stream);
+        let minimum = arity.start() + extra;
+        let maximum = arity.end() + extra;
+        if !(minimum..=maximum).contains(&args.len()) {
+            if stream {
+                self.diags.error(format!("'{what}' expects {minimum}..={maximum} arguments starting with a reader and writer, got {}", args.len()), span);
+            } else {
+                self.diags.error(format!("'{what}' expects {signature}, got {}", args.len()), span);
+            }
             return err;
         }
         let parameter = if decompress { "max_bytes" } else { "level" };
-        let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
-        let numeric = if let Some(argument) = args.get(1) {
+        let (source, destination, numeric_index) = if stream {
+            let Some((reader, writer)) = self.check_io_places(args, &what) else { return err };
+            (reader, Some(writer), 2)
+        } else {
+            let Some(data) = self.check_byte_view(&args[0], &what) else { return err };
+            (data, None, 1)
+        };
+        let numeric = if let Some(argument) = args.get(numeric_index) {
             let value = self.check_expr(argument, None);
             if value.ty == Ty::Error || !self.require_i64_arg(value.ty, argument.span, &format!("'{what}' {parameter}")) {
                 return err;
@@ -68312,14 +68346,22 @@ impl<'a, 't> Checker<'a, 't> {
         } else {
             Expr { kind: ExprKind::Int(1 << 30), ty: Ty::Int(IntTy { bits: 64, signed: true }), span }
         };
-        let dictionary = if let Some(argument) = args.get(2) {
+        let dictionary = if let Some(argument) = args.get(numeric_index + 1) {
             let Some(value) = self.check_byte_view(argument, &format!("{what} dictionary")) else { return err };
             Some(Box::new(value))
         } else {
             None
         };
-        let data = Box::new(data);
+        let data = Box::new(source);
         let numeric = Box::new(numeric);
+        if let Some(writer) = destination {
+            return Expr {
+                kind: ExprKind::CompressStream { kind, decompress, reader: data, writer: Box::new(writer), numeric, dictionary },
+                ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
+                span,
+            };
+        }
+        let result_ty = Ty::Result(Scalar::Buffer, Scalar::Enum(self.error_enum_id));
         let operation = if decompress {
             ExprKind::Decompress { kind, data, max_bytes: numeric, dictionary }
         } else {
@@ -71712,47 +71754,39 @@ impl<'a, 't> Checker<'a, 't> {
                 .error(format!("'io.copy' expects 2 arguments (a reader and a writer), got {}", args.len()), span);
             return err;
         }
-        let reader = self.check_expr(&args[0], Some(Ty::Reader));
-        let writer = self.check_expr(&args[1], Some(Ty::Writer));
-        if reader.ty == Ty::Error || writer.ty == Ty::Error {
-            return err;
-        }
-        if reader.ty != Ty::Reader {
-            self.diags
-                .error(format!("'io.copy' reads from a reader, got {}", ty_name(reader.ty)), args[0].span);
-            return err;
-        }
-        if writer.ty != Ty::Writer {
-            self.diags
-                .error(format!("'io.copy' writes to a writer, got {}", ty_name(writer.ty)), args[1].span);
-            return err;
-        }
-        // v1 restriction (mirrors `check_reader_method` / `check_writer_method`): each owned handle
-        // must be a bound local — an unbound temporary (`io.copy(fs.open(p)?, w)`) would leak its fd
-        // (its `Drop` never runs). Only the **unbuffered** borrowed std streams (`io.stdin` /
-        // `io.stdout` / `io.stderr`) are exempt (no fd, no buffer). A **buffered** std writer
-        // (`io.stdout.buffered()`) holds bytes that only reach the OS on `flush`/`Drop`, so an
-        // un-`Drop`ped temporary would silently lose `io.copy`'s tail chunk — it must be bound.
-        // Lifted when Move temporaries get a `Drop`.
-        if !matches!(reader.kind, ExprKind::Local(_) | ExprKind::ReaderStdin) {
-            self.diags.error(
-                "bind the reader to a local first, then pass it (`r := <expr>` then `io.copy(r, w)`) — a temporary owned reader handle is not dropped yet, so its fd would leak".to_string(),
-                args[0].span,
-            );
-            return err;
-        }
-        if !matches!(writer.kind, ExprKind::Local(_) | ExprKind::WriterStd { buffered: false, .. }) {
-            self.diags.error(
-                "bind the writer to a local first, then pass it (`w := <expr>` then `io.copy(r, w)`) — a temporary owned/buffered writer handle is not dropped/flushed yet, so its buffered output would be lost".to_string(),
-                args[1].span,
-            );
-            return err;
-        }
+        let Some((reader, writer)) = self.check_io_places(args, "io.copy") else { return err };
         Expr {
             kind: ExprKind::IoCopy { reader: Box::new(reader), writer: Box::new(writer) },
             ty: Ty::Result(Scalar::Int(IntTy { bits: 64, signed: true }), Scalar::Enum(self.error_enum_id)),
             span,
         }
+    }
+
+    fn check_io_places(&mut self, args: &[ast::Expr], what: &str) -> Option<(Expr, Expr)> {
+        let reader = self.check_expr(&args[0], Some(Ty::Reader));
+        let writer = self.check_expr(&args[1], Some(Ty::Writer));
+        if reader.ty == Ty::Error || writer.ty == Ty::Error {
+            return None;
+        }
+        if reader.ty != Ty::Reader {
+            self.diags
+                .error(format!("'{what}' reads from a reader, got {}", ty_name(reader.ty)), args[0].span);
+            return None;
+        }
+        if writer.ty != Ty::Writer {
+            self.diags
+                .error(format!("'{what}' writes to a writer, got {}", ty_name(writer.ty)), args[1].span);
+            return None;
+        }
+        if !matches!(reader.kind, ExprKind::Local(_) | ExprKind::ReaderStdin) {
+            self.diags.error(format!("bind the reader to a local first, then pass it to '{what}'"), args[0].span);
+            return None;
+        }
+        if !matches!(writer.kind, ExprKind::Local(_) | ExprKind::WriterStd { buffered: false, .. }) {
+            self.diags.error(format!("bind the writer to a local first, then pass it to '{what}'"), args[1].span);
+            return None;
+        }
+        Some((reader, writer))
     }
 
     /// Read-only initialized bytes of a bound text builder, borrowing its current generation.
@@ -74255,6 +74289,12 @@ impl<'a, 't> Checker<'a, 't> {
             ExprKind::TimeFormat { ns: input, .. } | ExprKind::TimeParse { input, .. }
             | ExprKind::UnicodeNfc { input }
             | ExprKind::EncodingDecode { input, .. } => self.finalize_expr(input),
+            ExprKind::CompressStream { reader, writer, numeric, dictionary, .. } => {
+                self.finalize_expr(reader);
+                self.finalize_expr(writer);
+                self.finalize_expr(numeric);
+                if let Some(dictionary) = dictionary { self.finalize_expr(dictionary); }
+            }
             ExprKind::Compress { data, level, dictionary, .. }
             | ExprKind::Decompress { data, max_bytes: level, dictionary, .. } => {
                 self.finalize_expr(data);
@@ -83059,9 +83099,10 @@ fn main() {owner:="owned".clone();value:=borrowed(owner);other:=fresh(owner)}
         // HttpRespondTimeoutNs consumes two native owners and returns unit/Error.
         // HttpCtxPeerEof shared-borrows a context and returns Copy bool/Error.
         // FileReadAt borrows File and writes an initialized byte view, returning count/Error.
+        // CompressStream borrows both I/O handles and returns a Copy count/Error.
         // All have explicit wildcard-free policies.
         assert_eq!(
-            variants, 366,
+            variants, 367,
             "the wildcard-free storage_variant_policy inventory must be revisited with ExprKind",
         );
 

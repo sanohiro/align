@@ -17158,6 +17158,29 @@ impl<'c, 'a> FnGen<'c, 'a> {
             | Rvalue::CodecEncoderPut { .. }
             | Rvalue::CodecEncoderFinish(_) => return self.gen_codec_rvalue(rv, result_ty),
             Rvalue::FrameInnerJoin { .. } => return self.gen_frame_inner_join_rvalue(rv),
+            Rvalue::CompressStream { kind, decompress, reader, writer, numeric, dictionary } => {
+                use align_sema::hir::CompressKind::*;
+                let key = match (kind, decompress) {
+                    (Gzip, true) => RuntimeKey::CompressGzipDecompressTo,
+                    (Gzip, false) => RuntimeKey::CompressGzipCompressTo,
+                    (Zlib, true) => RuntimeKey::CompressZlibDecompressTo,
+                    (Zlib, false) => RuntimeKey::CompressZlibCompressTo,
+                    (DeflateRaw, true) => RuntimeKey::CompressDeflateRawDecompressTo,
+                    (DeflateRaw, false) => RuntimeKey::CompressDeflateRawCompressTo,
+                    (Zstd, true) => RuntimeKey::CompressZstdDecompressTo,
+                    (Zstd, false) => RuntimeKey::CompressZstdCompressTo,
+                };
+                let source = self.operand(reader)?.into_pointer_value();
+                let destination = self.operand(writer)?.into_pointer_value();
+                let number = self.operand(numeric)?.into_int_value();
+                let (ptr, len) = if let Some(dict) = dictionary {
+                    self.split_str(dict)?
+                } else {
+                    (self.ctx.ptr_type(AddressSpace::default()).const_null().into(), self.ctx.i64_type().const_zero().into())
+                };
+                self.builder.build_call(self.runtime(key), &[source.into(), destination.into(), number.into(), ptr.into(), len.into()], "codec_count")
+                    .map_err(|e| self.err(e))?.try_as_basic_value().basic().ok_or_else(|| self.err("stream codec must return i64"))?
+            }
             Rvalue::IoCopy(r, w) => {
                 let rp = self.operand(r)?.into();
                 let wp = self.operand(w)?.into();
@@ -43476,6 +43499,36 @@ fn main() -> i32 = 0
         assert!(!ir.contains("!dbg !{}"), "module contains invalid empty !dbg attachment:\n{ir}");
         assert!(module.verify().is_ok());
     }
+    #[test]
+    fn stream_codec_mir_signature_matrix() {
+        let valid = mir("import std.compress\nfn f(r:reader,w:writer)->Result<i64,Error> = compress.zlib_compress_to(r,w,3,\"seed\")\nfn main() {}\n");
+        assert!(validate_resource_rvalues(&valid).is_ok());
+        assert!(validate_thin_partition_program(&valid, &[]).is_ok());
+        for mutation in 0..7 {
+            let mut bad = valid.clone();
+            let mut changes = 0;
+            for function in &mut bad.fns {
+                for block in &mut function.blocks {
+                    for statement in &mut block.stmts {
+                        let Stmt::Let(id, Rvalue::CompressStream { kind, reader, writer, numeric, dictionary, .. }) = statement else { continue };
+                        match mutation {
+                            0 => std::mem::swap(reader, writer),
+                            1 => *reader = Operand::Value(u32::MAX),
+                            2 => *writer = Operand::Const(Const::Unit),
+                            3 => *numeric = Operand::Const(Const::Bool(false)),
+                            4 => *kind = align_sema::hir::CompressKind::Gzip,
+                            5 => *dictionary = Some(reader.clone()),
+                            _ => function.value_tys[*id as usize] = Ty::Bool,
+                        }
+                        changes += 1;
+                    }
+                }
+            }
+            assert_eq!(changes, 1);
+            assert_xml_producer_rejected(&bad, &format!("stream codec/{mutation}"));
+        }
+    }
+
     #[test]
     fn deflate_codec_mir_signature_matrix() {
         for codec in ["gzip", "zlib", "deflate_raw", "zstd"] {

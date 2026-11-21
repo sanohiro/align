@@ -4770,6 +4770,31 @@ Compression emits one stream, even for empty input. Levels are `i64` 0..=9;
 out-of-range levels abort before native initialization, as for gzip. The source
 arguments evaluate in order. [Plan226](docs/impl/226-deflate-framing.md) owns this completion.
 
+**Reader-to-writer compression.**
+
+```text
+compress.gzip_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.gzip_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+compress.zlib_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.zlib_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+compress.deflate_raw_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.deflate_raw_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+compress.zstd_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.zstd_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+```
+
+Zlib, raw DEFLATE and Zstandard additionally accept a final dictionary after an explicit level
+or limit. The dictionary has the same framing and validation rules as in the one-shot calls.
+Each Impure call borrows its reader, writer and dictionary in source order. File and buffered
+handles must be bound to locals. The unbuffered standard handles can be passed directly.
+
+Success returns the number of output bytes accepted by the writer. The caller controls flushing.
+Encoding emits one complete stream, including for empty input. Decoding checks through EOF,
+including checksums and every trailing member under the format's ordinary admission rules.
+Any nonnegative i64 output limit is accepted, inclusive. Negative limits and invalid levels abort.
+An error can follow committed output, and the reader may have advanced by a window. Each payload
+window is at most 64 KiB; native workspace and caller-owned buffers are separate.
+
 ### std.rand
 
 Non-cryptographic use (`std.crypto` is the cryptographic counterpart).

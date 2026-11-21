@@ -2586,6 +2586,10 @@ expected preset through Adler-32, while raw DEFLATE requires the caller to share
 the bytes out of band. Zstandard accepts both raw contents and trained dictionaries.
 [Plan265](impl/265-compression-dictionaries.md) records the validation and framing rules.
 
+Using the existing I/O handles makes compressed files, pipes and buffered destinations work with
+the same format rules as one-shot calls. Incremental publication allows large streams and leaves
+flushing and recovery from partial output with the caller. [Plan266](impl/266-streaming-compression.md).
+
 ### Fallible raw carriers (Plan236)
 
 Current private GPU metadata allocation needs recoverable refusal and partial

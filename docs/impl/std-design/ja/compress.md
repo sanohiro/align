@@ -47,6 +47,31 @@ zlib・raw DEFLATE・Zstandard は、圧縮レベルまたは展開上限を指�
 ネイティブ作業領域、buffer ヘッダ、RSS はこの上限に含まない。
 [Plan226 の R156](../../226-deflate-framing.md#caller-selected-output-limits-llm-r156) が拡張契約を定める。
 
+## reader から writer への圧縮
+
+```text
+compress.gzip_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.gzip_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+compress.zlib_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.zlib_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+compress.deflate_raw_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.deflate_raw_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+compress.zstd_compress_to(source: reader, destination: writer, level: i64) -> Result<i64, Error>
+compress.zstd_decompress_to(source: reader, destination: writer, max_bytes: i64 = 1073741824) -> Result<i64, Error>
+```
+
+zlib・raw DEFLATE・Zstandard には、明示したレベルまたは上限の後に辞書を渡せる。
+辞書とフレームの検証規則は一括処理と同じ。呼び出しは Impure で、reader・writer・辞書を
+引数順に借用する。ファイルやバッファ付きハンドルはローカルに束縛する。バッファなしの
+標準入出力は直接渡せる。
+
+成功値は writer が受け取った出力バイト数。flush は呼び出し側が行う。
+圧縮は空入力も完全な 1 ストリームにする。展開は EOF まで読み、形式ごとの規則に従って
+チェックサムと後続フレームを検証する。展開上限は 0 以上の i64 で、上限ちょうどは成功する。
+負の上限と範囲外のレベルは abort する。失敗時にはすでに出力の一部が書き込まれ、
+reader が 1 ウィンドウ分先に進んでいることがある。入出力ウィンドウはそれぞれ最大
+64 KiB。ネイティブライブラリの作業領域と呼び出し元のバッファは別に必要となる。
+
 ## Type & ownership classification
 
 バイト列をバイト列へ変換する処理である。入力の `bytes` は借用ビューであり、そのデータポインタが FFI を越えて渡され、長さは別途渡される（draft §15 の FFI ルールに従う）。出力は所有権を持つ `buffer` であり、Align が buffer 機構を通じてメモリを確保し、C のエンジンがそこへ書き込む。既存の Move 型 `buffer`（#346）を使う。
