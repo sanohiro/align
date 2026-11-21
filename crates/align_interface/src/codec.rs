@@ -1170,6 +1170,19 @@ fn deserialize_impl(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn packed_bits_use_the_named_interface_leaf() {
+        let leaf = IType::Named { path: "bitset".into(), args: Vec::new() };
+        let bytes = [0, 6, 0, 0, 0, b'b', b'i', b't', b's', b'e', b't', 0, 0, 0, 0];
+        let mut writer = Writer::new();
+        write_type(&mut writer, &leaf);
+        assert_eq!(writer.buf, bytes);
+        assert_eq!(read_type(&mut Reader::new(&bytes)), Ok(leaf));
+        for end in 0..bytes.len() {
+            assert!(read_type(&mut Reader::new(&bytes[..end])).is_err());
+        }
+    }
+
     use super::*;
     #[test]
     fn tuple_carrier_interface_round_trip() {

@@ -979,6 +979,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::BytesView { bytes, elem } => {
             format!("bytes_view_le<{elem:?}>({})", operand_str(bytes))
         }
+        Rvalue::Bitset { op, operands } => format!("bitset.{op:?}({})", operands.iter().map(operand_str).collect::<Vec<_>>().join(", ")),
         Rvalue::SliceAsBytes { slice, elem } => {
             format!("slice_as_bytes<{elem:?}>({})", operand_str(slice))
         }

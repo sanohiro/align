@@ -362,6 +362,7 @@ fn resolved_owned_json_type(
         align_sema::Ty::Float(value) => named(value.name(), Vec::new()),
         align_sema::Ty::Bool => named("bool".to_string(), Vec::new()),
         align_sema::Ty::String => named("string".to_string(), Vec::new()),
+        align_sema::Ty::Bitset => named("bitset".to_string(), Vec::new()),
         align_sema::Ty::Str => named("str".to_string(), Vec::new()),
         align_sema::Ty::Struct(id) => structs
             .get(id as usize)
@@ -1620,6 +1621,7 @@ enum BuiltinCapability {
 /// one of them knows is how a valid interface starts failing import validation.
 const BUILTIN_CAPABILITIES: &[(&str, usize, BuiltinCapability)] = &[
     ("str", 0, BuiltinCapability::BorrowLeaf),
+    ("bitset", 0, BuiltinCapability::BorrowLeaf),
     ("region", 0, BuiltinCapability::BorrowLeaf),
     ("reader", 0, BuiltinCapability::BorrowLeaf),
     ("writer", 0, BuiltinCapability::BorrowLeaf),
@@ -2924,7 +2926,7 @@ fn validate_mutable_view_effect_signature(function: &IFnSig) -> Result<(), &'sta
         .map(|parameter| {
             parameter.mode == ParamMode::BorrowMut
                 && matches!(&parameter.ty, IType::Named { path, args }
-                if matches!(path.as_str(), "slice" | "soa") && args.len() == 1)
+                if (matches!(path.as_str(), "slice" | "soa") && args.len() == 1) || (path == "bitset" && args.is_empty()))
         })
         .collect::<Vec<_>>();
     align_sema::hir::validate_mutable_view_effect(

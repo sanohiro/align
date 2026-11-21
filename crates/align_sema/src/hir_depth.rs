@@ -937,6 +937,7 @@ fn walk_body_records<'a>(
                 | ExprKind::BuilderBytes { builder: recv }
                 | ExprKind::StrBytes { inner: recv }
                 | ExprKind::BytesView { bytes: recv, .. }
+                | ExprKind::BitsetReduce { view: recv, .. }
                 | ExprKind::SliceAsBytes { slice: recv, .. }
                 | ExprKind::BufferLen { buffer: recv } | ExprKind::BufferCapacity { buffer: recv } | ExprKind::BuilderLen { builder: recv } | ExprKind::ArrayBuilderLen { builder: recv }
                 | ExprKind::FsExists { path: recv }
@@ -1092,7 +1093,7 @@ fn walk_body_records<'a>(
                         work.push((BodyRecord::Expr(default), child_depth));
                     }
                 }
-                ExprKind::SliceRange { recv, start, end } => {
+                ExprKind::SliceRange { recv, start, end, .. } => {
                     work.push((BodyRecord::Expr(recv), child_depth));
                     if let Some(start) = start.as_deref() {
                         work.push((BodyRecord::Expr(start), child_depth));

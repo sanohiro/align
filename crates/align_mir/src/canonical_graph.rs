@@ -1577,6 +1577,7 @@ fn decode_scalar(cursor: &mut DecodeCursor<'_>) -> Result<Scalar, CanonicalCodec
         42 => Ok(Scalar::CodecI64Column),
         43 => Ok(Scalar::CodecF64Column),
         44 => Ok(Scalar::CodecBoolColumn),
+        64 => Ok(Scalar::Bitset),
         45 => Ok(Scalar::CodecStrColumn),
         46 => Ok(Scalar::CodecEncoder),
         47 => Ok(Scalar::HttpUpgrade),
@@ -1725,6 +1726,7 @@ fn decode_ty(cursor: &mut DecodeCursor<'_>) -> Result<Ty, CanonicalCodecError> {
         46 => Ok(Ty::HttpStream),
         47 => Ok(Ty::HttpHeaders),
         83 => Ok(Ty::HttpRequestView),
+        84 => Ok(Ty::Bitset),
         48 => Ok(Ty::JsonDoc),
         49 => Ok(Ty::JsonScanner(node(cursor)?)),
         50 => Ok(Ty::Struct(node(cursor)?)),
@@ -2571,6 +2573,7 @@ fn scalar(
             Scalar::CodecI64Column => leaf!(42),
             Scalar::CodecF64Column => leaf!(43),
             Scalar::CodecBoolColumn => leaf!(44),
+            Scalar::Bitset => leaf!(64),
             Scalar::CodecStrColumn => leaf!(45),
             Scalar::CodecEncoder => leaf!(46),
             Scalar::CryptoDigest => leaf!(51),
@@ -2779,6 +2782,7 @@ fn ty(
             Ty::HttpStream => leaf!(46),
             Ty::HttpHeaders => leaf!(47),
             Ty::HttpRequestView => leaf!(83),
+            Ty::Bitset => leaf!(84),
             Ty::JsonDoc => leaf!(48),
             Ty::JsonScanner(id) => node!(49, Struct, id),
             Ty::Struct(id) => node!(50, Struct, id),
@@ -3089,7 +3093,7 @@ mod tests {
             let mut trailing = expected.clone(); trailing.push(0);
             assert!(CanonicalTy::decode(&trailing).is_err());
         }
-        assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, 64]).is_err());
+        assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, 65]).is_err());
         let before = CanonicalTy::from_program(Ty::Option(Scalar::Tuple(0)), &program).map_err(|error| format!("{error:?}"))?;
         program.tuples[0].elems[0] = Scalar::Int(i(64));
         assert_ne!(before, CanonicalTy::from_program(Ty::Option(Scalar::Tuple(0)), &program).map_err(|error| format!("{error:?}"))?);
@@ -3691,7 +3695,7 @@ mod tests {
         for end in 0..expected.len() { assert!(CanonicalTy::decode(&expected[..end]).is_err()); }
         let mut trailing = expected.to_vec(); trailing.push(0);
         assert!(CanonicalTy::decode(&trailing).is_err());
-        assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 84]).is_err());
+        assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 85]).is_err());
         Ok(())
     }
 
@@ -3769,6 +3773,7 @@ mod tests {
             Ty::CodecF64Column,
             Ty::CodecBoolColumn,
             Ty::CodecStrColumn,
+            Ty::Bitset,
             Ty::CodecEncoder,
             Ty::CryptoDigest,
             Ty::FsDirectory,
@@ -3862,6 +3867,7 @@ mod tests {
             Scalar::CodecF64Column,
             Scalar::CodecBoolColumn,
             Scalar::CodecStrColumn,
+            Scalar::Bitset,
             Scalar::CodecEncoder,
             Scalar::CryptoDigest,
             Scalar::FsDirectory,
@@ -3912,7 +3918,7 @@ mod tests {
             assert_eq!(CanonicalTy::decode(&expected).as_ref(), Ok(&encoded));
             assert!(CanonicalTy::decode(&expected[..6]).is_err());
         }
-        for tag in 64..=u8::MAX {
+        for tag in 65..=u8::MAX {
             assert!(CanonicalTy::decode(&[3, 0, 0, 0, 0, 4, tag]).is_err());
         }
 
@@ -3960,6 +3966,8 @@ mod tests {
         );
 
         for (ty, expected) in [
+            (Ty::Bitset, vec![3, 0, 0, 0, 0, 84]),
+            (Ty::Option(Scalar::Bitset), vec![3, 0, 0, 0, 0, 4, 64]),
             (Ty::CryptoDigest, vec![3, 0, 0, 0, 0, 73]),
             (Ty::FsDirectory, vec![3, 0, 0, 0, 0, 74]),
             (Ty::FsDirCursor, vec![3, 0, 0, 0, 0, 75]),
@@ -4068,8 +4076,8 @@ mod tests {
         error(&[3, 0, 0, 0, 0, 0xff], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 63], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0, 4, 39], CanonicalCodecError::Truncated);
-        error(&[3, 0, 0, 0, 0, 84], CanonicalCodecError::UnknownTag);
-        error(&[3, 0, 0, 0, 0, 4, 64], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 85], CanonicalCodecError::UnknownTag);
+        error(&[3, 0, 0, 0, 0, 4, 65], CanonicalCodecError::UnknownTag);
         error(&[3, 0, 0, 0, 0, 4, 62], CanonicalCodecError::Truncated);
         error(&[3, 0, 0, 0, 0], CanonicalCodecError::Truncated);
         error(
@@ -4433,7 +4441,7 @@ mod tests {
             Scalar::Logger => [40],
             Scalar::CodecBatch => [41], Scalar::CodecI64Column => [42],
             Scalar::CodecF64Column => [43], Scalar::CodecBoolColumn => [44],
-            Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46], Scalar::CryptoDigest => [51], Scalar::FsDirectory => [52], Scalar::FsDirCursor => [53], Scalar::FsMemoryWriter => [55], Scalar::FsSealedFile => [56], Scalar::ProcessImage => [57], Scalar::ProcessUserNamespace => [58], Scalar::Command => [61], Scalar::ProcessChildScope => [59], Scalar::ProcessMember => [60], Scalar::ProcessSignalSubscription => [54],
+            Scalar::Bitset => [64], Scalar::CodecStrColumn => [45], Scalar::CodecEncoder => [46], Scalar::CryptoDigest => [51], Scalar::FsDirectory => [52], Scalar::FsDirCursor => [53], Scalar::FsMemoryWriter => [55], Scalar::FsSealedFile => [56], Scalar::ProcessImage => [57], Scalar::ProcessUserNamespace => [58], Scalar::Command => [61], Scalar::ProcessChildScope => [59], Scalar::ProcessMember => [60], Scalar::ProcessSignalSubscription => [54],
             Scalar::HttpUpgrade => [47],
             Scalar::XmlReader => [48],
             Scalar::HttpClient => [49],
@@ -4470,7 +4478,7 @@ mod tests {
             Ty::Command => [38], Ty::RunOutput => [39], Ty::HttpRequest => [40],
             Ty::HttpResponse => [41], Ty::HttpClient => [42], Ty::HttpServer => [43],
             Ty::HttpRequestCtx => [44], Ty::ResponseBuilder => [45], Ty::HttpStream => [46],
-            Ty::HttpHeaders => [47], Ty::HttpRequestView => [83], Ty::JsonDoc => [48],
+            Ty::HttpHeaders => [47], Ty::HttpRequestView => [83], Ty::Bitset => [84], Ty::JsonDoc => [48],
             Ty::JsonScanner(1) => [49, 1, 0x10, 0, 0],
             Ty::Struct(1) => [50, 1, 0x10, 0, 0], Ty::Tuple(1) => [51, 1, 0x30, 0, 0],
             Ty::Fn(1) => [52, 1, 0x50, 0, 0], Ty::Enum(1) => [53, 1, 0x20, 0, 0],

@@ -304,7 +304,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::FileCreateRw { .. } | Rvalue::FileOpenRw { .. } | Rvalue::FileOpenRo { .. } | Rvalue::FileCreateRwExclusive { .. } | Rvalue::FilePread { .. } | Rvalue::FilePreadInto { .. } | Rvalue::FileReadAt { .. } |
         Rvalue::FilePwrite { .. } | Rvalue::FileLen { .. } | Rvalue::FileSync(..) | Rvalue::BufferNew { .. } |
         Rvalue::BuilderBytes(..) | Rvalue::BufferBytes { .. } | Rvalue::BufferLen { .. } | Rvalue::BufferCapacity { .. } | Rvalue::BuilderLen(..) | Rvalue::ArrayBuilderLen(..) | Rvalue::ArrayBuilderRead { .. } |
-        Rvalue::BytesSet { .. } | Rvalue::BytesFill { .. } |
+        Rvalue::Bitset { .. } | Rvalue::BytesSet { .. } | Rvalue::BytesFill { .. } |
         Rvalue::BytesCopyFrom { .. } | Rvalue::BufferPut { .. } | Rvalue::BufferAppend { .. } |
         Rvalue::BufferAppendFilled { .. } | Rvalue::ArrayBuilderNew { .. } | Rvalue::ArrayBuilderPush { .. } |
         Rvalue::ArrayBuilderPushStr { .. } | Rvalue::ArrayBuilderAppend { .. } | Rvalue::ArrayBuilderBuild { .. } |

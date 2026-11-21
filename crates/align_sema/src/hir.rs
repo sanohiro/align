@@ -1552,7 +1552,8 @@ pub enum ExprKind {
     /// storage — no allocation, region inherited from `recv` (it cannot outlive it). `start` defaults
     /// to `0` and `end` to the receiver's length when omitted (both `i64`). Lowering emits a bounds
     /// check (`0 <= start <= end <= len`) that aborts on an out-of-range slice (the panic model).
-    SliceRange { recv: Box<Expr>, start: Option<Box<Expr>>, end: Option<Box<Expr>> },
+    SliceRange { kind: RangeKind, recv: Box<Expr>, start: Option<Box<Expr>>, end: Option<Box<Expr>> },
+    BitsetReduce { view: Box<Expr>, op: BitsetReduction },
     /// `recv[index].f0.f1…` — field access on an element of a struct array (`recv` is a fixed
     /// `array<Struct>` or an owned dynamic `array<Struct>`) with a *runtime* index, MMv2 slice 8f.
     /// `path` is the chain of field indices into the element struct (length ≥ 1); `struct_id`
@@ -2672,6 +2673,21 @@ pub enum ExprKind {
     },
     /// Detached Copy request view, minted from a live owner place.
     HttpCtxView { ctx: Box<Expr> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum RangeKind {
+    /// Both bounds are logical indices into the receiver.
+    Window,
+    /// The receiver is a byte slice and the sole end operand is the requested bit count.
+    PackedBits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum BitsetReduction {
+    Count,
+    Any,
+    All,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]

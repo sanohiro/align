@@ -188,8 +188,7 @@ MIR) stay recorded in the consultation digest + runway records until their align
 arrive.
 
 **Historical build sequence (2026-06 snapshot — kept for the build-order and decision record;
-every item below has since completed as recorded in the per-milestone sections, except
-`core.bitset` in item 6, still unbuilt for lack of a consumer):**
+every item below has since completed as recorded in the per-milestone sections and [Plan271](271-borrowed-bitsets.md)):**
 1. **core.math** — explicit-overflow arithmetic `checked_*` / `saturating_*` / `wrapping_*` for
    add/sub/mul **DONE** (methods on integers; `checked_*` → `Option<T>`, via LLVM `.sat` /
    `.with.overflow`). Scalar `abs` / `min` / `max` **DONE** (methods on numerics; `a.min(b)`

@@ -70,8 +70,7 @@ None — values in, values out.
   All are Pure, allocate no Align storage, and retain the target math accuracy
   and vectorization limits above. `atan2` requires exactly matching operand
   types, with no scalar broadcast, and returns radians in [-pi, pi].
-- `core.bitset` (§18.1 neighbor) — not implemented; bit work uses integer operators. Its layout
-  question is tied to packed-bool soa columns; settle together.
+- [core.bitset](bitset.md) supplies borrowed packed-bit views.
 
 ## Pitfalls
 
