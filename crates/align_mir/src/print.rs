@@ -1037,7 +1037,10 @@ fn rvalue_str(rv: &Rvalue) -> String {
         Rvalue::TcpAccept { listener, out } => format!("tcp_accept({}, -> _{out})", operand_str(listener)),
         Rvalue::UdpBind { host, port, out } => format!("udp_bind({}, {}, -> _{out})", operand_str(host), operand_str(port)),
         Rvalue::UdpSendTo { sock, data, host, port } => format!("udp_send_to({}, {}, {}, {})", operand_str(sock), operand_str(data), operand_str(host), operand_str(port)),
-        Rvalue::UdpRecvFrom { sock, buffer } => format!("udp_recv_from({}, {})", operand_str(sock), operand_str(buffer)),
+        Rvalue::SocketObserve { socket, buffer, out } => match buffer {
+            Some(buf) => format!("udp_recv_datagram({}, {}, -> _{out})", operand_str(socket), operand_str(buf)),
+            None => format!("socket_local_addr({}, -> _{out})", operand_str(socket)),
+        },
         Rvalue::ProcessSpawn { cmd, args, out } => format!("process_spawn({}, {}, -> _{out})", operand_str(cmd), operand_str(args)),
         Rvalue::ChildWait { child, out } => format!("child_wait({}, out s{out})", operand_str(child)),
         Rvalue::ChildKill { child, sig } => format!("child_kill({}, {})", operand_str(child), operand_str(sig)),

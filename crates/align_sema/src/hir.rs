@@ -2038,6 +2038,8 @@ pub enum ExprKind {
     /// all just work). The `ty` is `Result<tcp_conn, Error>`. `EINTR` on `accept` is retried (accept
     /// loops are the common case), unlike `connect`. `listener` is borrowed (never consumed).
     TcpAccept { listener: Box<Expr> },
+    /// Inspect a bound TCP or UDP handle and return its owned numeric endpoint.
+    SocketLocalAddr { socket: Box<Expr> },
     /// `udp.bind(host, port)` (`std.net`) — resolve `host` (via `getaddrinfo` with `AI_PASSIVE`; a
     /// null/empty host binds the wildcard address) and open a `SOCK_DGRAM` (UDP) socket bound to
     /// `port`. The `ty` is `Result<udp_socket, Error>` (an owned Move handle owning the socket fd;
@@ -2051,11 +2053,8 @@ pub enum ExprKind {
     /// borrowed `str`; `port` an `i64`. Impure.
     UdpSendTo { sock: Box<Expr>, data: Box<Expr>, host: Box<Expr>, port: Box<Expr> },
     /// `u.recv_from(buf)` (`std.net`) — block for one inbound datagram on the `udp_socket` `sock`,
-    /// filling the caller's `buffer` `buffer` up to its capacity (overwriting its length) and yielding
-    /// `Result<i64, Error>` (the number of bytes received). `EINTR` is retried (a blocking wait, the
-    /// `accept` rationale). A datagram larger than the buffer is truncated (the excess is discarded by
-    /// the kernel — `recvfrom` semantics), with the count being what fit. The peer address is **not**
-    /// returned in v1 (deferred — see `check_udp_recv_from`). `sock` and `buffer` are both borrowed.
+    /// filling the caller's buffer up to capacity. The returned net.datagram owns its peer
+    /// endpoint and records the number of bytes received after truncation.
     UdpRecvFrom { sock: Box<Expr>, buffer: Box<Expr> },
     /// `fs.read_file_view(path)` — mmap the regular file at `path` read-only into the enclosing arena,
     /// yielding a `str` view of its bytes. Requires an enclosing `arena {}` (like `heap.new`); the

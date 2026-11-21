@@ -10,7 +10,7 @@ fn numeric_service_decimal_and_admission() {
         #[cfg(feature = "alloc-count")]
         let before = global_alloc_count();
         // Moving the value must not preserve a pointer into the constructor's former stack slot.
-        let moved = std::hint::black_box([NumericService::new(std::hint::black_box(port)).unwrap()]);
+        let moved = std::hint::black_box([NumericService::new(std::hint::black_box(port), PortPolicy::Positive).unwrap()]);
         let service = &moved[0];
         #[cfg(feature = "alloc-count")]
         assert_eq!(global_alloc_count() - before, 0);
@@ -19,7 +19,14 @@ fn numeric_service_decimal_and_admission() {
         assert!(service.bytes[..service.start].iter().all(|byte| *byte == 0));
     }
     for port in [i64::MIN, -1, 0, 65536, i64::MAX] {
-        assert!(NumericService::new(port).is_none());
+        assert!(NumericService::new(port, PortPolicy::Positive).is_none());
+        let bound = NumericService::new(port, PortPolicy::AssignedAllowed);
+        if port == 0 {
+            let bound = bound.unwrap();
+            assert_eq!(&bound.bytes[bound.start..], b"0\0");
+        } else {
+            assert!(bound.is_none());
+        }
     }
 }
 

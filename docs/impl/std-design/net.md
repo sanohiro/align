@@ -28,7 +28,12 @@ l.accept() -> Result<tcp_conn, Error>
 // UDP
 udp.bind(host: str, port: i64) -> Result<udp_socket, Error>
 u.send_to(data: bytes, host: str, port: i64) -> Result<i64, Error>
-u.recv_from(buf: mut buffer) -> Result<i64, Error>        // fills caller buffer, returns byte count (v1)
+u.recv_from(buf: mut buffer) -> Result<net.datagram, Error>
+c.local_addr() -> Result<net.endpoint, Error>     // tcp_conn
+l.local_addr() -> Result<net.endpoint, Error>     // tcp_listener
+u.local_addr() -> Result<net.endpoint, Error>     // udp_socket
+net.endpoint { host: string, port: i64 }
+net.datagram { n: i64, peer: net.endpoint }
 // DNS
 dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
 ```
@@ -45,15 +50,10 @@ dns.resolve(host: str) -> Result<array<string>, Error>    // owned IP strings
   (`owns_fd: false` — the conn still owns and closes it). So the reader/writer's region is bound
   to the conn `c`; using them past c's Drop is rejected (`region_of(TcpReader) = region_of(c)`).
   This is the #297-trap-aware arm.
-- `dns.resolve` → owned `array<string>` (deep-drop like `read_dir` #339). `datagram`/`response`
-  are small structs (Copy) carrying counts + owned peer/body as appropriate.
-  - **Slice 4 v1 shape (shipped):** `recv_from` returns the received **count** only —
-    `Result<i64, Error>`, mirroring `reader.read` exactly (fill the caller's buffer, return the byte
-    count). The ideal `datagram {n, peer}` return is **deferred**: a `Result` `Ok` payload is a single
-    `Scalar` (there is no `Scalar::Tuple`), and the peer address is an owned `string`, so `{n, peer}`
-    would require synthesizing a builtin Move struct-with-owned-field aggregate — a library-specific compiler special case
-    that "ideal form or defer" forbids. It waits for first-class builtin-struct returns. The socket
-    already receives the peer at the syscall (`recvfrom`); v1 simply discards it (null `src_addr`).
+- `dns.resolve` returns an owned `array<string>`.
+- Port zero in `tcp.listen` and `udp.bind` asks the kernel to assign a port. Call `local_addr()` on the bound handle to obtain its actual address and port. Connect and send destinations require a port in 1–65535.
+- `net.endpoint` and `net.datagram` are ordinary Move structs. The host owns its numeric IPv4 or IPv6 spelling, including a decimal `%scope` suffix for a nonzero IPv6 scope ID. A peer survives socket closure and receive-buffer reuse.
+- `u.recv_from(buf)` returns the sender and the number of bytes stored. A long datagram fills the buffer and discards its tail. With positive capacity an empty datagram returns its sender and `n == 0`. A zero-capacity buffer returns `Error.Invalid` before receiving. A failed receive sets the logical buffer length to zero.
 
 ## Effect classification
 

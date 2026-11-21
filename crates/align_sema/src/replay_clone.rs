@@ -1272,6 +1272,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             host: boxed!(host),
             port: boxed!(port),
         },
+        ExprKind::SocketLocalAddr { socket } => ExprKind::SocketLocalAddr { socket: boxed!(socket) },
         ExprKind::TcpAccept { listener } => ExprKind::TcpAccept {
             listener: boxed!(listener),
         },
@@ -2882,7 +2883,8 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
         | ExprKind::DnsResolve { host: recv }
         | ExprKind::ConnReader { conn: recv }
         | ExprKind::ConnWriter { conn: recv }
-        | ExprKind::TcpAccept { listener: recv }
+        | ExprKind::SocketLocalAddr { socket: recv }
+                | ExprKind::TcpAccept { listener: recv }
         | ExprKind::FsReadFileView { path: recv }
         | ExprKind::FsReadBytesView { path: recv }
         | ExprKind::PathComponent { path: recv, .. }

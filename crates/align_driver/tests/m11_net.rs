@@ -11,6 +11,8 @@
 //! the import gate. (`docs/impl/std-design/net.md` Slice 2; `draft.md` §18.2.)
 
 mod common;
+#[path = "helpers/owned_fixture.rs"]
+mod owned_fixture;
 use common::*;
 
 /// Bind an in-process echo server on an ephemeral loopback port; return `(port, join_handle)`. The
@@ -327,107 +329,58 @@ pub fn main() -> Result<(), Error> {
 
 // --- Slice 3: tcp_listener (Align listens, Rust connects) + Gate-1 rejections ------------------
 
-/// Full Align-to-Align-shaped round trip in the server direction: an Align program `tcp.listen`s on
-/// `127.0.0.1`, then `accept`s **two sequential clients**, echoing each one's message back through
-/// the accepted conn's `reader()`/`writer()`. The Rust test drives both clients. The port is probed
-/// (bind `:0`, read the port, drop) then passed via `--port`; there is a small TOCTOU window between
-/// the probe drop and the Align `bind` (documented tradeoff — a collision would surface as a clean
-/// `EADDRINUSE` Err, never a hang). The client retries connecting until the server is listening.
+/// The server publishes its bound port only after the kernel has assigned it. Both echo owners
+/// run in a bounded process group so a failed build or stalled exchange retires every child.
+fn listening_server(exe: &std::path::Path) -> (std::process::Child, u16) {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(exe).stdin(Stdio::null()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
+    let port = line.trim().parse::<u16>().expect("server must report its bound port");
+    assert_ne!(port, 0);
+    (child, port)
+}
+
 #[test]
 fn tcp_listen_accept_serves_two_clients() {
-    if !backend_available() {
-        return;
-    }
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::process::{Command, Stdio};
-
-    // Probe a free loopback port (the Align listener can't use port 0 — it's rejected in v1).
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe bind");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-
-    // The server: listen, then serve two sequential clients (accept → read one message → echo it).
-    // Each accepted conn borrows a reader + writer over its fd (`owns_fd:false`); only the conn's
-    // Drop closes the fd. Exits 0 after both clients.
-    let prog = "\
+    if !backend_available() { return; }
+    owned_fixture::run("tcp_listen_accept_serves_two_clients", |_| {
+        use std::io::{Read, Write};
+        let src = r#"
 import std.net
 import std.io
-import std.cli
-pub fn main(args: array<str>) -> Result<(), Error> {
-  c := cli.command(\"srv\")
-  c.flag_i64(\"port\", 0)
-  p := c.parse(args)?
-  l := tcp.listen(\"127.0.0.1\", p.get_i64(\"port\"))?
-  conn1 := l.accept()?
-  r1 := conn1.reader()
-  w1 := conn1.writer()
-  mut b1 := buffer(64)
-  n1 := r1.read(b1)?
-  w1.write(b1.bytes())?
-  conn2 := l.accept()?
-  r2 := conn2.reader()
-  w2 := conn2.writer()
-  mut b2 := buffer(64)
-  n2 := r2.read(b2)?
-  w2.write(b2.bytes())?
-  return Ok(())
-}
-";
-    let built = build_exe("m11net-listen-serve", prog);
-    let mut child = Command::new(&built.exe)
-        .args(["--port", &port.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the Align server");
-
-    // Two sequential clients; each connects (with retry until the server is listening), sends its
-    // message, and reads the echo back.
-    for i in 0..2 {
-        let msg = format!("client{i}\n");
-        // A wall-clock deadline, not a fixed retry count: 100 x 20 ms budgeted only ~2 s, which the
-        // server child can exceed purely from scheduling pressure when the whole suite runs in
-        // parallel (this test passes in isolation and failed only in full-suite runs). 30 s matches
-        // the other server tests in this repo (`apps_web_serve`, `apps_web_root`). A genuinely dead
-        // server still fails, just on its own stderr rather than on a load-dependent stopwatch.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut sock = None;
-        loop {
-            match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(s) => {
-                    sock = Some(s);
-                    break;
-                }
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
-                }
-                Err(_) => break,
-            }
-        }
-        let mut sock = match sock {
-            Some(s) => s,
-            None => {
-                // The server never came up (e.g. the probe-port TOCTOU race lost) — surface stderr.
-                let _ = child.kill();
-                let out = child.wait_with_output().expect("wait server");
-                panic!("client {i} could not connect; server stderr: {}", String::from_utf8_lossy(&out.stderr));
-            }
-        };
-        sock.write_all(msg.as_bytes()).expect("client write");
-        let mut buf = [0u8; 64];
-        let n = sock.read(&mut buf).expect("client read");
-        assert_eq!(&buf[..n], msg.as_bytes(), "client {i} receives its echoed message");
+pub fn main() -> Result<(), Error> {
+    listener := tcp.listen("127.0.0.1", 0)?
+    address := listener.local_addr()?
+    print(address.port)
+    mut i: i64 := 0
+    loop {
+        conn := listener.accept()?
+        local := conn.local_addr()?
+        if local.port != address.port || local.host != address.host { return Err(Error.Invalid) }
+        r := conn.reader()
+        w := conn.writer()
+        mut b := buffer(64)
+        n := r.read(b)?
+        w.write(b.bytes())?
+        i = i + 1
+        if i == 2 { break }
     }
-
-    let out = child.wait_with_output().expect("wait server");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "the server accepts 2 clients and exits 0; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    return Ok(())
+}
+"#;
+        let built = build_exe("m11net-listen-serve", src);
+        let (mut child, port) = listening_server(&built.exe);
+        for msg in [b"hello", b"again"] {
+            let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            sock.write_all(msg).unwrap();
+            let mut got = [0; 5];
+            sock.read_exact(&mut got).unwrap();
+            assert_eq!(&got, msg);
+        }
+        assert!(child.wait().unwrap().success());
+    });
 }
 
 /// A `tcp_listener` is an owned handle bound to one local — it cannot be collected into an array (a
@@ -496,23 +449,20 @@ pub fn main() -> Result<(), Error> {
     assert!(check_errs("m11net-listen-noimport", src), "tcp.listen without `import std.net` must error");
 }
 
-/// Port `0` (kernel-assigned) is rejected in v1 — there is no way to read the bound port back yet, so
-/// `tcp.listen("127.0.0.1", 0)` is an `Err` (Error.Invalid) at runtime, never an abort. `main` exits
-/// non-zero.
 #[test]
-fn tcp_listen_port_zero_is_err() {
-    if !backend_available() {
-        return;
-    }
-    let prog = "\
+fn tcp_connected_local_addr() {
+    if !backend_available() { return; }
+    let out = build_and_run("m11net-tcp-local", r#"
 import std.net
 pub fn main() -> Result<(), Error> {
-  l := tcp.listen(\"127.0.0.1\", 0)?
-  return Ok(())
-}
-";
-    let out = build_and_run("m11net-listen-port0", prog);
-    assert_ne!(out.status.code(), Some(0), "port 0 (kernel-assigned) is rejected in v1 (main exits non-zero), never an abort");
+    listener := tcp.listen("127.0.0.1", 0)?
+    address := listener.local_addr()?
+    conn := tcp.connect(address.host, address.port)?
+    client := conn.local_addr()?
+    if client.port <= 0 || client.port == address.port || client.host != "127.0.0.1" { return Err(Error.Invalid) }
+    return Ok(())
+}"#);
+    assert!(out.status.success(), "{out:?}");
 }
 
 /// Adversarial-review F1: an owned reader constructed by a **direct** builtin (`fs.open`) inside a
@@ -576,83 +526,138 @@ pub fn main() -> Result<(), Error> {
 
 // --- Slice 4: udp_socket (bind + send_to + recv_from) + Gate-1 rejections ----------------------
 
-/// UDP datagram round trip: an Align program `udp.bind`s on `127.0.0.1`, `recv_from`s one datagram,
-/// then `send_to`s the same bytes back to the Rust peer. The Rust peer sends `ping` (retrying, since
-/// UDP is lossy and the server may not be bound yet) until it receives the echoed datagram back. The
-/// Align bind port is probed (bind `:0`, read, drop — port 0 is rejected in v1); the peer's port is
-/// passed in so the server can reply (v1 `recv_from` does not return the peer address — see the
-/// deferral note in `check_udp_socket_method`). Exercises bind + recv_from + send_to and the
-/// `slice<u8>` (`b.bytes()`) send path.
+/// Two independent senders receive replies using only the endpoint carried by each datagram.
 #[test]
 fn udp_bind_send_to_recv_from_roundtrip() {
-    if !backend_available() {
-        return;
-    }
-    use std::net::UdpSocket;
-    use std::process::{Command, Stdio};
-
-    // The Rust peer binds first so its port is known and can be handed to the Align server.
-    let peer = UdpSocket::bind("127.0.0.1:0").expect("peer bind");
-    peer.set_read_timeout(Some(std::time::Duration::from_millis(200))).expect("peer read timeout");
-    let peer_port = peer.local_addr().unwrap().port();
-
-    // Probe a free loopback port for the Align server (it can't use port 0 — rejected in v1).
-    let probe = UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-    let srv_port = probe.local_addr().unwrap().port();
-    drop(probe);
-
-    // The server: bind, receive one datagram, echo its bytes back to the peer's port.
-    let prog = "\
+    if !backend_available() { return; }
+    owned_fixture::run("udp_bind_send_to_recv_from_roundtrip", |_| {
+        let built = build_exe("m11net-udp-roundtrip", r#"
 import std.net
-import std.cli
-pub fn main(args: array<str>) -> Result<(), Error> {
-  c := cli.command(\"udp\")
-  c.flag_i64(\"port\", 0)
-  c.flag_i64(\"peer\", 0)
-  p := c.parse(args)?
-  u := udp.bind(\"127.0.0.1\", p.get_i64(\"port\"))?
-  mut b := buffer(64)
-  n := u.recv_from(b)?
-  u.send_to(b.bytes(), \"127.0.0.1\", p.get_i64(\"peer\"))?
-  return Ok(())
-}
-";
-    let built = build_exe("m11net-udp-roundtrip", prog);
-    let mut child = Command::new(&built.exe)
-        .args(["--port", &srv_port.to_string(), "--peer", &peer_port.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn the Align UDP server");
-
-    // Send `ping` (retrying — UDP is lossy and the server may not be bound yet) until the echo lands.
-    let mut got_echo = false;
-    for _ in 0..100 {
-        peer.send_to(b"ping", ("127.0.0.1", srv_port)).expect("peer sends ping");
-        let mut buf = [0u8; 64];
-        match peer.recv_from(&mut buf) {
-            Ok((n, _from)) => {
-                assert_eq!(&buf[..n], b"ping", "the server echoes the datagram bytes exactly");
-                got_echo = true;
-                break;
-            }
-            Err(_) => continue, // timeout — the server wasn't up yet / the datagram was lost; retry.
+pub fn main() -> Result<(), Error> {
+    server := udp.bind("127.0.0.1", 0)?
+    address := server.local_addr()?
+    print(address.port)
+    mut buf := buffer(4)
+    mut i: i64 := 0
+    loop {
+        packet := server.recv_from(buf)?
+        if packet.n != buf.bytes().len() { return Err(Error.Invalid) }
+        server.send_to(buf.bytes(), packet.peer.host, packet.peer.port)?
+        i = i + 1
+        if i == 2 { break }
+    }
+    return Ok(())
+}"#);
+        let (mut child, port) = listening_server(&built.exe);
+        let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for (peer, data) in [(&a, b"abcdef".as_slice()), (&b, b"".as_slice())] {
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            peer.send_to(data, ("127.0.0.1", port)).unwrap();
+            let mut reply = [0; 8];
+            let (n, from) = peer.recv_from(&mut reply).unwrap();
+            assert_eq!(from.port(), port);
+            assert_eq!(&reply[..n], &data[..data.len().min(4)]);
         }
-    }
-    if !got_echo {
-        let _ = child.kill();
-        let out = child.wait_with_output().expect("wait server");
-        panic!("never received the echoed datagram; server stderr: {}", String::from_utf8_lossy(&out.stderr));
-    }
+        assert!(child.wait().unwrap().success());
+    });
+}
 
-    let out = child.wait_with_output().expect("wait server");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "the UDP server binds, receives, echoes and exits 0; stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+#[test]
+fn datagram_records_across_cached_module_boundaries() {
+    if !backend_available() { return; }
+    owned_fixture::run("datagram_records_across_cached_module_boundaries", |_| {
+        let helper = fixture("crates/align_driver/tests/fixtures/socket_endpoint_ownership.align");
+        // This module uses std.net only in signatures. Replaying its interface must preserve
+        // the nested Move result and the source-level builtin import.
+        let types = "module types\nimport std.net\npub fn peer(message: net.datagram) -> net.endpoint = message.peer\n";
+        let main = r#"import packets
+import types
+fn main() -> Result<(), Error> {
+    match packets.receive(true, 2).map_err(packets.unchanged) {
+        Ok(_) => { return Err(Error.Invalid) }, Err(_) => {}
+    }
+    ignored := packets.receive(false, 3)?
+    result := packets.receive(false, 4)?
+    peer := types.peer(result)
+    if peer.host != "127.0.0.1" || peer.port <= 0 { return Err(Error.Invalid) }
+    print(peer.host)
+    return Ok(())
+}"#;
+        let files = [("main.align", main), ("packets.align", helper), ("types.align", types)];
+        let whole = build_and_run_multi("socket-observation-whole", &files, "main.align");
+        assert!(whole.status.success(), "{whole:?}");
+        assert_eq!(whole.stdout, b"127.0.0.1\n");
+        let project = Proj::new("socket-observation-units", &files, "main.align");
+        let cache = project.cache();
+        for warm in [false, true] {
+            let built = thin_build(&project, &cache, 1);
+            assert!(if warm { built.all_hit() } else { built.all_miss() });
+            assert_eq!(built.run(&project), "127.0.0.1\n");
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn exactly_once_endpoint_cleanup() {
+    use align_driver::{BuildTarget, CDriver, Profile};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    owned_fixture::run("exactly_once_endpoint_cleanup", |stage| {
+        let helper = fixture("crates/align_driver/tests/fixtures/socket_endpoint_ownership.align");
+        let main = r#"import packets
+extern "C" fn endpoint_balance() -> i32
+fn exercise() -> Result<(), Error> {
+    match packets.receive(true, 0).map_err(packets.unchanged) { Ok(_) => {return Err(Error.Invalid)}, Err(_) => {} }
+    ignored := packets.receive(false, 1)?
+    packet := packets.receive(false, 2)?
+    endpoint := packet.peer
+    name := endpoint.host
+    if name != "127.0.0.1" { return Err(Error.Invalid) }
+    return Ok(())
+}
+fn main() -> i32 {
+    exercise() else {return 1}
+    if unsafe { endpoint_balance() } != 1 { return 2 }
+    return 0
+}"#;
+        std::fs::write(stage.join("packets.align"), helper).unwrap();
+        let path = stage.join("main.align");
+        std::fs::write(&path, main).unwrap();
+        let mut sources = SourceMap::new();
+        let checked = align_driver::check(&mut sources, path.to_str().unwrap(), main);
+        assert!(!checked.diags.has_errors(), "{}", align_driver::format_diagnostics(&sources, &checked.diags));
+        let mir = align_driver::lower_to_mir(&checked.hir);
+        let object = stage.join("main.o");
+        align_driver::emit_object_file(&mir, &object, BuildTarget::Baseline, Profile::Release, &[], false).unwrap();
+        let c = stage.join("observe.c");
+        let observer = stage.join("observe.o");
+        std::fs::write(&c, fixture("crates/align_driver/tests/fixtures/socket_endpoint_cleanup.c")).unwrap();
+        assert!(Command::new("cc").arg("-c").arg(c).arg("-o").arg(&observer).status().unwrap().success());
+        let wrapper = stage.join("link-observer");
+        std::fs::write(&wrapper, "#!/bin/sh\nexec cc -Wl,--wrap=align_rt_free,--wrap=align_rt_udp_local_addr,--wrap=align_rt_udp_recv_datagram \"$@\"\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = stage.join("run");
+        align_driver::link_objects(&CDriver::explicit(wrapper).unwrap(), &[&object, &observer], &output,
+            &mir.link_libs, Profile::Release).unwrap();
+        let run = Command::new(output).output().unwrap();
+        assert!(run.status.success(), "{run:?}");
+    });
+}
+
+#[test]
+fn recv_from_requires_exclusive_buffer_and_local_handle() {
+    let used = check_diagnostics("net-type-only", "import std.net\nfn peer(d:net.datagram)->net.endpoint = d.peer\nfn main() {}");
+    assert!(!used.contains("unused import") && !used.contains("error:"), "{used}");
+    for (id, body) in [
+        ("socket-temp", "point:=udp.bind(\"127.0.0.1\",0)?.local_addr()?"),
+        ("read-only", "u:=udp.bind(\"127.0.0.1\",0)?; b:=buffer(1); d:=u.recv_from(b)?"),
+        ("live-view", "u:=udp.bind(\"127.0.0.1\",0)?; mut b:=buffer(4); view:=b.bytes(); d:=u.recv_from(b)?; print(view.len())"),
+        ("wrong-socket", "u:=udp.bind(\"127.0.0.1\",0)?; d:=u.local_addr(1)?"),
+    ] {
+        assert!(check_errs(id, &format!("import std.net\nfn main()->Result<(),Error> {{ {body}; return Ok(()) }}")));
+    }
 }
 
 /// A `udp_socket` is an owned handle bound to one local — it cannot be collected into an array (a
@@ -723,22 +728,22 @@ pub fn main() -> Result<(), Error> {
     assert!(check_errs("m11net-udp-noimport", src), "udp.bind without `import std.net` must error");
 }
 
-/// Port `0` (kernel-assigned) is rejected in v1 — `udp.bind("127.0.0.1", 0)` is an `Err`
-/// (Error.Invalid) at runtime, never an abort. `main` exits non-zero.
+/// The endpoint owns its host string after the originating UDP socket closes.
 #[test]
-fn udp_bind_port_zero_is_err() {
-    if !backend_available() {
-        return;
-    }
-    let prog = "\
+fn udp_local_address_survives_handle() {
+    if !backend_available() { return; }
+    let out = build_and_run("m11net-udp-port0", r#"
 import std.net
-pub fn main() -> Result<(), Error> {
-  u := udp.bind(\"127.0.0.1\", 0)?
-  return Ok(())
+fn bound() -> Result<net.endpoint, Error> {
+    sock := udp.bind("127.0.0.1", 0)?
+    return sock.local_addr()
 }
-";
-    let out = build_and_run("m11net-udp-port0", prog);
-    assert_ne!(out.status.code(), Some(0), "port 0 is rejected in v1 (main exits non-zero), never an abort");
+pub fn main() -> Result<(), Error> {
+    local := bound()?
+    if local.port <= 0 || local.host != "127.0.0.1" { return Err(Error.Invalid) }
+    return Ok(())
+}"#);
+    assert!(out.status.success(), "{out:?}");
 }
 
 /// `send_to` to port `0` is an `Err` (Error.Invalid) at runtime — a datagram destination port must
@@ -748,22 +753,12 @@ fn udp_send_to_port_zero_is_err() {
     if !backend_available() {
         return;
     }
-    // Probe a free loopback port for the (valid) bind, then send to the invalid port 0.
-    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe bind");
-    let port = probe.local_addr().unwrap().port();
-    drop(probe);
-    let prog = "\
-import std.net
-import std.cli
-pub fn main(args: array<str>) -> Result<(), Error> {
-  c := cli.command(\"udp\")
-  c.flag_i64(\"port\", 0)
-  p := c.parse(args)?
-  u := udp.bind(\"127.0.0.1\", p.get_i64(\"port\"))?
-  u.send_to(\"x\", \"127.0.0.1\", 0)?
+    let prog = r#"import std.net
+pub fn main() -> Result<(), Error> {
+  u := udp.bind("127.0.0.1", 0)?
+  u.send_to("x", "127.0.0.1", 0)?
   return Ok(())
-}
-";
-    let out = build_and_run_args("m11net-udp-sendport0", prog, &["--port", &port.to_string()]);
+}"#;
+    let out = build_and_run("m11net-udp-sendport0", prog);
     assert_ne!(out.status.code(), Some(0), "send_to to port 0 is Error.Invalid (main exits non-zero), never an abort");
 }

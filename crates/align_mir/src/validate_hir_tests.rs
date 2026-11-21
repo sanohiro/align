@@ -13116,8 +13116,9 @@ fn request11_expr_kind_inventory_tripwire() {
         // FileReadAt adds one explicit initialized byte-view native writer.
         // HttpCtxView adds headerless Copy request observation with exact owner provenance.
         // CompressStream authenticates two handle places, a numeric operand and optional dictionary.
+        // SocketLocalAddr reads one bound socket and returns an owned qualified record.
         variants,
-        367,
+        368,
         "ExprKind changed: update every exhaustive validation/ownership pass and the ledger owner inventory"
     );
 }
@@ -13125,6 +13126,8 @@ fn request11_expr_kind_inventory_tripwire() {
 #[test]
 fn hir_body_validator_native() {
     let mut program = baseline_program();
+    let Ok(endpoint) = u32::try_from(program.structs.len()) else { panic!("fixture struct count") };
+    program.structs.extend(align_sema::net::definitions(endpoint));
     let pages_id = u32::try_from(program.enums.len()).unwrap_or_else(|_| panic!("fixture enum count"));
     program.enums.push(EnumDef {
         name: "buffer.page_policy".to_string(), source_name: "buffer.page_policy".to_string(),
@@ -14034,13 +14037,13 @@ fn hir_body_validator_native() {
                 sock: Box::new(native_local(0, Ty::UdpSocket)),
                 buffer: Box::new(native_local(1, Ty::Buffer)),
             },
-            result_i64,
+            native_result(Ty::Struct(endpoint + 1), error),
         ),
         vec![
             body_test_local(0, "socket", Ty::UdpSocket, false, false),
             body_test_local(1, "buffer", Ty::Buffer, true, false),
         ],
-        result_i64
+        native_result(Ty::Struct(endpoint + 1), error)
     );
     let view_result = native_result(Ty::Str, error);
     add!(
@@ -21983,6 +21986,66 @@ fn select_broadcast_checked_hir_and_make_vec_producers() -> Result<(), String> {
         for definitions in [&local, &unit] {
             assert!(crate::producer::validate_partition_resource_rvalues(&bad, definitions).is_err(), "partition MIR {mutation}");
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn socket_observation_schemas_and_output_producers() -> Result<(), String> {
+    let source = "import std.net\nfn receive(s:udp_socket,borrow mut b:buffer) { d:=s.recv_from(b) }\nfn local(s:tcp_listener) { result:=s.local_addr() }\nfn main() {}\n";
+    let original = checked_source_program(source);
+    let endpoint = align_sema::net::record_id(&original.structs, align_sema::net::ENDPOINT).ok_or("endpoint")?;
+    let datagram = align_sema::net::record_id(&original.structs, align_sema::net::DATAGRAM).ok_or("datagram")?;
+    let whole = lower_program_checked(&original, false, None).map_err(|e| format!("{e:?}"))?;
+    let emitted = whole.fns.iter().filter(|f| f.name.as_str() == "receive").map(|f| f.name.clone()).collect();
+    assert!(crate::producer::validate_partition_resource_rvalues(&whole, &emitted).is_ok());
+    for mode in 0..5 {
+        let mut h = original.clone();
+        let mut m = whole.clone();
+        for records in [&mut h.structs, &mut m.structs] {
+            match mode {
+                0 => records[endpoint as usize].fields[0].ty = Ty::Str,
+                1 => records[datagram as usize].fields.swap(0,1),
+                2 => records[datagram as usize].fields[1].ty = Ty::Struct(datagram),
+                3 => records[endpoint as usize].c_repr = true,
+                _ => {
+                    let mut fake = records[endpoint as usize].clone();
+                    fake.name = "lookalike".into();
+                    records.push(fake);
+                }
+            }
+        }
+        assert!(lower_program_checked(&h, false, None).is_err(), "schema {mode}");
+        assert!(crate::producer::validate_mir_producers(&m).is_err(), "MIR schema {mode}");
+        assert!(crate::producer::validate_partition_resource_rvalues(&m, &emitted).is_err());
+    }
+    for name in ["receive", "local"] {
+        let mut h = original.clone();
+        let expression = body_first_let_init_mut(&mut h, name);
+        let Ty::Result(_, error) = expression.ty else { return Err("result".into()) };
+        expression.ty = Ty::Result(Scalar::Struct(if name == "receive" { endpoint } else { datagram }), error);
+        assert!(!body_core_metadata_is_valid(&h), "result {name}");
+    }
+    for mode in 0..8 {
+        let mut m = whole.clone();
+        let f = m.fns.iter_mut().find(|f| f.name.as_str() == "receive").ok_or("receive")?;
+        let (value, socket, buffer, out) = f.blocks.iter_mut().flat_map(|b| &mut b.stmts)
+            .find_map(|s| match s {
+                Stmt::Let(id, Rvalue::SocketObserve { socket, buffer, out }) => Some((*id, socket, buffer, out)),
+                _ => None,
+            }).ok_or("MIR operation")?;
+        match mode {
+            0 => *out = u32::MAX,
+            1 => f.slots[*out as usize] = Ty::Struct(endpoint),
+            2 => *buffer = None,
+            3 => *socket = Operand::Const(Const::Bool(false)),
+            4 => *buffer = Some(Operand::Value(u32::MAX)),
+            5 => f.value_tys[value as usize] = int(64),
+            6 => *buffer = Some(Operand::Arg(1)),
+            _ => *socket = Operand::Arg(0),
+        }
+        assert!(crate::producer::validate_mir_producers(&m).is_err(), "MIR {mode}");
+        assert!(crate::producer::validate_partition_resource_rvalues(&m, &emitted).is_err(), "unit {mode}");
     }
     Ok(())
 }

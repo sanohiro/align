@@ -1413,9 +1413,10 @@ merely because its `Ty` matches.
 | `TcpWriteTimeout` | `env[]; child[conn,ns]`; `TcpConn,i64; result Unit; conn borrowed and native socket state mutated; Impure`. |
 | `TcpListen` | `env[]; child[host,port]`; `Str,i64; result ERR(TcpListener); new owned socket; Impure`. |
 | `TcpAccept` | `env[]; child[listener]`; `TcpListener; result ERR(TcpConn); listener borrowed, result owns accepted socket; Impure`. |
+| `SocketLocalAddr` | Bound TCP connection, TCP listener or UDP socket. Impure shared read returning `Result<net.endpoint, Error>` with an independently owned host. |
 | `UdpBind` | `env[]; child[host,port]`; `Str,i64; result ERR(UdpSocket); new owned socket; Impure`. |
 | `UdpSendTo` | `env[]; child[sock,data,host,port]`; `UdpSocket,byte-view,Str,i64; result ERR(i64); all borrowed; Impure`. |
-| `UdpRecvFrom` | `env[]; child[sock,buffer]`; `LocalHandle(UdpSocket,sock), SourceMutLocal(Buffer,buffer); result ERR(i64); both borrowed, buffer mutated; Impure`. |
+| `UdpRecvFrom` | `env[]; child[sock,buffer]`; `LocalHandle(UdpSocket,sock), SourceMutLocal(Buffer,buffer); result ERR(net.datagram); both borrowed, buffer mutated, peer owns its numeric host; Impure`. |
 | `FsReadFileView` | `env[]; child[path]`; `Str; inside arena; result ERR(Str); view rooted in arena; Impure`. |
 | `FsReadBytesView` | `env[]; child[path]`; `Str; inside arena; result ERR(bytes); view rooted in arena; Impure`. |
 | `PathJoin` | `env[]; child[a,b]`; `Str,Str; result String; new owned string; Pure`. |
