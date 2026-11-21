@@ -151,6 +151,11 @@ record cannot give away its field. For a deeper move, first take the complete di
 into its own local. Existing views of dynamic backing follow its new owner, and contained borrowed
 values still depend on their original sources. Views of moved inline backing expire.
 
+When a call returns an owning record, `values := make_items().values` takes its
+owned field directly. If the call returns a Result, `values := read_items()?.values`
+propagates an error before taking the field. Use a named record if you also need
+a sibling, a Copy field, or a borrowed view.
+
 ### Replacing owned fields and shortening arrays
 
 An owned field can be replaced on a mutable record or through `borrow mut`:

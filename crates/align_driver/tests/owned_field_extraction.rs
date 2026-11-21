@@ -221,6 +221,31 @@ fn field_extraction_authority_matrix() {
                 r#"I { name:string } R { inner:I } fn main()->i32 {r:=R {inner:I {name:"a".clone()}}; moved:=r.inner; return r.inner.name.len() as i32}"#,
             ),
             (
+                "return-field-view-escape",
+                false,
+                r#"R {name:string} fn make()->R=R {name:"x".clone()} fn bad()->str {s:str:=make().name;return s} fn main()->i32=0"#,
+            ),
+            (
+                "bound-field-view-escape",
+                false,
+                r#"R {name:string} fn make()->R=R {name:"x".clone()} fn bad()->str {s:str:={o:=make();o.name};return s} fn main()->i32=0"#,
+            ),
+            (
+                "return-field-contained-view",
+                false,
+                r#"R {data:array<str>} fn wrap(v:str)->R=R {data:[v].to_array()} fn main()->i32 {mut t:="a".clone();a:=wrap(t).data;t="b".clone();return a[0].len() as i32}"#,
+            ),
+            (
+                "return-field-retains-view",
+                true,
+                r#"R {data:array<str>} fn wrap(v:str)->R=R {data:[v].to_array()} fn main()->i32 {t:="a".clone();a:=wrap(t).data;if a[0]!="a" {return 1};return 0}"#,
+            ),
+            (
+                "return-field-abstract-type",
+                false,
+                "R<T> {value:T} fn wrap<T>(v:T)->R<T> = R {value:v} fn pick<T>(v:T)->T = wrap(v).value fn main()->i32=0",
+            ),
+            (
                 "dynamic-scope",
                 true,
                 r#"R { values:array<i64>, sibling:array<i64> } fn main()->i32 {moved:={r:=R {values:[1].to_array(),sibling:[2].to_array()};r.values}; if moved[0]!=1 {return 1};return 0}"#,
@@ -441,6 +466,131 @@ fn field_extraction_allocation_lifecycle() {
     });
 }
 
+// The explicit block is the lifecycle oracle, including ordinary local cleanup timing.
+const RETURNED_FIELDS: &str = r#"
+extern "C" fn align_rt_requested_live_reset()
+extern "C" fn align_rt_requested_live_bytes()->i64
+extern "C" fn align_rt_requested_live_peak()->i64
+Packet { data:buffer, spare:buffer }
+fn packet(borrow mut visits:i64, fail:bool)->Result<Packet,Error> {
+    visits=visits+1
+    data:=buffer.try_filled(4,7)?
+    spare:=buffer.try_filled(3,9)?
+    if fail {return Err(Error.Invalid)}
+    return Ok(Packet {data:data,spare:spare})
+}
+fn inspect(data:buffer, live:i64)->i64 {
+    if data.len()!=4 || data.bytes()[3]!=7 {return -1}
+    return live
+}
+fn projected(borrow mut visits:i64, fail:bool)->Result<i64,Error> {
+    return Ok(inspect(packet(visits,fail)?.data, unsafe {align_rt_requested_live_bytes()}))
+}
+fn bound(borrow mut visits:i64, fail:bool)->Result<i64,Error> {
+    return Ok(inspect({p:=packet(visits,fail)?; p.data}, unsafe {align_rt_requested_live_bytes()}))
+}
+fn interrupted(borrow mut visits:i64)->Result<i64,Error> {
+    return Ok(inspect(packet(visits,false)?.data, {return Err(Error.Invalid)}))
+}
+fn owned()->Packet = Packet {data:buffer.filled(4,7), spare:buffer.filled(3,9)}
+fn from_task()->buffer = task_group { t:=spawn(fn {owned()}); wait(); t.get().data }
+fn from_callback()->buffer { callback:=owned; return callback().data }
+fn run()->Result<(),Error> {
+    mut visits:=0
+    expected:=bound(visits,false)?
+    peak:=unsafe {align_rt_requested_live_peak()}
+    if expected<=0 || unsafe {align_rt_requested_live_bytes()}!=0 {return Err(Error.Code(1))}
+    unsafe {align_rt_requested_live_reset()}
+    observed:=projected(visits,false)?
+    if observed!=expected || unsafe {align_rt_requested_live_peak()}!=peak {return Err(Error.Code(2))}
+    match projected(visits,true) {
+        Err(e)=>{match e {Invalid=>{},_=>{return Err(Error.Code(3))}}}
+        Ok(_)=>{return Err(Error.Code(4))}
+    }
+    match interrupted(visits) {Err(_)=>{},Ok(_)=>{return Err(Error.Code(5))}}
+    if visits!=4 || unsafe {align_rt_requested_live_bytes()}!=0 {return Err(Error.Code(6))}
+    mut index:=0
+    loop {
+        if index==3 {break}
+        from_worker:=from_task()
+        from_function:=from_callback()
+        if from_worker.bytes()[3]!=7 || from_function.bytes()[3]!=7 {return Err(Error.Code(7))}
+        index=index+1
+    }
+    if unsafe {align_rt_requested_live_bytes()}!=0 {return Err(Error.Code(8))}
+    return Ok(())
+}
+fn main()->i32 {
+    unsafe {align_rt_requested_live_reset()}
+    _:=run() else {return 1}
+    return 0
+}
+"#;
+
+#[test]
+fn returned_field_lifecycle() {
+    owned_fixture::run("returned_field_lifecycle", |stage| {
+        for per_unit in [false, true] {
+            let built = programs(stage, RETURNED_FIELDS, per_unit).unwrap();
+            execute(stage, &built, &format!("returned-{per_unit}"), false).unwrap();
+        }
+    });
+}
+
+#[test]
+fn returned_field_requires_an_owning_result() {
+    owned_fixture::run("returned_field_requires_an_owning_result", |stage| {
+        let prefix = r#"
+Inner { name:string }
+Packet { data:buffer, label:i64, inner:Inner }
+View { data:buffer, view:str }
+Wrapper<T> { value:T }
+fn wrap<T>(value:T)->Wrapper<T> = Wrapper {value:value}
+fn plain()->i64=1
+fn view()->View=View {data:buffer(0),view:"a"}
+fn make()->Packet = Packet {data:buffer(0),label:1,inner:Inner {name:"b".clone()}}
+fn replace(borrow mut data:buffer) { data=buffer(0) }
+"#;
+        for (body, reason) in [
+            ("x:=make().label", "complete owning field"),
+            ("x:=view().view", "complete owning field"),
+            ("x:=make().missing", "no field 'missing'"),
+            ("x:=make().inner.name", "local binding"),
+            ("x:=make(3).data", "argument"),
+            ("replace(make().data)", "stable"),
+            ("x:=1; y:=x().data", "undefined function"),
+            ("x:=plain().data", "has no fields"),
+            ("x:=wrap(1).value", "complete owning field"),
+            (
+                "x:=task_group { t:=spawn(fn {make()}); a:=t.get().data; wait(); a }",
+                "before 'wait()'",
+            ),
+            (
+                "x:=task_group { t:=spawn(fn {make()}); wait(); a:=t.get().data; t.get().data }",
+                "moved value 't'",
+            ),
+        ] {
+            let source = format!("{prefix} fn main()->i32 {{ {body}; return 0 }}");
+            let path = stage.join("main.align");
+            std::fs::write(&path, &source).unwrap();
+            for per_unit in [false, true] {
+                let mut sources = SourceMap::new();
+                let entry = path.to_str().unwrap();
+                let diags = if per_unit {
+                    align_driver::build_per_unit(&mut sources, entry, &source).diags
+                } else {
+                    align_driver::check(&mut sources, entry, &source).diags
+                };
+                let message = align_driver::format_diagnostics(&sources, &diags);
+                assert!(
+                    diags.has_errors() && message.contains(reason),
+                    "{body}: {message}"
+                );
+            }
+        }
+    });
+}
+
 #[test]
 fn field_extraction_imports_and_cache() {
     owned_fixture::run("field_extraction_imports_and_cache", |stage| {
@@ -449,6 +599,7 @@ fn field_extraction_imports_and_cache() {
 pub Container<T> { value:T, marker:i64 }
 pub Inner { name:string }
 pub fn extract<T>(owner:Container<T>)->T = owner.value
+pub fn wrap<T>(value:T)->Container<T> = Container {value:value,marker:7}
 pub fn make()->Container<array<i64>> = Container {value:[4,5].to_array(),marker:9}
 pub fn inner()->Container<Inner> = Container {value:Inner {name:"inner".clone()},marker:8}
 "#;
@@ -465,6 +616,10 @@ fn main()->i32 {
   if nested.name!="inner" || owner.marker!=8 {return 3}
   c:=model.extract(model.inner())
   if c.name!="inner" {return 4}
+  direct:=model.make().value
+  if direct.sum()!=9 {return 5}
+  generic:=model.wrap("generic".clone()).value
+  if generic!="generic" {return 6}
   return 0
 }
 "#;

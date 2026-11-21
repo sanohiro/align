@@ -54543,8 +54543,7 @@ impl<'a, 't> Checker<'a, 't> {
         Expr { kind: ExprKind::Local(id), ty: local_ty, span }
     }
 
-    /// `recv.field` (not a method call) — a struct field read. M4: the receiver must be
-    /// a local (chained field access on a value comes later).
+    /// Resolve a named field on a place, an indexed record, or a returned owning record.
     fn check_field_access(&mut self, recv: &ast::Expr, field: &ast::Ident, expected: Option<Ty>, span: Span) -> Expr {
         let err = Expr { kind: ExprKind::Local(u32::MAX), ty: Ty::Error, span };
         // `io.stdin` / `io.stdout` / `io.stderr` — a std.io `reader` / `writer` VALUE (a constructor).
@@ -54626,6 +54625,27 @@ impl<'a, 't> Checker<'a, 't> {
             names.push(field);
             return self.check_index_field(arr, index, &names, expected, span, IndexedFieldUse::Value);
         }
+        // A single returned field is the value of { owner := recv; owner.field }.
+        // Keeping the ordinary Let and Field gives MoveCheck and cleanup the entire parent.
+        let producer = match &recv.kind {
+            ast::ExprKind::Try(inner) => inner.as_ref(),
+            _ => recv,
+        };
+        if matches!(producer.kind, ast::ExprKind::Call { .. }) {
+            let owner = self.check_expr(recv, None);
+            let Some((index, ty)) = self.field_of(owner.ty, &field.name, field.span) else {
+                return err;
+            };
+            if !owned_field_extraction_is_valid(ty, self.structs, self.tuples, self.enums, self.tagged_types) {
+                self.diags.error(
+                    "only a complete owning field can be taken from a returned record; bind the record first to read other fields".to_string(),
+                    field.span,
+                );
+                return err;
+            }
+            self.constrain(ty, expected, span);
+            return self.project_record_value(owner, vec![index], ty, span);
+        }
         // Resolve the receiver to a struct **place** — a local, or a nested field path `l.a.b`.
         let (root, mut path, recv_ty) = match self.resolve_place(recv) {
             Some(t) => t,
@@ -54657,17 +54677,25 @@ impl<'a, 't> Checker<'a, 't> {
         match self.field_of(recv_ty, &field.name, span) {
             Some((index, ty)) => {
                 path.push(index);
-                // An **owned** (Move) leaf field — a `string`, or a whole nested Move struct — may be
-                // *borrowed* (`u.name.len()`, a `str` argument, `io.stdout.write(u.name)`): the
-                // `string` → `str` coercion / `Len` wrap the access non-consuming, and the borrow is
-                // `Frame`-regioned (tied to the struct, can't escape). *Moving* it out (`n := u.name`,
-                // `f(u.name)` by value, `return u.name`) is a partial move — still deferred, rejected
-                // by `MoveCheck` at the consuming site (it would need the field nulled so the
-                // struct's `Drop` doesn't double-free it).
+                // MoveCheck distinguishes a borrowing read from a consuming direct-field move.
                 self.constrain(ty, expected, span);
                 Expr { kind: ExprKind::Field { root, path }, ty, span }
             }
             None => err,
+        }
+    }
+
+    /// Bind one evaluated record inside the projection's block. The local has no source spelling.
+    fn project_record_value(&mut self, owner: Expr, path: Vec<u32>, ty: Ty, span: Span) -> Expr {
+        let root = self.declare(&format!("$field_owner{}", self.locals.len()), owner.ty, false);
+        self.scope.pop();
+        Expr {
+            kind: ExprKind::Block(Block {
+                stmts: vec![Stmt::Let { local: root, init: owner }],
+                value: Some(Box::new(Expr { kind: ExprKind::Field { root, path }, ty, span })),
+            }),
+            ty,
+            span,
         }
     }
 
@@ -72179,16 +72207,7 @@ impl<'a, 't> Checker<'a, 't> {
             // Canonical Let(Index)/Field retains both bounds and the independent Copy result.
             // Owning fields retain their parent reservation; fixed fields snapshot before Index.
             let element = self.index_with_fixed_field_snapshot(r, i, ty, span);
-            let root = self.declare(&format!("$indexed_copy{}", self.locals.len()), ty, false);
-            self.scope.pop();
-            return Expr {
-                kind: ExprKind::Block(Block {
-                    stmts: vec![Stmt::Let { local: root, init: element }],
-                    value: Some(Box::new(Expr { kind: ExprKind::Field { root, path }, ty: leaf_ty, span })),
-                }),
-                ty: leaf_ty,
-                span,
-            };
+            return self.project_record_value(element, path, leaf_ty, span);
         }
         Expr {
             kind: ExprKind::ElemField { recv: Box::new(r), index: Box::new(i), path, struct_id },

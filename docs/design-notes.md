@@ -466,7 +466,9 @@ not a package exemption, and it still rejects temporaries.
 recursive layout and Drop plan, so extraction uses that plan's exact zero and forwards the
 parent's cleanup bit. Arrays, nested records and tuples need no container-specific extraction
 API or hidden clone. Projected storage distinguishes allocated generations that transfer from
-inline backing that materializes elsewhere; sibling ownership remains independent. Plan192
+inline backing that materializes elsewhere; sibling ownership remains independent. Binding
+a returned record inside the projection lets `read()?.field` use the same transfer and
+ordinary sibling cleanup, including on early exits. Plan192
 completes this composition without widening field formation, deeper extraction or exclusive
 partial-field borrowing.
 
