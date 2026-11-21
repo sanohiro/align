@@ -2379,6 +2379,8 @@ pub enum ExprKind {
     /// Slice 2 carries no pooled state. **Impure**? No — allocating the handle performs no I/O; the
     /// *requests* (`get`/`post`/`request`) are Impure. No operands.
     HttpClient,
+    /// Immutable HTTPS origin, trust, client chain, private key and offline CRL views.
+    HttpTlsClient { args: Vec<Expr> },
     /// `cl.timeout(ns)` — set the client `client`'s default I/O timeout (`ns` nanoseconds) applied to
     /// every request on it, mutating in place. The `ty` is [`crate::Ty::Unit`]. `ns == 0` = no timeout
     /// (the default — current blocking behavior); a negative `ns` **aborts** at runtime. `client` is a

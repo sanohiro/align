@@ -4,6 +4,8 @@
 > Status: implemented, 2026-09-09. This is the S3/SigV4 prerequisite after
 > the implemented named-time and path-encoding family.
 
+The same Move `http_client` carries an origin-scoped TLS policy through local and imported helpers. Moving or returning the client transfers its verification context, credentials and connection pool together.
+
 ## Evidence and capability boundary
 
 Before this capability, the compiler accepted `http.client()` and `http.request(...)` only as

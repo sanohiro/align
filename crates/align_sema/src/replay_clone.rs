@@ -601,6 +601,7 @@ fn clone_expr_kind(clones: &mut ChildValues, kind: &ExprKind) -> Option<ExprKind
             kind: *kind,
         },
         ExprKind::BuilderToString(expr) => ExprKind::BuilderToString(boxed!(expr)),
+        ExprKind::HttpTlsClient { args } => ExprKind::HttpTlsClient { args: take_exprs(clones, args.len())? },
         ExprKind::FsTree { kind, args } => ExprKind::FsTree { kind: *kind, args: take_exprs(clones, args.len())? },
         ExprKind::ProcessLive { kind, args } => ExprKind::ProcessLive { kind: *kind, args: take_exprs(clones, args.len())? },
         ExprKind::ArrayLit {
@@ -2748,6 +2749,7 @@ fn drop_expr_kind(kind: ExprKind, work: &mut Vec<DropWork>) {
             payload: operands, ..
         }
         | ExprKind::Call { args: operands, .. }
+        | ExprKind::HttpTlsClient { args: operands }
         | ExprKind::FsTree { args: operands, .. }
         | ExprKind::ProcessLive { args: operands, .. }
         | ExprKind::StructLit {

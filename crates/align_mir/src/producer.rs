@@ -1987,6 +1987,18 @@ pub fn native_owner_mir_contract<'a>(
                 (req, Ty::HttpRequest, consume),
             ];
         }
+        Rvalue::HttpTlsClient { views, out } => {
+            let valid = views.len() == 5 && views.iter().all(|v| match v {
+                Operand::Arg(i) => function.param_modes.get(*i as usize) == Some(&align_ast::ParamMode::ByValue),
+                Operand::Value(_) | Operand::BorrowedPlace(_) => true,
+                _ => false,
+            });
+            contract.result = if valid { i32_ty } else { Ty::Error };
+            contract.outputs.push((*out, Ty::HttpClient));
+            for (index, view) in views.iter().enumerate() {
+                contract.operands.push((view, if index == 0 { Ty::Str } else { byte_view(view) }, read));
+            }
+        }
         Rvalue::HttpGetMany {
             client,
             urls,
@@ -2116,7 +2128,7 @@ fn xml_written_slots(rvalue: &Rvalue) -> Vec<(Slot, XmlAccessProvenance)> {
         | Rvalue::HttpClientRequest { out, .. }
         | Rvalue::HttpClientRequestStream { out, .. }
         | Rvalue::HttpReadStreamRead { out, .. }
-        | Rvalue::HttpGetMany { out, .. }
+        | Rvalue::HttpTlsClient { out, .. } | Rvalue::HttpGetMany { out, .. }
         | Rvalue::HttpServe { out, .. }
         | Rvalue::HttpAccept { out, .. }
         | Rvalue::HttpRespondStream { out, .. }
@@ -2285,6 +2297,7 @@ fn xml_out_producer_operands(rvalue: &Rvalue) -> Vec<&Operand> {
         Rvalue::HttpReadStreamHeader { stream, name, .. } => vec![stream, name],
         Rvalue::HttpReadStreamRead { stream, buffer, .. }
         | Rvalue::HttpSseStreamNext { stream, buffer, .. } => vec![stream, buffer],
+        Rvalue::HttpTlsClient { views, .. } => views.iter().collect(),
         Rvalue::HttpGetMany {
             client,
             urls,
@@ -7194,7 +7207,7 @@ impl<'a> XmlAccessAnalyzer<'a> {
             | Rvalue::HttpReadStreamSse { .. }
             | Rvalue::HttpSseStreamRetryMs { .. }
             | Rvalue::HttpSseStreamNext { .. }
-            | Rvalue::HttpGetMany { .. }
+            | Rvalue::HttpTlsClient { .. } | Rvalue::HttpGetMany { .. }
             | Rvalue::HttpServe { .. }
             | Rvalue::HttpAccept { .. }
             | Rvalue::HttpServerMaxRequestBodyBytes { .. }
@@ -12814,7 +12827,7 @@ pub fn validate_str_match_terminators(program: &Program) -> Result<(), ProducerE
     Ok(())
 }
 
-/// Check the SSA dependencies of vector constructions, blends and socket observations at their
+/// Check the SSA dependencies of vector constructions, blends and selected native calls at their
 /// statement positions. Cache dominance per pair of blocks and visit shared producers once.
 fn validate_operand_availability(function: &Function) -> Result<(), ProducerError> {
     use crate::operand_inputs::OperandInputs;
@@ -12823,7 +12836,7 @@ fn validate_operand_availability(function: &Function) -> Result<(), ProducerErro
     for block in &function.blocks {
         for (index, stmt) in block.stmts.iter().enumerate() {
             if let Stmt::Let(id, rv) = stmt
-                && (matches!(rv, Rvalue::MakeVec { .. } | Rvalue::SocketObserve { .. })
+                && (matches!(rv, Rvalue::MakeVec { .. } | Rvalue::SocketObserve { .. } | Rvalue::HttpTlsClient { .. })
                     || matches!(rv, Rvalue::Select { cond, .. }
                         if matches!(function.value_tys.get(*id as usize), Some(Ty::Vec(..)))
                         || matches!(xml_operand_base_ty(function, cond), Some(Ty::Mask(..)))))

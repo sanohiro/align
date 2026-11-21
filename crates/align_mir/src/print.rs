@@ -1297,6 +1297,7 @@ fn rvalue_str(rv: &Rvalue) -> String {
             operand_str(stream),
             operand_str(buffer),
         ),
+        Rvalue::HttpTlsClient { views, out } => format!("http_tls_client({} -> _{out})", views.iter().map(operand_str).collect::<Vec<_>>().join(", ")),
         Rvalue::HttpGetMany { client, urls, max_concurrency, out } => format!(
             "http_get_many({}, {}, {}, -> _{out})",
             operand_str(client),

@@ -345,7 +345,7 @@ macro_rules! unmodelled_rvalues {
         Rvalue::HttpClientGet { .. } | Rvalue::HttpClientPost { .. } | Rvalue::HttpClientRequest { .. } |
         Rvalue::HttpClientRequestStream { .. } | Rvalue::HttpReadStreamStatus { .. } | Rvalue::HttpReadStreamHeader { .. } |
         Rvalue::HttpReadStreamRead { .. } | Rvalue::HttpReadStreamSse { .. } | Rvalue::HttpSseStreamLastEventId { .. } |
-        Rvalue::HttpSseStreamRetryMs { .. } | Rvalue::HttpSseStreamNext { .. } | Rvalue::HttpGetMany { .. } |
+        Rvalue::HttpSseStreamRetryMs { .. } | Rvalue::HttpSseStreamNext { .. } | Rvalue::HttpTlsClient { .. } | Rvalue::HttpGetMany { .. } |
         Rvalue::HttpServe { .. } | Rvalue::HttpAccept { .. } | Rvalue::HttpServerMaxRequestBodyBytes { .. } | Rvalue::HttpCtxMethod { .. } |
         Rvalue::HttpCtxPath { .. } | Rvalue::HttpCtxHeader { .. } | Rvalue::HttpHeadersCount { .. } |
         Rvalue::HttpHeadersTokensValid { .. } | Rvalue::HttpHeadersContainsToken { .. } | Rvalue::HttpCtxUpgradeReady { .. } | Rvalue::HttpCtxPeerEof { .. } |

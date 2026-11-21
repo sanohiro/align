@@ -4934,6 +4934,8 @@ is catastrophic; v1 does not auto-generate nonces (pair with `crypto.random`).
 
 A primitive, not a framework.
 
+`http.tls_client(origin: str, trust_pem: bytes, certificate_chain_pem: bytes, private_key_pem: bytes, crls_pem: bytes) -> Result<http_client, Error>` creates a Move client bound to one verified HTTPS origin. Explicit CA roots replace system trust. An optional client certificate chain and key are supplied together. Nonempty CRLs require explicit roots and fresh verification on every request. Construction borrows all inputs and retains its parsed credentials. The exact PEM, origin, failure and pool rules are in `docs/impl/269-private-http-client-tls.md`.
+
 An `http_server` owns an optional inbound request-body cap:
 `srv.max_request_body_bytes(limit: i64) -> ()` sets it before a subsequent
 `accept()`. Zero restores the 1 GiB default. A positive value up to 1 GiB bounds

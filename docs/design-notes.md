@@ -1,5 +1,7 @@
 # Align Design Notes
 
+An HTTPS client with explicit credentials binds the parsed trust roots, optional client identity and the connection pool to one origin. This lets two clients use different roots in the same process. Offline CRLs require a fresh connection so an idle TLS session cannot extend a past verification decision. [HTTPS client contract](impl/269-private-http-client-tls.md)
+
 A datagram carries its sender as an ordinary Move record. Owning the numeric host lets callers keep a peer after another receive or after closing the socket. Looking up the bound port on the same handle removes the race between probing a free port and opening the listener.
 
 Literal text splitting materializes an independently owned array of borrowed views. Keeping the field headers separate from the input buffer allows fields to survive array replacement while retaining the input's UTF-8 validation and lifetime. An empty separator splits on Unicode scalar boundaries so every field is valid text.

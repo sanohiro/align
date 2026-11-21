@@ -1875,7 +1875,7 @@ and http last (needs net + TLS).
     (needs a runtime-return ABI extension).
 - **`std.http`** — the last M11 module, now **COMPLETE** (Slices 1–5 + `get_many`). Client-side
   HTTPS/TLS ships (Slice 5, OpenSSL libssl, mandatory verification — `https://` connects over TLS,
-  never a plaintext downgrade); server-side TLS + revocation stay recorded post-v1. `get_many` builds
+  never a plaintext downgrade); Plan 269 adds origin-specific trust, mutual TLS and offline CRLs; server-side TLS stays deferred. `get_many` builds
   on the net substrate via a dedicated bounded blocking-I/O claim-loop pool — the #301 lesson.
   - **Slice 1 (request/response types + HTTP/1.1 serialize/parse, NO sockets) — DONE.** Two new
     Move handle types `Ty::HttpRequest` / `Ty::HttpResponse` (+ `Scalar::HttpResponse`), full

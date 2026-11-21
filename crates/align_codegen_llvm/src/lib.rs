@@ -19165,6 +19165,20 @@ impl<'c, 'a> FnGen<'c, 'a> {
             // and returns an i32 status (0 = ok; else the lowest-index error). Zero the out slot first
             // (the Err branch reads `{null,0}` → nothing to free), like `fs.read_dir`. `urls` is a
             // `slice<str>` (split to ptr+len); `max_concurrency` is an i64.
+            Rvalue::HttpTlsClient { views, out } => {
+                if views.len() != 5 { return Err(self.err("invalid TLS client input count")); }
+                let slot = *self.slots.get(out).ok_or_else(|| self.err("missing TLS client output"))?;
+                let mut args = Vec::with_capacity(11);
+                for view in views {
+                    let (ptr, len) = self.split_str(view)?;
+                    args.push(ptr.into());
+                    args.push(len.into());
+                }
+                args.push(slot.into());
+                self.builder.build_call(self.runtime(RuntimeKey::HttpTlsClientNew), &args, "tls.client")
+                    .map_err(|error| self.err(error))?.try_as_basic_value().basic()
+                    .ok_or_else(|| self.err("missing TLS constructor status"))?
+            }
             Rvalue::HttpGetMany { client, urls, max_concurrency, out } => {
                 let c = self.operand(client)?.into_pointer_value();
                 let out_ptr = self.slots[out];

@@ -77,7 +77,7 @@ mod probe {
 }
 
 #[cfg(test)]
-mod probe {
+pub(super) mod probe {
     use super::{AL_INVALID, c_int};
     use core::cell::Cell;
 
@@ -164,7 +164,7 @@ std::thread_local! {
 }
 
 #[cfg(test)]
-fn set_allocation_failpoint(after: Option<usize>) {
+pub(super) fn set_allocation_failpoint(after: Option<usize>) {
     ALLOCATION_FAIL_AFTER.with(|value| value.set(after));
     ALLOCATION_FAIL_TRIGGERED.with(|value| value.set(false));
 }
@@ -186,7 +186,7 @@ fn allocation_failpoint() -> Result<(), c_int> {
 }
 
 #[cfg(test)]
-fn allocation_failpoint_triggered() -> bool {
+pub(super) fn allocation_failpoint_triggered() -> bool {
     ALLOCATION_FAIL_TRIGGERED.with(core::cell::Cell::get)
 }
 
@@ -338,7 +338,7 @@ impl Drop for KeyParts {
     }
 }
 
-struct SensitiveDer {
+pub(super) struct SensitiveDer {
     ptr: NonNull<u8>,
     len: usize,
 }
@@ -358,7 +358,7 @@ impl SensitiveDer {
         Ok(Self { ptr, len })
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub(super) fn as_slice(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
@@ -410,7 +410,7 @@ unsafe fn checked_key<'a>(key: *mut CryptoKey, expected: KeyKind) -> Result<&'a 
     Ok(key)
 }
 
-fn clear_errors() {
+pub(super) fn clear_errors() {
     unsafe { ERR_clear_error() };
 }
 
@@ -471,71 +471,66 @@ fn decode_base64(lines: &[&[u8]]) -> Result<SensitiveDer, c_int> {
     let chars = lines.iter().try_fold(0usize, |sum, line| {
         sum.checked_add(line.len()).ok_or(AL_CODE)
     })?;
-    if chars == 0 || chars % 4 != 0 {
+    decode_base64_digits(lines.iter().flat_map(|line| line.iter().copied()), chars, usize::MAX)
+}
+
+pub(super) fn decode_base64_digits(
+    digits: impl DoubleEndedIterator<Item = u8> + Clone,
+    chars: usize,
+    limit: usize,
+) -> Result<SensitiveDer, c_int> {
+    if chars == 0 || !chars.is_multiple_of(4) {
         return Err(AL_INVALID);
     }
-    let last = *lines.last().ok_or(AL_INVALID)?;
-    let padding = if last.ends_with(b"==") {
-        2
-    } else if last.ends_with(b"=") {
-        1
-    } else {
-        0
-    };
+    let padding = digits.clone().rev().take_while(|&byte| byte == b'=').take(3).count();
+    if padding > 2 { return Err(AL_INVALID); }
     let decoded = chars
         .checked_div(4)
         .and_then(|n| n.checked_mul(3))
         .and_then(|n| n.checked_sub(padding))
         .ok_or(AL_CODE)?;
+    if decoded > limit { return Err(AL_INVALID); }
     let out = SensitiveDer::new(decoded)?;
     let mut quartet = [0u8; 4];
     let mut qlen = 0usize;
     let mut written = 0usize;
     let mut position = 0usize;
-    for line in lines {
-        for &byte in *line {
-            let final_two = position + 2 >= chars;
-            let in_padding = position >= chars - padding;
-            quartet[qlen] = match b64_value(byte) {
-                Some(value) if !in_padding => value,
-                None if byte == b'=' && final_two && in_padding => 0,
-                None => return Err(AL_INVALID),
-                Some(_) => return Err(AL_INVALID),
+    for byte in digits {
+        let final_two = position + 2 >= chars;
+        let in_padding = position >= chars - padding;
+        quartet[qlen] = match b64_value(byte) {
+            Some(value) if !in_padding => value,
+            None if byte == b'=' && final_two && in_padding => 0,
+            None => return Err(AL_INVALID),
+            Some(_) => return Err(AL_INVALID),
+        };
+        qlen += 1;
+        position += 1;
+        if qlen == 4 {
+            let block = [
+                (quartet[0] << 2) | (quartet[1] >> 4),
+                (quartet[1] << 4) | (quartet[2] >> 2),
+                (quartet[2] << 6) | quartet[3],
+            ];
+            let remaining = decoded.saturating_sub(written).min(3);
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    block.as_ptr(),
+                    out.ptr.as_ptr().add(written),
+                    remaining,
+                )
             };
-            qlen += 1;
-            position += 1;
-            if qlen == 4 {
-                let block = [
-                    (quartet[0] << 2) | (quartet[1] >> 4),
-                    (quartet[1] << 4) | (quartet[2] >> 2),
-                    (quartet[2] << 6) | quartet[3],
-                ];
-                let remaining = decoded.saturating_sub(written).min(3);
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        block.as_ptr(),
-                        out.ptr.as_ptr().add(written),
-                        remaining,
-                    )
-                };
-                written += remaining;
-                qlen = 0;
-            }
+            written += remaining;
+            qlen = 0;
         }
     }
     let canonical_padding = match padding {
         0 => true,
-        1 => {
-            last[last.len() - 1] == b'='
-                && b64_value(last[last.len() - 2]).is_some_and(|v| v & 0x03 == 0)
-        }
-        2 => {
-            last[last.len() - 2..] == *b"=="
-                && b64_value(last[last.len() - 3]).is_some_and(|v| v & 0x0f == 0)
-        }
+        1 => quartet[2] & 0x03 == 0,
+        2 => quartet[1] & 0x0f == 0,
         _ => false,
     };
-    if !canonical_padding || written != decoded {
+    if !canonical_padding || position != chars || qlen != 0 || written != decoded {
         return Err(AL_INVALID);
     }
     Ok(out)

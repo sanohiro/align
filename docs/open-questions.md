@@ -15,6 +15,10 @@ current callable surface use `draft.md` / `language-spec.md`; for current subsys
 
 **Socket endpoints (Plan268).** UDP receive returns the sender and stored byte count. Numeric local and peer endpoints own their host strings. A TCP listener or UDP socket may request a kernel-assigned port and read it through `local_addr()`.
 
+### Origin-scoped client TLS
+
+`http.tls_client` supports explicit trust, mutual TLS and offline CRLs. Its immutable origin limits all request paths before socket acquisition, and its existing Move owner releases credentials and pooled connections together. [HTTPS client contract](impl/269-private-http-client-tls.md)
+
 ### Literal text splitting
 
 `str.split(separator)` preserves empty fields and returns `array<str>` borrowing only the receiver. An empty separator matches every Unicode scalar boundary. Plan261 records ownership and cleanup.
