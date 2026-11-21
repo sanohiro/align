@@ -647,6 +647,7 @@ jobs:
         run: |
           scripts/cargo.sh build --locked -p align_driver -p align_runtime
           scripts/cargo.sh test --locked -p align_driver --test m11_crypto blake3_official
+          scripts/test-blake3-package.sh --shared target/debug/alignc
           scripts/install-blake3.sh "$RUNNER_TEMP/blake3-static" static
           scripts/test-blake3-package.sh target/debug "$RUNNER_TEMP/blake3-static/lib/libblake3.a"
 

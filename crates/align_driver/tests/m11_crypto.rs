@@ -275,6 +275,8 @@ fn main() {
   print(encoding.hex_encode(retained[0..32]))
   retained = digest(3073)
   print(encoding.hex_encode(retained[0..32]))
+  retained = crypto.blake3("abc")
+  print(encoding.hex_encode(retained[0..32]))
 }
 "#;
     let result = build_and_run("m11-crypto-blake3-vectors", program);
@@ -286,6 +288,7 @@ fn main() {
         "42214739f095a406f3fc83deb889744ac00df831c10daa55189b5d121c855af7",
         "d00278ae47eb27b34faecf67b4fe263f82d5412916c1ffd97c8cb7fb814b8444",
         "7124b49501012f81cc7f11ca069ec9226cecb8a2c850cfe644e327d22d3e1cd3",
+        "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
     ]);
 }
 
