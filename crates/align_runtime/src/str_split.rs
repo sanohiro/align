@@ -3,8 +3,7 @@ use super::{
     validate_utf8,
 };
 
-unsafe fn split_input<'a>(ptr: *const u8, len: i64) -> Option<&'a str> {
-    let n = safe_len(len).ok()?;
+unsafe fn split_input<'a>(ptr: *const u8, n: usize) -> Option<&'a str> {
     if ptr.is_null() {
         return (n == 0).then_some("");
     }
@@ -169,9 +168,16 @@ pub unsafe extern "C" fn align_rt_str_split(
         ptr: core::ptr::null(),
         len: 0,
     };
-    let (Some(source), Some(separator)) = (unsafe { split_input(source, source_len) }, unsafe {
-        split_input(separator, separator_len)
-    }) else {
+    let (Ok(n), Ok(m)) = (safe_len(source_len), safe_len(separator_len)) else {
+        return empty;
+    };
+    if (source.is_null() && n != 0) || (separator.is_null() && m != 0) {
+        return empty;
+    }
+    let Some(source) = (unsafe { split_input(source, n) }) else {
+        return empty;
+    };
+    let Some(separator) = (unsafe { split_input(separator, m) }) else {
         return empty;
     };
     let bytes = source.as_bytes();
@@ -199,6 +205,42 @@ mod tests {
     use super::super::align_rt_free;
     use super::*;
 
+    fn assert_fields(text: &str, sep: &str) {
+        let expected: Vec<_> = text.split(sep).collect();
+        let result = unsafe {
+            align_rt_str_split(
+                text.as_ptr(),
+                text.len() as i64,
+                sep.as_ptr(),
+                sep.len() as i64,
+            )
+        };
+        assert_eq!(result.len, expected.len() as i64);
+        let fields =
+            unsafe { std::slice::from_raw_parts(result.ptr.cast::<AlignStr>(), expected.len()) };
+        for (got, want) in fields.iter().zip(expected) {
+            assert_eq!((got.ptr, got.len), (want.as_ptr(), want.len() as i64));
+        }
+        unsafe { align_rt_free(result.ptr.cast_mut()) };
+    }
+
+    #[test]
+    fn str_split_short_matches_restart_after_sparse_blocks() {
+        for sep in ["ab", "aba", "abca"] {
+            let last = sep.as_bytes()[sep.len() - 1] as char;
+            for gap in 8..40 {
+                for tail in 0..12 {
+                    let text = format!(
+                        "{sep}{}{last}xx{sep}{sep}{}",
+                        "x".repeat(gap),
+                        "z".repeat(tail)
+                    );
+                    assert_fields(&text, sep);
+                }
+            }
+        }
+    }
+
     #[test]
     fn str_split_matches_every_reference_header_through_growth() {
         for pattern in [
@@ -216,23 +258,7 @@ mod tests {
             for repeats in [0, 1, 2, 7, 15, 16, 17, 31, 32, 33, 129] {
                 let text = format!("{0}β{0}{0}尾{0}", pattern.repeat(repeats));
                 for sep in ["", pattern, ":", "界", "ab", "axca", "abba", "absent"] {
-                    let expected: Vec<_> = text.split(sep).collect();
-                    let result = unsafe {
-                        align_rt_str_split(
-                            text.as_ptr(),
-                            text.len() as i64,
-                            sep.as_ptr(),
-                            sep.len() as i64,
-                        )
-                    };
-                    assert_eq!(result.len, expected.len() as i64);
-                    let fields = unsafe {
-                        std::slice::from_raw_parts(result.ptr.cast::<AlignStr>(), expected.len())
-                    };
-                    for (got, want) in fields.iter().zip(expected) {
-                        assert_eq!((got.ptr, got.len), (want.as_ptr(), want.len() as i64));
-                    }
-                    unsafe { align_rt_free(result.ptr.cast_mut()) };
+                    assert_fields(&text, sep);
                 }
             }
         }
