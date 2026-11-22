@@ -349,7 +349,12 @@ mod tests {
         let domain = [0, 65_537, 131_074, i64::MIN, i64::MAX, -1, 1];
         let keys: Vec<_> = (0..777).map(|i| domain[i % domain.len()]).collect();
         let values: Vec<_> = (0..777i64)
-            .map(|i| if i % 3 == 0 { i64::MAX } else { -i })
+            .map(|i| match i % 7 {
+                0 => i64::MAX,
+                1 => i64::MIN,
+                _ if i % 3 == 0 => i64::MAX,
+                _ => -i,
+            })
             .collect();
         let ops = [
             GroupColumnSpec {
@@ -381,7 +386,7 @@ mod tests {
         for (&key, &value) in keys.iter().zip(&values) {
             let entry = expected
                 .entry(key)
-                .or_insert([0i64, i64::MIN, 0, i64::MAX, 0, i64::MAX]);
+                .or_insert([0i64, value, 0, value, 0, value]);
             entry[0] += 1;
             entry[1] = entry[1].max(value);
             entry[2] = entry[2].wrapping_add(key);
