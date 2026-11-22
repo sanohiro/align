@@ -1,5 +1,7 @@
 use super::safe_slice;
 
+const DELIMITER_PREFIX: usize = 3 * 4;
+
 /// For a small Unicode set, search the leading bytes together. On a shared
 /// prefix that does not match a whole scalar, switch to full substring searches
 /// so a long run of near misses does not repeatedly enter the byte dispatcher.
@@ -48,11 +50,20 @@ fn scalar_in_set(scalar: &[u8], set: &[u8]) -> bool {
 }
 
 fn find_in_large_scalar_set(haystack: &[u8], set: &[u8]) -> Option<usize> {
-    // Short receivers can finish without building an index for a long delimiter set.
+    let prefix = &set[..set.len().min(DELIMITER_PREFIX)];
     let mut offset = 0;
     let mut previous_miss = &[][..];
-    while offset < haystack.len().min(8) {
-        let scalar = leading_scalar(&haystack[offset..])?;
+    while offset < haystack.len() {
+        let rest = &haystack[offset..];
+        let scalar = leading_scalar(rest)?;
+        // Finish a short suffix directly. With more input, check for an immediate
+        // hit in the set prefix before paying to index all delimiter bytes.
+        if offset >= 8 && rest.len() > 32 {
+            if scalar != previous_miss && scalar_in_set(scalar, prefix) {
+                return Some(offset);
+            }
+            break;
+        }
         if scalar != previous_miss && scalar_in_set(scalar, set) {
             return Some(offset);
         }
@@ -107,7 +118,7 @@ fn find_in_large_scalar_set(haystack: &[u8], set: &[u8]) -> Option<usize> {
 #[inline]
 fn probe_first_scalar<const N: usize>(text: &[u8], set: &[u8]) -> Option<i64> {
     let scalar = text.first_chunk::<N>()?;
-    let prefix = &set[..set.len().min(12)];
+    let prefix = &set[..set.len().min(DELIMITER_PREFIX)];
     let hit = if N == 1 {
         prefix.contains(&scalar[0])
     } else {
@@ -155,7 +166,7 @@ pub unsafe extern "C" fn align_rt_str_find_any(
     if let Some(answer) = first {
         return answer;
     }
-    let index = if set.len() > 12 {
+    let index = if set.len() > DELIMITER_PREFIX {
         find_in_large_scalar_set(haystack, set)
     } else if set.is_ascii() {
         match set {
@@ -230,6 +241,30 @@ mod tests {
     }
 
     #[test]
+    fn str_find_any_large_set_hits_across_the_receiver_probe() {
+        for pad in [0, 11, 12, 16] {
+            let set = format!("{}é{}", "b".repeat(pad), "a".repeat(4096));
+            for tail in [0, 1, 30, 31, 32, 33, 64] {
+                for text in [
+                    format!("🚀🚀é{}", "z".repeat(tail)),
+                    format!("🚀🚀ê{}", "z".repeat(tail)),
+                ] {
+                    let want = text.find('é').map_or(-1, |i| i64::try_from(i).unwrap());
+                    let got = unsafe {
+                        align_rt_str_find_any(
+                            text.as_ptr(),
+                            text.len() as i64,
+                            set.as_ptr(),
+                            set.len() as i64,
+                        )
+                    };
+                    assert_eq!(want, got, "padding={pad}, tail={tail}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn str_find_any_large_sets_confirm_leads_and_repeated_misses() {
         for alphabet in ["é", "é界", "é界🚀", "!é界🚀", ":é界🚀\0", "abcde", "界京"]
         {
@@ -250,7 +285,7 @@ mod tests {
                 "ы界",
                 "x🚀",
             ] {
-                for text in [text.to_owned(), format!("yyyyyyyyyyyyyyyyy{text}")] {
+                for text in [text.to_owned(), format!("{}{}", "y".repeat(64), text)] {
                     let expected = text
                         .char_indices()
                         .find(|(_, c)| set.contains(*c))
