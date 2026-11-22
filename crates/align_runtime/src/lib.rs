@@ -15823,6 +15823,31 @@ pub unsafe extern "C" fn align_rt_str_find(hptr: *const u8, hlen: i64, nptr: *co
     }
 }
 
+/// For a small Unicode set, search the leading bytes together. On a shared
+/// prefix that does not match a whole scalar, switch to full substring searches
+/// so a long run of near misses does not repeatedly enter the byte dispatcher.
+fn find_small_scalar_set(haystack: &[u8], members: &[&[u8]]) -> Option<usize> {
+    let candidate = match members {
+        [a] => return memchr::memmem::find(haystack, a),
+        [a, b] => memchr::memchr2(a[0], b[0], haystack)?,
+        [a, b, c] => memchr::memchr3(a[0], b[0], c[0], haystack)?,
+        _ => return None,
+    };
+    let suffix = &haystack[candidate..];
+    if members.iter().any(|member| suffix.starts_with(member)) {
+        return Some(candidate);
+    }
+    let rest = &suffix[1..];
+    let mut best = None;
+    for member in members {
+        // A complete UTF-8 scalar cannot straddle another scalar's start.
+        if let Some(at) = memchr::memmem::find(&rest[..best.unwrap_or(rest.len())], member) {
+            best = Some(at);
+        }
+    }
+    best.map(|at| candidate + 1 + at)
+}
+
 /// First UTF-8 byte offset occupied by any scalar in the delimiter set, or -1.
 /// Null, nonpositive and unrepresentable ranges are empty.
 ///
@@ -15850,14 +15875,20 @@ pub unsafe extern "C" fn align_rt_str_find_any(hptr: *const u8, hlen: i64, sptr:
             }
         }
     } else {
-        // A set member is a complete scalar. Comparing UTF-8 substrings for
-        // complete encodings cannot match an interior continuation byte.
-        let Ok(text) = std::str::from_utf8(haystack) else { return -1 };
-        text.char_indices().find_map(|(at, ch)| {
-            let mut encoded = [0; 4];
-            let scalar = ch.encode_utf8(&mut encoded);
-            memchr::memmem::find(set, scalar.as_bytes()).map(|_| at)
-        })
+        let Ok(delimiters) = std::str::from_utf8(set) else { return -1 };
+        let mut chars = delimiters.char_indices();
+        let mut members = [&[][..]; 3];
+        let mut count = 0;
+        for (slot, (start, ch)) in members.iter_mut().zip(&mut chars) {
+            *slot = &set[start..start + ch.len_utf8()];
+            count += 1;
+        }
+        if chars.next().is_none() {
+            find_small_scalar_set(haystack, &members[..count])
+        } else {
+            let Ok(text) = std::str::from_utf8(haystack) else { return -1 };
+            text.char_indices().find_map(|(at, ch)| delimiters.contains(ch).then_some(at))
+        }
     };
     index.and_then(|at| i64::try_from(at).ok()).unwrap_or(-1)
 }
@@ -37849,9 +37880,9 @@ mod tests {
 
     #[test]
     fn str_find_any_matches_scalar_oracle_and_native_boundary() {
-        let texts = ["", "a", "á", "a\0b", "😊ď", "üďあñ𝄞Ê", "cafe\u{301}", "הϟ/:"];
+        let texts = ["", "a", "á", "a\0b", "😊ď", "üďあñ𝄞Ê", "cafe\u{301}", "הϟ/:", "èèè中界é", "èàé🚀", "東京:京"];
         for text in texts {
-            for chars in ["", "a", ":/", "/:,", ";;:,:", "a\0", "ê", "Ċ", "𝄞😊", "ñû", "é", "ďあ", "🚀aø"] {
+            for chars in ["", "a", ":/", "/:,", ";;:,:", "a\0", "ê", "Ċ", "𝄞😊", "ñû", "é", "ďあ", "🚀aø", "é界", "界é", "界éé", "é界🚀中", "京東"] {
                 let want = text.char_indices().find(|(_, c)| chars.chars().any(|v| v == *c))
                     .map_or(-1, |(at, _)| i64::try_from(at).unwrap());
                 let actual = unsafe { align_rt_str_find_any(text.as_ptr(), text.len() as i64, chars.as_ptr(), chars.len() as i64) };
