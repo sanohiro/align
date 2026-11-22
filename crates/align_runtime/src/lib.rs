@@ -6033,9 +6033,14 @@ pub unsafe extern "C" fn align_rt_json_decode_scalar(input: *const u8, input_len
 /// Slot index for a key: Fibonacci multiply + an XOR-fold so the low bits used by `& mask` are
 /// well-distributed at any (power-of-two) table size.
 #[inline]
-fn group_slot(k: i64, mask: usize) -> usize {
+fn group_hash(k: i64) -> u64 {
     let h = (k as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    (h ^ (h >> 29)) as usize & mask
+    h ^ (h >> 29)
+}
+
+#[inline]
+fn group_slot(k: i64, mask: usize) -> usize {
+    group_hash(k) as usize & mask
 }
 
 /// Generic column-oriented group-aggregate over i64 keys. `per_row(i)` is the value folded for row
@@ -6333,9 +6338,8 @@ impl std::hash::Hash for WyKey<'_> {
     }
 }
 
-/// Pass-through hasher for the already-`wyhash`'d [`WyKey`]: the key's `Hash` feeds one `write_u64`
-/// (the precomputed hash), which is returned as-is. wyhash already avalanches, so the map needs no
-/// further mixing. `write` is never reached (a `WyKey` only ever calls `write_u64`).
+/// Pass through a pre-mixed group key. Both WyKey and the integer spill key
+/// feed their complete hash through one write_u64 call.
 #[derive(Default)]
 struct IdentityHasher(u64);
 impl std::hash::Hasher for IdentityHasher {
@@ -6349,10 +6353,8 @@ impl std::hash::Hasher for IdentityHasher {
     }
     #[inline]
     fn write(&mut self, _: &[u8]) {
-        // Unreachable: `WyKey::hash` only ever calls `write_u64`. Kept a no-op (not `unreachable!`)
-        // so a future non-`WyKey` key can't turn a wrong-hasher mistake into a runtime panic in the
-        // linked user binary — such a bug would surface as a test failure, never a crash in the field.
-        debug_assert!(false, "IdentityHasher only accepts pre-hashed WyKey (write_u64)");
+        // Both group key types feed a single mixed word through write_u64.
+        debug_assert!(false, "IdentityHasher expects a pre-hashed group key");
     }
 }
 
