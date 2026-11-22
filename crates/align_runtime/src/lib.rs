@@ -87,6 +87,8 @@ mod unicode_nfc;
 pub use unicode_nfc::align_rt_unicode_nfc;
 mod time_formats;
 pub use time_formats::*;
+mod str_split;
+pub use str_split::align_rt_str_split;
 mod group_multi_cols;
 pub use group_multi_cols::{GroupColumnSpec, align_rt_group_multi_cols};
 mod compress_stream;
@@ -16044,34 +16046,6 @@ pub unsafe extern "C" fn align_rt_str_finder_free(plan: *mut FinderPlan) {
 #[inline]
 fn str_subview(s: &[u8]) -> AlignStr {
     AlignStr { ptr: s.as_ptr(), len: s.len() as i64 }
-}
-
-/// Allocate contiguous borrowed field headers for a literal UTF-8 split.
-///
-/// # Safety
-/// Each non-null input must cover its declared readable extent. The source bytes
-/// must remain valid for every use of the returned fields. Free the header pointer once.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_str_split(
-    source: *const u8, source_len: i64, separator: *const u8, separator_len: i64,
-) -> AlignStr {
-    let empty = AlignStr { ptr: core::ptr::null(), len: 0 };
-    if source_len < 0 || separator_len < 0
-        || (source.is_null() && source_len != 0) || (separator.is_null() && separator_len != 0)
-    {
-        return empty;
-    }
-    let (Some(source), Some(separator)) = (unsafe { abi_str_view(source, source_len) },
-        unsafe { abi_str_view(separator, separator_len) }) else { return empty; };
-    let fields = source.split(separator);
-    let count = fields.clone().count();
-    let bytes = count.checked_mul(size_of::<AlignStr>()).and_then(|n| i64::try_from(n).ok())
-        .unwrap_or_else(|| align_rt_alloc_size_fail());
-    let headers = align_rt_alloc(bytes).cast::<AlignStr>();
-    for (index, field) in fields.enumerate() {
-        unsafe { headers.add(index).write(str_subview(field.as_bytes())) };
-    }
-    AlignStr { ptr: headers.cast(), len: count as i64 }
 }
 
 /// `s.trim()` (M5, `core.string`) — return a borrowed sub-`str` `{ptr,len}` of `s` with leading
