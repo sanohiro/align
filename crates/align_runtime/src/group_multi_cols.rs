@@ -65,6 +65,16 @@ unsafe fn fold<K: Hash + Eq, R: Copy, S: BuildHasher>(
             };
         }
     }
+    unsafe { publish(&representatives, &accumulators, specs.len(), headers) }
+}
+
+/// Both key domains finish staging and all fallible checks before publishing.
+unsafe fn publish<R: Copy>(
+    representatives: &[R],
+    accumulators: &[i64],
+    columns: usize,
+    headers: *mut AlignStr,
+) -> Option<i64> {
     let groups = representatives.len();
     let count = i64::try_from(groups).ok()?;
     let keys_size = byte_extent::<R>(groups)?;
@@ -80,9 +90,9 @@ unsafe fn fold<K: Hash + Eq, R: Copy, S: BuildHasher>(
             len: count,
         })
     };
-    for column in 0..specs.len() {
+    for column in 0..columns {
         let values = align_rt_alloc(values_size).cast::<i64>();
-        for (i, group) in accumulators.chunks_exact(specs.len()).enumerate() {
+        for (i, group) in accumulators.chunks_exact(columns).enumerate() {
             unsafe { values.add(i).write(group[column]) };
         }
         unsafe {
@@ -93,6 +103,108 @@ unsafe fn fold<K: Hash + Eq, R: Copy, S: BuildHasher>(
         };
     }
     Some(count)
+}
+
+/// Select the reduction once per column and tile. Offsets identify the
+/// beginning of an existing group's K cells; column is below K.
+unsafe fn reduce_values(
+    offsets: &[usize],
+    column: usize,
+    values: &[i64],
+    accumulators: &mut [i64],
+    combine: impl Fn(i64, i64) -> i64,
+) {
+    for (&offset, &value) in offsets.iter().zip(values) {
+        // The caller interns every offset as the start of a full row.
+        let cell = unsafe { accumulators.get_unchecked_mut(offset + column) };
+        *cell = combine(*cell, value);
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct IntegerKey(i64);
+
+impl Hash for IntegerKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(super::group_hash(self.0));
+    }
+}
+
+/// A direct-mapped table resolves repeated keys with one probe. Keys sharing a slot
+/// use the full hash map. No preliminary key-range scan is necessary.
+unsafe fn fold_integers(
+    keys: &[i64],
+    specs: &[GroupColumnSpec],
+    headers: *mut AlignStr,
+) -> Option<i64> {
+    if keys.is_empty() {
+        return unsafe { publish::<i64>(&[], &[], specs.len(), headers) };
+    }
+    let width = (keys.len() / 4).clamp(64, 65536).next_power_of_two();
+    let mask = (width - 1) as u64;
+    let mut direct = vec![(0i64, 0usize); width];
+    let mut distant = HashMap::with_hasher(WyBuildHasher::default());
+    let mut representatives = Vec::new();
+    let mut accumulators = Vec::new();
+    let mut offsets = [0usize; 256];
+    for (tile, chunk) in keys.chunks(offsets.len()).enumerate() {
+        let row = tile * offsets.len();
+        let offsets = &mut offsets[..chunk.len()];
+        for (slot, &key) in offsets.iter_mut().zip(chunk) {
+            let bits = key as u64;
+            let index = usize::try_from((bits ^ (bits >> 16) ^ (bits >> 48)) & mask).ok()?;
+            let (tag, direct_id) = &mut direct[index];
+            if *direct_id != 0 && *tag == key {
+                *slot = *direct_id - 1;
+                continue;
+            }
+            let id = if *direct_id == 0 {
+                *tag = key;
+                direct_id
+            } else {
+                distant.entry(IntegerKey(key)).or_insert(0)
+            };
+            if *id == 0 {
+                let start = accumulators.len();
+                let end = start.checked_add(specs.len())?;
+                byte_extent::<i64>(end)?;
+                accumulators.extend(specs.iter().map(|s| match s.op {
+                    1 => i64::MAX,
+                    2 => i64::MIN,
+                    _ => 0,
+                }));
+                representatives.push(key);
+                *id = start + 1;
+            }
+            *slot = *id - 1;
+        }
+        for (column, spec) in specs.iter().enumerate() {
+            if spec.op == 3 {
+                for &offset in offsets.iter() {
+                    // Every interned offset starts a row of specs.len() cells.
+                    unsafe { *accumulators.get_unchecked_mut(offset + column) += 1 };
+                }
+            } else {
+                // Validation guarantees a live, aligned value column of keys.len() elements.
+                let values =
+                    unsafe { std::slice::from_raw_parts(spec.values.add(row), chunk.len()) };
+                unsafe {
+                    match spec.op {
+                        1 => reduce_values(offsets, column, values, &mut accumulators, i64::min),
+                        2 => reduce_values(offsets, column, values, &mut accumulators, i64::max),
+                        _ => reduce_values(
+                            offsets,
+                            column,
+                            values,
+                            &mut accumulators,
+                            i64::wrapping_add,
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    unsafe { publish(&representatives, &accumulators, specs.len(), headers) }
 }
 
 /// Return the number of groups or -1 without changing the caller's headers.
@@ -139,18 +251,12 @@ pub unsafe extern "C" fn align_rt_group_multi_cols(
         }
     }
     let count = if key_kind == 0 {
-        unsafe {
-            fold(
-                n,
-                specs,
-                headers,
-                std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default(),
-                |i| {
-                    let key = *keys.cast::<i64>().add(i);
-                    Some((key, key))
-                },
-            )
-        }
+        let keys = if n == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(keys.cast::<i64>(), n) }
+        };
+        unsafe { fold_integers(keys, specs, headers) }
     } else {
         unsafe {
             fold(n, specs, headers, WyBuildHasher::default(), |i| {
@@ -235,6 +341,82 @@ mod tests {
                 expected
             );
             unsafe { align_rt_free(header.ptr.cast_mut()) };
+        }
+    }
+
+    #[test]
+    fn integer_groups_keep_all_columns_aligned_across_tiles_and_collisions() {
+        let domain = [0, 65_537, 131_074, i64::MIN, i64::MAX, -1, 1];
+        let keys: Vec<_> = (0..777).map(|i| domain[i % domain.len()]).collect();
+        let values: Vec<_> = (0..777i64)
+            .map(|i| if i % 3 == 0 { i64::MAX } else { -i })
+            .collect();
+        let ops = [
+            GroupColumnSpec {
+                op: 3,
+                values: ptr::null(),
+            },
+            GroupColumnSpec {
+                op: 2,
+                values: values.as_ptr(),
+            },
+            GroupColumnSpec {
+                op: 0,
+                values: keys.as_ptr(),
+            },
+            GroupColumnSpec {
+                op: 1,
+                values: values.as_ptr(),
+            },
+            GroupColumnSpec {
+                op: 0,
+                values: values.as_ptr(),
+            },
+            GroupColumnSpec {
+                op: 1,
+                values: values.as_ptr(),
+            },
+        ];
+        let mut expected = std::collections::BTreeMap::new();
+        for (&key, &value) in keys.iter().zip(&values) {
+            let entry = expected
+                .entry(key)
+                .or_insert([0i64, i64::MIN, 0, i64::MAX, 0, i64::MAX]);
+            entry[0] += 1;
+            entry[1] = entry[1].max(value);
+            entry[2] = entry[2].wrapping_add(key);
+            entry[3] = entry[3].min(value);
+            entry[4] = entry[4].wrapping_add(value);
+            entry[5] = entry[5].min(value);
+        }
+        let mut headers = [AlignStr {
+            ptr: ptr::null(),
+            len: 0,
+        }; 7];
+        let count = unsafe {
+            align_rt_group_multi_cols(
+                keys.as_ptr().cast(),
+                ops.as_ptr(),
+                777,
+                headers.as_mut_ptr(),
+                6,
+                0,
+            )
+        };
+        assert_eq!(count, 7);
+        let columns = headers.map(|h| {
+            assert_eq!(h.len, count);
+            unsafe { std::slice::from_raw_parts(h.ptr.cast::<i64>(), 7) }
+        });
+        for (row, key) in columns[0].iter().enumerate() {
+            let cells = expected.remove(key).unwrap();
+            for (column, value) in columns[1..].iter().zip(cells) {
+                assert_eq!(column[row], value);
+            }
+        }
+        assert!(expected.is_empty());
+        for h in headers {
+            unsafe { align_rt_free(h.ptr.cast_mut()) };
         }
     }
 
