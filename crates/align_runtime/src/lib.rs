@@ -15848,6 +15848,15 @@ fn find_small_scalar_set(haystack: &[u8], members: &[&[u8]]) -> Option<usize> {
     best.map(|at| candidate + 1 + at)
 }
 
+fn find_in_large_scalar_set(haystack: &[u8], set: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(haystack).ok()?;
+    text.char_indices().find_map(|(at, ch)| {
+        let mut encoded = [0; 4];
+        let scalar = ch.encode_utf8(&mut encoded);
+        memchr::memmem::find(set, scalar.as_bytes()).map(|_| at)
+    })
+}
+
 /// First UTF-8 byte offset occupied by any scalar in the delimiter set, or -1.
 /// Null, nonpositive and unrepresentable ranges are empty.
 ///
@@ -15874,6 +15883,9 @@ pub unsafe extern "C" fn align_rt_str_find_any(hptr: *const u8, hlen: i64, sptr:
                 haystack.iter().position(|&byte| members[usize::from(byte)])
             }
         }
+    } else if set.len() > 3 * 4 {
+        // Four bytes per scalar bounds delimiter setup even for a huge set.
+        find_in_large_scalar_set(haystack, set)
     } else {
         let Ok(delimiters) = std::str::from_utf8(set) else { return -1 };
         let mut chars = delimiters.char_indices();
@@ -15886,8 +15898,7 @@ pub unsafe extern "C" fn align_rt_str_find_any(hptr: *const u8, hlen: i64, sptr:
         if chars.next().is_none() {
             find_small_scalar_set(haystack, &members[..count])
         } else {
-            let Ok(text) = std::str::from_utf8(haystack) else { return -1 };
-            text.char_indices().find_map(|(at, ch)| delimiters.contains(ch).then_some(at))
+            find_in_large_scalar_set(haystack, set)
         }
     };
     index.and_then(|at| i64::try_from(at).ok()).unwrap_or(-1)
