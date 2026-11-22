@@ -89,6 +89,8 @@ mod time_formats;
 pub use time_formats::*;
 mod str_split;
 pub use str_split::align_rt_str_split;
+mod json_string;
+use json_string::{JsonStringBody, json_string_equals, json_string_span, json_unescape_to, json_unescaped_len};
 mod group_multi_cols;
 pub use group_multi_cols::{GroupColumnSpec, align_rt_group_multi_cols};
 mod compress_stream;
@@ -4003,7 +4005,7 @@ fn write_json_str_body(buf: &mut BuilderBuf, bytes: &[u8]) {
 //
 // Each classifier reads one fixed-width block and returns a per-byte "needs escape" map: the x86
 // paths pack it as a bitmask (one bit per byte), the NEON path as a nibble lane map (4 bits per byte
-// — see `json_escape_map_neon`), each consumed by its own body writer. The "control byte" test
+// — see `json_escape_map_neon`), shared by body writers and the typed parser. The "control byte" test
 // `c < 0x20` is branchless on hardware without an unsigned compare via the saturating-subtract
 // identity `subs_epu8(c, 0x1F) == 0  ⟺  c <= 0x1F`.
 //
@@ -4640,15 +4642,16 @@ unsafe fn decode_nested(p: &mut JsonParser, sub: *const JsonSubTable, dst: *mut 
 /// (16 = a `str` view element). Clean entries borrow `p`'s input and escaped entries borrow its
 /// arena, so the result must not outlive those sources.
 unsafe fn decode_scalar_array_value(p: &mut JsonParser, elem_kind: i32, elem_width: usize, elem_signed: bool) -> Option<AlignStr> {
+    if elem_kind == 3 && elem_width == size_of::<AlignStr>() {
+        let headers = parse_borrowed_string_array(p)?;
+        return Some(publish_scalar_array(&headers, i64::try_from(headers.len()).ok()?));
+    }
     let (bytes, count) = unsafe { parse_scalar_array(p, elem_kind, elem_width, elem_signed) }?;
     Some(publish_scalar_array(&bytes, count))
 }
 
 /// Validate and stage scalar elements. The enclosing field or root chooses when to publish.
 unsafe fn parse_scalar_array(p: &mut JsonParser, elem_kind: i32, elem_width: usize, elem_signed: bool) -> Option<(Vec<u8>, i64)> {
-    p.ws();
-    p.expect(b'[')?;
-    p.ws();
     // Synthetic per-element descriptor so `write_value`'s scalar arms see the right width/sign. A
     // scalar element has no name / sub-table / Option tag.
     let ed = JsonField {
@@ -4661,38 +4664,52 @@ unsafe fn parse_scalar_array(p: &mut JsonParser, elem_kind: i32, elem_width: usi
     };
     let mut buf: Vec<u8> = Vec::new();
     let mut count: i64 = 0;
-    if p.peek() == Some(b']') {
-        p.pos += 1;
-    } else {
-        loop {
-            let eoff = buf.len();
-            let end = eoff.checked_add(elem_width).filter(|&n| isize::try_from(n).is_ok())?;
-            buf.resize(end, 0);
-            let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
-            unsafe { write_value(p, elem_kind, elem_width as i64, &ed, eptr)? };
-            count += 1;
-            p.ws();
-            match p.peek() {
-                Some(b',') => {
-                    p.pos += 1;
-                    p.ws();
-                    continue;
-                }
-                Some(b']') => {
-                    p.pos += 1;
-                    break;
-                }
-                _ => return None, // scalar elements own nothing → no partial-cleanup needed on bail
-            }
-        }
-    }
+    parse_array_elements(p, |p| {
+        let eoff = buf.len();
+        let end = eoff.checked_add(elem_width).filter(|&n| isize::try_from(n).is_ok())?;
+        buf.resize(end, 0);
+        let eptr = unsafe { buf.as_mut_ptr().add(eoff) };
+        unsafe { write_value(p, elem_kind, elem_width as i64, &ed, eptr)? };
+        count += 1;
+        Some(())
+    })?;
     Some((buf, count))
 }
 
-fn publish_scalar_array(bytes: &[u8], count: i64) -> AlignStr {
-    let dst = align_rt_alloc(bytes.len() as i64);
-    if !bytes.is_empty() {
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len()) };
+fn parse_array_elements(p: &mut JsonParser<'_>, mut element: impl FnMut(&mut JsonParser<'_>) -> Option<()>) -> Option<()> {
+    p.ws();
+    p.expect(b'[')?;
+    p.ws();
+    if p.peek() == Some(b']') {
+        p.pos += 1;
+        return Some(());
+    }
+    loop {
+        element(p)?;
+        p.ws();
+        match p.peek() {
+            Some(b',') => { p.pos += 1; p.ws(); }
+            Some(b']') => { p.pos += 1; return Some(()); }
+            _ => return None,
+        }
+    }
+}
+
+fn parse_borrowed_string_array(p: &mut JsonParser<'_>) -> Option<Vec<AlignStr>> {
+    let mut headers = Vec::new();
+    parse_array_elements(p, |p| {
+        if headers.len() == isize::MAX.unsigned_abs() / size_of::<AlignStr>() { return None; }
+        headers.push(p.string_value()?);
+        Some(())
+    })?;
+    Some(headers)
+}
+
+fn publish_scalar_array<T: Copy>(values: &[T], count: i64) -> AlignStr {
+    let bytes = std::mem::size_of_val(values);
+    let dst = align_rt_alloc(bytes as i64);
+    if !values.is_empty() {
+        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), dst, bytes) };
     }
     AlignStr { ptr: dst, len: count }
 }
@@ -4700,30 +4717,12 @@ fn publish_scalar_array(bytes: &[u8], count: i64) -> AlignStr {
 /// Stage independently owned strings until the caller validates its complete container.
 /// The list frees every completed payload on a malformed element, delimiter or later root failure.
 fn parse_owned_string_array(p: &mut JsonParser<'_>) -> Option<OwnedStringList> {
-    p.ws();
-    p.expect(b'[')?;
-    p.ws();
     let mut items = OwnedStringList::default();
-    if p.peek() == Some(b']') {
-        p.pos += 1;
-        return Some(items);
-    }
-    loop {
-        let value = p.owned_string_value()?;
-        items.push_owned(value);
-        p.ws();
-        match p.peek() {
-            Some(b',') => {
-                p.pos += 1;
-                p.ws();
-            }
-            Some(b']') => {
-                p.pos += 1;
-                return Some(items);
-            }
-            _ => return None,
-        }
-    }
+    parse_array_elements(p, |p| {
+        items.push_owned(p.owned_string_value()?);
+        Some(())
+    })?;
+    Some(items)
 }
 
 /// Record fields publish at their closing bracket; enclosing record cleanup owns later failures.
@@ -5854,11 +5853,11 @@ pub unsafe extern "C" fn align_rt_json_decode_str_array(
     let src = unsafe { std::slice::from_raw_parts(input, n) };
     if !validate_utf8(src) { return 1; }
     let mut parser = JsonParser { src, pos: 0, arena };
-    let Some((bytes, count)) = (unsafe { parse_scalar_array(&mut parser, 3, size_of::<AlignStr>(), false) })
-        else { return 1; };
+    let Some(headers) = parse_borrowed_string_array(&mut parser) else { return 1; };
     parser.ws();
     if parser.pos != src.len() { return 1; }
-    unsafe { out.write(publish_scalar_array(&bytes, count)) };
+    let Ok(count) = i64::try_from(headers.len()) else { return 1; };
+    unsafe { out.write(publish_scalar_array(&headers, count)) };
     0
 }
 
@@ -7477,187 +7476,13 @@ fn validate_utf8(bytes: &[u8]) -> bool {
     validate_utf8_scalar(bytes)
 }
 
-/// Decode the number of UTF-8 bytes produced by a JSON string body. The input has already passed the
-/// document-wide UTF-8 check at every public decode boundary; this pass owns the JSON string grammar:
-/// raw C0 bytes are rejected, short escapes are mapped, and Unicode escapes require valid surrogate
-/// pairing. It allocates nothing, so ignored keys and values can be validated without scratch space.
-fn json_unescaped_len(raw: &[u8]) -> Option<usize> {
-    let mut i = 0;
-    let mut len = 0usize;
-    while i < raw.len() {
-        let b = raw[i];
-        if b != b'\\' {
-            if b < 0x20 || b == b'"' { return None; }
-            len = len.checked_add(1)?;
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let e = *raw.get(i)?;
-        i += 1;
-        match e {
-            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
-                len = len.checked_add(1)?;
-            }
-            b'u' => {
-                let cp = json_hex4(raw, i)?;
-                i += 4;
-                let scalar = if (0xD800..=0xDBFF).contains(&cp) {
-                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') { return None; }
-                    let lo = json_hex4(raw, i + 2)?;
-                    if !(0xDC00..=0xDFFF).contains(&lo) { return None; }
-                    i += 6;
-                    0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
-                } else if (0xDC00..=0xDFFF).contains(&cp) {
-                    return None;
-                } else {
-                    cp
-                };
-                len = len.checked_add(char::from_u32(scalar)?.len_utf8())?;
-            }
-            _ => return None,
-        }
-    }
-    Some(len)
-}
-
-/// Write a validated JSON string body into an exactly sized destination. Returns the number of
-/// bytes written; the destination is caller-owned and no temporary proportional buffer is used.
-fn json_unescape_to(raw: &[u8], dst: &mut [u8]) -> Option<usize> {
-    let expected = json_unescaped_len(raw)?;
-    if expected != dst.len() { return None; }
-    let mut i = 0;
-    let mut out = 0;
-    while i < raw.len() {
-        let b = raw[i];
-        if b != b'\\' {
-            dst[out] = b;
-            out += 1;
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let e = raw[i];
-        i += 1;
-        match e {
-            b'"' => dst[out] = b'"',
-            b'\\' => dst[out] = b'\\',
-            b'/' => dst[out] = b'/',
-            b'b' => dst[out] = 0x08,
-            b'f' => dst[out] = 0x0c,
-            b'n' => dst[out] = b'\n',
-            b'r' => dst[out] = b'\r',
-            b't' => dst[out] = b'\t',
-            b'u' => {
-                let cp = json_hex4(raw, i)?;
-                i += 4;
-                let scalar = if (0xD800..=0xDBFF).contains(&cp) {
-                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') { return None; }
-                    let lo = json_hex4(raw, i + 2)?;
-                    if !(0xDC00..=0xDFFF).contains(&lo) { return None; }
-                    i += 6;
-                    0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
-                } else if (0xDC00..=0xDFFF).contains(&cp) {
-                    return None;
-                } else {
-                    cp
-                };
-                let c = char::from_u32(scalar)?;
-                let mut buf = [0u8; 4];
-                let bytes = c.encode_utf8(&mut buf).as_bytes();
-                dst[out..out + bytes.len()].copy_from_slice(bytes);
-                out += bytes.len();
-                continue;
-            }
-            _ => return None,
-        }
-        out += 1;
-    }
-    (out == expected).then_some(out)
-}
-
-/// Compare a raw JSON string body to a clean semantic key without materializing the escaped body.
-fn json_string_equals(raw: &[u8], target: &[u8]) -> bool {
-    let Some(expected) = json_unescaped_len(raw) else { return false };
-    if expected != target.len() { return false; }
-    let mut i = 0;
-    let mut out = 0;
-    while i < raw.len() {
-        let b = raw[i];
-        if b != b'\\' {
-            if target.get(out) != Some(&b) { return false; }
-            out += 1;
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let e = raw[i];
-        i += 1;
-        let scalar = match e {
-            b'"' => 0x22,
-            b'\\' => 0x5c,
-            b'/' => 0x2f,
-            b'b' => 0x08,
-            b'f' => 0x0c,
-            b'n' => 0x0a,
-            b'r' => 0x0d,
-            b't' => 0x09,
-            b'u' => {
-                let Some(cp) = json_hex4(raw, i) else { return false };
-                i += 4;
-                if (0xD800..=0xDBFF).contains(&cp) {
-                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') { return false; }
-                    let Some(lo) = json_hex4(raw, i + 2) else { return false };
-                    if !(0xDC00..=0xDFFF).contains(&lo) { return false; }
-                    i += 6;
-                    0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
-                } else if (0xDC00..=0xDFFF).contains(&cp) {
-                    return false;
-                } else {
-                    cp
-                }
-            }
-            _ => return false,
-        };
-        let Some(c) = char::from_u32(scalar) else { return false };
-        let mut buf = [0u8; 4];
-        let bytes = c.encode_utf8(&mut buf).as_bytes();
-        if target.get(out..out + bytes.len()) != Some(bytes) { return false; }
-        out += bytes.len();
-    }
-    out == expected
-}
-
-/// Return the raw body and end quote for a JSON string starting at start. The returned body is
-/// validated before it is exposed, including raw C0 bytes and surrogate pairing.
-fn json_string_span(src: &[u8], start: usize) -> Option<(usize, usize)> {
-    if src.get(start) != Some(&b'"') { return None; }
-    let body_start = start + 1;
-    let mut pos = body_start;
-    loop {
-        let off = find_quote_or_escape(src.get(pos..)?)?;
-        pos += off;
-        match src.get(pos).copied()? {
-            b'"' => {
-                json_unescaped_len(&src[body_start..pos])?;
-                return Some((body_start, pos));
-            }
-            b'\\' => {
-                pos = pos.checked_add(2)?;
-                if pos > src.len() { return None; }
-            }
-            _ => return None,
-        }
-    }
-}
-
 /// Validate every JSON string token in src, including tokens ignored by a projected typed decode.
 fn validate_json_string_grammar(src: &[u8]) -> bool {
     let mut pos = 0;
     while let Some(rel) = memchr::memchr(b'"', &src[pos..]) {
         let start = pos + rel;
         let Some((_, end)) = json_string_span(src, start) else { return false };
-        pos = end + 1;
+        pos = end;
     }
     true
 }
@@ -7872,50 +7697,43 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    /// Read and validate any JSON string body, returning the raw bytes between its quotes.
-    fn string_body(&mut self) -> Option<&'a [u8]> {
-        let (body, end) = json_string_span(self.src, self.pos)?;
-        self.pos = end + 1;
-        Some(&self.src[body..end])
+    fn string_token(&mut self) -> Option<JsonStringBody<'a>> {
+        let (body, next) = json_string_span(self.src, self.pos)?;
+        self.pos = next;
+        Some(body)
     }
 
-    /// Read a JSON string as an Align str: clean strings borrow the input, while escaped selected
-    /// strings require the caller's arena and are materialized at their decoded size.
+    /// Read and validate a JSON string body, returning the raw bytes between its quotes.
+    fn string_body(&mut self) -> Option<&'a [u8]> {
+        Some(self.string_token()?.raw)
+    }
+
+    /// Clean strings borrow the input. Escaped selected strings use the active arena.
     fn string_value(&mut self) -> Option<AlignStr> {
-        let raw = self.string_body()?;
-        if !raw.contains(&b'\\') {
-            return Some(AlignStr { ptr: raw.as_ptr(), len: raw.len() as i64 });
-        }
-        if self.arena.is_null() {
-            return None;
-        }
-        let len = json_unescaped_len(raw)?;
+        let token = self.string_token()?;
+        let Some(len) = token.escaped_len else { return Some(str_subview(token.raw)); };
+        if self.arena.is_null() { return None; }
         let dst = unsafe { (&mut *self.arena).alloc_uninit(len, 1) };
         let output = unsafe { core::slice::from_raw_parts_mut(dst, len) };
-        json_unescape_to(raw, output)?;
+        json_unescape_to(token.raw, output)?;
         Some(AlignStr { ptr: dst, len: len as i64 })
     }
 
-    /// Read a JSON string into a free-standing owned allocation. Clean and escaped tokens follow
-    /// the same path: the returned bytes never borrow the input or the current arena.
+    /// Owned strings retain neither the input nor the current arena.
     fn owned_string_value(&mut self) -> Option<AlignStr> {
-        let raw = self.string_body()?;
-        let len = if raw.contains(&b'\\') {
-            json_unescaped_len(raw)?
-        } else {
-            raw.len()
-        };
+        let token = self.string_token()?;
+        let len = token.escaped_len.unwrap_or(token.raw.len());
         let len_i64 = i64::try_from(len).ok()?;
         let dst = align_rt_alloc(len_i64);
         if len > 0 {
-            if raw.contains(&b'\\') {
+            if token.escaped_len.is_some() {
                 let output = unsafe { core::slice::from_raw_parts_mut(dst, len) };
-                if json_unescape_to(raw, output).is_none() {
+                if json_unescape_to(token.raw, output).is_none() {
                     unsafe { align_rt_free(dst) };
                     return None;
                 }
             } else {
-                unsafe { core::ptr::copy_nonoverlapping(raw.as_ptr(), dst, len) };
+                unsafe { core::ptr::copy_nonoverlapping(token.raw.as_ptr(), dst, len) };
             }
         }
         Some(AlignStr { ptr: dst, len: len_i64 })
