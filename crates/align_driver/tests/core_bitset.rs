@@ -70,7 +70,9 @@ fn main()->i32 {
 "#;
     let files = [("masks.align", HELPERS), ("main.align", main)];
     let ir = emit_llvm_multi("packed-bits-ir", &files, "main.align");
-    assert!(ir.contains("llvm.ctpop.i8"), "missing packed popcount");
+    for width in ["i8", "i64"] {
+        assert!(ir.contains(&format!("llvm.ctpop.{width}")), "missing packed {width} popcount");
+    }
     for output in [
         build_and_run_multi("packed-bits-whole", &files, "main.align"),
         build_per_unit_multi("packed-bits-units", &files, "main.align").link_and_run(),
@@ -243,6 +245,11 @@ pub fn probe(length:i64, end:bool)->i64 {
       if bits[last] || bits.count() != last {return -4}
       bits[last] = true
       if !bits.all() {return -5}
+      mut i:=0
+      loop {if i==bits.len() {break}; bits[i]=false; i=i+1}
+      if bits.any() || bits.count()!=0 {return -6}
+      bits[last]=true
+      if !bits.any() || bits.count()!=1 {return -7}
     }
     return 0
   }
@@ -256,7 +263,7 @@ pub fn release(p:raw) { unsafe { release_mapping(p) } }
 fn main()->i32 {
   mut length:=0
   loop {
-    if length==34 { break }
+    if length==131 { break }
     if pkg.bitmap.probe(length,true)!=0 || pkg.bitmap.probe(length,false)!=0 { return 1 }
     length=length+1
   }

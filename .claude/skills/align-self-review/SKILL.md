@@ -166,6 +166,7 @@ The M6 builtin arc surfaced a whole class of sema bugs around type variables and
 
 - **Diagnostics**: reusing an error helper in a new context — re-read its hardcoded message and generalize it (#26/#31 "Option payload" reused for arrays); point the span at the offending sub-node; emit one error per root cause, then return a sentinel (no cascade). (#74, #105, #117, #189, #206)
 - **Perf** (mostly medium — one glance, don't chase every nit): don't clone a `Copy` type (`Ty`, small structs); `&str` over `String`; `with_capacity` for known sizes; hoist invariant work out of hot loops (#94 re-lowered captures in an inner sort loop). For a performance acceptance condition, measure actual work counts from producer-owned outcomes for both revisions; an expected corpus/unit count is not evidence that either path did that work exactly once (#884). The bot posts one comment per line — treat fifteen near-identical clone nits as *one* lesson.
+- **Scan setup:** Does an early decision still avoid scanning a large opposite operand? Measure first-hit, late-hit and miss cases as well as throughput.
 - **Producer identity**: bind a cache/toolchain identity to producer-owned evidence
   for the resource actually in use. A filesystem pathname is not the identity of
   a loaded dynamic library: the entry may be replaced after mapping. Resolve the
