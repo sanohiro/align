@@ -66,7 +66,7 @@ invented exact counts here.
 | `historical-workflow-source-boundary` | 1 | 1 | Watch; a workflow that checks out an older tag must not assume newly added helper scripts exist in that historical source tree. |
 | `workflow-trust-provenance` | 1 | 1 | Watch; PR-controlled workflow code must execute classifiers from the trusted base, with an explicit bootstrap arm when the trusted base predates the classifier. |
 | `review-checkpoint-completeness` | 1 | 1 | Watch; only a wrapper-owned cycle verdict recorded after successful reviewer exit and result validation may authorize changed-slice continuation. |
-| `hot-path-scan-regression` | 1 | 1 | Watch; incremental boundary discovery must retain the established bulk-search primitive rather than regress to a byte-at-a-time scan. |
+| `hot-path-scan-regression` | 2 | 2 | Check both early decisions and full scans, including a large opposite operand. |
 | `native-thread-state-scope` | 1 | 1 | Watch; a constructor-scoped native thread-state guard does not cover delayed stream I/O or Drop. Establish the guard at every operation that can invoke the guarded native API, and pin read plus teardown with thread-local counter owners. |
 | `failure-evidence-preservation` | 2 | 2 | Promoted: bounded live progress and failure diagnostics must survive every phase, including timed benchmark subprocesses. Preserve captured stderr and replay it before cleanup; test a late invocation after successful correctness checks as well as the first failure. |
 
@@ -756,3 +756,5 @@ independent native ABI audit and all three platform checks passed.
 | #1416 | Plan244 strategy | Review | `analysis-fact-consumer-sweep` | Native ResourceViewFromRaw(StrUtf8) retained owner lifetime but lacked byte-validation observations. The final direct/native/helper/carrier and parent-resource matrix expires overlapping text after writes while preserving independent resources. |
 | #1416 | Plan244 strategy | Review | `analysis-control-path-completeness` | In-place external writes must expire byte observations without ending the resource generation or dependent-resource lifetime. Source-visible collection-write routing and repeated-view/parent/Drop owners close that distinction. |
 | #1416 | Plan244 strategy | Review | `validation-phase-completeness` | The proposed File receiver included fields although the existing admission accepts only bound Local receivers. The final contract and source/HIR owner use that exact domain. The arbitrary-native-error correction was author-identified before review and is not counted. |
+
+| #1453 | `f5633ac6` | P2 | `hot-path-scan-regression` | Validating a multi-MiB delimiter set before an immediate scalar match regressed the prior early path. The small-set optimization now bounds setup by twelve bytes and retains the prior fallback for larger sets. |

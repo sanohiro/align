@@ -2,7 +2,7 @@
 //! quotients plus low three-bit remainders, including when the logical index is i64::MAX.
 use super::*;
 use align_mir::BitsetOp;
-use inkwell::values::{PointerValue, StructValue};
+use inkwell::values::{PhiValue, PointerValue, StructValue};
 
 #[derive(Clone, Copy)]
 struct BitView<'c> {
@@ -255,144 +255,281 @@ impl<'c> FnGen<'c, '_> {
             }
             (BitsetOp::Count | BitsetOp::Any | BitsetOp::All, [source]) => {
                 let view = self.unpack_bits(self.operand_by_value(source)?.into_struct_value())?;
-                let count = self.bit_count(view)?;
-                match op {
-                    BitsetOp::Any => self
-                        .builder
-                        .build_int_compare(IntPredicate::NE, count, zero, "bits.any")
-                        .map_err(|error| self.err(error))?
-                        .into(),
-                    BitsetOp::All => self
-                        .builder
-                        .build_int_compare(IntPredicate::EQ, count, view.len, "bits.all")
-                        .map_err(|error| self.err(error))?
-                        .into(),
-                    _ => count.into(),
-                }
+                self.bit_terminal(view, op)?.into()
             }
             _ => return Err(self.err("malformed packed bit operands")),
         };
         Ok(Some(value))
     }
 
-    fn bit_count(&mut self, view: BitView<'c>) -> Result<IntValue<'c>, CodegenError> {
-        let i64 = self.ctx.i64_type();
-        let i8 = self.ctx.i8_type();
-        let zero = i64.const_zero();
-        let one = i64.const_int(1, false);
-        let empty = self
-            .builder
-            .build_int_compare(IntPredicate::EQ, view.len, zero, "bits.empty")
-            .map_err(|error| self.err(error))?;
-        let entry = self
-            .builder
-            .get_insert_block()
-            .ok_or_else(|| self.err("missing bit count block"))?;
-        let init = self.ctx.append_basic_block(self.func, "bit_count.init");
-        let body = self.ctx.append_basic_block(self.func, "bit_count.byte");
-        let exit = self.ctx.append_basic_block(self.func, "bit_count.done");
-        self.builder
-            .build_conditional_branch(empty, exit, init)
-            .map_err(|error| self.err(error))?;
-        self.builder.position_at_end(init);
-        let last_index = self
-            .builder
-            .build_int_sub(view.len, one, "bits.last.index")
-            .map_err(|error| self.err(error))?;
-        let (last_byte, last_bit) =
-            bit_position(self.builder, view.head, last_index).map_err(|e| self.err(e))?;
-        let head = self
-            .builder
-            .build_int_truncate(view.head, i8, "bits.head.shift")
-            .map_err(|error| self.err(error))?;
-        let last = self
-            .builder
-            .build_int_truncate(last_bit, i8, "bits.tail.bit")
-            .map_err(|error| self.err(error))?;
-        let shift = self
-            .builder
-            .build_int_sub(i8.const_int(7, false), last, "bits.tail.shift")
-            .map_err(|error| self.err(error))?;
-        let first_mask = self
-            .builder
-            .build_left_shift(i8.const_all_ones(), head, "bits.first.mask")
-            .map_err(|error| self.err(error))?;
-        let last_mask = self
-            .builder
-            .build_right_shift(i8.const_all_ones(), shift, false, "bits.last.mask")
-            .map_err(|error| self.err(error))?;
-        self.builder
-            .build_unconditional_branch(body)
-            .map_err(|error| self.err(error))?;
-        self.builder.position_at_end(body);
-        let position = self
-            .builder
-            .build_phi(i64, "bits.position")
-            .map_err(|error| self.err(error))?;
-        let total = self
-            .builder
-            .build_phi(i64, "bits.total")
-            .map_err(|error| self.err(error))?;
-        let index = position.as_basic_value().into_int_value();
-        let is_first = self
-            .builder
-            .build_int_compare(IntPredicate::EQ, index, zero, "bits.first")
-            .map_err(|error| self.err(error))?;
-        let is_last = self
-            .builder
-            .build_int_compare(IntPredicate::EQ, index, last_byte, "bits.last")
-            .map_err(|error| self.err(error))?;
-        let left = self
-            .builder
-            .build_select(is_first, first_mask, i8.const_all_ones(), "bits.left")
-            .map_err(|error| self.err(error))?
-            .into_int_value();
-        let right = self
-            .builder
-            .build_select(is_last, last_mask, i8.const_all_ones(), "bits.right")
-            .map_err(|error| self.err(error))?
-            .into_int_value();
-        let mask = self
-            .builder
-            .build_and(left, right, "bits.mask")
-            .map_err(|error| self.err(error))?;
-        let address = self.bit_byte_ptr(view.base, index)?;
-        let raw = self
-            .builder
-            .build_load(i8, address, "bits.byte")
-            .map_err(|error| self.err(error))?
-            .into_int_value();
-        let selected = self
-            .builder
+    /// A partial byte contributes its active bits only. Predicates reduce to a
+    /// single question: did we see a one (any) or a zero (all)?
+    fn bit_contribution(
+        &self,
+        base: PointerValue<'c>,
+        index: IntValue<'c>,
+        mask: IntValue<'c>,
+        op: BitsetOp,
+    ) -> Result<IntValue<'c>, CodegenError> {
+        let b = self.builder;
+        let ty = mask.get_type();
+        let address = self.bit_byte_ptr(base, index)?;
+        let raw = b
+            .build_load(ty, address, "bits.raw")
+            .map_err(|e| self.err(e))?;
+        raw.as_instruction_value()
+            .ok_or_else(|| self.err("missing packed load"))?
+            .set_alignment(1)
+            .map_err(|e| self.err(e))?;
+        let raw = raw.into_int_value();
+        let selected = b
             .build_and(raw, mask, "bits.active")
-            .map_err(|error| self.err(error))?;
-        let pop = self
-            .call_intrinsic("llvm.ctpop", &[i8.into()], &[selected.into()])?
+            .map_err(|e| self.err(e))?;
+        if op == BitsetOp::Count {
+            let pop = self
+                .call_intrinsic("llvm.ctpop", &[ty.into()], &[selected.into()])?
+                .into_int_value();
+            return b
+                .build_int_cast(pop, self.ctx.i64_type(), "bits.pop")
+                .map_err(|e| self.err(e));
+        }
+        let expected = if op == BitsetOp::All {
+            mask
+        } else {
+            ty.const_zero()
+        };
+        b.build_int_compare(IntPredicate::NE, selected, expected, "bits.decisive")
+            .map_err(|e| self.err(e))
+    }
+
+    /// Scan [start, end) in complete units. The caller rounds this interval to
+    /// a multiple of the unit width. A predicate leaves the entire reduction
+    /// immediately on its first decisive load.
+    fn bit_scan_units(
+        &self,
+        view: BitView<'c>,
+        range: (IntValue<'c>, IntValue<'c>),
+        ty: IntType<'c>,
+        initial: IntValue<'c>,
+        op: BitsetOp,
+        result: PhiValue<'c>,
+    ) -> Result<IntValue<'c>, CodegenError> {
+        let (start, end) = range;
+        let b = self.builder;
+        let word = self.ctx.i64_type();
+        let entry = b
+            .get_insert_block()
+            .ok_or_else(|| self.err("missing packed scan entry"))?;
+        let body = self.ctx.append_basic_block(self.func, "bits.scan");
+        let after = self.ctx.append_basic_block(self.func, "bits.scanned");
+        let empty = b
+            .build_int_compare(IntPredicate::EQ, start, end, "bits.skip")
+            .map_err(|e| self.err(e))?;
+        b.build_conditional_branch(empty, after, body)
+            .map_err(|e| self.err(e))?;
+        b.position_at_end(body);
+        let offset = b.build_phi(word, "bits.offset").map_err(|e| self.err(e))?;
+        let total = if op == BitsetOp::Count {
+            Some(b.build_phi(word, "bits.total").map_err(|e| self.err(e))?)
+        } else {
+            None
+        };
+        let index = offset.as_basic_value().into_int_value();
+        let contribution = self.bit_contribution(view.base, index, ty.const_all_ones(), op)?;
+        let (latch, sum) = if let Some(total) = total {
+            let sum = b
+                .build_int_add(
+                    total.as_basic_value().into_int_value(),
+                    contribution,
+                    "bits.sum",
+                )
+                .map_err(|e| self.err(e))?;
+            total.add_incoming(&[(&initial, entry), (&sum, body)]);
+            (body, sum)
+        } else {
+            let latch = self.ctx.append_basic_block(self.func, "bits.advance");
+            let exit = result
+                .as_instruction()
+                .get_parent()
+                .ok_or_else(|| self.err("missing packed result block"))?;
+            b.build_conditional_branch(contribution, exit, latch)
+                .map_err(|e| self.err(e))?;
+            result.add_incoming(&[(&self.ctx.bool_type().const_all_ones(), body)]);
+            b.position_at_end(latch);
+            (latch, initial)
+        };
+        let step = word.const_int(u64::from(ty.get_bit_width() / 8), false);
+        let next = b
+            .build_int_add(index, step, "bits.next")
+            .map_err(|e| self.err(e))?;
+        offset.add_incoming(&[(&start, entry), (&next, latch)]);
+        let done = b
+            .build_int_compare(IntPredicate::EQ, next, end, "bits.end")
+            .map_err(|e| self.err(e))?;
+        b.build_conditional_branch(done, after, body)
+            .map_err(|e| self.err(e))?;
+        b.position_at_end(after);
+        if op == BitsetOp::Count {
+            let complete = b
+                .build_phi(word, "bits.subtotal")
+                .map_err(|e| self.err(e))?;
+            complete.add_incoming(&[(&initial, entry), (&sum, latch)]);
+            Ok(complete.as_basic_value().into_int_value())
+        } else {
+            Ok(initial)
+        }
+    }
+
+    fn bit_terminal(&self, view: BitView<'c>, op: BitsetOp) -> Result<IntValue<'c>, CodegenError> {
+        let b = self.builder;
+        let word = self.ctx.i64_type();
+        let byte = self.ctx.i8_type();
+        let zero = word.const_zero();
+        let one = word.const_int(1, false);
+        let entry = b
+            .get_insert_block()
+            .ok_or_else(|| self.err("missing packed terminal entry"))?;
+        let first = self.ctx.append_basic_block(self.func, "bits.first");
+        let interior = self.ctx.append_basic_block(self.func, "bits.interior");
+        let exit = self.ctx.append_basic_block(self.func, "bits.done");
+        let result_ty = if op == BitsetOp::Count {
+            word
+        } else {
+            self.ctx.bool_type()
+        };
+        b.position_at_end(exit);
+        let result = b
+            .build_phi(result_ty, "bits.result")
+            .map_err(|e| self.err(e))?;
+        result.add_incoming(&[(&result_ty.const_zero(), entry)]);
+        b.position_at_end(entry);
+        let empty = b
+            .build_int_compare(IntPredicate::EQ, view.len, zero, "bits.empty")
+            .map_err(|e| self.err(e))?;
+        b.build_conditional_branch(empty, exit, first)
+            .map_err(|e| self.err(e))?;
+        b.position_at_end(first);
+        let head = b
+            .build_int_truncate(view.head, byte, "bits.head")
+            .map_err(|e| self.err(e))?;
+        let left = b
+            .build_left_shift(byte.const_all_ones(), head, "bits.left")
+            .map_err(|e| self.err(e))?;
+        // A view of at least one byte contains every active bit in this
+        // first byte irrespective of its head. Resolve a decisive predicate
+        // before computing the far boundary of a potentially large view.
+        let masked_first = if op == BitsetOp::Count {
+            first
+        } else {
+            let observed = self.bit_contribution(view.base, zero, left, op)?;
+            let full_first = b
+                .build_int_compare(
+                    IntPredicate::UGE,
+                    view.len,
+                    word.const_int(8, false),
+                    "bits.full.first",
+                )
+                .map_err(|e| self.err(e))?;
+            let decided = b
+                .build_and(full_first, observed, "bits.early")
+                .map_err(|e| self.err(e))?;
+            let bounds = self.ctx.append_basic_block(self.func, "bits.bounds");
+            b.build_conditional_branch(decided, exit, bounds)
+                .map_err(|e| self.err(e))?;
+            result.add_incoming(&[(&result_ty.const_all_ones(), first)]);
+            b.position_at_end(bounds);
+            bounds
+        };
+        let last_index = b
+            .build_int_sub(view.len, one, "bits.last.index")
+            .map_err(|e| self.err(e))?;
+        let (last_byte, last_bit) =
+            bit_position(b, view.head, last_index).map_err(|e| self.err(e))?;
+        let last = b
+            .build_int_truncate(last_bit, byte, "bits.last.bit")
+            .map_err(|e| self.err(e))?;
+        let shift = b
+            .build_int_sub(byte.const_int(7, false), last, "bits.tail.shift")
+            .map_err(|e| self.err(e))?;
+        let right = b
+            .build_right_shift(byte.const_all_ones(), shift, false, "bits.right")
+            .map_err(|e| self.err(e))?;
+        let single = b
+            .build_int_compare(IntPredicate::EQ, last_byte, zero, "bits.single")
+            .map_err(|e| self.err(e))?;
+        let first_right = b
+            .build_select(single, right, byte.const_all_ones(), "bits.first.right")
+            .map_err(|e| self.err(e))?
             .into_int_value();
-        let add = self
-            .builder
-            .build_int_z_extend(pop, i64, "bits.popcount")
-            .map_err(|error| self.err(error))?;
-        let sum = self
-            .builder
-            .build_int_add(total.as_basic_value().into_int_value(), add, "bits.sum")
-            .map_err(|error| self.err(error))?;
-        let next = self
-            .builder
-            .build_int_add(index, one, "bits.next")
-            .map_err(|error| self.err(error))?;
-        position.add_incoming(&[(&zero, init), (&next, body)]);
-        total.add_incoming(&[(&zero, init), (&sum, body)]);
-        self.builder
-            .build_conditional_branch(is_last, exit, body)
-            .map_err(|error| self.err(error))?;
-        self.builder.position_at_end(exit);
-        let result = self
-            .builder
-            .build_phi(i64, "bits.count")
-            .map_err(|error| self.err(error))?;
-        result.add_incoming(&[(&zero, entry), (&sum, body)]);
-        Ok(result.as_basic_value().into_int_value())
+        let first_mask = b
+            .build_and(left, first_right, "bits.first.mask")
+            .map_err(|e| self.err(e))?;
+        let initial = self.bit_contribution(view.base, zero, first_mask, op)?;
+        let done = if op == BitsetOp::Count {
+            single
+        } else {
+            b.build_or(single, initial, "bits.first.done")
+                .map_err(|e| self.err(e))?
+        };
+        b.build_conditional_branch(done, exit, interior)
+            .map_err(|e| self.err(e))?;
+        result.add_incoming(&[(&initial, masked_first)]);
+
+        b.position_at_end(interior);
+        // The first and last bytes are distinct here. Load only complete units
+        // between them, then handle at most unit_bytes - 1 remaining bytes.
+        let length = b
+            .build_int_sub(last_byte, one, "bits.middle.len")
+            .map_err(|e| self.err(e))?;
+        let unit_end = |width: u64| -> Result<IntValue<'c>, CodegenError> {
+            let whole = b
+                .build_and(
+                    length,
+                    word.const_int(!(width - 1), false),
+                    "bits.middle.whole",
+                )
+                .map_err(|e| self.err(e))?;
+            b.build_int_add(one, whole, "bits.middle.end")
+                .map_err(|e| self.err(e))
+        };
+        let word_end = unit_end(8)?;
+        let (start, count) = if op == BitsetOp::Count {
+            (one, initial)
+        } else {
+            // Combine a full cache line into one predicate before branching.
+            // LLVM divides the wide equality into the target's legal widths.
+            let width =
+                std::num::NonZeroU32::new(512).ok_or_else(|| self.err("zero packed scan width"))?;
+            let wide = self
+                .ctx
+                .custom_width_int_type(width)
+                .map_err(|e| self.err(e))?;
+            let wide_end = unit_end(64)?;
+            let count = self.bit_scan_units(view, (one, wide_end), wide, initial, op, result)?;
+            (wide_end, count)
+        };
+        let count = self.bit_scan_units(view, (start, word_end), word, count, op, result)?;
+        let count = self.bit_scan_units(view, (word_end, last_byte), byte, count, op, result)?;
+        let tail = self.bit_contribution(view.base, last_byte, right, op)?;
+        let final_value = if op == BitsetOp::Count {
+            b.build_int_add(count, tail, "bits.count")
+                .map_err(|e| self.err(e))?
+        } else {
+            tail
+        };
+        let last_block = b
+            .get_insert_block()
+            .ok_or_else(|| self.err("missing packed tail block"))?;
+        b.build_unconditional_branch(exit)
+            .map_err(|e| self.err(e))?;
+        result.add_incoming(&[(&final_value, last_block)]);
+        b.position_at_end(exit);
+        let value = result.as_basic_value().into_int_value();
+        if op == BitsetOp::All {
+            b.build_not(value, "bits.all").map_err(|e| self.err(e))
+        } else {
+            Ok(value)
+        }
     }
 }
 
