@@ -245,9 +245,29 @@ pub fn probe(length:i64, end:bool)->i64 {
       if bits[last] || bits.count() != last {return -4}
       bits[last] = true
       if !bits.all() {return -5}
+      if length==75 {
+        mut probe:=0
+        loop {
+          if probe==bits.len() {break}
+          bits[probe]=false
+          if bits.all() {return -8}
+          bits[probe]=true
+          probe=probe+1
+        }
+      }
       mut i:=0
       loop {if i==bits.len() {break}; bits[i]=false; i=i+1}
       if bits.any() || bits.count()!=0 {return -6}
+      if length==75 {
+        mut probe:=0
+        loop {
+          if probe==bits.len() {break}
+          bits[probe]=true
+          if !bits.any() {return -9}
+          bits[probe]=false
+          probe=probe+1
+        }
+      }
       bits[last]=true
       if !bits.any() || bits.count()!=1 {return -7}
     }
