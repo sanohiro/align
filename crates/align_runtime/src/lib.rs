@@ -87,6 +87,8 @@ mod unicode_nfc;
 pub use unicode_nfc::align_rt_unicode_nfc;
 mod time_formats;
 pub use time_formats::*;
+mod str_find_any;
+pub use str_find_any::align_rt_str_find_any;
 mod str_split;
 pub use str_split::align_rt_str_split;
 mod json_string;
@@ -15643,87 +15645,6 @@ pub unsafe extern "C" fn align_rt_str_find(hptr: *const u8, hlen: i64, nptr: *co
         Some(i) => i as i64,
         None => -1,
     }
-}
-
-/// For a small Unicode set, search the leading bytes together. On a shared
-/// prefix that does not match a whole scalar, switch to full substring searches
-/// so a long run of near misses does not repeatedly enter the byte dispatcher.
-fn find_small_scalar_set(haystack: &[u8], members: &[&[u8]]) -> Option<usize> {
-    let candidate = match members {
-        [a] => return memchr::memmem::find(haystack, a),
-        [a, b] => memchr::memchr2(a[0], b[0], haystack)?,
-        [a, b, c] => memchr::memchr3(a[0], b[0], c[0], haystack)?,
-        _ => return None,
-    };
-    let suffix = &haystack[candidate..];
-    if members.iter().any(|member| suffix.starts_with(member)) {
-        return Some(candidate);
-    }
-    let rest = &suffix[1..];
-    let mut best = None;
-    for member in members {
-        // A complete UTF-8 scalar cannot straddle another scalar's start.
-        if let Some(at) = memchr::memmem::find(&rest[..best.unwrap_or(rest.len())], member) {
-            best = Some(at);
-        }
-    }
-    best.map(|at| candidate + 1 + at)
-}
-
-fn find_in_large_scalar_set(haystack: &[u8], set: &[u8]) -> Option<usize> {
-    let text = std::str::from_utf8(haystack).ok()?;
-    text.char_indices().find_map(|(at, ch)| {
-        let mut encoded = [0; 4];
-        let scalar = ch.encode_utf8(&mut encoded);
-        memchr::memmem::find(set, scalar.as_bytes()).map(|_| at)
-    })
-}
-
-/// First UTF-8 byte offset occupied by any scalar in the delimiter set, or -1.
-/// Null, nonpositive and unrepresentable ranges are empty.
-///
-/// # Safety
-/// Admitted positive ranges must describe live readable UTF-8 for this call.
-/// The views may overlap.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn align_rt_str_find_any(hptr: *const u8, hlen: i64, sptr: *const u8, slen: i64) -> i64 {
-    let haystack = unsafe { safe_slice(hptr, hlen) };
-    let set = unsafe { safe_slice(sptr, slen) };
-    if haystack.is_empty() || set.is_empty() {
-        return -1;
-    }
-    let index = if set.is_ascii() {
-        match set {
-            [a] => memchr::memchr(*a, haystack),
-            [a, b] => memchr::memchr2(*a, *b, haystack),
-            [a, b, c] => memchr::memchr3(*a, *b, *c, haystack),
-            _ => {
-                let mut members = [false; 256];
-                for &byte in set {
-                    members[usize::from(byte)] = true;
-                }
-                haystack.iter().position(|&byte| members[usize::from(byte)])
-            }
-        }
-    } else if set.len() > 3 * 4 {
-        // Four bytes per scalar bounds delimiter setup even for a huge set.
-        find_in_large_scalar_set(haystack, set)
-    } else {
-        let Ok(delimiters) = std::str::from_utf8(set) else { return -1 };
-        let mut chars = delimiters.char_indices();
-        let mut members = [&[][..]; 3];
-        let mut count = 0;
-        for (slot, (start, ch)) in members.iter_mut().zip(&mut chars) {
-            *slot = &set[start..start + ch.len_utf8()];
-            count += 1;
-        }
-        if chars.next().is_none() {
-            find_small_scalar_set(haystack, &members[..count])
-        } else {
-            find_in_large_scalar_set(haystack, set)
-        }
-    };
-    index.and_then(|at| i64::try_from(at).ok()).unwrap_or(-1)
 }
 
 /// `s.rfind(needle)` (M5, `core.string`) — the byte index of `needle`'s **last** occurrence in `s`,
